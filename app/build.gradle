@@ -1,0 +1,69 @@
+plugins {
+    alias(libs.plugins.android.application)
+}
+
+android {
+    namespace 'com.example.cardboardplusplus'
+    compileSdk {
+        version = release(36) {
+            minorApiLevel = 1
+        }
+    }
+
+    defaultConfig {
+        applicationId "com.example.cardboardplusplus"
+        minSdk 24
+        targetSdk 36
+        versionCode 1
+        versionName "1.0"
+
+        ndk {
+            abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86', 'x86_64'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+    
+    packagingOptions {
+        pickFirst 'lib/x86/libmediapipe_tasks_vision_jni.so'
+        pickFirst 'lib/x86_64/libmediapipe_tasks_vision_jni.so'
+        pickFirst 'lib/armeabi-v7a/libmediapipe_tasks_vision_jni.so'
+        pickFirst 'lib/arm64-v8a/libmediapipe_tasks_vision_jni.so'
+    }
+}
+
+configurations.all {
+    resolutionStrategy {
+        force 'com.google.protobuf:protobuf-javalite:3.19.6'
+    }
+}
+
+dependencies {
+    // AndroidX Core
+    implementation libs.androidx.core.ktx
+    implementation libs.androidx.lifecycle.runtime.ktx
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+
+    // Cardboard SDK (local AAR)
+    implementation(files("libs/sdk-base-1.200.0.aar"))
+
+    // MediaPipe from Maven - Tasks Vision includes Hands
+    implementation 'com.google.mediapipe:tasks-vision:0.10.32'
+
+    // CameraX
+    implementation libs.camerax.core
+    implementation libs.camerax.camera2
+    implementation libs.camerax.lifecycle
+    implementation libs.camerax.view
+
+    // Testing
+}
