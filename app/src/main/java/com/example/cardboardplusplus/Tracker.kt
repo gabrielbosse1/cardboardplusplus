@@ -33,6 +33,7 @@ object Tracker : SensorEventListener {
 
     private var lastTimestamp: Long = 0
 
+    // TODO: Turn this into a setting.
     private const val accelerometerDeadzone = 0.2f
 
     fun initialize(context: Context) {
@@ -58,13 +59,13 @@ object Tracker : SensorEventListener {
     fun stop() {
         sensorManager?.unregisterListener(this)
     }
-
+    // TODO: Reset position on long press.
     fun resetPosition() {
         position[0] = 0f
         position[1] = 0f
         position[2] = 0f
     }
-
+    // TODO: Make a toggle for the 6DoF.
     override fun onSensorChanged(event: SensorEvent) {
         val dt = (System.nanoTime() - lastTimestamp) / 1e9f
         lastTimestamp = System.nanoTime()

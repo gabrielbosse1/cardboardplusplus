@@ -264,10 +264,12 @@ class MainActivity : AppCompatActivity(), GvrView.StereoRenderer {
     private fun openCamera() {
         val cameraManager = getSystemService(CAMERA_SERVICE) as CameraManager
         try {
+            // TODO: Add a dropdown menu to select the camera ID.
             val cameraId = cameraManager.cameraIdList[0]
             val characteristics = cameraManager.getCameraCharacteristics(cameraId)
             val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
 
+            // TODO: Add a dropdown menu to select the camera resolution.
             val previewSizes = map?.getOutputSizes(ImageFormat.YUV_420_888)
             val previewSize = android.util.Size(640, 480)
 
