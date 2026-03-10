@@ -6,6 +6,8 @@ These features include:
 
 ### Hand tracking
 
+<p align="left"> <img width="500" src="assets/hand-tracking-demo.jpg"/> </p>
+
 ### 6DOF (degrees of freedom)
 
 ### SteamVR compatibility
@@ -19,7 +21,7 @@ I'm working to implement the features I want and to make the project work. If yo
 
 ## Current progress
 - [x] Camera preview
-- [x] Hand tracking
+- [x] Hand tracking (currently slow, but will be moved to the computer when the driver is ready)
 - [x] 6DoF (unstable)
 - [ ] SteamVR driver
 - [ ] Controller emulation
