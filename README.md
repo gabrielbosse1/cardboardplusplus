@@ -20,6 +20,6 @@ I'm working to implement the features I want and to make the project work. If yo
 ## Current progress
 - [x] Camera preview
 - [x] Hand tracking
-- [ ] 6DoF
+- [x] 6DoF (unstable)
 - [ ] SteamVR driver
 - [ ] Controller emulation
