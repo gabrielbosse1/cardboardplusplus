@@ -1,6 +1,10 @@
 # Cardboard++
 ## Bringing Google Cardboard Closer to a Meta Quest!
 
+![License](https://img.shields.io/github/license/gabrielbosse1/cardboardplusplus)
+![Stars](https://img.shields.io/github/stars/gabrielbosse1/cardboardplusplus)
+![Last Commit](https://img.shields.io/github/last-commit/gabrielbosse1/cardboardplusplus)
+
 I'm making this software with one goal: bringing features normally exclusive to expensive VR (like the Meta Quest) to a simple Google Cardboard.
 These features include:
 
