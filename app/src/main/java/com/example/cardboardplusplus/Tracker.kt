@@ -9,21 +9,30 @@ import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.sqrt
 
+/**
+ * Handles 6DoF head tracking using device IMU sensors.
+ * Uses gyroscope for rotation and linear acceleration for position estimation.
+ * Note: Position drifts over time due to lack of visual odometry.
+ */
 object Tracker : SensorEventListener {
     private var sensorManager: SensorManager? = null
     private var gyroSensor: Sensor? = null
     private var accelSensor: Sensor? = null
     private var rotSensor: Sensor? = null
 
+    /** Angular velocity in rad/s: [x, y, z] */
     var gyroscope = FloatArray(3)
         private set
 
+    /** Linear acceleration in m/s²: [x, y, z] */
     var accelerometer = FloatArray(3)
         private set
 
+    /** Rotation in degrees: [pitch, yaw, roll] */
     var rotation = FloatArray(3)
         private set
 
+    /** Estimated position in meters: [x, y, z] - drifts over time */
     var position = FloatArray(3)
         private set
 
@@ -36,6 +45,7 @@ object Tracker : SensorEventListener {
     // TODO: Turn this into a setting.
     private const val accelerometerDeadzone = 0.2f
 
+    /** Initializes sensors from the given context. */
     fun initialize(context: Context) {
         sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
         gyroSensor = sensorManager?.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
@@ -43,6 +53,7 @@ object Tracker : SensorEventListener {
         accelSensor = sensorManager?.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION)
     }
 
+    /** Starts listening to IMU sensors at game delay. */
     fun start() {
         gyroSensor?.let {
             sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
@@ -56,10 +67,13 @@ object Tracker : SensorEventListener {
         lastTimestamp = System.nanoTime()
     }
 
+    /** Stops listening to all sensors. */
     fun stop() {
         sensorManager?.unregisterListener(this)
     }
+
     // TODO: Reset position on long press.
+    /** Resets estimated position to origin (0,0,0). */
     fun resetPosition() {
         position[0] = 0f
         position[1] = 0f
