@@ -4,6 +4,7 @@
 
 using namespace vr;
 
+/** Virtual HMD device driver for SteamVR. Presents as a display to OpenVR. */
 class HmdDriver : public ITrackedDeviceServerDriver, public IVRDisplayComponent
 {
 public:
