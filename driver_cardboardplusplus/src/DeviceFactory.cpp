@@ -2,9 +2,11 @@
 #include <openvr_driver.h>
 #include <windows.h>
 
+// DLL export macro for SteamVR driver interface.
 #define HMD_DLL_EXPORT extern "C" __declspec( dllexport )
 
-DeviceProvider deviceProvider; //global, single instance, of the class that provides OpenVR with all of your devices.
+// Global provider instance for SteamVR to load.
+DeviceProvider deviceProvider;
 
 /**
 This method returns an instance of your provider that OpenVR uses.

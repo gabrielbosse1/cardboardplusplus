@@ -1,5 +1,6 @@
 #include <DeviceProvider.h>
 
+// Device provider entry point. Registers controller and HMD drivers with SteamVR.
 EVRInitError DeviceProvider::Init(IVRDriverContext* pDriverContext)
 {
     EVRInitError initError = InitServerDriverContext(pDriverContext);

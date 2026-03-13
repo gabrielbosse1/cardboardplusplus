@@ -1,5 +1,6 @@
 #include <ControllerDriver.h>
 
+// Controller driver implementation. Exposes joystick/trackpad to SteamVR.
 EVRInitError ControllerDriver::Activate(uint32_t unObjectId)
 {
 	driverId = unObjectId; //unique ID for your driver
