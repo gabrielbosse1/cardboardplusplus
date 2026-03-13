@@ -38,6 +38,10 @@ import java.util.concurrent.Executors
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 
+/**
+ * Main VR activity.
+ * Handles camera preview, hand tracking, 6DoF tracking, and VR rendering.
+ */
 class MainActivity : AppCompatActivity(), GvrView.StereoRenderer {
 
     private var cameraDevice: CameraDevice? = null
