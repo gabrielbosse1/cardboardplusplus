@@ -4,9 +4,13 @@ import android.graphics.Bitmap
 import android.media.Image
 import android.util.Log
 
+/**
+ * Image conversion utilities, primarily for camera YUV to RGB.
+ */
 object Images {
     private var reusableBitmap: Bitmap? = null
 
+    /** Converts YUV_420_888 camera image to ARGB Bitmap. */
     fun yuvToBitmap(planes: Array<Image.Plane>, width: Int, height: Int): Bitmap? {
         try {
             val yBuffer = planes[0].buffer
