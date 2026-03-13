@@ -3,6 +3,7 @@
 
 using namespace vr;
 
+// Virtual HMD driver implementation. Presents as a display device to SteamVR.
 EVRInitError HmdDriver::Activate(uint32_t unObjectId)
 {
     driverId = unObjectId;
