@@ -13,18 +13,28 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.Executors
 
+/**
+ * MediaPipe hand tracking singleton.
+ * Detects 21 landmarks per hand using GPU acceleration.
+ */
 object Hands {
     init {
         System.loadLibrary("mediapipe_tasks_vision_jni")
     }
 
+    /** Single hand detection result with landmarks and handedness. */
     data class HandData(val landmarks: List<Landmark>, val handedness: String)
+
+    /** 3D hand landmark point. Coordinates normalized [0,1]. */
     data class Landmark(val x: Float, val y: Float, val z: Float)
 
+    /** Current detected hands. */
     var handResults: List<HandData> = emptyList()
+
     var handLandmarker: HandLandmarker? = null
     private val inferenceExecutor = Executors.newFixedThreadPool(2)
 
+    /** Initializes MediaPipe hand landmarker with GPU delegate. */
     fun initializeMediaPipe(context: Context) {
         try {
             val baseOptions = BaseOptions.builder()
@@ -48,6 +58,7 @@ object Hands {
         }
     }
 
+    /** Runs hand detection asynchronously on the given image. */
     fun detectAsync(mpImage: MPImage, timestamp: Long) {
         handLandmarker?.detectAsync(mpImage, timestamp)
     }
@@ -76,6 +87,7 @@ object Hands {
         handResults = hands
     }
 
+    /** Renders detected hand landmarks and connections as lines/points using OpenGL. */
     fun drawHandLandmarks(lineProgram: Int) {
         val hands = handResults
         if (hands.isEmpty()) return
