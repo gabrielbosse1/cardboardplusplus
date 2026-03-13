@@ -27,5 +27,5 @@ I'm working to implement the features I want and to make the project work. If yo
 - [x] Camera preview
 - [x] Hand tracking (currently slow, but will be moved to the computer when the driver is ready)
 - [x] 6DoF (unstable)
-- [ ] SteamVR driver
+- [x] SteamVR driver (still not connected to the android app)
 - [ ] Controller emulation
