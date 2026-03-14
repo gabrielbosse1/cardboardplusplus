@@ -38,8 +38,8 @@ EVRInitError ControllerDriver::Activate(uint32_t unObjectId)
 DriverPose_t ControllerDriver::GetPose()
 {
 	DriverPose_t pose = { 0 }; //This example doesn't use Pose, so this method is just returning a default Pose.
-	pose.poseIsValid = false;
-	pose.result = TrackingResult_Calibrating_OutOfRange;
+	pose.poseIsValid = true;
+	pose.result = TrackingResult_Running_OK;
 	pose.deviceIsConnected = true;
 
 	HmdQuaternion_t quat;
