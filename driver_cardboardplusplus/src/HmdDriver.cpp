@@ -1,5 +1,6 @@
 #include <HmdDriver.h>
 #include <openvr_driver.h>
+#include <vulkan/vulkan.hpp>
 
 using namespace vr;
 
@@ -91,6 +92,25 @@ DriverPose_t HmdDriver::GetPose()
     pose.vecPosition[2] = 0.0;
 
     return pose;
+}
+
+void Present(vr::SharedTextureHandle_t backbufferTextureHandle)
+{
+    // Present function with the backbuffer (both eyes, at least i think so)
+
+}
+
+void WaitForPresent()
+{
+	// Wait for the frame to be presented.
+}
+
+bool GetTimeSinceLastVsync(float* pfSecondsSinceLastVsync, uint64_t* pulFrameCounter)
+{
+    // Get the time since the last vsync and the current frame counter.
+	pfSecondsSinceLastVsync[0] = 0.016f; // example value for 60Hz
+	pulFrameCounter[0] = 0; // example value
+	return false;
 }
 
 void HmdDriver::RunFrame()
