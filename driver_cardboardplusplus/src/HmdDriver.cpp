@@ -1,6 +1,7 @@
 #include <HmdDriver.h>
 #include <openvr_driver.h>
 #include <vulkan/vulkan.hpp>
+#pragma comment(lib, "vulkan-1.lib")
 
 using namespace vr;
 
@@ -8,6 +9,35 @@ using namespace vr;
 EVRInitError HmdDriver::Activate(uint32_t unObjectId)
 {
     driverId = unObjectId;
+
+    // When I wrote this code, only God and I understood it.
+    // Now only God understands it.
+    // If you're an atheist, good luck.
+    // I even managed to somehow get the error "'cannot open file 'kernel32.lib'"
+
+    // Vulkan initialization
+    vk::ApplicationInfo appInfo("CardboardPlusPlus", 1, "CardboardPlusPlus", 1, VK_API_VERSION_1_0);
+    const char* extensions[] = { VK_KHR_SURFACE_EXTENSION_NAME };
+    vk::InstanceCreateInfo createInfo({}, &appInfo, 0, nullptr, 1, extensions);
+    vkInstance = vk::createInstance(createInfo);
+
+    uint32_t deviceCount = 0;
+    vkInstance.enumeratePhysicalDevices(&deviceCount, nullptr);
+    std::vector<vk::PhysicalDevice> devices(deviceCount);
+    vkInstance.enumeratePhysicalDevices(&deviceCount, devices.data());
+    vkPhysicalDevice = devices[0];
+
+    vk::PhysicalDeviceProperties deviceProps = vkPhysicalDevice.getProperties();
+    printf("Using Vulkan device: %s\n", deviceProps.deviceName.data());
+
+    float queuePriority = 1.0f;
+    vk::QueueFamilyProperties queueProps = vkPhysicalDevice.getQueueFamilyProperties()[0];
+    vk::DeviceQueueCreateInfo queueCreateInfo({}, 0, 1, &queuePriority);
+    vk::DeviceCreateInfo deviceCreateInfo({}, 1, &queueCreateInfo);
+    vkDevice = vkPhysicalDevice.createDevice(deviceCreateInfo);
+    vkDevice.getQueue(0, 0, &vkGraphicsQueue);
+
+    printf("Vulkan device initialized successfully\n");
 
     PropertyContainerHandle_t props = VRProperties()->TrackedDeviceToPropertyContainer(driverId);
 

@@ -1,6 +1,7 @@
 #pragma once
 #include <openvr_driver.h>
 #include <windows.h>
+#include <vulkan/vulkan.hpp>
 
 using namespace vr;
 
@@ -27,4 +28,9 @@ public:
 
 private:
     uint32_t driverId;
+
+    vk::Instance vkInstance;
+    vk::PhysicalDevice vkPhysicalDevice;
+    vk::Device vkDevice;
+    vk::Queue vkGraphicsQueue;
 };
