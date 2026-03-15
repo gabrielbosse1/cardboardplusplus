@@ -78,6 +78,8 @@ EVRInitError HmdDriver::Activate(uint32_t unObjectId)
 
 void HmdDriver::Deactivate()
 {
+    vkDevice.destroy();
+    vkInstance.destroy();
     driverId = k_unTrackedDeviceIndexInvalid;
 }
 
