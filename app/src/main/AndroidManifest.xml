@@ -43,12 +43,6 @@
                 <category android:name="android.intent.category.LAUNCHER" />
                 <category android:name="com.google.intent.category.CARDBOARD" />
             </intent-filter>
-            <meta-data
-                android:name="com.google.android.vr.icon"
-                android:resource="@mipmap/ic_launcher" />
-            <meta-data
-                android:name="com.google.android.vr.icon_background"
-                android:resource="@drawable/ic_launcher_background" />
         </activity>
     </application>
 
