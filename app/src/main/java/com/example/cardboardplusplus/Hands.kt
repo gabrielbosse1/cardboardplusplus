@@ -1,7 +1,7 @@
 package com.example.cardboardplusplus
 
 import android.content.Context
-import android.opengl.GLES20
+import android.opengl.GLES30
 import android.util.Log
 import com.google.mediapipe.framework.image.MPImage
 import com.google.mediapipe.tasks.core.BaseOptions
@@ -92,7 +92,7 @@ object Hands {
         val hands = handResults
         if (hands.isEmpty()) return
 
-        GLES20.glUseProgram(lineProgram)
+        GLES30.glUseProgram(lineProgram)
 
         val handConnections = listOf(
             Pair(0, 1), Pair(1, 2), Pair(2, 3), Pair(3, 4),
@@ -116,12 +116,12 @@ object Hands {
                     val lineBuffer = ByteBuffer.allocateDirect(lineCoords.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
                     lineBuffer.put(lineCoords).position(0)
 
-                    val posHandle = GLES20.glGetAttribLocation(lineProgram, "aPosition")
-                    GLES20.glEnableVertexAttribArray(posHandle)
-                    GLES20.glVertexAttribPointer(posHandle, 3, GLES20.GL_FLOAT, false, 0, lineBuffer)
-                    GLES20.glLineWidth(3f)
-                    GLES20.glDrawArrays(GLES20.GL_LINES, 0, 2)
-                    GLES20.glDisableVertexAttribArray(posHandle)
+                    val posHandle = GLES30.glGetAttribLocation(lineProgram, "aPosition")
+                    GLES30.glEnableVertexAttribArray(posHandle)
+                    GLES30.glVertexAttribPointer(posHandle, 3, GLES30.GL_FLOAT, false, 0, lineBuffer)
+                    GLES30.glLineWidth(3f)
+                    GLES30.glDrawArrays(GLES30.GL_LINES, 0, 2)
+                    GLES30.glDisableVertexAttribArray(posHandle)
                 }
             }
 
@@ -130,11 +130,11 @@ object Hands {
                 val pointBuffer = ByteBuffer.allocateDirect(pointCoords.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
                 pointBuffer.put(pointCoords).position(0)
 
-                val posHandle = GLES20.glGetAttribLocation(lineProgram, "aPosition")
-                GLES20.glEnableVertexAttribArray(posHandle)
-                GLES20.glVertexAttribPointer(posHandle, 3, GLES20.GL_FLOAT, false, 0, pointBuffer)
-                GLES20.glDrawArrays(GLES20.GL_POINTS, 0, 1)
-                GLES20.glDisableVertexAttribArray(posHandle)
+                val posHandle = GLES30.glGetAttribLocation(lineProgram, "aPosition")
+                GLES30.glEnableVertexAttribArray(posHandle)
+                GLES30.glVertexAttribPointer(posHandle, 3, GLES30.GL_FLOAT, false, 0, pointBuffer)
+                GLES30.glDrawArrays(GLES30.GL_POINTS, 0, 1)
+                GLES30.glDisableVertexAttribArray(posHandle)
             }
         }
     }
