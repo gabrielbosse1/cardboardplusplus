@@ -3,12 +3,15 @@
 // Controller driver implementation. Exposes joystick/trackpad to SteamVR.
 EVRInitError ControllerDriver::Activate(uint32_t unObjectId)
 {
+	// TODO: Check if every Property is okay to be recognized as a Vive controller.
+	// Original example code from finallyfunctional/openvr-driver-example
 	driverId = unObjectId; //unique ID for your driver
 
 	PropertyContainerHandle_t props = VRProperties()->TrackedDeviceToPropertyContainer(driverId); //this gets a container object where you store all the information about your driver
 
+	VRProperties()->SetStringProperty(props, Prop_RenderModelName_String, "vr_controller_vive_1_5");
 	VRProperties()->SetStringProperty(props, Prop_InputProfilePath_String, "{example}/input/controller_profile.json"); //tell OpenVR where to get your driver's Input Profile
-	VRProperties()->SetInt32Property(props, Prop_ControllerRoleHint_Int32, ETrackedControllerRole::TrackedControllerRole_Treadmill); //tells OpenVR what kind of device this is
+	VRProperties()->SetInt32Property(props, Prop_ControllerRoleHint_Int32, ETrackedControllerRole::TrackedControllerRole_LeftHand); //tells OpenVR what kind of device this is
 	VRDriverInput()->CreateScalarComponent(props, "/input/joystick/y", &joystickYHandle, EVRScalarType::VRScalarType_Absolute,
 		EVRScalarUnits::VRScalarUnits_NormalizedTwoSided); //sets up handler you'll use to send joystick commands to OpenVR with, in the Y direction (forward/backward)
 	VRDriverInput()->CreateScalarComponent(props, "/input/trackpad/y", &trackpadYHandle, EVRScalarType::VRScalarType_Absolute,
@@ -27,7 +30,6 @@ EVRInitError ControllerDriver::Activate(uint32_t unObjectId)
 	//VRProperties()->SetInt32Property(props, Prop_Axis0Type_Int32, k_eControllerAxis_TrackPad);
 	//VRProperties()->SetInt32Property(props, Prop_Axis2Type_Int32, k_eControllerAxis_Joystick);
 	//VRProperties()->SetStringProperty(props, Prop_SerialNumber_String, "example_controler_serial");
-	//VRProperties()->SetStringProperty(props, Prop_RenderModelName_String, "vr_controller_vive_1_5");
 	//uint64_t availableButtons = ButtonMaskFromId(k_EButton_SteamVR_Touchpad) |
 	//	ButtonMaskFromId(k_EButton_IndexController_JoyStick);
 	//VRProperties()->SetUint64Property(props, Prop_SupportedButtons_Uint64, availableButtons);
@@ -37,11 +39,13 @@ EVRInitError ControllerDriver::Activate(uint32_t unObjectId)
 
 DriverPose_t ControllerDriver::GetPose()
 {
-	DriverPose_t pose = { 0 }; //This example doesn't use Pose, so this method is just returning a default Pose.
+	DriverPose_t pose = { 0 };
+	// Report a valid, stationary pose by default so compositor treats this Controller as available.
 	pose.poseIsValid = true;
 	pose.result = TrackingResult_Running_OK;
 	pose.deviceIsConnected = true;
 
+	// Rotation in quaternion form. (Placeholder values for now, can be updated with real tracking data later)
 	HmdQuaternion_t quat;
 	quat.w = 1;
 	quat.x = 0;
@@ -51,11 +55,18 @@ DriverPose_t ControllerDriver::GetPose()
 	pose.qWorldFromDriverRotation = quat;
 	pose.qDriverFromHeadRotation = quat;
 
+	// Position in meters. (Placeholder values for now, can be updated with real tracking data later)
+	pose.vecPosition[0] = 0.0;
+	pose.vecPosition[1] = 0.0;
+	pose.vecPosition[2] = 0.0;
+
 	return pose;
 }
 
 void ControllerDriver::RunFrame()
 {
+	// TODO: Replace the following code with real input data from your hardware. This is just an example of how to send input data to OpenVR.
+	// Original example code from finallyfunctional/openvr-driver-example
 	//Since we used VRScalarUnits_NormalizedTwoSided as the unit, the range is -1 to 1.
 	VRDriverInput()->UpdateScalarComponent(joystickYHandle, 0.95f, 0); //move forward
 	VRDriverInput()->UpdateScalarComponent(trackpadYHandle, 0.95f, 0); //move foward
@@ -65,15 +76,13 @@ void ControllerDriver::RunFrame()
 
 void ControllerDriver::Deactivate()
 {
+	// Clean up any state you need to here. This will be called when the driver is unloaded.
 	driverId = k_unTrackedDeviceIndexInvalid;
 }
 
 void* ControllerDriver::GetComponent(const char* pchComponentNameAndVersion)
 {
-	//I found that if this method just returns null always, it works fine. But I'm leaving the if statement in since it doesn't hurt.
-	//Check out the IVRDriverInput_Version declaration in openvr_driver.h. You can search that file for other _Version declarations 
-	//to see other components that are available. You could also put a log in this class and output the value passed into this 
-	//method to see what OpenVR is looking for.
+	// Return this class if OpenVR is requesting that.
 	if (strcmp(IVRDriverInput_Version, pchComponentNameAndVersion) == 0)
 	{
 		return this;

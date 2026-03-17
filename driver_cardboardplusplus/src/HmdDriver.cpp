@@ -28,6 +28,7 @@ EVRInitError HmdDriver::Activate(uint32_t unObjectId)
 
     DriverLog("HmdDriver::Activate called");
 
+	// Create a D3D11 device for rendering.
     D3D_FEATURE_LEVEL featureLevel;
     HRESULT hr = D3D11CreateDevice(
         nullptr,
@@ -49,6 +50,7 @@ EVRInitError HmdDriver::Activate(uint32_t unObjectId)
 
     DriverLog("D3D11 device initialized successfully");
 
+	// TODO: Make sure those properties are correct to be seen as a valid HMD by SteamVR. Some of them are just placeholders for now.
     PropertyContainerHandle_t props = VRProperties()->TrackedDeviceToPropertyContainer(driverId);
 
     VRProperties()->SetStringProperty(props, Prop_ModelNumber_String, "CardboardPlusPlus");
@@ -90,6 +92,7 @@ EVRInitError HmdDriver::Activate(uint32_t unObjectId)
 
 void HmdDriver::Deactivate()
 {
+	// Clean up resources and reset state.
     DestroyAllSwapTextureSets(0);
 
     if (pD3D11DeviceContext) {
@@ -107,6 +110,7 @@ void HmdDriver::EnterStandby() {}
 
 void* HmdDriver::GetComponent(const char* pchComponentNameAndVersion)
 {
+	// Return to SteamVR which interfaces we support. This is how SteamVR knows we have display and direct mode components.
     DriverLog("GetComponent called with: %s", pchComponentNameAndVersion);
     if (strcmp(pchComponentNameAndVersion, IVRDisplayComponent_Version) == 0)
     {
@@ -135,7 +139,7 @@ DriverPose_t HmdDriver::GetPose()
     pose.result = TrackingResult_Running_OK;
     pose.deviceIsConnected = true;
 
-    // identity rotations / zero translation
+	// Rotation in quaternion form. (Placeholder values for now, can be updated with real tracking data later)
     HmdQuaternion_t quat;
     quat.w = 1.0;
     quat.x = 0.0;
@@ -144,6 +148,8 @@ DriverPose_t HmdDriver::GetPose()
 
     pose.qWorldFromDriverRotation = quat;
     pose.qDriverFromHeadRotation = quat;
+
+	// Position in meters. (Placeholder values for now, can be updated with real tracking data later)
     pose.vecPosition[0] = 0.0;
     pose.vecPosition[1] = 0.0;
     pose.vecPosition[2] = 0.0;
@@ -199,6 +205,7 @@ void HmdDriver::GetEyeOutputViewport( EVREye eEye, uint32_t *pnX, uint32_t *pnY,
 
 void HmdDriver::GetProjectionRaw( EVREye eEye, float *pfLeft, float *pfRight, float *pfTop, float *pfBottom )
 {
+	// Return a simple symmetric projection for now. These values can be adjusted to change the FOV and aspect ratio.
     *pfLeft = -1.0;
     *pfRight = 1.0;
     *pfTop = -1.0;
@@ -207,6 +214,7 @@ void HmdDriver::GetProjectionRaw( EVREye eEye, float *pfLeft, float *pfRight, fl
 
 DistortionCoordinates_t HmdDriver::ComputeDistortion( EVREye eEye, float fU, float fV )
 {
+	// No distortion at all, Cardboard SDK should handle this.
     DistortionCoordinates_t coordinates;
     coordinates.rfBlue[0] = fU;
     coordinates.rfBlue[1] = fV;
@@ -219,6 +227,7 @@ DistortionCoordinates_t HmdDriver::ComputeDistortion( EVREye eEye, float fU, flo
 
 void HmdDriver::CreateSwapTextureSet(uint32_t unPid, const SwapTextureSetDesc_t* pSwapTextureSetDesc, SwapTextureSet_t* pOutSwapTextureSet)
 {
+	// Create a shared texture that the application can render into. (still has a lot to be improved, especially perfomance)
     DriverLog("CreateSwapTextureSet called: width=%d, height=%d, format=%d, samples=%d",
         pSwapTextureSetDesc->nWidth, pSwapTextureSetDesc->nHeight, pSwapTextureSetDesc->nFormat, pSwapTextureSetDesc->nSampleCount);
 
@@ -286,6 +295,7 @@ void HmdDriver::CreateSwapTextureSet(uint32_t unPid, const SwapTextureSetDesc_t*
 
 void HmdDriver::DestroySwapTextureSet(vr::SharedTextureHandle_t sharedTextureHandle)
 {
+	// Find the texture set with the given shared handle and release it.
     DriverLog("DestroySwapTextureSet called: handle=%llu", (uint64_t)sharedTextureHandle);
 
     HANDLE h = (HANDLE)sharedTextureHandle;
@@ -305,6 +315,7 @@ void HmdDriver::DestroySwapTextureSet(vr::SharedTextureHandle_t sharedTextureHan
 
 void HmdDriver::DestroyAllSwapTextureSets(uint32_t unPid)
 {
+	// Release all texture sets associated with the given process ID.
     DriverLog("DestroyAllSwapTextureSets called for pid=%d", unPid);
 
     auto it = m_swapTextureSets.find(unPid);
@@ -320,6 +331,7 @@ void HmdDriver::DestroyAllSwapTextureSets(uint32_t unPid)
 
 void HmdDriver::GetNextSwapTextureSetIndex(vr::SharedTextureHandle_t sharedTextureHandles[2], uint32_t(*pIndices)[2])
 {
+	// We just return index 0 for both eyes.
     DriverLog("GetNextSwapTextureSetIndex called");
     (*pIndices)[0] = 0;
     (*pIndices)[1] = 0;
@@ -327,24 +339,25 @@ void HmdDriver::GetNextSwapTextureSetIndex(vr::SharedTextureHandle_t sharedTextu
 
 void HmdDriver::SubmitLayer(const SubmitLayerPerEye_t(&perEye)[2])
 {
+	// This is where the application submits the textures it rendered for each eye.
     DriverLog("SubmitLayer called - left: %llu, right: %llu",
         (uint64_t)perEye[0].hTexture, (uint64_t)perEye[1].hTexture);
 }
 
 void HmdDriver::Present(vr::SharedTextureHandle_t syncTexture)
 {
+	// This is called after all layers have been submitted. We can acquire the sync texture here to synchronize with the application's rendering.
     DriverLog("Present called! syncTexture=%llu", (uint64_t)syncTexture);
-
-    // SIMPLE VERSION - just log for now, no D3D operations to avoid freeze
-    // The sync texture handling can be added after we confirm Present works
 }
 
 void HmdDriver::PostPresent()
 {
+	// This is called after Present returns, allowing the driver to take more time until vsync after they've successfully acquired the sync texture in Present. We can use this to do any additional work needed before the next frame.
     DriverLog("PostPresent called");
 }
 
 void HmdDriver::GetFrameTiming(DriverDirectMode_FrameTiming* pFrameTiming)
 {
+	// This is called to get additional frame timing stats from driver. Can be used to get the current framerate to optimize the encoder settings in real-time.
     DriverLog("GetFrameTiming called");
 }
