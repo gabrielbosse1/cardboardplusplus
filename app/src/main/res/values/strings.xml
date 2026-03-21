@@ -1,4 +1,0 @@
-<resources>
-    <string name="app_name">cardboardplusplus</string>
-    <string name="gvr_vr_mode_component">com.google.vr.vrcore/com.google.vr.sdk.base.google.VRActivity</string>
-</resources>
