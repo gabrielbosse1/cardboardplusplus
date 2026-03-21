@@ -22,6 +22,7 @@
     <ClInclude Include="include\ControllerDriver.h" />
     <ClInclude Include="include\DeviceProvider.h" />
     <ClInclude Include="include\HmdDriver.h" />
+    <ClInclude Include="include\VideoEncoder.h" />
     <ClInclude Include="include\openvr.h" />
     <ClInclude Include="include\openvr_capi.h" />
     <ClInclude Include="include\openvr_driver.h" />
@@ -31,6 +32,7 @@
     <ClCompile Include="src\DeviceFactory.cpp" />
     <ClCompile Include="src\DeviceProvider.cpp" />
     <ClCompile Include="src\HmdDriver.cpp" />
+    <ClCompile Include="src\VideoEncoder.cpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="include\openvr_api.cs" />
@@ -105,14 +107,14 @@
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <LinkIncremental>true</LinkIncremental>
-    <IncludePath>include</IncludePath>
+    <IncludePath>$(ProjectDir)include;$(ProjectDir)lib\ffmpeg\include;$(IncludePath)</IncludePath>
     <SourcePath>src</SourcePath>
-    <LibraryPath>$(VC_LibraryPath_x64);$(WindowsSDK_LibraryPath_x64);</LibraryPath>
+    <LibraryPath>$(ProjectDir)lib;$(ProjectDir)lib\ffmpeg\lib;$(VC_LibraryPath_x64);$(WindowsSDK_LibraryPath_x64);</LibraryPath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <LinkIncremental>false</LinkIncremental>
-    <IncludePath>include;$(IncludePath)</IncludePath>
-    <LibraryPath>lib;$(LibraryPath)</LibraryPath>
+    <IncludePath>$(ProjectDir)include;$(ProjectDir)lib\ffmpeg\include;$(IncludePath)</IncludePath>
+    <LibraryPath>$(ProjectDir)lib;$(ProjectDir)lib\ffmpeg\lib;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
@@ -158,12 +160,14 @@
       <ConformanceMode>true</ConformanceMode>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalLibraryDirectories>lib</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>lib;$(FFmpegLibPath);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>openvr_api.lib;d3d11.lib;dxgi.lib;avcodec.lib;avformat.lib;avutil.lib;swscale.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -177,6 +181,7 @@
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
       <WholeProgramOptimization>false</WholeProgramOptimization>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -184,6 +189,8 @@
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
+      <AdditionalLibraryDirectories>lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>openvr_api.lib;d3d11.lib;dxgi.lib;avcodec.lib;avformat.lib;avutil.lib;swscale.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

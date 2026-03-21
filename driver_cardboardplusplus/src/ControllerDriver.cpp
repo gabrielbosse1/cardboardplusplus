@@ -1,4 +1,6 @@
 #include <ControllerDriver.h>
+#include <chrono>
+#include <cmath>
 
 // Controller driver implementation. Exposes joystick/trackpad to SteamVR.
 EVRInitError ControllerDriver::Activate(uint32_t unObjectId)
@@ -40,12 +42,18 @@ EVRInitError ControllerDriver::Activate(uint32_t unObjectId)
 DriverPose_t ControllerDriver::GetPose()
 {
 	DriverPose_t pose = { 0 };
-	// Report a valid, stationary pose by default so compositor treats this Controller as available.
 	pose.poseIsValid = true;
 	pose.result = TrackingResult_Running_OK;
 	pose.deviceIsConnected = true;
 
-	// Rotation in quaternion form. (Placeholder values for now, can be updated with real tracking data later)
+	static auto startTime = std::chrono::steady_clock::now();
+	auto now = std::chrono::steady_clock::now();
+	double elapsed = std::chrono::duration<double>(now - startTime).count();
+
+	float bobHeight = (float)(sin(elapsed * 1.8) * 0.03);
+	float swayX = (float)(sin(elapsed * 2.2) * 0.015);
+	float forward = (float)(sin(elapsed * 1.3) * 0.01);
+
 	HmdQuaternion_t quat;
 	quat.w = 1;
 	quat.x = 0;
@@ -55,10 +63,9 @@ DriverPose_t ControllerDriver::GetPose()
 	pose.qWorldFromDriverRotation = quat;
 	pose.qDriverFromHeadRotation = quat;
 
-	// Position in meters. (Placeholder values for now, can be updated with real tracking data later)
-	pose.vecPosition[0] = 0.0;
-	pose.vecPosition[1] = 0.0;
-	pose.vecPosition[2] = 0.0;
+	pose.vecPosition[0] = swayX;
+	pose.vecPosition[1] = bobHeight;
+	pose.vecPosition[2] = forward;
 
 	return pose;
 }

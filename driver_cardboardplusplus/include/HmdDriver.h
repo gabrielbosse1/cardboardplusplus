@@ -1,5 +1,6 @@
 #pragma once
 #include "openvr_driver.h"
+#include "VideoEncoder.h"
 #include <windows.h>
 #include <d3d11.h>
 #include <map>
@@ -44,6 +45,10 @@ public:
     void GetFrameTiming(DriverDirectMode_FrameTiming* pFrameTiming) override;
 
 private:
+    bool InitializeVideoEncoder();
+    void ShutdownVideoEncoder();
+    void OnEncodedPacket(uint8_t* data, int size, int64_t pts, bool keyframe);
+
     uint32_t driverId;
 
     ID3D11Device* pD3D11Device;
@@ -51,4 +56,9 @@ private:
 
     std::map<uint32_t, std::vector<SwapTextureSet>> m_swapTextureSets;
     uint32_t m_currentSwapSetIndex;
+
+    VideoEncoder* m_pVideoEncoder;
+    bool m_encoderInitialized;
+    int64_t m_encoderPts;
+    uint32_t m_lastEncodedPid;
 };

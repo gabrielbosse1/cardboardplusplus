@@ -1,6 +1,9 @@
 #include "HmdDriver.h"
 #include <dxgi.h>
+#include <dxgi1_2.h>
 #include <cstdarg>
+#include <chrono>
+#include <cmath>
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 
@@ -25,6 +28,10 @@ EVRInitError HmdDriver::Activate(uint32_t unObjectId)
     // I even managed to somehow get the error "'cannot open file 'kernel32.lib'"
     driverId = unObjectId;
     m_currentSwapSetIndex = 0;
+    m_encoderInitialized = false;
+    m_encoderPts = 0;
+    m_lastEncodedPid = 0;
+    m_pVideoEncoder = nullptr;
 
     DriverLog("HmdDriver::Activate called");
 
@@ -49,6 +56,10 @@ EVRInitError HmdDriver::Activate(uint32_t unObjectId)
     }
 
     DriverLog("D3D11 device initialized successfully");
+
+    if (!InitializeVideoEncoder()) {
+        DriverLog("WARNING: Video encoder initialization failed. Encoding will be disabled.");
+    }
 
 	// TODO: Make sure those properties are correct to be seen as a valid HMD by SteamVR. Some of them are just placeholders for now.
     PropertyContainerHandle_t props = VRProperties()->TrackedDeviceToPropertyContainer(driverId);
@@ -93,6 +104,9 @@ EVRInitError HmdDriver::Activate(uint32_t unObjectId)
 void HmdDriver::Deactivate()
 {
 	// Clean up resources and reset state.
+    DriverLog("HmdDriver::Deactivate called");
+
+    ShutdownVideoEncoder();
     DestroyAllSwapTextureSets(0);
 
     if (pD3D11DeviceContext) {
@@ -134,12 +148,17 @@ void HmdDriver::DebugRequest(const char* pchRequest, char* pchResponseBuffer, ui
 DriverPose_t HmdDriver::GetPose()
 {
     DriverPose_t pose = { 0 };
-    // Report a valid, stationary pose by default so compositor treats this HMD as available.
     pose.poseIsValid = true;
     pose.result = TrackingResult_Running_OK;
     pose.deviceIsConnected = true;
 
-	// Rotation in quaternion form. (Placeholder values for now, can be updated with real tracking data later)
+    static auto startTime = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
+    double elapsed = std::chrono::duration<double>(now - startTime).count();
+
+    float bobHeight = (float)(sin(elapsed * 2.0) * 0.02);
+    float swayX = (float)(sin(elapsed * 1.5) * 0.01);
+
     HmdQuaternion_t quat;
     quat.w = 1.0;
     quat.x = 0.0;
@@ -149,9 +168,8 @@ DriverPose_t HmdDriver::GetPose()
     pose.qWorldFromDriverRotation = quat;
     pose.qDriverFromHeadRotation = quat;
 
-	// Position in meters. (Placeholder values for now, can be updated with real tracking data later)
-    pose.vecPosition[0] = 0.0;
-    pose.vecPosition[1] = 0.0;
+    pose.vecPosition[0] = swayX;
+    pose.vecPosition[1] = bobHeight;
     pose.vecPosition[2] = 0.0;
 
     return pose;
@@ -342,6 +360,70 @@ void HmdDriver::SubmitLayer(const SubmitLayerPerEye_t(&perEye)[2])
 	// This is where the application submits the textures it rendered for each eye.
     DriverLog("SubmitLayer called - left: %llu, right: %llu",
         (uint64_t)perEye[0].hTexture, (uint64_t)perEye[1].hTexture);
+
+    if (!m_encoderInitialized || !m_pVideoEncoder) {
+        return;
+    }
+
+    for (int eye = 0; eye < 2; eye++) {
+        HANDLE hTexture = (HANDLE)perEye[eye].hTexture;
+        if (!hTexture) {
+            DriverLog("  [Eye %d] No texture handle", eye);
+            continue;
+        }
+
+        IDXGIResource* pResource = nullptr;
+        HRESULT hr = pD3D11Device->OpenSharedResource(hTexture, __uuidof(IDXGIResource), (void**)&pResource);
+        if (FAILED(hr) || !pResource) {
+            DriverLog("  [Eye %d] Failed to open shared texture! HRESULT: 0x%x", eye, hr);
+            continue;
+        }
+
+        ID3D11Texture2D* pTexture = nullptr;
+        hr = pResource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&pTexture);
+        pResource->Release();
+
+        if (FAILED(hr) || !pTexture) {
+            DriverLog("  [Eye %d] Failed to get texture from resource! HRESULT: 0x%x", eye, hr);
+            continue;
+        }
+
+        D3D11_TEXTURE2D_DESC desc;
+        pTexture->GetDesc(&desc);
+        DriverLog("  [Eye %d] Texture: %dx%d, format=%d", eye, desc.Width, desc.Height, desc.Format);
+
+        IDXGIKeyedMutex* pKeyedMutex = nullptr;
+        hr = pTexture->QueryInterface(__uuidof(IDXGIKeyedMutex), (void**)&pKeyedMutex);
+        
+        if (SUCCEEDED(hr) && pKeyedMutex) {
+            hr = pKeyedMutex->AcquireSync(0, 100);
+            if (FAILED(hr)) {
+                DriverLog("  [Eye %d] Failed to acquire keyed mutex! HRESULT: 0x%x", eye, hr);
+                pKeyedMutex->Release();
+                pTexture->Release();
+                continue;
+            }
+            DriverLog("  [Eye %d] Acquired keyed mutex", eye);
+        } else {
+            DriverLog("  [Eye %d] No keyed mutex available (texture might be in use)", eye);
+        }
+
+        if (!m_pVideoEncoder->EncodeFrame(pTexture, m_encoderPts)) {
+            DriverLog("  [Eye %d] Failed to encode frame!", eye);
+        } else {
+            DriverLog("  [Eye %d] Frame encoded successfully, pts=%lld", eye, m_encoderPts);
+        }
+
+        if (pKeyedMutex) {
+            pKeyedMutex->ReleaseSync(0);
+            DriverLog("  [Eye %d] Released keyed mutex", eye);
+            pKeyedMutex->Release();
+        }
+
+        pTexture->Release();
+    }
+
+    m_encoderPts++;
 }
 
 void HmdDriver::Present(vr::SharedTextureHandle_t syncTexture)
@@ -360,4 +442,70 @@ void HmdDriver::GetFrameTiming(DriverDirectMode_FrameTiming* pFrameTiming)
 {
 	// This is called to get additional frame timing stats from driver. Can be used to get the current framerate to optimize the encoder settings in real-time.
     DriverLog("GetFrameTiming called");
+}
+
+bool HmdDriver::InitializeVideoEncoder()
+{
+    DriverLog("========================================");
+    DriverLog("Initializing Video Encoder...");
+    DriverLog("========================================");
+
+    if (!pD3D11Device || !pD3D11DeviceContext) {
+        DriverLog("Cannot initialize encoder: D3D device not available!");
+        return false;
+    }
+
+    m_pVideoEncoder = new VideoEncoder();
+    if (!m_pVideoEncoder) {
+        DriverLog("Failed to allocate VideoEncoder!");
+        return false;
+    }
+
+    int width = 960;
+    int height = 1080;
+    int fps = 60;
+    int bitrate = 8000000;
+    bool useGpuEncoding = false;
+
+    DriverLog("Encoder configuration:");
+    DriverLog("  Resolution: %dx%d", width, height);
+    DriverLog("  FPS: %d", fps);
+    DriverLog("  Bitrate: %d bps (%d kbps)", bitrate, bitrate / 1000);
+    DriverLog("  GPU Encoding: %s", useGpuEncoding ? "YES" : "NO");
+
+    m_pVideoEncoder->SetEncodedPacketCallback([this](uint8_t* data, int size, int64_t pts, bool keyframe) {
+        OnEncodedPacket(data, size, pts, keyframe);
+    });
+
+    if (!m_pVideoEncoder->Initialize(pD3D11Device, pD3D11DeviceContext, width, height, fps, bitrate, useGpuEncoding)) {
+        DriverLog("VideoEncoder::Initialize failed!");
+        delete m_pVideoEncoder;
+        m_pVideoEncoder = nullptr;
+        return false;
+    }
+
+    m_encoderInitialized = true;
+    m_encoderPts = 0;
+    DriverLog("Video Encoder initialized successfully!");
+    return true;
+}
+
+void HmdDriver::ShutdownVideoEncoder()
+{
+    DriverLog("Shutting down Video Encoder...");
+
+    if (m_pVideoEncoder) {
+        m_pVideoEncoder->Shutdown();
+        delete m_pVideoEncoder;
+        m_pVideoEncoder = nullptr;
+    }
+
+    m_encoderInitialized = false;
+    DriverLog("Video Encoder shutdown complete.");
+}
+
+void HmdDriver::OnEncodedPacket(uint8_t* data, int size, int64_t pts, bool keyframe)
+{
+    DriverLog("[Encoded] size=%d, pts=%lld, keyframe=%s, data[0]=0x%02X",
+              size, pts, keyframe ? "YES" : "NO", data[0]);
 }
