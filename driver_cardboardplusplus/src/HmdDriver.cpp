@@ -4,10 +4,13 @@
 #include <cstdarg>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 
 using namespace vr;
+
+static const int UDP_SERVER_PORT = 42069;
 
 void DriverLog(const char* pFormat, ...) {
     char buffer[1024];
@@ -32,10 +35,15 @@ EVRInitError HmdDriver::Activate(uint32_t unObjectId)
     m_encoderPts = 0;
     m_lastEncodedPid = 0;
     m_pVideoEncoder = nullptr;
+    m_hasSubmit = false;
+    m_udpSocket = INVALID_SOCKET;
+    m_udpInitialized = false;
+    m_submitLayers[0] = { 0 };
+    m_submitLayers[1] = { 0 };
 
     DriverLog("HmdDriver::Activate called");
 
-	// Create a D3D11 device for rendering.
+    // Create a D3D11 device for rendering.
     D3D_FEATURE_LEVEL featureLevel;
     HRESULT hr = D3D11CreateDevice(
         nullptr,
@@ -61,7 +69,11 @@ EVRInitError HmdDriver::Activate(uint32_t unObjectId)
         DriverLog("WARNING: Video encoder initialization failed. Encoding will be disabled.");
     }
 
-	// TODO: Make sure those properties are correct to be seen as a valid HMD by SteamVR. Some of them are just placeholders for now.
+    if (!InitializeUDP()) {
+        DriverLog("WARNING: UDP initialization failed. Frame transmission will be disabled.");
+    }
+
+    // Set HMD properties
     PropertyContainerHandle_t props = VRProperties()->TrackedDeviceToPropertyContainer(driverId);
 
     VRProperties()->SetStringProperty(props, Prop_ModelNumber_String, "CardboardPlusPlus");
@@ -79,11 +91,12 @@ EVRInitError HmdDriver::Activate(uint32_t unObjectId)
     VRProperties()->SetUint64Property(props, Prop_CurrentUniverseId_Uint64, 2);
     VRProperties()->SetFloatProperty(props, Prop_UserHeadToEyeDepthMeters_Float, 0.f);
     VRProperties()->SetBoolProperty(props, Prop_IsOnDesktop_Bool, false);
-    VRProperties()->SetBoolProperty(props, Prop_DisplayDebugMode_Bool, true);
+    VRProperties()->SetBoolProperty(props, Prop_DisplayDebugMode_Bool, false);
     VRProperties()->SetBoolProperty(props, Prop_HasDriverDirectModeComponent_Bool, true);
 
-    DriverLog("HMD properties set: HasDriverDirectModeComponent=true, IsDisplayOnDesktop=false");
+    DriverLog("HMD properties set: HasDriverDirectModeComponent=true, IsDisplayOnDesktop=false, DebugMode=false");
 
+    // Eye-to-head transforms
     HmdMatrix34_t eyeToHeadLeft = { 0 };
     eyeToHeadLeft.m[0][0] = 1.0f;
     eyeToHeadLeft.m[1][1] = 1.0f;
@@ -106,6 +119,7 @@ void HmdDriver::Deactivate()
 	// Clean up resources and reset state.
     DriverLog("HmdDriver::Deactivate called");
 
+    ShutdownUDP();
     ShutdownVideoEncoder();
     DestroyAllSwapTextureSets(0);
 
@@ -203,7 +217,7 @@ bool HmdDriver::IsDisplayRealDisplay()
 
 void HmdDriver::GetRecommendedRenderTargetSize( uint32_t *pnWidth, uint32_t *pnHeight )
 {
-    if (pnWidth) *pnWidth = 1920; // single-eye recommended width
+    if (pnWidth) *pnWidth = 1920 / 2; // single-eye recommended width
     if (pnHeight) *pnHeight = 1080; // single-eye recommended height
 }
 
@@ -245,7 +259,7 @@ DistortionCoordinates_t HmdDriver::ComputeDistortion( EVREye eEye, float fU, flo
 
 void HmdDriver::CreateSwapTextureSet(uint32_t unPid, const SwapTextureSetDesc_t* pSwapTextureSetDesc, SwapTextureSet_t* pOutSwapTextureSet)
 {
-	// Create a shared texture that the application can render into. (still has a lot to be improved, especially perfomance)
+	// Create a shared texture that the application can render into.
     DriverLog("CreateSwapTextureSet called: width=%d, height=%d, format=%d, samples=%d",
         pSwapTextureSetDesc->nWidth, pSwapTextureSetDesc->nHeight, pSwapTextureSetDesc->nFormat, pSwapTextureSetDesc->nSampleCount);
 
@@ -254,13 +268,15 @@ void HmdDriver::CreateSwapTextureSet(uint32_t unPid, const SwapTextureSetDesc_t*
     desc.Height = pSwapTextureSetDesc->nHeight;
     desc.MipLevels = 1;
     desc.ArraySize = 1;
-    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;  // Use a known good format
-    desc.SampleDesc.Count = 1;  // No MSAA for now
+    desc.Format = (DXGI_FORMAT)pSwapTextureSetDesc->nFormat;  // Use SteamVR's exact format
+    desc.SampleDesc.Count = 1;
     desc.SampleDesc.Quality = 0;
     desc.Usage = D3D11_USAGE_DEFAULT;
     desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     desc.CPUAccessFlags = 0;
-    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;  // Need keyed mutex for AcquireSync
+    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;  // No keyed mutex
+
+    DriverLog("Creating texture: %dx%d format=%d flags=SHARED", desc.Width, desc.Height, desc.Format);
 
     ID3D11Texture2D* pTexture = nullptr;
     HRESULT hr = pD3D11Device->CreateTexture2D(&desc, nullptr, &pTexture);
@@ -296,10 +312,11 @@ void HmdDriver::CreateSwapTextureSet(uint32_t unPid, const SwapTextureSetDesc_t*
     pOutSwapTextureSet->rSharedTextureHandles[2] = (vr::SharedTextureHandle_t)hSharedHandle;
     pOutSwapTextureSet->unTextureFlags = 0;
 
-    // Store for later
+    // Store for later lookup in SubmitLayer
     SwapTextureSet sts;
     sts.pTexture = pTexture;
     sts.hSharedHandle = hSharedHandle;
+    sts.pKeyedMutex = nullptr;
 
     auto it = m_swapTextureSets.find(unPid);
     if (it == m_swapTextureSets.end()) {
@@ -309,6 +326,9 @@ void HmdDriver::CreateSwapTextureSet(uint32_t unPid, const SwapTextureSetDesc_t*
     } else {
         it->second.push_back(sts);
     }
+
+    // Map handle -> texture for quick lookup in SubmitLayer
+    m_textureHandleMap[(vr::SharedTextureHandle_t)hSharedHandle] = pTexture;
 }
 
 void HmdDriver::DestroySwapTextureSet(vr::SharedTextureHandle_t sharedTextureHandle)
@@ -318,9 +338,16 @@ void HmdDriver::DestroySwapTextureSet(vr::SharedTextureHandle_t sharedTextureHan
 
     HANDLE h = (HANDLE)sharedTextureHandle;
 
+    // Remove from handle maps
+    m_textureHandleMap.erase(sharedTextureHandle);
+    m_mutexHandleMap.erase(sharedTextureHandle);
+
     for (auto& pair : m_swapTextureSets) {
         for (auto it = pair.second.begin(); it != pair.second.end(); ++it) {
             if (it->hSharedHandle == h) {
+                if (it->pKeyedMutex) {
+                    it->pKeyedMutex->Release();
+                }
                 if (it->pTexture) {
                     it->pTexture->Release();
                 }
@@ -339,6 +366,12 @@ void HmdDriver::DestroyAllSwapTextureSets(uint32_t unPid)
     auto it = m_swapTextureSets.find(unPid);
     if (it != m_swapTextureSets.end()) {
         for (auto& sts : it->second) {
+            // Remove from handle maps
+            m_textureHandleMap.erase((vr::SharedTextureHandle_t)sts.hSharedHandle);
+            m_mutexHandleMap.erase((vr::SharedTextureHandle_t)sts.hSharedHandle);
+            if (sts.pKeyedMutex) {
+                sts.pKeyedMutex->Release();
+            }
             if (sts.pTexture) {
                 sts.pTexture->Release();
             }
@@ -361,75 +394,51 @@ void HmdDriver::SubmitLayer(const SubmitLayerPerEye_t(&perEye)[2])
     DriverLog("SubmitLayer called - left: %llu, right: %llu",
         (uint64_t)perEye[0].hTexture, (uint64_t)perEye[1].hTexture);
 
-    if (!m_encoderInitialized || !m_pVideoEncoder) {
-        return;
-    }
-
-    for (int eye = 0; eye < 2; eye++) {
-        HANDLE hTexture = (HANDLE)perEye[eye].hTexture;
-        if (!hTexture) {
-            DriverLog("  [Eye %d] No texture handle", eye);
-            continue;
-        }
-
-        IDXGIResource* pResource = nullptr;
-        HRESULT hr = pD3D11Device->OpenSharedResource(hTexture, __uuidof(IDXGIResource), (void**)&pResource);
-        if (FAILED(hr) || !pResource) {
-            DriverLog("  [Eye %d] Failed to open shared texture! HRESULT: 0x%x", eye, hr);
-            continue;
-        }
-
-        ID3D11Texture2D* pTexture = nullptr;
-        hr = pResource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&pTexture);
-        pResource->Release();
-
-        if (FAILED(hr) || !pTexture) {
-            DriverLog("  [Eye %d] Failed to get texture from resource! HRESULT: 0x%x", eye, hr);
-            continue;
-        }
-
-        D3D11_TEXTURE2D_DESC desc;
-        pTexture->GetDesc(&desc);
-        DriverLog("  [Eye %d] Texture: %dx%d, format=%d", eye, desc.Width, desc.Height, desc.Format);
-
-        IDXGIKeyedMutex* pKeyedMutex = nullptr;
-        hr = pTexture->QueryInterface(__uuidof(IDXGIKeyedMutex), (void**)&pKeyedMutex);
-        
-        if (SUCCEEDED(hr) && pKeyedMutex) {
-            hr = pKeyedMutex->AcquireSync(0, 100);
-            if (FAILED(hr)) {
-                DriverLog("  [Eye %d] Failed to acquire keyed mutex! HRESULT: 0x%x", eye, hr);
-                pKeyedMutex->Release();
-                pTexture->Release();
-                continue;
-            }
-            DriverLog("  [Eye %d] Acquired keyed mutex", eye);
-        } else {
-            DriverLog("  [Eye %d] No keyed mutex available (texture might be in use)", eye);
-        }
-
-        if (!m_pVideoEncoder->EncodeFrame(pTexture, m_encoderPts)) {
-            DriverLog("  [Eye %d] Failed to encode frame!", eye);
-        } else {
-            DriverLog("  [Eye %d] Frame encoded successfully, pts=%lld", eye, m_encoderPts);
-        }
-
-        if (pKeyedMutex) {
-            pKeyedMutex->ReleaseSync(0);
-            DriverLog("  [Eye %d] Released keyed mutex", eye);
-            pKeyedMutex->Release();
-        }
-
-        pTexture->Release();
-    }
-
-    m_encoderPts++;
+    // Store handles - encode only on Present (after all SubmitLayers for this frame)
+    m_submitLayers[0].hTexture = perEye[0].hTexture;
+    m_submitLayers[1].hTexture = perEye[1].hTexture;
+    m_hasSubmit = true;
 }
 
 void HmdDriver::Present(vr::SharedTextureHandle_t syncTexture)
 {
-	// This is called after all layers have been submitted. We can acquire the sync texture here to synchronize with the application's rendering.
-    DriverLog("Present called! syncTexture=%llu", (uint64_t)syncTexture);
+    DriverLog("Present called! syncTexture=%llu, hasSubmit=%s",
+        (uint64_t)syncTexture, m_hasSubmit ? "yes" : "no");
+
+    if (!m_hasSubmit || !m_encoderInitialized || !m_pVideoEncoder) {
+        return;
+    }
+
+    // Use stored texture pointers from the map (set up in CreateSwapTextureSet)
+    ID3D11Texture2D* pLeftTex = nullptr;
+    ID3D11Texture2D* pRightTex = nullptr;
+
+    auto itL = m_textureHandleMap.find(m_submitLayers[0].hTexture);
+    if (itL != m_textureHandleMap.end()) pLeftTex = itL->second;
+
+    auto itR = m_textureHandleMap.find(m_submitLayers[1].hTexture);
+    if (itR != m_textureHandleMap.end()) pRightTex = itR->second;
+
+    DriverLog("Map lookup: left=%llu->%s, right=%llu->%s, map_size=%zu",
+        (uint64_t)m_submitLayers[0].hTexture, pLeftTex ? "FOUND" : "NOT FOUND",
+        (uint64_t)m_submitLayers[1].hTexture, pRightTex ? "FOUND" : "NOT FOUND",
+        m_textureHandleMap.size());
+
+    // Flush GPU pipeline to ensure we see vrcompositor's writes
+    pD3D11DeviceContext->Flush();
+
+    // Encode SBS - no mutex, no OpenSharedResource, just read directly
+    if (pLeftTex && pRightTex) {
+        DriverLog("Encoding SBS: left=%llu right=%llu pts=%lld",
+            (uint64_t)m_submitLayers[0].hTexture, (uint64_t)m_submitLayers[1].hTexture, m_encoderPts);
+        m_pVideoEncoder->EncodeFrameSBS(pLeftTex, pRightTex, m_encoderPts);
+        m_encoderPts++;
+    } else if (pLeftTex) {
+        m_pVideoEncoder->EncodeFrame(pLeftTex, m_encoderPts);
+        m_encoderPts++;
+    }
+
+    m_hasSubmit = false;
 }
 
 void HmdDriver::PostPresent()
@@ -461,14 +470,15 @@ bool HmdDriver::InitializeVideoEncoder()
         return false;
     }
 
-    int width = 960;
-    int height = 1080;
+    // SBS resolution: 1440x1620 per eye -> 2880x1620
+    int width = 2880;
+    int height = 1620;
     int fps = 60;
-    int bitrate = 8000000;
+    int bitrate = 20000000;
     bool useGpuEncoding = false;
 
     DriverLog("Encoder configuration:");
-    DriverLog("  Resolution: %dx%d", width, height);
+    DriverLog("  Resolution: %dx%d (SBS: %dx%d per eye)", width, height, width / 2, height);
     DriverLog("  FPS: %d", fps);
     DriverLog("  Bitrate: %d bps (%d kbps)", bitrate, bitrate / 1000);
     DriverLog("  GPU Encoding: %s", useGpuEncoding ? "YES" : "NO");
@@ -508,4 +518,66 @@ void HmdDriver::OnEncodedPacket(uint8_t* data, int size, int64_t pts, bool keyfr
 {
     DriverLog("[Encoded] size=%d, pts=%lld, keyframe=%s, data[0]=0x%02X",
               size, pts, keyframe ? "YES" : "NO", data[0]);
+
+    if (m_udpInitialized && m_udpSocket != INVALID_SOCKET && size > 0) {
+        // Send in chunks (UDP max ~65507, but safer to use smaller chunks)
+        int maxChunk = 60000;
+        int offset = 0;
+        while (offset < size) {
+            int chunkSize = (size - offset > maxChunk) ? maxChunk : (size - offset);
+            int sent = sendto(m_udpSocket, (const char*)(data + offset), chunkSize, 0,
+                              (sockaddr*)&m_serverAddr, sizeof(m_serverAddr));
+            if (sent == SOCKET_ERROR) {
+                DriverLog("[UDP] sendto failed! WSAError: %d", WSAGetLastError());
+                break;
+            }
+            offset += sent;
+        }
+    }
+}
+
+bool HmdDriver::InitializeUDP()
+{
+    DriverLog("Initializing UDP socket...");
+
+    WSADATA wsaData;
+    int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    if (result != 0) {
+        DriverLog("WSAStartup failed! Error: %d", result);
+        return false;
+    }
+
+    m_udpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (m_udpSocket == INVALID_SOCKET) {
+        DriverLog("socket() failed! WSAError: %d", WSAGetLastError());
+        WSACleanup();
+        return false;
+    }
+
+    // Set socket buffer size
+    int bufSize = 1024 * 1024; // 1MB send buffer
+    setsockopt(m_udpSocket, SOL_SOCKET, SO_SNDBUF, (const char*)&bufSize, sizeof(bufSize));
+
+    // Target: localhost:42069
+    m_serverAddr.sin_family = AF_INET;
+    m_serverAddr.sin_port = htons(UDP_SERVER_PORT);
+    inet_pton(AF_INET, "127.0.0.1", &m_serverAddr.sin_addr);
+
+    m_udpInitialized = true;
+    DriverLog("UDP socket initialized. Sending to 127.0.0.1:%d", UDP_SERVER_PORT);
+    return true;
+}
+
+void HmdDriver::ShutdownUDP()
+{
+    DriverLog("Shutting down UDP socket...");
+
+    if (m_udpSocket != INVALID_SOCKET) {
+        closesocket(m_udpSocket);
+        m_udpSocket = INVALID_SOCKET;
+    }
+
+    m_udpInitialized = false;
+    WSACleanup();
+    DriverLog("UDP socket shutdown complete.");
 }

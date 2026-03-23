@@ -1,16 +1,29 @@
 #pragma once
-#include "openvr_driver.h"
-#include "VideoEncoder.h"
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <d3d11.h>
+#include "openvr_driver.h"
+#include "VideoEncoder.h"
 #include <map>
 #include <vector>
+
+#pragma comment(lib, "ws2_32.lib")
 
 using namespace vr;
 
 struct SwapTextureSet {
     ID3D11Texture2D* pTexture;
     HANDLE hSharedHandle;
+    IDXGIKeyedMutex* pKeyedMutex;
+};
+
+// Per-eye submit layer info from SteamVR
+struct SubmitLayerInfo {
+    vr::SharedTextureHandle_t hTexture;
 };
 
 /** Virtual HMD device driver for SteamVR. Presents as a display to OpenVR. */
@@ -44,10 +57,16 @@ public:
     void PostPresent() override;
     void GetFrameTiming(DriverDirectMode_FrameTiming* pFrameTiming) override;
 
+    VideoEncoder* GetVideoEncoder() { return m_pVideoEncoder; }
+    void OnEncodedPacket(uint8_t* data, int size, int64_t pts, bool keyframe);
+
 private:
     bool InitializeVideoEncoder();
     void ShutdownVideoEncoder();
-    void OnEncodedPacket(uint8_t* data, int size, int64_t pts, bool keyframe);
+
+    // UDP networking
+    bool InitializeUDP();
+    void ShutdownUDP();
 
     uint32_t driverId;
 
@@ -55,10 +74,23 @@ private:
     ID3D11DeviceContext* pD3D11DeviceContext;
 
     std::map<uint32_t, std::vector<SwapTextureSet>> m_swapTextureSets;
+    // Map from SharedTextureHandle to the actual D3D11 texture
+    std::map<vr::SharedTextureHandle_t, ID3D11Texture2D*> m_textureHandleMap;
+    // Map from SharedTextureHandle to the keyed mutex for synchronization
+    std::map<vr::SharedTextureHandle_t, IDXGIKeyedMutex*> m_mutexHandleMap;
     uint32_t m_currentSwapSetIndex;
 
     VideoEncoder* m_pVideoEncoder;
     bool m_encoderInitialized;
     int64_t m_encoderPts;
     uint32_t m_lastEncodedPid;
+
+    // Per-eye submit layer tracking for SBS compositing
+    SubmitLayerInfo m_submitLayers[2];
+    bool m_hasSubmit;
+
+    // UDP socket
+    SOCKET m_udpSocket;
+    sockaddr_in m_serverAddr;
+    bool m_udpInitialized;
 };

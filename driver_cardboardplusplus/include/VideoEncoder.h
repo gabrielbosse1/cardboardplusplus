@@ -18,13 +18,14 @@ public:
     VideoEncoder();
     ~VideoEncoder();
 
-    bool Initialize(ID3D11Device* pDevice, ID3D11DeviceContext* pContext, 
+    bool Initialize(ID3D11Device* pDevice, ID3D11DeviceContext* pContext,
                     int width, int height, int fps, int bitrate, bool useGpuEncoding);
     
     void Shutdown();
 
     bool EncodeFrame(ID3D11Texture2D* pTexture, int64_t pts);
-    
+    bool EncodeFrameSBS(ID3D11Texture2D* pLeft, ID3D11Texture2D* pRight, int64_t pts);
+
     void SetEncodedPacketCallback(EncodedPacketCallback callback);
 
     bool IsInitialized() const { return m_initialized; }
@@ -33,12 +34,18 @@ public:
 
 private:
     bool InitializeFFmpeg();
-    bool InitializeHardwareEncoder();
-    bool InitializeSoftwareEncoder();
     void CleanupFFmpeg();
-    
+
+    bool InitializeShaderConversion();
+    void CleanupShaderConversion();
+
     bool ConvertTextureToFrame(ID3D11Texture2D* pTexture);
-    bool EncodeFrameInternal();
+    bool ConvertViaShader(ID3D11Texture2D* pSource);
+    bool ComposeSBS(ID3D11Texture2D* pLeft, ID3D11Texture2D* pRight);
+
+    void SetupBlitPipeline(ID3D11ShaderResourceView* pSRV);
+    bool ReadBackConversionRT();
+
     bool SendFrameToEncoder();
     bool ReceiveEncodedPackets();
 
@@ -47,18 +54,14 @@ private:
 
     ID3D11Device* m_pDevice;
     ID3D11DeviceContext* m_pContext;
-    
+
     AVCodecContext* m_pCodecContext;
     AVFrame* m_pFrame;
     AVPacket* m_pPacket;
     SwsContext* m_pConvertContext;
-    
+
     ID3D11Texture2D* m_pStagingTexture;
-    ID3D11Texture2D* m_pNV12TextureY;
-    ID3D11Texture2D* m_pNV12TextureUV;
-    ID3D11ShaderResourceView* m_pSRVY;
-    ID3D11ShaderResourceView* m_pSRVUV;
-    
+
     bool m_initialized;
     bool m_useGpuEncoding;
     int m_width;
@@ -66,9 +69,26 @@ private:
     int m_fps;
     int m_bitrate;
     int64_t m_frameCount;
-    
+
     EncodedPacketCallback m_encodedPacketCallback;
-    
+
     uint8_t* m_pSoftwareFrameBuffer;
     bool m_hasValidFrame;
+
+    // Shader-based format conversion (for R10G10B10A2_UNORM textures)
+    ID3D11Texture2D* m_pConversionRT;
+    ID3D11RenderTargetView* m_pConversionRTV;
+    ID3D11VertexShader* m_pBlitVS;
+    ID3D11PixelShader* m_pBlitPS;
+    ID3D11PixelShader* m_pSBSPS;
+    ID3D11SamplerState* m_pBlitSampler;
+    ID3D11BlendState* m_pBlitBlend;
+    ID3D11InputLayout* m_pBlitInputLayout;
+    ID3D11Buffer* m_pBlitVertexBuffer;
+    bool m_shaderConversionReady;
+
+    // Private staging copies for reading shared textures safely
+    ID3D11Texture2D* m_pLeftStaging;
+    ID3D11Texture2D* m_pRightStaging;
+    ID3D11Texture2D* m_pSingleStaging;
 };
