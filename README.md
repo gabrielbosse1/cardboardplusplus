@@ -19,18 +19,17 @@ A VR app built with the Google Cardboard SDK that runs on your phone inside a he
 
 - **Camera passthrough**: Low-latency preview using the Camera2 API, rendered via
   OpenGL ES shaders to provide a see-through background.
-- **Hand tracking**: Powered by MediaPipe Hand Landmarker. Tracks 21 points per hand
-  on-device. *(Not yet ported to the new app, in progress)*
+- **Hand tracking**: Powered by MediaPipe Hand Landmarker. Tracks 21 points per hand. *(Not yet ported to the new app, in progress)*
 - **6DoF tracking**: Experimental 6-Degrees-of-Freedom using the device's IMU
-  (linear acceleration + rotation vector). Drifts ~10-20cm during fast movements
+  (linear acceleration + rotation vector). Drifts during fast movements
   without visual odometry. *(Not yet ported to the new app, in progress)*
 
 ### SteamVR driver (`driver_cardboardplusplus/`)
 
 A C++ OpenVR-based driver that makes SteamVR recognize your phone as a VR headset.
 
-- **HMD driver**: Provides head tracking data to SteamVR.
-- **Controller driver**: Maps input from external gamepads (Xbox, PS, etc.) as
+- **HMD driver** *(in progress): Provides head tracking data to SteamVR.
+- **Controller driver** *(in progress): Maps input from external gamepads (Xbox, PS, etc.) as
   virtual VR controllers.
 - **Video encoding**: Encodes and streams VR video to the Android app.
 - **Network bridge** *(in progress)*: Connects the Android app to the driver over
