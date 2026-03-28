@@ -3,6 +3,8 @@
 #include <dxgi1_2.h>
 #include <cstdarg>
 #include <chrono>
+#include <cstring>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #pragma comment(lib, "d3d11.lib")
@@ -519,20 +521,71 @@ void HmdDriver::OnEncodedPacket(uint8_t* data, int size, int64_t pts, bool keyfr
     DriverLog("[Encoded] size=%d, pts=%lld, keyframe=%s, data[0]=0x%02X",
               size, pts, keyframe ? "YES" : "NO", data[0]);
 
-    if (m_udpInitialized && m_udpSocket != INVALID_SOCKET && size > 0) {
-        // Send in chunks (UDP max ~65507, but safer to use smaller chunks)
-        int maxChunk = 60000;
-        int offset = 0;
-        while (offset < size) {
-            int chunkSize = (size - offset > maxChunk) ? maxChunk : (size - offset);
-            int sent = sendto(m_udpSocket, (const char*)(data + offset), chunkSize, 0,
-                              (sockaddr*)&m_serverAddr, sizeof(m_serverAddr));
-            if (sent == SOCKET_ERROR) {
-                DriverLog("[UDP] sendto failed! WSAError: %d", WSAGetLastError());
+    if (!m_udpInitialized || m_udpSocket == INVALID_SOCKET || size <= 0) {
+        return;
+    }
+
+    // libx264 keyframes: SPS and PPS have NAL start codes, but IDR data follows
+    // without one. Insert IDR start code after PPS for valid H264 stream.
+    static const uint8_t idr_prefix[] = { 0x00, 0x00, 0x00, 0x01, 0x65 };
+    bool needs_fix = false;
+    int pps_data_end = -1;
+
+    if (keyframe && size > 10) {
+        // Find PPS NAL (type 8) and its data end
+        for (int i = 0; i < size - 5; i++) {
+            if (data[i] == 0x00 && data[i+1] == 0x00 && data[i+2] == 0x00 &&
+                data[i+3] == 0x01 && (data[i+4] & 0x1F) == 8) {
+                // Found PPS start. Find next NAL start code or end of small PPS
+                for (int j = i + 5; j < size - 3; j++) {
+                    if (data[j] == 0x00 && data[j+1] == 0x00 &&
+                        ((data[j+2] == 0x01) || (data[j+2] == 0x00 && data[j+3] == 0x01))) {
+                        pps_data_end = j;
+                        break;
+                    }
+                }
+                if (pps_data_end < 0) pps_data_end = i + 5 + 4; // assume short PPS
+                // Check if IDR start code already present
+                if (pps_data_end + 4 < size &&
+                    data[pps_data_end] == 0x00 && data[pps_data_end+1] == 0x00 &&
+                    data[pps_data_end+2] == 0x00 && data[pps_data_end+3] == 0x01 &&
+                    (data[pps_data_end+4] & 0x1F) == 5) {
+                    break; // IDR start code already present
+                }
+                needs_fix = true;
                 break;
             }
-            offset += sent;
         }
+    }
+
+    if (needs_fix && pps_data_end > 0) {
+        // Build fixed buffer: [up to PPS end] + [IDR start code] + [remaining IDR data]
+        int fixed_size = size + 5; // extra 5 bytes for NAL start + IDR header
+        uint8_t* fixed = (uint8_t*)malloc(fixed_size);
+        memcpy(fixed, data, pps_data_end);
+        memcpy(fixed + pps_data_end, idr_prefix, 5);
+        memcpy(fixed + pps_data_end + 5, data + pps_data_end, size - pps_data_end);
+
+        // Send fixed buffer
+        int offset = 0;
+        while (offset < fixed_size) {
+            int cs = (fixed_size - offset > 60000) ? 60000 : (fixed_size - offset);
+            sendto(m_udpSocket, (const char*)(fixed + offset), cs, 0,
+                   (sockaddr*)&m_serverAddr, sizeof(m_serverAddr));
+            offset += cs;
+        }
+        free(fixed);
+        DriverLog("[UDP] Fixed keyframe: inserted IDR start code at offset %d", pps_data_end);
+        return;
+    }
+
+    // Normal send (P-frames or already-correct keyframes)
+    int offset = 0;
+    while (offset < size) {
+        int chunkSize = (size - offset > 60000) ? 60000 : (size - offset);
+        sendto(m_udpSocket, (const char*)(data + offset), chunkSize, 0,
+               (sockaddr*)&m_serverAddr, sizeof(m_serverAddr));
+        offset += chunkSize;
     }
 }
 
