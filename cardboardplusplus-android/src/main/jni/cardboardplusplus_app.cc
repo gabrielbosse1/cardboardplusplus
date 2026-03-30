@@ -138,9 +138,13 @@ HelloCardboardApp::HelloCardboardApp(JavaVM* vm, jobject obj,
   head_tracker_ = CardboardHeadTracker_create();
   CardboardHeadTracker_setLowPassFilter(head_tracker_,
                                         kVelocityFilterCutoffFrequency);
+
+  networkClient_.Start();
+  LOGD("Network client started");
 }
 
 HelloCardboardApp::~HelloCardboardApp() {
+  networkClient_.Stop();
   CardboardHeadTracker_destroy(head_tracker_);
   CardboardLensDistortion_destroy(lens_distortion_);
   CardboardDistortionRenderer_destroy(distortion_renderer_);
@@ -289,10 +293,16 @@ void HelloCardboardApp::OnTriggerEvent() {
   show_camera_texture_ = !show_camera_texture_;
 }
 
-void HelloCardboardApp::OnPause() { CardboardHeadTracker_pause(head_tracker_); }
+void HelloCardboardApp::OnPause() {
+  CardboardHeadTracker_pause(head_tracker_);
+  networkClient_.Stop();
+}
 
 void HelloCardboardApp::OnResume() {
   CardboardHeadTracker_resume(head_tracker_);
+
+  // Restart network client
+  networkClient_.Start();
 
   // Parameters may have changed.
   device_params_changed_ = true;
@@ -464,6 +474,22 @@ Matrix4x4 HelloCardboardApp::GetPose() {
   CardboardHeadTracker_getPose(
       head_tracker_, GetBootTimeNano() + kPredictionTimeWithoutVsyncNanos,
       kLandscapeLeft, &out_position[0], &out_orientation[0]);
+
+  // Send head tracking to SteamVR driver
+  // Cardboard SDK: position in meters, orientation as quaternion (x,y,z,w)
+  // Default height when no 6DoF
+  float posY = out_position[1];
+  if (posY == 0.0f) posY = cbpp::DEFAULT_HEAD_HEIGHT;
+
+  networkClient_.SendTracking(
+      out_orientation[3], // w
+      -out_orientation[0], // x (negated)
+      -out_orientation[1], // y (negated)
+      -out_orientation[2], // z (negated)
+      out_position[0],    // x
+      posY,               // y (height)
+      out_position[2]);   // z
+
   return GetTranslationMatrix(out_position) *
          Quatf::FromXYZW(&out_orientation[0]).ToMatrix();
 }

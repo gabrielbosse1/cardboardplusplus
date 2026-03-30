@@ -12,8 +12,6 @@
 
 using namespace vr;
 
-static const int UDP_SERVER_PORT = 42069;
-
 void DriverLog(const char* pFormat, ...) {
     char buffer[1024];
     va_list args;
@@ -24,7 +22,36 @@ void DriverLog(const char* pFormat, ...) {
     va_end(args);
 }
 
-// Virtual HMD driver implementation. Presents as a display device to SteamVR.
+// ============================================================
+// Helper: get local IP address as string
+// ============================================================
+std::string HmdDriver::GetLocalIPAddress() {
+    char hostname[256];
+    if (gethostname(hostname, sizeof(hostname)) != 0) {
+        return "127.0.0.1";
+    }
+
+    struct addrinfo hints = {}, *result = nullptr;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_flags = AI_PASSIVE;
+
+    // Use a dummy address to trigger route lookup
+    if (getaddrinfo(hostname, nullptr, &hints, &result) != 0 || !result) {
+        return "127.0.0.1";
+    }
+
+    char ipStr[INET_ADDRSTRLEN];
+    struct sockaddr_in* addr = (struct sockaddr_in*)result->ai_addr;
+    inet_ntop(AF_INET, &addr->sin_addr, ipStr, sizeof(ipStr));
+    freeaddrinfo(result);
+
+    return std::string(ipStr);
+}
+
+// ============================================================
+// Activate: init everything
+// ============================================================
 EVRInitError HmdDriver::Activate(uint32_t unObjectId)
 {
     // When I wrote this code, only God and I understood it.
@@ -38,10 +65,23 @@ EVRInitError HmdDriver::Activate(uint32_t unObjectId)
     m_lastEncodedPid = 0;
     m_pVideoEncoder = nullptr;
     m_hasSubmit = false;
-    m_udpSocket = INVALID_SOCKET;
-    m_udpInitialized = false;
     m_submitLayers[0] = { 0 };
     m_submitLayers[1] = { 0 };
+
+    // Networking state
+    m_wsaInitialized = false;
+    m_broadcastSocket = INVALID_SOCKET;
+    m_broadcastRunning = false;
+    m_discoverySocket = INVALID_SOCKET;
+    m_discoveryRunning = false;
+    m_videoSocket = INVALID_SOCKET;
+    m_videoTargetSet = false;
+    m_trackingSocket = INVALID_SOCKET;
+    m_trackingRunning = false;
+    m_hasTracking = false;
+    m_cameraSocket = INVALID_SOCKET;
+    m_cameraRunning = false;
+    m_latestTracking = {};
 
     DriverLog("HmdDriver::Activate called");
 
@@ -71,8 +111,8 @@ EVRInitError HmdDriver::Activate(uint32_t unObjectId)
         DriverLog("WARNING: Video encoder initialization failed. Encoding will be disabled.");
     }
 
-    if (!InitializeUDP()) {
-        DriverLog("WARNING: UDP initialization failed. Frame transmission will be disabled.");
+    if (!InitializeNetworking()) {
+        DriverLog("WARNING: Networking initialization failed.");
     }
 
     // Set HMD properties
@@ -116,12 +156,15 @@ EVRInitError HmdDriver::Activate(uint32_t unObjectId)
     return VRInitError_None;
 }
 
+// ============================================================
+// Deactivate: clean up everything
+// ============================================================
 void HmdDriver::Deactivate()
 {
 	// Clean up resources and reset state.
     DriverLog("HmdDriver::Deactivate called");
 
-    ShutdownUDP();
+    ShutdownNetworking();
     ShutdownVideoEncoder();
     DestroyAllSwapTextureSets(0);
 
@@ -161,6 +204,9 @@ void HmdDriver::DebugRequest(const char* pchRequest, char* pchResponseBuffer, ui
     }
 }
 
+// ============================================================
+// GetPose: use phone tracking data when available, fallback to placeholder
+// ============================================================
 DriverPose_t HmdDriver::GetPose()
 {
     DriverPose_t pose = { 0 };
@@ -168,6 +214,35 @@ DriverPose_t HmdDriver::GetPose()
     pose.result = TrackingResult_Running_OK;
     pose.deviceIsConnected = true;
 
+    HmdQuaternion_t identity;
+    identity.w = 1.0;
+    identity.x = 0.0;
+    identity.y = 0.0;
+    identity.z = 0.0;
+
+    pose.qWorldFromDriverRotation = identity;
+    pose.qDriverFromHeadRotation = identity;
+
+    // Use phone tracking data if available
+    {
+        std::lock_guard<std::mutex> lock(m_trackingMutex);
+        if (m_hasTracking) {
+            // Orientation from phone quaternion (raw, no transformation)
+            pose.qRotation.w = m_latestTracking.orientationW;
+            pose.qRotation.x = m_latestTracking.orientationX;
+            pose.qRotation.y = m_latestTracking.orientationY;
+            pose.qRotation.z = m_latestTracking.orientationZ;
+
+            // Position from phone (with default height fallback)
+            pose.vecPosition[0] = m_latestTracking.positionX;
+            pose.vecPosition[1] = m_latestTracking.positionY;
+            pose.vecPosition[2] = m_latestTracking.positionZ;
+
+            return pose;
+        }
+    }
+
+    // Fallback: gentle bob animation so SteamVR knows we're alive
     static auto startTime = std::chrono::steady_clock::now();
     auto now = std::chrono::steady_clock::now();
     double elapsed = std::chrono::duration<double>(now - startTime).count();
@@ -175,15 +250,7 @@ DriverPose_t HmdDriver::GetPose()
     float bobHeight = (float)(sin(elapsed * 2.0) * 0.02);
     float swayX = (float)(sin(elapsed * 1.5) * 0.01);
 
-    HmdQuaternion_t quat;
-    quat.w = 1.0;
-    quat.x = 0.0;
-    quat.y = 0.0;
-    quat.z = 0.0;
-
-    pose.qWorldFromDriverRotation = quat;
-    pose.qDriverFromHeadRotation = quat;
-
+    pose.qRotation = identity;
     pose.vecPosition[0] = swayX;
     pose.vecPosition[1] = bobHeight;
     pose.vecPosition[2] = 0.0;
@@ -198,7 +265,9 @@ void HmdDriver::RunFrame()
     VRServerDriverHost()->TrackedDevicePoseUpdated(driverId, pose, sizeof(DriverPose_t));
 }
 
-// IVRDisplayComponent implementations
+// ============================================================
+// IVRDisplayComponent
+// ============================================================
 void HmdDriver::GetWindowBounds( int32_t *pnX, int32_t *pnY, uint32_t *pnWidth, uint32_t *pnHeight )
 {
     if (pnX) *pnX = 0;
@@ -207,15 +276,8 @@ void HmdDriver::GetWindowBounds( int32_t *pnX, int32_t *pnY, uint32_t *pnWidth, 
     if (pnHeight) *pnHeight = 1080;
 }
 
-bool HmdDriver::IsDisplayOnDesktop()
-{
-    return false;
-}
-
-bool HmdDriver::IsDisplayRealDisplay()
-{
-    return false;
-}
+bool HmdDriver::IsDisplayOnDesktop() { return false; }
+bool HmdDriver::IsDisplayRealDisplay() { return false; }
 
 void HmdDriver::GetRecommendedRenderTargetSize( uint32_t *pnWidth, uint32_t *pnHeight )
 {
@@ -259,6 +321,9 @@ DistortionCoordinates_t HmdDriver::ComputeDistortion( EVREye eEye, float fU, flo
     return coordinates;
 }
 
+// ============================================================
+// IVRDriverDirectModeComponent
+// ============================================================
 void HmdDriver::CreateSwapTextureSet(uint32_t unPid, const SwapTextureSetDesc_t* pSwapTextureSetDesc, SwapTextureSet_t* pOutSwapTextureSet)
 {
 	// Create a shared texture that the application can render into.
@@ -276,7 +341,7 @@ void HmdDriver::CreateSwapTextureSet(uint32_t unPid, const SwapTextureSetDesc_t*
     desc.Usage = D3D11_USAGE_DEFAULT;
     desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     desc.CPUAccessFlags = 0;
-    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;  // No keyed mutex
+    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
 
     DriverLog("Creating texture: %dx%d format=%d flags=SHARED", desc.Width, desc.Height, desc.Format);
 
@@ -347,12 +412,8 @@ void HmdDriver::DestroySwapTextureSet(vr::SharedTextureHandle_t sharedTextureHan
     for (auto& pair : m_swapTextureSets) {
         for (auto it = pair.second.begin(); it != pair.second.end(); ++it) {
             if (it->hSharedHandle == h) {
-                if (it->pKeyedMutex) {
-                    it->pKeyedMutex->Release();
-                }
-                if (it->pTexture) {
-                    it->pTexture->Release();
-                }
+                if (it->pKeyedMutex) it->pKeyedMutex->Release();
+                if (it->pTexture) it->pTexture->Release();
                 pair.second.erase(it);
                 return;
             }
@@ -371,12 +432,8 @@ void HmdDriver::DestroyAllSwapTextureSets(uint32_t unPid)
             // Remove from handle maps
             m_textureHandleMap.erase((vr::SharedTextureHandle_t)sts.hSharedHandle);
             m_mutexHandleMap.erase((vr::SharedTextureHandle_t)sts.hSharedHandle);
-            if (sts.pKeyedMutex) {
-                sts.pKeyedMutex->Release();
-            }
-            if (sts.pTexture) {
-                sts.pTexture->Release();
-            }
+            if (sts.pKeyedMutex) sts.pKeyedMutex->Release();
+            if (sts.pTexture) sts.pTexture->Release();
         }
         m_swapTextureSets.erase(it);
     }
@@ -455,6 +512,9 @@ void HmdDriver::GetFrameTiming(DriverDirectMode_FrameTiming* pFrameTiming)
     DriverLog("GetFrameTiming called");
 }
 
+// ============================================================
+// Video Encoder
+// ============================================================
 bool HmdDriver::InitializeVideoEncoder()
 {
     DriverLog("========================================");
@@ -516,17 +576,24 @@ void HmdDriver::ShutdownVideoEncoder()
     DriverLog("Video Encoder shutdown complete.");
 }
 
+// ============================================================
+// OnEncodedPacket: send encoded H264 to phone via video socket
+// ============================================================
 void HmdDriver::OnEncodedPacket(uint8_t* data, int size, int64_t pts, bool keyframe)
 {
     DriverLog("[Encoded] size=%d, pts=%lld, keyframe=%s, data[0]=0x%02X",
               size, pts, keyframe ? "YES" : "NO", data[0]);
 
-    if (!m_udpInitialized || m_udpSocket == INVALID_SOCKET || size <= 0) {
+    if (!m_wsaInitialized || m_videoSocket == INVALID_SOCKET || size <= 0) {
         return;
     }
 
-    // libx264 keyframes: SPS and PPS have NAL start codes, but IDR data follows
-    // without one. Insert IDR start code after PPS for valid H264 stream.
+    // Don't send if no phone is connected
+    if (!m_videoTargetSet) {
+        return;
+    }
+
+    // libx264 keyframes: insert IDR start code after PPS if missing
     static const uint8_t idr_prefix[] = { 0x00, 0x00, 0x00, 0x01, 0x65 };
     bool needs_fix = false;
     int pps_data_end = -1;
@@ -558,79 +625,436 @@ void HmdDriver::OnEncodedPacket(uint8_t* data, int size, int64_t pts, bool keyfr
         }
     }
 
+    uint8_t* sendData = data;
+    int sendSize = size;
+
+    uint8_t* fixedBuf = nullptr;
     if (needs_fix && pps_data_end > 0) {
-        // Build fixed buffer: [up to PPS end] + [IDR start code] + [remaining IDR data]
-        int fixed_size = size + 5; // extra 5 bytes for NAL start + IDR header
-        uint8_t* fixed = (uint8_t*)malloc(fixed_size);
-        memcpy(fixed, data, pps_data_end);
-        memcpy(fixed + pps_data_end, idr_prefix, 5);
-        memcpy(fixed + pps_data_end + 5, data + pps_data_end, size - pps_data_end);
-
-        // Send fixed buffer
-        int offset = 0;
-        while (offset < fixed_size) {
-            int cs = (fixed_size - offset > 60000) ? 60000 : (fixed_size - offset);
-            sendto(m_udpSocket, (const char*)(fixed + offset), cs, 0,
-                   (sockaddr*)&m_serverAddr, sizeof(m_serverAddr));
-            offset += cs;
-        }
-        free(fixed);
+        sendSize = size + 5;
+        fixedBuf = (uint8_t*)malloc(sendSize);
+        memcpy(fixedBuf, data, pps_data_end);
+        memcpy(fixedBuf + pps_data_end, idr_prefix, 5);
+        memcpy(fixedBuf + pps_data_end + 5, data + pps_data_end, size - pps_data_end);
+        sendData = fixedBuf;
         DriverLog("[UDP] Fixed keyframe: inserted IDR start code at offset %d", pps_data_end);
-        return;
     }
 
-    // Normal send (P-frames or already-correct keyframes)
-    int offset = 0;
-    while (offset < size) {
-        int chunkSize = (size - offset > 60000) ? 60000 : (size - offset);
-        sendto(m_udpSocket, (const char*)(data + offset), chunkSize, 0,
-               (sockaddr*)&m_serverAddr, sizeof(m_serverAddr));
-        offset += chunkSize;
+    // Build protocol header
+    cbpp::PacketHeader header;
+    header.magic[0] = cbpp::MAGIC[0];
+    header.magic[1] = cbpp::MAGIC[1];
+    header.version = cbpp::PROTOCOL_VERSION;
+    header.type = cbpp::PT_VIDEO_CHUNK;
+
+    // Calculate chunks needed
+    uint32_t totalChunks = (sendSize + cbpp::VIDEO_CHUNK_SIZE - 1) / cbpp::VIDEO_CHUNK_SIZE;
+    static uint32_t frameCounter = 0;
+
+    // Allocate send buffer once (avoid 60KB stack allocation)
+    const int headerSize = sizeof(cbpp::PacketHeader) + sizeof(cbpp::VideoChunkHeader);
+    uint8_t* sendBuf = (uint8_t*)malloc(headerSize + cbpp::VIDEO_CHUNK_SIZE);
+
+    for (uint32_t chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {
+        uint32_t offset = chunkIdx * cbpp::VIDEO_CHUNK_SIZE;
+        uint32_t chunkLen = sendSize - offset;
+        if (chunkLen > cbpp::VIDEO_CHUNK_SIZE) chunkLen = cbpp::VIDEO_CHUNK_SIZE;
+
+        cbpp::VideoChunkHeader chunkHeader;
+        chunkHeader.frameId = frameCounter;
+        chunkHeader.chunkIndex = chunkIdx;
+        chunkHeader.totalChunks = totalChunks;
+        chunkHeader.frameSize = (uint32_t)sendSize;
+        chunkHeader.keyframe = keyframe ? 1 : 0;
+
+        // Pack: [PacketHeader] [VideoChunkHeader] [data]
+        header.payloadSize = sizeof(cbpp::VideoChunkHeader) + chunkLen;
+        memcpy(sendBuf, &header, sizeof(cbpp::PacketHeader));
+        memcpy(sendBuf + sizeof(cbpp::PacketHeader), &chunkHeader, sizeof(cbpp::VideoChunkHeader));
+        memcpy(sendBuf + headerSize, sendData + offset, chunkLen);
+
+        sendto(m_videoSocket, (const char*)sendBuf, headerSize + chunkLen, 0,
+               (sockaddr*)&m_videoTargetAddr, sizeof(m_videoTargetAddr));
     }
+
+    free(sendBuf);
+    frameCounter++;
+
+    if (fixedBuf) free(fixedBuf);
 }
 
-bool HmdDriver::InitializeUDP()
+// ============================================================
+// Networking: Initialize / Shutdown
+// ============================================================
+bool HmdDriver::InitializeNetworking()
 {
-    DriverLog("Initializing UDP socket...");
+    DriverLog("Initializing networking...");
 
-    WSADATA wsaData;
-    int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    WSADATA wsa;
+    int result = WSAStartup(MAKEWORD(2, 2), &wsa);
     if (result != 0) {
         DriverLog("WSAStartup failed! Error: %d", result);
         return false;
     }
+    m_wsaInitialized = true;
 
-    m_udpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (m_udpSocket == INVALID_SOCKET) {
-        DriverLog("socket() failed! WSAError: %d", WSAGetLastError());
-        WSACleanup();
-        return false;
+    if (!InitializeVideoSocket()) {
+        DriverLog("WARNING: Video socket init failed");
     }
 
-    // Set socket buffer size
-    int bufSize = 1024 * 1024; // 1MB send buffer
-    setsockopt(m_udpSocket, SOL_SOCKET, SO_SNDBUF, (const char*)&bufSize, sizeof(bufSize));
+    if (!StartBroadcastThread()) {
+        DriverLog("WARNING: Broadcast thread start failed");
+    }
 
-    // Target: localhost:42069
-    m_serverAddr.sin_family = AF_INET;
-    m_serverAddr.sin_port = htons(UDP_SERVER_PORT);
-    inet_pton(AF_INET, "127.0.0.1", &m_serverAddr.sin_addr);
+    if (!StartDiscoveryListener()) {
+        DriverLog("WARNING: Discovery listener start failed");
+    }
 
-    m_udpInitialized = true;
-    DriverLog("UDP socket initialized. Sending to 127.0.0.1:%d", UDP_SERVER_PORT);
+    if (!StartTrackingReceiver()) {
+        DriverLog("WARNING: Tracking receiver start failed");
+    }
+
+    if (!StartCameraReceiver()) {
+        DriverLog("WARNING: Camera receiver start failed");
+    }
+
+    std::string localIp = GetLocalIPAddress();
+    DriverLog("Local IP: %s", localIp.c_str());
+    DriverLog("Networking initialized. Broadcast=%d, Discovery=%d, Video=%d, Tracking=%d, Camera=%d",
+              m_broadcastRunning.load(), m_discoveryRunning.load(), m_videoSocket != INVALID_SOCKET,
+              m_trackingRunning.load(), m_cameraRunning.load());
+
     return true;
 }
 
-void HmdDriver::ShutdownUDP()
+void HmdDriver::ShutdownNetworking()
 {
-    DriverLog("Shutting down UDP socket...");
+    DriverLog("Shutting down networking...");
 
-    if (m_udpSocket != INVALID_SOCKET) {
-        closesocket(m_udpSocket);
-        m_udpSocket = INVALID_SOCKET;
+    // Stop broadcast thread
+    m_broadcastRunning = false;
+    if (m_broadcastSocket != INVALID_SOCKET) {
+        closesocket(m_broadcastSocket);
+        m_broadcastSocket = INVALID_SOCKET;
+    }
+    if (m_broadcastThread.joinable()) m_broadcastThread.join();
+
+    // Stop discovery listener
+    m_discoveryRunning = false;
+    if (m_discoverySocket != INVALID_SOCKET) {
+        closesocket(m_discoverySocket);
+        m_discoverySocket = INVALID_SOCKET;
+    }
+    if (m_discoveryThread.joinable()) m_discoveryThread.join();
+
+    // Stop tracking receiver
+    m_trackingRunning = false;
+    if (m_trackingSocket != INVALID_SOCKET) {
+        closesocket(m_trackingSocket);
+        m_trackingSocket = INVALID_SOCKET;
+    }
+    if (m_trackingThread.joinable()) m_trackingThread.join();
+
+    // Stop camera receiver
+    m_cameraRunning = false;
+    if (m_cameraSocket != INVALID_SOCKET) {
+        closesocket(m_cameraSocket);
+        m_cameraSocket = INVALID_SOCKET;
+    }
+    if (m_cameraThread.joinable()) m_cameraThread.join();
+
+    ShutdownVideoSocket();
+
+    m_wsaInitialized = false;
+    WSACleanup();
+    DriverLog("Networking shutdown complete.");
+}
+
+// ============================================================
+// Broadcast: periodically announce driver on LAN
+// ============================================================
+bool HmdDriver::StartBroadcastThread()
+{
+    m_broadcastSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (m_broadcastSocket == INVALID_SOCKET) {
+        DriverLog("Broadcast socket() failed! Error: %d", WSAGetLastError());
+        return false;
     }
 
-    m_udpInitialized = false;
-    WSACleanup();
-    DriverLog("UDP socket shutdown complete.");
+    int broadcastEnable = 1;
+    setsockopt(m_broadcastSocket, SOL_SOCKET, SO_BROADCAST, (const char*)&broadcastEnable, sizeof(broadcastEnable));
+
+    int bufSize = 65536;
+    setsockopt(m_broadcastSocket, SOL_SOCKET, SO_SNDBUF, (const char*)&bufSize, sizeof(bufSize));
+
+    m_broadcastRunning = true;
+    m_broadcastThread = std::thread(&HmdDriver::BroadcastLoop, this);
+    DriverLog("Broadcast thread started on port %d", cbpp::PORT_BROADCAST);
+    return true;
+}
+
+void HmdDriver::BroadcastLoop()
+{
+    sockaddr_in broadcastAddr = {};
+    broadcastAddr.sin_family = AF_INET;
+    broadcastAddr.sin_port = htons(cbpp::PORT_BROADCAST);
+    broadcastAddr.sin_addr.s_addr = INADDR_BROADCAST;
+
+    std::string localIp = GetLocalIPAddress();
+
+    while (m_broadcastRunning) {
+        cbpp::PacketHeader header = {};
+        header.magic[0] = cbpp::MAGIC[0];
+        header.magic[1] = cbpp::MAGIC[1];
+        header.version = cbpp::PROTOCOL_VERSION;
+        header.type = cbpp::PT_DISCOVERY_ANNOUNCE;
+        header.payloadSize = sizeof(cbpp::AnnouncePayload);
+
+        cbpp::AnnouncePayload payload = {};
+        payload.videoPort = cbpp::PORT_VIDEO;
+        payload.cameraPort = cbpp::PORT_CAMERA;
+        payload.trackingPort = cbpp::PORT_TRACKING;
+
+        // Convert our IP to network byte order
+        struct in_addr addr;
+        inet_pton(AF_INET, localIp.c_str(), &addr);
+        payload.serverIp = addr.S_un.S_addr;
+
+        strncpy_s(payload.name, "CardboardPlusPlus", sizeof(payload.name) - 1);
+
+        uint8_t buf[sizeof(cbpp::PacketHeader) + sizeof(cbpp::AnnouncePayload)];
+        memcpy(buf, &header, sizeof(cbpp::PacketHeader));
+        memcpy(buf + sizeof(cbpp::PacketHeader), &payload, sizeof(cbpp::AnnouncePayload));
+
+        sendto(m_broadcastSocket, (const char*)buf, sizeof(buf), 0,
+               (sockaddr*)&broadcastAddr, sizeof(broadcastAddr));
+
+        Sleep(cbpp::BROADCAST_INTERVAL_MS);
+    }
+}
+
+// ============================================================
+// Discovery Listener: listen for phone responses
+// ============================================================
+bool HmdDriver::StartDiscoveryListener()
+{
+    m_discoverySocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (m_discoverySocket == INVALID_SOCKET) {
+        DriverLog("Discovery socket() failed! Error: %d", WSAGetLastError());
+        return false;
+    }
+
+    int reuse = 1;
+    setsockopt(m_discoverySocket, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+
+    sockaddr_in bindAddr = {};
+    bindAddr.sin_family = AF_INET;
+    bindAddr.sin_port = htons(cbpp::PORT_BROADCAST);
+    bindAddr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(m_discoverySocket, (sockaddr*)&bindAddr, sizeof(bindAddr)) == SOCKET_ERROR) {
+        DriverLog("Discovery bind() failed! Error: %d", WSAGetLastError());
+        closesocket(m_discoverySocket);
+        m_discoverySocket = INVALID_SOCKET;
+        return false;
+    }
+
+    // Set non-blocking
+    u_long mode = 1;
+    ioctlsocket(m_discoverySocket, FIONBIO, &mode);
+
+    m_discoveryRunning = true;
+    m_discoveryThread = std::thread(&HmdDriver::DiscoveryListenerLoop, this);
+    DriverLog("Discovery listener started on port %d", cbpp::PORT_BROADCAST);
+    return true;
+}
+
+void HmdDriver::DiscoveryListenerLoop()
+{
+    uint8_t buf[1024];
+    sockaddr_in fromAddr = {};
+    int fromLen = sizeof(fromAddr);
+
+    while (m_discoveryRunning) {
+        int received = recvfrom(m_discoverySocket, (char*)buf, sizeof(buf), 0,
+                                (sockaddr*)&fromAddr, &fromLen);
+
+        if (received > 0 && received >= (int)sizeof(cbpp::PacketHeader)) {
+            cbpp::PacketHeader* hdr = (cbpp::PacketHeader*)buf;
+
+            if (hdr->magic[0] != cbpp::MAGIC[0] || hdr->magic[1] != cbpp::MAGIC[1]) {
+                Sleep(10);
+                continue;
+            }
+
+            if (hdr->type == cbpp::PT_DISCOVERY_RESPONSE) {
+                if (received >= (int)(sizeof(cbpp::PacketHeader) + sizeof(cbpp::ResponsePayload))) {
+                    cbpp::ResponsePayload* resp = (cbpp::ResponsePayload*)(buf + sizeof(cbpp::PacketHeader));
+
+                    std::lock_guard<std::mutex> lock(m_clientMutex);
+                    m_client.connected = true;
+                    m_client.addr = fromAddr;
+                    m_client.addr.sin_port = htons(cbpp::PORT_VIDEO);
+
+                    // Set video target to the phone
+                    m_videoTargetAddr = fromAddr;
+                    m_videoTargetAddr.sin_port = htons(cbpp::PORT_VIDEO);
+                    m_videoTargetSet = true;
+
+                    char ipStr[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, &fromAddr.sin_addr, ipStr, sizeof(ipStr));
+                    DriverLog("Phone connected: %s", ipStr);
+                }
+            }
+        }
+
+        Sleep(10);
+    }
+}
+
+// ============================================================
+// Video Socket: send H264 frames to phone
+// ============================================================
+bool HmdDriver::InitializeVideoSocket()
+{
+    m_videoSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (m_videoSocket == INVALID_SOCKET) {
+        DriverLog("Video socket() failed! Error: %d", WSAGetLastError());
+        return false;
+    }
+
+    int bufSize = 1024 * 1024; // 1MB send buffer
+    setsockopt(m_videoSocket, SOL_SOCKET, SO_SNDBUF, (const char*)&bufSize, sizeof(bufSize));
+
+    DriverLog("Video socket initialized on port %d", cbpp::PORT_VIDEO);
+    return true;
+}
+
+void HmdDriver::ShutdownVideoSocket()
+{
+    if (m_videoSocket != INVALID_SOCKET) {
+        closesocket(m_videoSocket);
+        m_videoSocket = INVALID_SOCKET;
+    }
+    m_videoTargetSet = false;
+}
+
+// ============================================================
+// Tracking Receiver: receive orientation/position from phone
+// ============================================================
+bool HmdDriver::StartTrackingReceiver()
+{
+    m_trackingSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (m_trackingSocket == INVALID_SOCKET) {
+        DriverLog("Tracking socket() failed! Error: %d", WSAGetLastError());
+        return false;
+    }
+
+    int reuse = 1;
+    setsockopt(m_trackingSocket, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+
+    sockaddr_in bindAddr = {};
+    bindAddr.sin_family = AF_INET;
+    bindAddr.sin_port = htons(cbpp::PORT_TRACKING);
+    bindAddr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(m_trackingSocket, (sockaddr*)&bindAddr, sizeof(bindAddr)) == SOCKET_ERROR) {
+        DriverLog("Tracking bind() failed! Error: %d", WSAGetLastError());
+        closesocket(m_trackingSocket);
+        m_trackingSocket = INVALID_SOCKET;
+        return false;
+    }
+
+    u_long mode = 1;
+    ioctlsocket(m_trackingSocket, FIONBIO, &mode);
+
+    m_trackingRunning = true;
+    m_trackingThread = std::thread(&HmdDriver::TrackingReceiverLoop, this);
+    DriverLog("Tracking receiver started on port %d", cbpp::PORT_TRACKING);
+    return true;
+}
+
+void HmdDriver::TrackingReceiverLoop()
+{
+    uint8_t buf[1024];
+    sockaddr_in fromAddr = {};
+    int fromLen = sizeof(fromAddr);
+
+    while (m_trackingRunning) {
+        int received = recvfrom(m_trackingSocket, (char*)buf, sizeof(buf), 0,
+                                (sockaddr*)&fromAddr, &fromLen);
+
+        if (received >= (int)(sizeof(cbpp::PacketHeader) + sizeof(cbpp::TrackingPayload))) {
+            cbpp::PacketHeader* hdr = (cbpp::PacketHeader*)buf;
+
+            if (hdr->magic[0] == cbpp::MAGIC[0] && hdr->magic[1] == cbpp::MAGIC[1] &&
+                hdr->type == cbpp::PT_TRACKING) {
+                cbpp::TrackingPayload* track = (cbpp::TrackingPayload*)(buf + sizeof(cbpp::PacketHeader));
+
+                std::lock_guard<std::mutex> lock(m_trackingMutex);
+                m_latestTracking = *track;
+                m_hasTracking = true;
+            }
+        }
+
+        Sleep(2); // ~500 Hz polling, low latency
+    }
+}
+
+// ============================================================
+// Camera Receiver: receive camera frames from phone (placeholder)
+// ============================================================
+bool HmdDriver::StartCameraReceiver()
+{
+    m_cameraSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (m_cameraSocket == INVALID_SOCKET) {
+        DriverLog("Camera socket() failed! Error: %d", WSAGetLastError());
+        return false;
+    }
+
+    int reuse = 1;
+    setsockopt(m_cameraSocket, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+
+    sockaddr_in bindAddr = {};
+    bindAddr.sin_family = AF_INET;
+    bindAddr.sin_port = htons(cbpp::PORT_CAMERA);
+    bindAddr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(m_cameraSocket, (sockaddr*)&bindAddr, sizeof(bindAddr)) == SOCKET_ERROR) {
+        DriverLog("Camera bind() failed! Error: %d", WSAGetLastError());
+        closesocket(m_cameraSocket);
+        m_cameraSocket = INVALID_SOCKET;
+        return false;
+    }
+
+    u_long mode = 1;
+    ioctlsocket(m_cameraSocket, FIONBIO, &mode);
+
+    m_cameraRunning = true;
+    m_cameraThread = std::thread(&HmdDriver::CameraReceiverLoop, this);
+    DriverLog("Camera receiver started on port %d (placeholder)", cbpp::PORT_CAMERA);
+    return true;
+}
+
+void HmdDriver::CameraReceiverLoop()
+{
+    uint8_t buf[65536];
+    sockaddr_in fromAddr = {};
+    int fromLen = sizeof(fromAddr);
+
+    while (m_cameraRunning) {
+        int received = recvfrom(m_cameraSocket, (char*)buf, sizeof(buf), 0,
+                                (sockaddr*)&fromAddr, &fromLen);
+
+        if (received >= (int)sizeof(cbpp::PacketHeader)) {
+            cbpp::PacketHeader* hdr = (cbpp::PacketHeader*)buf;
+
+            if (hdr->magic[0] == cbpp::MAGIC[0] && hdr->magic[1] == cbpp::MAGIC[1] &&
+                hdr->type == cbpp::PT_CAMERA_CHUNK) {
+                // TODO: decode camera frames when real data arrives
+                DriverLog("[Camera] Received chunk: %d bytes (placeholder)", received);
+            }
+        }
+
+        Sleep(10);
+    }
 }

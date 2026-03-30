@@ -28,6 +28,7 @@
 #include <GLES2/gl2.h>
 #include "cardboard.h"
 #include "util.h"
+#include "NetworkClient.h"
 
 namespace ndk_cardboardplusplus {
 
@@ -222,6 +223,9 @@ class HelloCardboardApp {
   int cur_target_object_;
 
   TexturedMesh quad_;
+
+  // Network client for discovery, video, tracking, camera
+  cbpp::NetworkClient networkClient_;
 };
 
 }  // namespace ndk_cardboardplusplus

@@ -37,7 +37,9 @@ file(GLOB native_srcs "src/main/jni/*.cc")
 # Output binary
 add_library(cardboard_jni SHARED ${native_srcs})
 # Includes
-target_include_directories(cardboard_jni PRIVATE ${CARDBOARD_INCLUDE_DIR})
+target_include_directories(cardboard_jni PRIVATE
+    ${CARDBOARD_INCLUDE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
 # Build
 target_link_libraries(cardboard_jni
     ${ANDROID_LIB}
