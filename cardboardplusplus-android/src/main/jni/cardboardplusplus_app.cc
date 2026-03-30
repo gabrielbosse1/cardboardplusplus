@@ -33,53 +33,10 @@ namespace ndk_cardboardplusplus {
 
 namespace {
 
-// The objects are about 1 meter in radius, so the min/max target distance are
-// set so that the objects are always within the room (which is about 5 meters
-// across) and the reticle is always closer than any objects.
-constexpr float kMinTargetDistance = 2.5f;
-constexpr float kMaxTargetDistance = 3.5f;
-constexpr float kMinTargetHeight = 0.5f;
-constexpr float kMaxTargetHeight = kMinTargetHeight + 3.0f;
-
-constexpr float kDefaultFloorHeight = -1.7f;
-
 // 6 Hz cutoff frequency for the velocity filter of the head tracker.
 constexpr int kVelocityFilterCutoffFrequency = 6;
 
 constexpr uint64_t kPredictionTimeWithoutVsyncNanos = 50000000;
-
-// Angle threshold for determining whether the controller is pointing at the
-// object.
-constexpr float kAngleLimit = 0.2f;
-
-// Number of different possible targets
-constexpr int kTargetMeshCount = 3;
-
-// Simple shaders to render .obj files without any lighting.
-constexpr const char* kObjVertexShader =
-    R"glsl(
-    uniform mat4 u_MVP;
-    attribute vec4 a_Position;
-    attribute vec2 a_UV;
-    varying vec2 v_UV;
-
-    void main() {
-      v_UV = a_UV;
-      gl_Position = u_MVP * a_Position;
-    })glsl";
-
-constexpr const char* kObjFragmentShader =
-    R"glsl(
-    precision mediump float;
-
-    uniform sampler2D u_Texture;
-    varying vec2 v_UV;
-
-    void main() {
-      // The y coordinate of this sample's textures is reversed compared to
-      // what OpenGL expects, so we invert the y coordinate.
-      gl_FragColor = texture2D(u_Texture, vec2(v_UV.x, 1.0 - v_UV.y));
-    })glsl";
 
 constexpr const char* kTexVertexShader =
     R"glsl(
@@ -92,6 +49,7 @@ constexpr const char* kTexVertexShader =
       v_TexCoord = a_TexCoord;
     })glsl";
 
+// OES external texture sampler for camera passthrough
 constexpr const char* kTexFragmentShader =
     R"glsl(
     #extension GL_OES_EGL_image_external : require
@@ -100,6 +58,16 @@ constexpr const char* kTexFragmentShader =
     uniform samplerExternalOES sTexture;
     void main() {
       gl_FragColor = texture2D(sTexture, vec2(v_TexCoord.x, 1.0 - v_TexCoord.y));
+    })glsl";
+
+// Regular 2D texture sampler for eye textures
+constexpr const char* k2DTexFragmentShader =
+    R"glsl(
+    precision mediump float;
+    varying vec2 v_TexCoord;
+    uniform sampler2D sTexture;
+    void main() {
+      gl_FragColor = texture2D(sTexture, v_TexCoord);
     })glsl";
 
 }  // anonymous namespace
@@ -116,19 +84,20 @@ CardboardPlusPlusApp::CardboardPlusPlusApp(JavaVM* vm, jobject obj,
       depthRenderBuffer_(0),
       framebuffer_(0),
       texture_(0),
-      obj_program_(0),
-      obj_position_param_(0),
-      obj_uv_param_(0),
-      obj_modelview_projection_param_(0),
-      target_object_meshes_(kTargetMeshCount),
-      target_object_not_selected_textures_(kTargetMeshCount),
-      target_object_selected_textures_(kTargetMeshCount),
+      tex2d_program_(0),
+      tex2d_position_param_(0),
+      tex2d_tex_coord_param_(0),
+      tex2d_mvp_param_(0),
+      tex2d_texture_param_(0),
       camera_texture_(0),
       camera_width_(0),
       camera_height_(0),
       camera_texture_initialized_(false),
       show_camera_texture_(false),
-      cur_target_object_(RandomUniformInt(kTargetMeshCount)) {
+      left_eye_custom_texture_(0),
+      right_eye_custom_texture_(0),
+      left_eye_texture_set_(false),
+      right_eye_texture_set_(false) {
   JNIEnv* env;
   vm->GetEnv((void**)&env, JNI_VERSION_1_6);
   java_asset_mgr_ = env->NewGlobalRef(asset_mgr_obj);
@@ -151,26 +120,9 @@ CardboardPlusPlusApp::~CardboardPlusPlusApp() {
 }
 
 void CardboardPlusPlusApp::OnSurfaceCreated(JNIEnv* env) {
-  const int obj_vertex_shader =
-      LoadGLShader(GL_VERTEX_SHADER, kObjVertexShader);
-  const int obj_fragment_shader =
-      LoadGLShader(GL_FRAGMENT_SHADER, kObjFragmentShader);
-
-  obj_program_ = glCreateProgram();
-  glAttachShader(obj_program_, obj_vertex_shader);
-  glAttachShader(obj_program_, obj_fragment_shader);
-  glLinkProgram(obj_program_);
-  glUseProgram(obj_program_);
-
-  CHECKGLERROR("Obj program");
-
-  obj_position_param_ = glGetAttribLocation(obj_program_, "a_Position");
-  obj_uv_param_ = glGetAttribLocation(obj_program_, "a_UV");
-  obj_modelview_projection_param_ = glGetUniformLocation(obj_program_, "u_MVP");
-
-  CHECKGLERROR("Obj program params");
-
   const int tex_vertex_shader = LoadGLShader(GL_VERTEX_SHADER, kTexVertexShader);
+
+  // Camera OES texture program
   const int tex_fragment_shader = LoadGLShader(GL_FRAGMENT_SHADER, kTexFragmentShader);
   tex_program_ = glCreateProgram();
   glAttachShader(tex_program_, tex_vertex_shader);
@@ -187,34 +139,25 @@ void CardboardPlusPlusApp::OnSurfaceCreated(JNIEnv* env) {
 
   CHECKGLERROR("Tex program params");
 
+  // 2D texture program for eye textures
+  const int tex2d_fragment_shader = LoadGLShader(GL_FRAGMENT_SHADER, k2DTexFragmentShader);
+  tex2d_program_ = glCreateProgram();
+  glAttachShader(tex2d_program_, tex_vertex_shader);
+  glAttachShader(tex2d_program_, tex2d_fragment_shader);
+  glLinkProgram(tex2d_program_);
+  glUseProgram(tex2d_program_);
+
+  CHECKGLERROR("Tex2D program");
+
+  tex2d_position_param_ = glGetAttribLocation(tex2d_program_, "a_Position");
+  tex2d_tex_coord_param_ = glGetAttribLocation(tex2d_program_, "a_TexCoord");
+  tex2d_mvp_param_ = glGetUniformLocation(tex2d_program_, "u_MVPMatrix");
+  tex2d_texture_param_ = glGetUniformLocation(tex2d_program_, "sTexture");
+
+  CHECKGLERROR("Tex2D program params");
+
   CARDBOARDPLUSPLUS_CHECK(quad_.Initialize(tex_position_param_, tex_tex_coord_param_,
                                         "Quad.obj", asset_mgr_));
-
-  CARDBOARDPLUSPLUS_CHECK(room_.Initialize(obj_position_param_, obj_uv_param_,
-                                        "CubeRoom.obj", asset_mgr_));
-  CARDBOARDPLUSPLUS_CHECK(
-      room_tex_.Initialize(env, java_asset_mgr_, "CubeRoom_BakedDiffuse.png"));
-  CARDBOARDPLUSPLUS_CHECK(target_object_meshes_[0].Initialize(
-      obj_position_param_, obj_uv_param_, "Icosahedron.obj", asset_mgr_));
-  CARDBOARDPLUSPLUS_CHECK(target_object_not_selected_textures_[0].Initialize(
-      env, java_asset_mgr_, "Icosahedron_Blue_BakedDiffuse.png"));
-  CARDBOARDPLUSPLUS_CHECK(target_object_selected_textures_[0].Initialize(
-      env, java_asset_mgr_, "Icosahedron_Pink_BakedDiffuse.png"));
-  CARDBOARDPLUSPLUS_CHECK(target_object_meshes_[1].Initialize(
-      obj_position_param_, obj_uv_param_, "QuadSphere.obj", asset_mgr_));
-  CARDBOARDPLUSPLUS_CHECK(target_object_not_selected_textures_[1].Initialize(
-      env, java_asset_mgr_, "QuadSphere_Blue_BakedDiffuse.png"));
-  CARDBOARDPLUSPLUS_CHECK(target_object_selected_textures_[1].Initialize(
-      env, java_asset_mgr_, "QuadSphere_Pink_BakedDiffuse.png"));
-  CARDBOARDPLUSPLUS_CHECK(target_object_meshes_[2].Initialize(
-      obj_position_param_, obj_uv_param_, "TriSphere.obj", asset_mgr_));
-  CARDBOARDPLUSPLUS_CHECK(target_object_not_selected_textures_[2].Initialize(
-      env, java_asset_mgr_, "TriSphere_Blue_BakedDiffuse.png"));
-  CARDBOARDPLUSPLUS_CHECK(target_object_selected_textures_[2].Initialize(
-      env, java_asset_mgr_, "TriSphere_Pink_BakedDiffuse.png"));
-
-  // Target object first appears directly in front of user.
-  model_target_ = GetTranslationMatrix({0.0f, 1.5f, kMinTargetDistance});
 
   CHECKGLERROR("OnSurfaceCreated");
 }
@@ -233,10 +176,6 @@ void CardboardPlusPlusApp::OnDrawFrame() {
   // Update Head Pose.
   head_view_ = GetPose();
 
-  // Incorporate the floor height into the head_view
-  head_view_ =
-      head_view_ * GetTranslationMatrix({0.0f, kDefaultFloorHeight, 0.0f});
-
   glEnable(GL_DEPTH_TEST);
   glEnable(GL_CULL_FACE);
   glDisable(GL_SCISSOR_TEST);
@@ -249,15 +188,12 @@ void CardboardPlusPlusApp::OnDrawFrame() {
   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
   if (camera_texture_initialized_ && show_camera_texture_) {
-    // Draw camera texture as full-screen background
     DrawCameraQuad(camera_texture_);
+  } else if (left_eye_texture_set_) {
+    DrawEyeQuad(left_eye_custom_texture_);
   } else {
-    Matrix4x4 left_eye_matrix = GetMatrixFromGlArray(eye_matrices_[0]);
-    Matrix4x4 left_eye_view = left_eye_matrix * head_view_;
-    Matrix4x4 left_projection_matrix = GetMatrixFromGlArray(projection_matrices_[0]);
-    modelview_projection_target_ = left_projection_matrix * left_eye_view * model_target_;
-    modelview_projection_room_ = left_projection_matrix * left_eye_view;
-    DrawWorld();
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
   }
 
   // Draw right eye
@@ -266,15 +202,12 @@ void CardboardPlusPlusApp::OnDrawFrame() {
   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
   if (camera_texture_initialized_ && show_camera_texture_) {
-    // Draw the SAME camera texture - no stereo offset
     DrawCameraQuad(camera_texture_);
+  } else if (right_eye_texture_set_) {
+    DrawEyeQuad(right_eye_custom_texture_);
   } else {
-    Matrix4x4 right_eye_matrix = GetMatrixFromGlArray(eye_matrices_[1]);
-    Matrix4x4 right_eye_view = right_eye_matrix * head_view_;
-    Matrix4x4 right_projection_matrix = GetMatrixFromGlArray(projection_matrices_[1]);
-    modelview_projection_target_ = right_projection_matrix * right_eye_view * model_target_;
-    modelview_projection_room_ = right_projection_matrix * right_eye_view;
-    DrawWorld();
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
   }
 
   // Render with distortion
@@ -287,9 +220,6 @@ void CardboardPlusPlusApp::OnDrawFrame() {
 }
 
 void CardboardPlusPlusApp::OnTriggerEvent() {
-  if (IsPointingAtTarget()) {
-    HideTarget();
-  }
   show_camera_texture_ = !show_camera_texture_;
 }
 
@@ -494,67 +424,20 @@ Matrix4x4 CardboardPlusPlusApp::GetPose() {
          Quatf::FromXYZW(&out_orientation[0]).ToMatrix();
 }
 
-void CardboardPlusPlusApp::DrawWorld() {
-  DrawRoom();
-  DrawTarget();
-}
-
-void CardboardPlusPlusApp::DrawTarget() {
-  glUseProgram(obj_program_);
-
-  std::array<float, 16> target_array = modelview_projection_target_.ToGlArray();
-  glUniformMatrix4fv(obj_modelview_projection_param_, 1, GL_FALSE,
-                     target_array.data());
-
-  if (IsPointingAtTarget()) {
-    target_object_selected_textures_[cur_target_object_].Bind();
-  } else {
-    target_object_not_selected_textures_[cur_target_object_].Bind();
-  }
-  target_object_meshes_[cur_target_object_].Draw();
-
-  CHECKGLERROR("DrawTarget");
-}
-
-void CardboardPlusPlusApp::DrawRoom() {
-  glUseProgram(obj_program_);
-
-  std::array<float, 16> room_array = modelview_projection_room_.ToGlArray();
-  glUniformMatrix4fv(obj_modelview_projection_param_, 1, GL_FALSE,
-                     room_array.data());
-
-  room_tex_.Bind();
-  room_.Draw();
-
-  CHECKGLERROR("DrawRoom");
-}
-
-void CardboardPlusPlusApp::DrawTexQuad(GLuint texture_id) {
-  glUseProgram(tex_program_);
+void CardboardPlusPlusApp::DrawEyeQuad(GLuint texture_id) {
+  glUseProgram(tex2d_program_);
 
   Matrix4x4 identity = GetIdentityMatrix();
   std::array<float, 16> identity_array = identity.ToGlArray();
-  glUniformMatrix4fv(tex_mvp_param_, 1, GL_FALSE, identity_array.data());
+  glUniformMatrix4fv(tex2d_mvp_param_, 1, GL_FALSE, identity_array.data());
 
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, texture_id);
-  glUniform1i(tex_texture_param_, 0);
+  glUniform1i(tex2d_texture_param_, 0);
 
   quad_.Draw();
 
-  CHECKGLERROR("DrawTexQuad");
-}
-
-void CardboardPlusPlusApp::HideTarget() {
-  cur_target_object_ = RandomUniformInt(kTargetMeshCount);
-
-  float angle = RandomUniformFloat(-M_PI, M_PI);
-  float distance = RandomUniformFloat(kMinTargetDistance, kMaxTargetDistance);
-  float height = RandomUniformFloat(kMinTargetHeight, kMaxTargetHeight);
-  std::array<float, 3> target_position = {std::cos(angle) * distance, height,
-                                          std::sin(angle) * distance};
-
-  model_target_ = GetTranslationMatrix(target_position);
+  CHECKGLERROR("DrawEyeQuad");
 }
 
 void CardboardPlusPlusApp::DrawCameraQuad(GLuint texture_id) {
@@ -571,19 +454,6 @@ void CardboardPlusPlusApp::DrawCameraQuad(GLuint texture_id) {
   quad_.Draw();
 
   CHECKGLERROR("DrawCameraQuad");
-}
-
-bool CardboardPlusPlusApp::IsPointingAtTarget() {
-  // Compute vectors pointing towards the reticle and towards the target object
-  // in head space.
-  Matrix4x4 head_from_target = head_view_ * model_target_;
-
-  const std::array<float, 4> unit_quaternion = {0.f, 0.f, 0.f, 1.f};
-  const std::array<float, 4> point_vector = {0.f, 0.f, -1.f, 0.f};
-  const std::array<float, 4> target_vector = head_from_target * unit_quaternion;
-
-  float angle = AngleBetweenVectors(point_vector, target_vector);
-  return angle < kAngleLimit;
 }
 
 void CardboardPlusPlusApp::OnCameraTextureInitialized(int textureId, int width, int height) {
@@ -609,6 +479,18 @@ int CardboardPlusPlusApp::CreateCameraTexture() {
 void CardboardPlusPlusApp::ResetCameraTexture() {
   camera_texture_initialized_ = false;
   LOGD("Camera texture reset for pause");
+}
+
+void CardboardPlusPlusApp::SetEyeTexture(int eye, int textureId) {
+  if (eye == 0) {
+    left_eye_custom_texture_ = static_cast<GLuint>(textureId);
+    left_eye_texture_set_ = (textureId != 0);
+    LOGD("Left eye texture set: id=%d", textureId);
+  } else if (eye == 1) {
+    right_eye_custom_texture_ = static_cast<GLuint>(textureId);
+    right_eye_texture_set_ = (textureId != 0);
+    LOGD("Right eye texture set: id=%d", textureId);
+  }
 }
 
 }  // namespace ndk_cardboardplusplus

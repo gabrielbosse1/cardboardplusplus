@@ -33,8 +33,8 @@
 namespace ndk_cardboardplusplus {
 
 /**
- * This is a sample app for the Cardboard SDK. It loads a simple environment and
- * objects that you can click on.
+ * Cardboard++ VR app. Renders camera passthrough or custom eye textures
+ * (one per eye) through the Cardboard lens distortion pipeline.
  */
 class CardboardPlusPlusApp {
  public:
@@ -71,7 +71,7 @@ class CardboardPlusPlusApp {
   void OnDrawFrame();
 
   /**
-   * Hides the target object if it's being targeted.
+   * Toggles camera passthrough on/off.
    */
   void OnTriggerEvent();
 
@@ -90,8 +90,6 @@ class CardboardPlusPlusApp {
    */
   void SwitchViewer();
 
-  void DrawTexQuad(GLuint texture_id);
-
   void DrawCameraQuad(GLuint texture_id);
 
   void OnCameraTextureInitialized(int textureId, int width, int height);
@@ -99,6 +97,8 @@ class CardboardPlusPlusApp {
   int CreateCameraTexture();
 
   void ResetCameraTexture();
+
+  void SetEyeTexture(int eye, int textureId);
 
   private:
   /**
@@ -136,33 +136,9 @@ class CardboardPlusPlusApp {
   Matrix4x4 GetPose();
 
   /**
-   * Draws all world-space objects for the given eye.
+   * Draws a 2D texture quad for the given eye.
    */
-  void DrawWorld();
-
-  /**
-   * Draws the target object.
-   */
-  void DrawTarget();
-
-  /**
-   * Draws the room.
-   */
-  void DrawRoom();
-
-  /**
-   * Finds a new random position for the target object.
-   */
-  void HideTarget();
-
-  /**
-   * Checks if user is pointing or looking at the target object by calculating
-   * whether the angle between the user's gaze and the vector pointing towards
-   * the object is lower than some threshold.
-   *
-   * @return true if the user is pointing at the target object.
-   */
-  bool IsPointingAtTarget();
+  void DrawEyeQuad(GLuint texture_id);
 
   jobject java_asset_mgr_;
   AAssetManager* asset_mgr_;
@@ -186,10 +162,11 @@ class CardboardPlusPlusApp {
   GLuint framebuffer_;        // framebuffer object
   GLuint texture_;            // distortion texture
 
-  GLuint obj_program_;
-  GLuint obj_position_param_;
-  GLuint obj_uv_param_;
-  GLuint obj_modelview_projection_param_;
+  GLuint tex2d_program_;
+  GLuint tex2d_position_param_;
+  GLuint tex2d_tex_coord_param_;
+  GLuint tex2d_mvp_param_;
+  GLuint tex2d_texture_param_;
 
   GLuint tex_program_;
   GLuint tex_position_param_;
@@ -208,19 +185,12 @@ class CardboardPlusPlusApp {
   bool camera_texture_initialized_;
   bool show_camera_texture_;
 
+  GLuint left_eye_custom_texture_;
+  GLuint right_eye_custom_texture_;
+  bool left_eye_texture_set_;
+  bool right_eye_texture_set_;
+
   Matrix4x4 head_view_;
-  Matrix4x4 model_target_;
-
-  Matrix4x4 modelview_projection_target_;
-  Matrix4x4 modelview_projection_room_;
-
-  TexturedMesh room_;
-  Texture room_tex_;
-
-  std::vector<TexturedMesh> target_object_meshes_;
-  std::vector<Texture> target_object_not_selected_textures_;
-  std::vector<Texture> target_object_selected_textures_;
-  int cur_target_object_;
 
   TexturedMesh quad_;
 

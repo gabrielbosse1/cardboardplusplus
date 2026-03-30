@@ -565,6 +565,8 @@ public class VrActivity extends AppCompatActivity implements PopupMenu.OnMenuIte
 
   private native void nativeResetCameraTexture(long nativeApp);
 
+  private native void nativeSetEyeTexture(long nativeApp, int eye, int textureId);
+
   public void updateCameraTexture() {
     try {
       if (cameraSurfaceTexture != null) {
