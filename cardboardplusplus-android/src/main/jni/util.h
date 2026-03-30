@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#ifndef HELLO_CARDBOARD_ANDROID_SRC_MAIN_JNI_UTIL_H_
-#define HELLO_CARDBOARD_ANDROID_SRC_MAIN_JNI_UTIL_H_
+#ifndef CARDBOARD_PLUS_PLUS_ANDROID_SRC_MAIN_JNI_UTIL_H_
+#define CARDBOARD_PLUS_PLUS_ANDROID_SRC_MAIN_JNI_UTIL_H_
 
 #include <android/asset_manager.h>
 #include <jni.h>
@@ -29,7 +29,7 @@
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
-#define HELLOCARDBOARD_CHECK(condition)                                    \
+#define CARDBOARDPLUSPLUS_CHECK(condition)                                    \
   if (!(condition)) {                                                      \
     LOGE("*** CHECK FAILED at %s:%d: %s", __FILE__, __LINE__, #condition); \
     abort();                                                               \
@@ -193,4 +193,4 @@ class Texture {
 
 }  // namespace ndk_cardboardplusplus
 
-#endif  // HELLO_CARDBOARD_ANDROID_SRC_MAIN_JNI_UTIL_H_
+#endif  // CARDBOARD_PLUS_PLUS_ANDROID_SRC_MAIN_JNI_UTIL_H_

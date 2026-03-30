@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#ifndef HELLO_CARDBOARD_ANDROID_SRC_MAIN_JNI_HELLO_CARDBOARD_APP_H_
-#define HELLO_CARDBOARD_ANDROID_SRC_MAIN_JNI_HELLO_CARDBOARD_APP_H_
+#ifndef CARDBOARD_PLUS_PLUS_ANDROID_SRC_MAIN_JNI_CARDBOARD_PLUS_PLUS_APP_H_
+#define CARDBOARD_PLUS_PLUS_ANDROID_SRC_MAIN_JNI_CARDBOARD_PLUS_PLUS_APP_H_
 
 #include <android/asset_manager.h>
 #include <jni.h>
@@ -36,18 +36,18 @@ namespace ndk_cardboardplusplus {
  * This is a sample app for the Cardboard SDK. It loads a simple environment and
  * objects that you can click on.
  */
-class HelloCardboardApp {
+class CardboardPlusPlusApp {
  public:
   /**
-   * Creates a HelloCardboardApp.
+   * Creates a CardboardPlusPlusApp.
    *
    * @param vm JavaVM pointer.
    * @param obj Android activity object.
    * @param asset_mgr_obj The asset manager object.
    */
-  HelloCardboardApp(JavaVM* vm, jobject obj, jobject asset_mgr_obj);
+  CardboardPlusPlusApp(JavaVM* vm, jobject obj, jobject asset_mgr_obj);
 
-  ~HelloCardboardApp();
+  ~CardboardPlusPlusApp();
 
   /**
    * Initializes any GL-related objects. This should be called on the rendering
@@ -230,4 +230,4 @@ class HelloCardboardApp {
 
 }  // namespace ndk_cardboardplusplus
 
-#endif  // HELLO_CARDBOARD_ANDROID_SRC_MAIN_JNI_HELLO_CARDBOARD_APP_H_
+#endif  // CARDBOARD_PLUS_PLUS_ANDROID_SRC_MAIN_JNI_CARDBOARD_PLUS_PLUS_APP_H_

@@ -541,7 +541,7 @@ bool Texture::Initialize(JNIEnv* env, jobject java_asset_mgr,
 }
 
 void Texture::Bind() const {
-  HELLOCARDBOARD_CHECK(texture_id_ != 0);
+  CARDBOARDPLUSPLUS_CHECK(texture_id_ != 0);
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, texture_id_);
 }

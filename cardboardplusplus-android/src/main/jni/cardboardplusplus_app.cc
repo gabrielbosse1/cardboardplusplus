@@ -104,7 +104,7 @@ constexpr const char* kTexFragmentShader =
 
 }  // anonymous namespace
 
-HelloCardboardApp::HelloCardboardApp(JavaVM* vm, jobject obj,
+CardboardPlusPlusApp::CardboardPlusPlusApp(JavaVM* vm, jobject obj,
                                      jobject asset_mgr_obj)
     : head_tracker_(nullptr),
       lens_distortion_(nullptr),
@@ -143,14 +143,14 @@ HelloCardboardApp::HelloCardboardApp(JavaVM* vm, jobject obj,
   LOGD("Network client started");
 }
 
-HelloCardboardApp::~HelloCardboardApp() {
+CardboardPlusPlusApp::~CardboardPlusPlusApp() {
   networkClient_.Stop();
   CardboardHeadTracker_destroy(head_tracker_);
   CardboardLensDistortion_destroy(lens_distortion_);
   CardboardDistortionRenderer_destroy(distortion_renderer_);
 }
 
-void HelloCardboardApp::OnSurfaceCreated(JNIEnv* env) {
+void CardboardPlusPlusApp::OnSurfaceCreated(JNIEnv* env) {
   const int obj_vertex_shader =
       LoadGLShader(GL_VERTEX_SHADER, kObjVertexShader);
   const int obj_fragment_shader =
@@ -187,30 +187,30 @@ void HelloCardboardApp::OnSurfaceCreated(JNIEnv* env) {
 
   CHECKGLERROR("Tex program params");
 
-  HELLOCARDBOARD_CHECK(quad_.Initialize(tex_position_param_, tex_tex_coord_param_,
+  CARDBOARDPLUSPLUS_CHECK(quad_.Initialize(tex_position_param_, tex_tex_coord_param_,
                                         "Quad.obj", asset_mgr_));
 
-  HELLOCARDBOARD_CHECK(room_.Initialize(obj_position_param_, obj_uv_param_,
+  CARDBOARDPLUSPLUS_CHECK(room_.Initialize(obj_position_param_, obj_uv_param_,
                                         "CubeRoom.obj", asset_mgr_));
-  HELLOCARDBOARD_CHECK(
+  CARDBOARDPLUSPLUS_CHECK(
       room_tex_.Initialize(env, java_asset_mgr_, "CubeRoom_BakedDiffuse.png"));
-  HELLOCARDBOARD_CHECK(target_object_meshes_[0].Initialize(
+  CARDBOARDPLUSPLUS_CHECK(target_object_meshes_[0].Initialize(
       obj_position_param_, obj_uv_param_, "Icosahedron.obj", asset_mgr_));
-  HELLOCARDBOARD_CHECK(target_object_not_selected_textures_[0].Initialize(
+  CARDBOARDPLUSPLUS_CHECK(target_object_not_selected_textures_[0].Initialize(
       env, java_asset_mgr_, "Icosahedron_Blue_BakedDiffuse.png"));
-  HELLOCARDBOARD_CHECK(target_object_selected_textures_[0].Initialize(
+  CARDBOARDPLUSPLUS_CHECK(target_object_selected_textures_[0].Initialize(
       env, java_asset_mgr_, "Icosahedron_Pink_BakedDiffuse.png"));
-  HELLOCARDBOARD_CHECK(target_object_meshes_[1].Initialize(
+  CARDBOARDPLUSPLUS_CHECK(target_object_meshes_[1].Initialize(
       obj_position_param_, obj_uv_param_, "QuadSphere.obj", asset_mgr_));
-  HELLOCARDBOARD_CHECK(target_object_not_selected_textures_[1].Initialize(
+  CARDBOARDPLUSPLUS_CHECK(target_object_not_selected_textures_[1].Initialize(
       env, java_asset_mgr_, "QuadSphere_Blue_BakedDiffuse.png"));
-  HELLOCARDBOARD_CHECK(target_object_selected_textures_[1].Initialize(
+  CARDBOARDPLUSPLUS_CHECK(target_object_selected_textures_[1].Initialize(
       env, java_asset_mgr_, "QuadSphere_Pink_BakedDiffuse.png"));
-  HELLOCARDBOARD_CHECK(target_object_meshes_[2].Initialize(
+  CARDBOARDPLUSPLUS_CHECK(target_object_meshes_[2].Initialize(
       obj_position_param_, obj_uv_param_, "TriSphere.obj", asset_mgr_));
-  HELLOCARDBOARD_CHECK(target_object_not_selected_textures_[2].Initialize(
+  CARDBOARDPLUSPLUS_CHECK(target_object_not_selected_textures_[2].Initialize(
       env, java_asset_mgr_, "TriSphere_Blue_BakedDiffuse.png"));
-  HELLOCARDBOARD_CHECK(target_object_selected_textures_[2].Initialize(
+  CARDBOARDPLUSPLUS_CHECK(target_object_selected_textures_[2].Initialize(
       env, java_asset_mgr_, "TriSphere_Pink_BakedDiffuse.png"));
 
   // Target object first appears directly in front of user.
@@ -219,13 +219,13 @@ void HelloCardboardApp::OnSurfaceCreated(JNIEnv* env) {
   CHECKGLERROR("OnSurfaceCreated");
 }
 
-void HelloCardboardApp::SetScreenParams(int width, int height) {
+void CardboardPlusPlusApp::SetScreenParams(int width, int height) {
   screen_width_ = width;
   screen_height_ = height;
   screen_params_changed_ = true;
 }
 
-void HelloCardboardApp::OnDrawFrame() {
+void CardboardPlusPlusApp::OnDrawFrame() {
   if (!UpdateDeviceParams()) {
     return;
   }
@@ -286,19 +286,19 @@ void HelloCardboardApp::OnDrawFrame() {
   CHECKGLERROR("onDrawFrame");
 }
 
-void HelloCardboardApp::OnTriggerEvent() {
+void CardboardPlusPlusApp::OnTriggerEvent() {
   if (IsPointingAtTarget()) {
     HideTarget();
   }
   show_camera_texture_ = !show_camera_texture_;
 }
 
-void HelloCardboardApp::OnPause() {
+void CardboardPlusPlusApp::OnPause() {
   CardboardHeadTracker_pause(head_tracker_);
   networkClient_.Stop();
 }
 
-void HelloCardboardApp::OnResume() {
+void CardboardPlusPlusApp::OnResume() {
   CardboardHeadTracker_resume(head_tracker_);
 
   // Restart network client
@@ -318,11 +318,11 @@ void HelloCardboardApp::OnResume() {
   CardboardQrCode_destroy(buffer);
 }
 
-void HelloCardboardApp::SwitchViewer() {
+void CardboardPlusPlusApp::SwitchViewer() {
   CardboardQrCode_scanQrCodeAndSaveDeviceParams();
 }
 
-bool HelloCardboardApp::UpdateDeviceParams() {
+bool CardboardPlusPlusApp::UpdateDeviceParams() {
   // Checks if screen or device parameters changed
   if (!screen_params_changed_ && !device_params_changed_) {
     return true;
@@ -379,7 +379,7 @@ bool HelloCardboardApp::UpdateDeviceParams() {
   return true;
 }
 
-void HelloCardboardApp::GlSetup() {
+void CardboardPlusPlusApp::GlSetup() {
   LOGD("GL SETUP");
 
   if (framebuffer_ != 0) {
@@ -446,7 +446,7 @@ void HelloCardboardApp::GlSetup() {
   CHECKGLERROR("GlSetup");
 }
 
-void HelloCardboardApp::GlTeardown() {
+void CardboardPlusPlusApp::GlTeardown() {
   if (framebuffer_ == 0) {
     return;
   }
@@ -468,7 +468,7 @@ void HelloCardboardApp::GlTeardown() {
   CHECKGLERROR("GlTeardown");
 }
 
-Matrix4x4 HelloCardboardApp::GetPose() {
+Matrix4x4 CardboardPlusPlusApp::GetPose() {
   std::array<float, 4> out_orientation;
   std::array<float, 3> out_position;
   CardboardHeadTracker_getPose(
@@ -494,12 +494,12 @@ Matrix4x4 HelloCardboardApp::GetPose() {
          Quatf::FromXYZW(&out_orientation[0]).ToMatrix();
 }
 
-void HelloCardboardApp::DrawWorld() {
+void CardboardPlusPlusApp::DrawWorld() {
   DrawRoom();
   DrawTarget();
 }
 
-void HelloCardboardApp::DrawTarget() {
+void CardboardPlusPlusApp::DrawTarget() {
   glUseProgram(obj_program_);
 
   std::array<float, 16> target_array = modelview_projection_target_.ToGlArray();
@@ -516,7 +516,7 @@ void HelloCardboardApp::DrawTarget() {
   CHECKGLERROR("DrawTarget");
 }
 
-void HelloCardboardApp::DrawRoom() {
+void CardboardPlusPlusApp::DrawRoom() {
   glUseProgram(obj_program_);
 
   std::array<float, 16> room_array = modelview_projection_room_.ToGlArray();
@@ -529,7 +529,7 @@ void HelloCardboardApp::DrawRoom() {
   CHECKGLERROR("DrawRoom");
 }
 
-void HelloCardboardApp::DrawTexQuad(GLuint texture_id) {
+void CardboardPlusPlusApp::DrawTexQuad(GLuint texture_id) {
   glUseProgram(tex_program_);
 
   Matrix4x4 identity = GetIdentityMatrix();
@@ -545,7 +545,7 @@ void HelloCardboardApp::DrawTexQuad(GLuint texture_id) {
   CHECKGLERROR("DrawTexQuad");
 }
 
-void HelloCardboardApp::HideTarget() {
+void CardboardPlusPlusApp::HideTarget() {
   cur_target_object_ = RandomUniformInt(kTargetMeshCount);
 
   float angle = RandomUniformFloat(-M_PI, M_PI);
@@ -557,7 +557,7 @@ void HelloCardboardApp::HideTarget() {
   model_target_ = GetTranslationMatrix(target_position);
 }
 
-void HelloCardboardApp::DrawCameraQuad(GLuint texture_id) {
+void CardboardPlusPlusApp::DrawCameraQuad(GLuint texture_id) {
   glUseProgram(tex_program_);
 
   Matrix4x4 identity = GetIdentityMatrix();
@@ -573,7 +573,7 @@ void HelloCardboardApp::DrawCameraQuad(GLuint texture_id) {
   CHECKGLERROR("DrawCameraQuad");
 }
 
-bool HelloCardboardApp::IsPointingAtTarget() {
+bool CardboardPlusPlusApp::IsPointingAtTarget() {
   // Compute vectors pointing towards the reticle and towards the target object
   // in head space.
   Matrix4x4 head_from_target = head_view_ * model_target_;
@@ -586,7 +586,7 @@ bool HelloCardboardApp::IsPointingAtTarget() {
   return angle < kAngleLimit;
 }
 
-void HelloCardboardApp::OnCameraTextureInitialized(int textureId, int width, int height) {
+void CardboardPlusPlusApp::OnCameraTextureInitialized(int textureId, int width, int height) {
   camera_texture_ = static_cast<GLuint>(textureId);
   camera_width_ = width;
   camera_height_ = height;
@@ -594,7 +594,7 @@ void HelloCardboardApp::OnCameraTextureInitialized(int textureId, int width, int
   LOGD("Camera texture initialized: id=%d, size=%dx%d", textureId, width, height);
 }
 
-int HelloCardboardApp::CreateCameraTexture() {
+int CardboardPlusPlusApp::CreateCameraTexture() {
   GLuint textureId = 0;
   glGenTextures(1, &textureId);
   glBindTexture(GL_TEXTURE_EXTERNAL_OES, textureId);
@@ -606,7 +606,7 @@ int HelloCardboardApp::CreateCameraTexture() {
   return static_cast<int>(textureId);
 }
 
-void HelloCardboardApp::ResetCameraTexture() {
+void CardboardPlusPlusApp::ResetCameraTexture() {
   camera_texture_initialized_ = false;
   LOGD("Camera texture reset for pause");
 }
