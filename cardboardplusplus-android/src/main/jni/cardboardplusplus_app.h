@@ -97,6 +97,8 @@ class HelloCardboardApp {
 
   int CreateCameraTexture();
 
+  void ResetCameraTexture();
+
   private:
   /**
    * Default near clip plane z-axis coordinate.

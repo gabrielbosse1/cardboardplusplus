@@ -580,4 +580,9 @@ int HelloCardboardApp::CreateCameraTexture() {
   return static_cast<int>(textureId);
 }
 
+void HelloCardboardApp::ResetCameraTexture() {
+  camera_texture_initialized_ = false;
+  LOGD("Camera texture reset for pause");
+}
+
 }  // namespace ndk_cardboardplusplus

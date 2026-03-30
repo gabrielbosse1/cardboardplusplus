@@ -89,6 +89,7 @@ public class VrActivity extends AppCompatActivity implements PopupMenu.OnMenuIte
   private Handler cameraHandler;
   private boolean cameraInitialized = false;
   private boolean cameraTexturePassed = false;
+  private final Object cameraLock = new Object();
   private int cameraWidth = 640;
   private int cameraHeight = 480;
 
@@ -149,6 +150,9 @@ public class VrActivity extends AppCompatActivity implements PopupMenu.OnMenuIte
   }
 
   private void createCaptureSession() {
+    if (cameraDevice == null || cameraSurface == null) {
+      return;
+    }
     try {
       final CaptureRequest.Builder captureRequestBuilder =
           cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
@@ -159,33 +163,73 @@ public class VrActivity extends AppCompatActivity implements PopupMenu.OnMenuIte
           new CameraCaptureSession.StateCallback() {
             @Override
             public void onConfigured(CameraCaptureSession session) {
-              captureSession = session;
+              synchronized (cameraLock) {
+                if (!cameraInitialized || cameraDevice == null) {
+                  session.close();
+                  return;
+                }
+                captureSession = session;
+              }
               try {
                 captureRequestBuilder.set(CaptureRequest.CONTROL_AF_MODE,
                     CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
                 captureRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE,
                     CaptureRequest.CONTROL_AE_MODE_ON);
-                captureSession.setRepeatingRequest(captureRequestBuilder.build(), null, cameraHandler);
-              } catch (CameraAccessException e) {
-                Log.e(TAG, "Failed to start preview: " + e.getMessage());
+                session.setRepeatingRequest(captureRequestBuilder.build(), null, cameraHandler);
+              } catch (Exception e) {
+                Log.w(TAG, "Failed to start preview: " + e.getMessage());
               }
             }
 
             @Override
             public void onConfigureFailed(CameraCaptureSession session) {
-              Log.e(TAG, "Camera configuration failed");
+              Log.w(TAG, "Camera configuration failed");
             }
           },
           cameraHandler);
-    } catch (CameraAccessException e) {
-      Log.e(TAG, "Failed to create capture session: " + e.getMessage());
+    } catch (Exception e) {
+      Log.w(TAG, "Failed to create capture session: " + e.getMessage());
     }
   }
 
   @Override
   protected void onPause() {
     super.onPause();
+
+    // 1. Tell native to stop head tracking and camera rendering FIRST
     nativeOnPause(nativeApp);
+    nativeResetCameraTexture(nativeApp);
+
+    // 2. Stop camera hardware
+    synchronized (cameraLock) {
+      cameraInitialized = false;
+      if (captureSession != null) {
+        try { captureSession.close(); } catch (Exception e) {}
+        captureSession = null;
+      }
+      if (cameraDevice != null) {
+        try { cameraDevice.close(); } catch (Exception e) {}
+        cameraDevice = null;
+      }
+      if (cameraThread != null) {
+        cameraThread.quitSafely();
+        cameraThread = null;
+      }
+      cameraHandler = null;
+    }
+
+    // 3. Release texture so it gets recreated fresh on resume
+    if (cameraSurface != null) {
+      try { cameraSurface.release(); } catch (Exception e) {}
+      cameraSurface = null;
+    }
+    if (cameraSurfaceTexture != null) {
+      try { cameraSurfaceTexture.release(); } catch (Exception e) {}
+      cameraSurfaceTexture = null;
+    }
+    cameraTexturePassed = false;
+
+    // 4. Stop GL thread LAST
     glView.onPause();
   }
 
@@ -210,89 +254,15 @@ public class VrActivity extends AppCompatActivity implements PopupMenu.OnMenuIte
 
     glView.onResume();
     nativeOnResume(nativeApp);
-  }
 
-  @SuppressLint("MissingPermission")
-  private void initCameraOnGlThreadWithTexture(int textureId) {
-    if (cameraInitialized || cameraSurfaceTexture != null) {
-      return;
-    }
-
-    // Initialize camera manager
-    cameraManager = (CameraManager) getSystemService(Context.CAMERA_SERVICE);
-
-    try {
-      String[] cameraIds = cameraManager.getCameraIdList();
-      String backCameraId = null;
-      for (String id : cameraIds) {
-        CameraCharacteristics characteristics = cameraManager.getCameraCharacteristics(id);
-        Integer facing = characteristics.get(CameraCharacteristics.LENS_FACING);
-        if (facing != null && facing == CameraCharacteristics.LENS_FACING_BACK) {
-          backCameraId = id;
-          break;
-        }
+    // Queue camera setup on GL thread (guards prevent duplicates)
+    glView.queueEvent(() -> {
+      if (!cameraTexturePassed) {
+        int textureId = nativeCreateCameraTexture(nativeApp);
+        ensureCameraTexture(textureId);
       }
-
-      if (backCameraId == null) {
-        Log.e(TAG, "No back camera found");
-        return;
-      }
-
-      CameraCharacteristics characteristics = cameraManager.getCameraCharacteristics(backCameraId);
-      android.hardware.camera2.params.StreamConfigurationMap map =
-          characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
-      Size[] outputSizes = map.getOutputSizes(SurfaceTexture.class);
-
-      if (outputSizes != null && outputSizes.length > 0) {
-        for (Size size : outputSizes) {
-          if (size.getWidth() >= 640 && size.getHeight() >= 480) {
-            cameraWidth = size.getWidth();
-            cameraHeight = size.getHeight();
-            break;
-          }
-        }
-      }
-
-      // Create SurfaceTexture with pre-created texture ID
-      cameraSurfaceTexture = new SurfaceTexture(textureId);
-      cameraSurfaceTexture.setDefaultBufferSize(cameraWidth, cameraHeight);
-      cameraSurface = new Surface(cameraSurfaceTexture);
-
-      // Setup camera thread
-      cameraThread = new HandlerThread("CameraThread");
-      cameraThread.start();
-      cameraHandler = new Handler(cameraThread.getLooper());
-
-      // Open camera
-      cameraManager.openCamera(backCameraId, new CameraDevice.StateCallback() {
-        @Override
-        public void onOpened(CameraDevice camera) {
-          cameraDevice = camera;
-          createCaptureSession();
-        }
-
-        @Override
-        public void onDisconnected(CameraDevice camera) {
-          camera.close();
-          cameraDevice = null;
-        }
-
-        @Override
-        public void onError(CameraDevice camera, int error) {
-          camera.close();
-          cameraDevice = null;
-        }
-      }, cameraHandler);
-
-      cameraInitialized = true;
-      cameraTexturePassed = true;
-      // Pass camera texture info to native immediately
-      nativeOnCameraTextureInitialized(nativeApp, textureId, cameraWidth, cameraHeight);
-      Log.i(TAG, "Camera initialized with texture: " + textureId + " size: " + cameraWidth + "x" + cameraHeight);
-
-    } catch (CameraAccessException e) {
-      Log.e(TAG, "Camera access exception: " + e.getMessage());
-    }
+      openCamera();
+    });
   }
 
   @Override
@@ -333,16 +303,133 @@ public class VrActivity extends AppCompatActivity implements PopupMenu.OnMenuIte
     }
   }
 
+  private void ensureCameraTexture(int textureId) {
+    if (cameraSurfaceTexture == null) {
+      cameraSurfaceTexture = new SurfaceTexture(textureId);
+      cameraSurfaceTexture.setDefaultBufferSize(cameraWidth, cameraHeight);
+      cameraSurface = new Surface(cameraSurfaceTexture);
+      cameraTexturePassed = true;
+      nativeOnCameraTextureInitialized(nativeApp, textureId, cameraWidth, cameraHeight);
+      Log.i(TAG, "Camera texture created: " + textureId);
+    }
+  }
+
+  @SuppressLint("MissingPermission")
+  private void openCamera() {
+    synchronized (cameraLock) {
+      if (cameraInitialized) {
+        return;
+      }
+    }
+
+    // Initialize camera manager
+    cameraManager = (CameraManager) getSystemService(Context.CAMERA_SERVICE);
+    if (cameraManager == null) {
+      Log.w(TAG, "CameraManager not available");
+      return;
+    }
+
+    try {
+      String[] cameraIds = cameraManager.getCameraIdList();
+      String backCameraId = null;
+      for (String id : cameraIds) {
+        CameraCharacteristics characteristics = cameraManager.getCameraCharacteristics(id);
+        Integer facing = characteristics.get(CameraCharacteristics.LENS_FACING);
+        if (facing != null && facing == CameraCharacteristics.LENS_FACING_BACK) {
+          backCameraId = id;
+          break;
+        }
+      }
+
+      if (backCameraId == null) {
+        Log.w(TAG, "No back camera found");
+        return;
+      }
+
+      CameraCharacteristics characteristics = cameraManager.getCameraCharacteristics(backCameraId);
+      android.hardware.camera2.params.StreamConfigurationMap map =
+          characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+      Size[] outputSizes = map.getOutputSizes(SurfaceTexture.class);
+
+      if (outputSizes != null && outputSizes.length > 0) {
+        for (Size size : outputSizes) {
+          if (size.getWidth() >= 640 && size.getHeight() >= 480) {
+            cameraWidth = size.getWidth();
+            cameraHeight = size.getHeight();
+            break;
+          }
+        }
+      }
+
+      if (cameraSurfaceTexture != null) {
+        cameraSurfaceTexture.setDefaultBufferSize(cameraWidth, cameraHeight);
+      }
+
+      synchronized (cameraLock) {
+        cameraThread = new HandlerThread("CameraThread");
+        cameraThread.start();
+        cameraHandler = new Handler(cameraThread.getLooper());
+      }
+
+      // Open camera
+      cameraManager.openCamera(backCameraId, new CameraDevice.StateCallback() {
+        @Override
+        public void onOpened(CameraDevice camera) {
+          synchronized (cameraLock) {
+            if (!cameraInitialized) {
+              cameraDevice = camera;
+              try {
+                createCaptureSession();
+                cameraInitialized = true;
+              } catch (Exception e) {
+                Log.w(TAG, "Session setup failed: " + e.getMessage());
+                camera.close();
+                cameraDevice = null;
+              }
+            } else {
+              camera.close();
+            }
+          }
+        }
+
+        @Override
+        public void onDisconnected(CameraDevice camera) {
+          synchronized (cameraLock) {
+            camera.close();
+            if (cameraDevice == camera) {
+              cameraDevice = null;
+            }
+          }
+        }
+
+        @Override
+        public void onError(CameraDevice camera, int error) {
+          synchronized (cameraLock) {
+            camera.close();
+            if (cameraDevice == camera) {
+              cameraDevice = null;
+            }
+          }
+        }
+      }, cameraHandler);
+
+      Log.i(TAG, "Camera opening, size: " + cameraWidth + "x" + cameraHeight);
+
+    } catch (Exception e) {
+      Log.w(TAG, "Could not open camera: " + e.getMessage());
+    }
+  }
+
   private class Renderer implements GLSurfaceView.Renderer {
     @Override
     public void onSurfaceCreated(GL10 gl10, EGLConfig eglConfig) {
       nativeOnSurfaceCreated(nativeApp);
 
-      // Initialize camera on GL thread if permission granted
-      if (checkCameraPermission() && !cameraInitialized) {
-        // Create camera texture in native code first
+      // Always create texture first (starts black), camera is optional
+      if (checkCameraPermission() && !cameraTexturePassed) {
         int textureId = nativeCreateCameraTexture(nativeApp);
-        initCameraOnGlThreadWithTexture(textureId);
+        ensureCameraTexture(textureId);
+        openCamera();
       }
     }
 
@@ -353,9 +440,13 @@ public class VrActivity extends AppCompatActivity implements PopupMenu.OnMenuIte
 
     @Override
     public void onDrawFrame(GL10 gl10) {
-      // Update camera texture - must be called on GL thread
-      if (cameraSurfaceTexture != null) {
-        cameraSurfaceTexture.updateTexImage();
+      // Update camera texture safely - must be called on GL thread
+      try {
+        if (cameraSurfaceTexture != null) {
+          cameraSurfaceTexture.updateTexImage();
+        }
+      } catch (Exception e) {
+        // Texture not ready or invalidated - skip frame, don't crash
       }
 
       nativeOnDrawFrame(nativeApp);
@@ -472,9 +563,15 @@ public class VrActivity extends AppCompatActivity implements PopupMenu.OnMenuIte
 
   private native int nativeCreateCameraTexture(long nativeApp);
 
+  private native void nativeResetCameraTexture(long nativeApp);
+
   public void updateCameraTexture() {
-    if (cameraSurfaceTexture != null) {
-      cameraSurfaceTexture.updateTexImage();
+    try {
+      if (cameraSurfaceTexture != null) {
+        cameraSurfaceTexture.updateTexImage();
+      }
+    } catch (Exception e) {
+      // skip
     }
   }
 }

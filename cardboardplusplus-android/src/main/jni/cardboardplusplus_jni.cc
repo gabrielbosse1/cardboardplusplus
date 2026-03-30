@@ -101,4 +101,9 @@ JNI_METHOD(jint, nativeCreateCameraTexture)
   return native(native_app)->CreateCameraTexture();
 }
 
+JNI_METHOD(void, nativeResetCameraTexture)
+(JNIEnv* /*env*/, jobject /*obj*/, jlong native_app) {
+  native(native_app)->ResetCameraTexture();
+}
+
 }  // extern "C"
