@@ -10,11 +10,6 @@
 #include "VideoEncoder.h"
 #include <map>
 #include <vector>
-#include <string>
-#include <thread>
-#include <atomic>
-#include <mutex>
-#include "Protocol.h"
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -29,14 +24,6 @@ struct SwapTextureSet {
 // Per-eye submit layer info from SteamVR
 struct SubmitLayerInfo {
     vr::SharedTextureHandle_t hTexture;
-};
-
-// Remote client state (the phone)
-struct RemoteClient {
-    sockaddr_in addr;
-    bool connected;
-    std::string name;
-    RemoteClient() : addr{}, connected(false) {}
 };
 
 /** Virtual HMD device driver for SteamVR. Presents as a display to OpenVR. */
@@ -77,32 +64,9 @@ private:
     bool InitializeVideoEncoder();
     void ShutdownVideoEncoder();
 
-    // ---- Network initialization / shutdown ----
-    bool InitializeNetworking();
-    void ShutdownNetworking();
-
-    // ---- Broadcast discovery (PC -> LAN, broadcast port) ----
-    bool StartBroadcastThread();
-    void BroadcastLoop();
-
-    // ---- Discovery response listener (phone -> PC, broadcast port) ----
-    bool StartDiscoveryListener();
-    void DiscoveryListenerLoop();
-
-    // ---- Video socket (PC -> phone, video port) ----
-    bool InitializeVideoSocket();
-    void ShutdownVideoSocket();
-
-    // ---- Tracking receiver (phone -> PC, tracking port) ----
-    bool StartTrackingReceiver();
-    void TrackingReceiverLoop();
-
-    // ---- Camera receiver (phone -> PC, camera port) ----
-    bool StartCameraReceiver();
-    void CameraReceiverLoop();
-
-    // ---- Helpers ----
-    std::string GetLocalIPAddress();
+    // UDP networking
+    bool InitializeUDP();
+    void ShutdownUDP();
 
     uint32_t driverId;
 
@@ -125,40 +89,8 @@ private:
     SubmitLayerInfo m_submitLayers[2];
     bool m_hasSubmit;
 
-    // ---- Networking state ----
-    WSADATA m_wsaData;
-    bool m_wsaInitialized;
-
-    // Broadcast discovery thread
-    SOCKET m_broadcastSocket;
-    std::thread m_broadcastThread;
-    std::atomic<bool> m_broadcastRunning;
-
-    // Discovery response listener thread
-    SOCKET m_discoverySocket;
-    std::thread m_discoveryThread;
-    std::atomic<bool> m_discoveryRunning;
-
-    // Video socket (send encoded frames to phone)
-    SOCKET m_videoSocket;
-    sockaddr_in m_videoTargetAddr;
-    bool m_videoTargetSet;
-
-    // Tracking receiver thread
-    SOCKET m_trackingSocket;
-    std::thread m_trackingThread;
-    std::atomic<bool> m_trackingRunning;
-    std::mutex m_trackingMutex;
-    // Latest tracking data from phone
-    cbpp::TrackingPayload m_latestTracking;
-    bool m_hasTracking;
-
-    // Camera receiver thread
-    SOCKET m_cameraSocket;
-    std::thread m_cameraThread;
-    std::atomic<bool> m_cameraRunning;
-
-    // Remote client
-    RemoteClient m_client;
-    std::mutex m_clientMutex;
+    // UDP socket
+    SOCKET m_udpSocket;
+    sockaddr_in m_serverAddr;
+    bool m_udpInitialized;
 };
