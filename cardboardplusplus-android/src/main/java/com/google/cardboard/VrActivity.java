@@ -53,6 +53,9 @@ import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.CaptureRequest;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
 
 /**
  * A Google Cardboard VR NDK sample application.
@@ -92,6 +95,11 @@ public class VrActivity extends AppCompatActivity implements PopupMenu.OnMenuIte
   private final Object cameraLock = new Object();
   private int cameraWidth = 640;
   private int cameraHeight = 480;
+
+  private static final int UDP_DISCOVERY_PORT = 42070;
+  private static final int DISCOVERY_INTERVAL_MS = 500;
+  private volatile boolean discoveryRunning = false;
+  private Thread discoveryThread = null;
 
   @SuppressLint("ClickableViewAccessibility")
   @Override
@@ -199,6 +207,7 @@ public class VrActivity extends AppCompatActivity implements PopupMenu.OnMenuIte
     // 1. Tell native to stop head tracking and camera rendering FIRST
     nativeOnPause(nativeApp);
     nativeResetCameraTexture(nativeApp);
+    stopDiscovery();
 
     // 2. Stop camera hardware
     synchronized (cameraLock) {
@@ -254,6 +263,8 @@ public class VrActivity extends AppCompatActivity implements PopupMenu.OnMenuIte
 
     glView.onResume();
     nativeOnResume(nativeApp);
+
+    startDiscovery();
 
     // Queue camera setup on GL thread (guards prevent duplicates)
     glView.queueEvent(() -> {
@@ -574,6 +585,63 @@ public class VrActivity extends AppCompatActivity implements PopupMenu.OnMenuIte
       }
     } catch (Exception e) {
       // skip
+    }
+  }
+
+  private void startDiscovery() {
+    if (discoveryThread != null && discoveryThread.isAlive()) {
+      return;
+    }
+    discoveryRunning = true;
+    discoveryThread = new Thread(() -> {
+      try {
+        DatagramSocket socket = new DatagramSocket();
+        socket.setBroadcast(true);
+        socket.setSoTimeout(1000);
+
+        byte[] sendData = "CARDBOARD_DISCOVERY".getBytes();
+        byte[] recvBuffer = new byte[64];
+
+        while (discoveryRunning) {
+          DatagramPacket sendPacket = new DatagramPacket(
+              sendData, sendData.length, InetAddress.getByName("255.255.255.255"), UDP_DISCOVERY_PORT);
+          socket.send(sendPacket);
+          Log.d(TAG, "Discovery broadcast sent");
+
+          try {
+            DatagramPacket recvPacket = new DatagramPacket(recvBuffer, recvBuffer.length);
+            socket.receive(recvPacket);
+            String response = new String(recvPacket.getData(), 0, recvPacket.getLength());
+            Log.d(TAG, "Discovery response: " + response + " from " + recvPacket.getAddress());
+            if ("ACK".equals(response)) {
+              discoveryRunning = false;
+              Log.i(TAG, "Discovery successful, driver connected");
+              break;
+            }
+          } catch (Exception e) {
+          }
+
+          if (discoveryRunning) {
+            Thread.sleep(DISCOVERY_INTERVAL_MS);
+          }
+        }
+
+        socket.close();
+      } catch (Exception e) {
+        Log.e(TAG, "Discovery error: " + e.getMessage());
+      }
+    });
+    discoveryThread.start();
+  }
+
+  private void stopDiscovery() {
+    discoveryRunning = false;
+    if (discoveryThread != null) {
+      try {
+        discoveryThread.join(2000);
+      } catch (InterruptedException e) {
+      }
+      discoveryThread = null;
     }
   }
 }
