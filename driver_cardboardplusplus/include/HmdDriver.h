@@ -10,6 +10,9 @@
 #include "VideoEncoder.h"
 #include <map>
 #include <vector>
+#include <thread>
+#include <atomic>
+#include <mutex>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -68,6 +71,12 @@ private:
     bool InitializeUDP();
     void ShutdownUDP();
 
+    // UDP discovery
+    bool InitializeDiscovery();
+    void ShutdownDiscovery();
+    void DiscoveryThreadFunc();
+    void SwitchDataTarget(const char* phoneIp);
+
     uint32_t driverId;
 
     ID3D11Device* pD3D11Device;
@@ -93,4 +102,11 @@ private:
     SOCKET m_udpSocket;
     sockaddr_in m_serverAddr;
     bool m_udpInitialized;
+
+    // UDP discovery socket
+    SOCKET m_discoverySocket;
+    bool m_discoveryInitialized;
+    std::atomic<bool> m_discoveryRunning;
+    std::thread m_discoveryThread;
+    std::mutex m_targetIpMutex;
 };
