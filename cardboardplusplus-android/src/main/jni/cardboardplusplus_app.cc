@@ -22,6 +22,7 @@
 
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <fstream>
 
 #include <GLES2/gl2.h>
@@ -97,7 +98,11 @@ CardboardPlusPlusApp::CardboardPlusPlusApp(JavaVM* vm, jobject obj,
       left_eye_custom_texture_(0),
       right_eye_custom_texture_(0),
       left_eye_texture_set_(false),
-      right_eye_texture_set_(false) {
+      right_eye_texture_set_(false),
+      video_texture_(0),
+      video_receiver_started_(false),
+      video_width_(2880),
+      video_height_(1620) {
   JNIEnv* env;
   vm->GetEnv((void**)&env, JNI_VERSION_1_6);
   java_asset_mgr_ = env->NewGlobalRef(asset_mgr_obj);
@@ -107,6 +112,9 @@ CardboardPlusPlusApp::CardboardPlusPlusApp(JavaVM* vm, jobject obj,
   head_tracker_ = CardboardHeadTracker_create();
   CardboardHeadTracker_setLowPassFilter(head_tracker_,
                                         kVelocityFilterCutoffFrequency);
+
+  video_receiver_ = std::make_unique<VideoReceiver>();
+  h264_decoder_ = std::make_unique<H264Decoder>();
 }
 
 CardboardPlusPlusApp::~CardboardPlusPlusApp() {
@@ -327,16 +335,20 @@ void CardboardPlusPlusApp::GlSetup() {
                GL_RGB, GL_UNSIGNED_BYTE, 0);
 
   left_eye_texture_description_.texture = left_eye_texture_;
-  left_eye_texture_description_.left_u = 0;
-  left_eye_texture_description_.right_u = 1;
-  left_eye_texture_description_.top_v = 1;
-  left_eye_texture_description_.bottom_v = 0;
+  // The incoming video is side-by-side stereo: left half = left eye view,
+  // right half = right eye view. Select each eye's half of the texture here,
+  // otherwise both eyes are shown the full SBS image and every object appears
+  // doubled.
+  left_eye_texture_description_.left_u = 0.0f;
+  left_eye_texture_description_.right_u = 0.5f;
+  left_eye_texture_description_.top_v = 1.0f;
+  left_eye_texture_description_.bottom_v = 0.0f;
 
   right_eye_texture_description_.texture = right_eye_texture_;
-  right_eye_texture_description_.left_u = 0;
-  right_eye_texture_description_.right_u = 1;
-  right_eye_texture_description_.top_v = 1;
-  right_eye_texture_description_.bottom_v = 0;
+  right_eye_texture_description_.left_u = 0.5f;
+  right_eye_texture_description_.right_u = 1.0f;
+  right_eye_texture_description_.top_v = 1.0f;
+  right_eye_texture_description_.bottom_v = 0.0f;
 
   glGenRenderbuffers(1, &depthRenderBuffer_);
   glBindRenderbuffer(GL_RENDERBUFFER, depthRenderBuffer_);
@@ -411,6 +423,8 @@ void CardboardPlusPlusApp::DrawEyeQuad(GLuint texture_id) {
   glBindTexture(GL_TEXTURE_2D, texture_id);
   glUniform1i(tex2d_texture_param_, 0);
 
+  LOGD("DrawEyeQuad: texture=%d, program=%d", texture_id, tex2d_program_);
+
   quad_.Draw();
 
   CHECKGLERROR("DrawEyeQuad");
@@ -467,6 +481,125 @@ void CardboardPlusPlusApp::SetEyeTexture(int eye, int textureId) {
     right_eye_texture_set_ = (textureId != 0);
     LOGD("Right eye texture set: id=%d", textureId);
   }
+}
+
+void CardboardPlusPlusApp::StartVideoReceiver(int port) {
+  if (video_receiver_started_) {
+    LOGD("Video receiver already started");
+    return;
+  }
+
+  LOGD("Starting video receiver on port %d", port);
+
+  video_receiver_->Start(port);
+  video_receiver_started_ = true;
+
+  glGenTextures(1, &video_texture_);
+  glBindTexture(GL_TEXTURE_2D, video_texture_);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  if (video_width_ > 0 && video_height_ > 0) {
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, video_width_, video_height_,
+                 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+  }
+
+  h264_decoder_->Initialize(video_width_, video_height_);
+
+  LOGD("Video receiver started, texture=%d", video_texture_);
+}
+
+void CardboardPlusPlusApp::StopVideoReceiver() {
+  if (!video_receiver_started_) {
+    return;
+  }
+
+  LOGD("Stopping video receiver");
+
+  video_receiver_->Stop();
+  h264_decoder_->Shutdown();
+
+  if (video_texture_) {
+    glDeleteTextures(1, &video_texture_);
+    video_texture_ = 0;
+  }
+
+  video_receiver_started_ = false;
+  LOGD("Video receiver stopped");
+}
+
+bool CardboardPlusPlusApp::HasVideoFrame() {
+  if (!video_receiver_started_) return false;
+  return video_receiver_->HasFrame();
+}
+
+void CardboardPlusPlusApp::UpdateVideoTexture() {
+  if (!video_receiver_started_ || !video_texture_) return;
+
+  uint8_t* frame_data = nullptr;
+  int frame_size = 0;
+
+  // Decode and drain every frame the receiver queued since the last tick.
+  // Previously only a single frame was pulled per tick, so the fast receive
+  // thread's extra frames were dropped - and a dropped P-frame decodes
+  // against the wrong reference, corrupting the image.
+  bool got_rgba = false;
+  int rgba_width = 0;
+  int rgba_height = 0;
+  uint8_t* rgba_data = nullptr;
+
+  while (video_receiver_->GetFrame(&frame_data, &frame_size)) {
+    LOGD("Got frame, size=%d", frame_size);
+    if (!h264_decoder_->DecodePacket(frame_data, frame_size)) {
+      continue;
+    }
+    LOGD("Decoded packet, has_frame=%d", h264_decoder_->HasDecodedFrame());
+    if (!h264_decoder_->HasDecodedFrame()) {
+      continue;
+    }
+
+    int width = 0;
+    int height = 0;
+    int rgba_size = 0;
+    if (h264_decoder_->GetRGBAFrame(&rgba_data, &rgba_size, &width, &height)) {
+      got_rgba = true;
+      rgba_width = width;
+      rgba_height = height;
+    } else {
+      LOGE("GetRGBAFrame failed!");
+    }
+  }
+
+  if (!got_rgba || !rgba_data || rgba_width <= 0 || rgba_height <= 0) {
+    return;
+  }
+
+  if (rgba_width != video_width_ || rgba_height != video_height_) {
+    LOGD("Frame dimensions changed: %dx%d -> %dx%d, reinitializing decoder",
+         video_width_, video_height_, rgba_width, rgba_height);
+    h264_decoder_->Shutdown();
+    if (!h264_decoder_->Initialize(rgba_width, rgba_height)) {
+      LOGE("Failed to reinitialize decoder with new dimensions");
+      return;
+    }
+    video_width_ = rgba_width;
+    video_height_ = rgba_height;
+    glBindTexture(GL_TEXTURE_2D, video_texture_);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, video_width_, video_height_,
+                 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    // The RGBA buffer was freed by Shutdown(); skip upload this frame.
+    return;
+  }
+
+  LOGD("Uploading RGBA to GL: tex=%d, size=%dx%d", video_texture_, rgba_width, rgba_height);
+  glBindTexture(GL_TEXTURE_2D, video_texture_);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, rgba_width, rgba_height,
+               0, GL_RGBA, GL_UNSIGNED_BYTE, rgba_data);
+  LOGD("glTexImage2D done");
+
+  SetEyeTexture(0, video_texture_);
+  SetEyeTexture(1, video_texture_);
 }
 
 }  // namespace ndk_cardboardplusplus
