@@ -279,7 +279,7 @@ bool VideoEncoder::InitializeFFmpeg()
     m_pCodecContext->height = m_height;
     m_pCodecContext->time_base = { 1, m_fps };
     m_pCodecContext->framerate = { m_fps, 1 };
-    m_pCodecContext->gop_size = 30;
+    m_pCodecContext->gop_size = 10;
     m_pCodecContext->max_b_frames = 0;
     m_pCodecContext->pix_fmt = AV_PIX_FMT_NV12;
 

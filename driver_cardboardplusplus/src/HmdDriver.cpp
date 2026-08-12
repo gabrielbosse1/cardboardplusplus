@@ -554,12 +554,22 @@ void HmdDriver::OnEncodedPacket(uint8_t* data, int size, int64_t pts, bool keyfr
                     }
                 }
                 if (pps_data_end < 0) pps_data_end = i + 5 + 4; // assume short PPS
-                // Check if IDR start code already present
-                if (pps_data_end + 4 < size &&
+                // Check if IDR start code already present. libx264 emits a 3-byte
+                // 00 00 01 65 start code after PPS, so accept both 3- and 4-byte forms.
+                bool idr_sc_present = false;
+                if (pps_data_end + 3 < size &&
+                    data[pps_data_end] == 0x00 && data[pps_data_end+1] == 0x00 &&
+                    data[pps_data_end+2] == 0x01 &&
+                    (data[pps_data_end+3] & 0x1F) == 5) {
+                    idr_sc_present = true; // 3-byte start code: 00 00 01 65
+                } else if (pps_data_end + 4 < size &&
                     data[pps_data_end] == 0x00 && data[pps_data_end+1] == 0x00 &&
                     data[pps_data_end+2] == 0x00 && data[pps_data_end+3] == 0x01 &&
                     (data[pps_data_end+4] & 0x1F) == 5) {
-                    break; // IDR start code already present
+                    idr_sc_present = true; // 4-byte start code: 00 00 00 01 65
+                }
+                if (idr_sc_present) {
+                    break; // IDR start code already present, no fix needed
                 }
                 needs_fix = true;
                 break;
@@ -575,27 +585,54 @@ void HmdDriver::OnEncodedPacket(uint8_t* data, int size, int64_t pts, bool keyfr
         memcpy(fixed + pps_data_end, idr_prefix, 5);
         memcpy(fixed + pps_data_end + 5, data + pps_data_end, size - pps_data_end);
 
-        // Send fixed buffer
-        int offset = 0;
-        while (offset < fixed_size) {
-            int cs = (fixed_size - offset > 60000) ? 60000 : (fixed_size - offset);
-            sendto(m_udpSocket, (const char*)(fixed + offset), cs, 0,
-                   (sockaddr*)&m_serverAddr, sizeof(m_serverAddr));
-            offset += cs;
+        // Frame the fixed keyframe with a 4-byte big-endian length prefix so
+        // the receiver can reconstruct the exact AVPacket (one full frame).
+        int framed_size = fixed_size + 4;
+        uint8_t* framed = (uint8_t*)malloc(framed_size);
+        if (framed) {
+            framed[0] = (uint8_t)((fixed_size >> 24) & 0xFF);
+            framed[1] = (uint8_t)((fixed_size >> 16) & 0xFF);
+            framed[2] = (uint8_t)((fixed_size >> 8) & 0xFF);
+            framed[3] = (uint8_t)(fixed_size & 0xFF);
+            memcpy(framed + 4, fixed, fixed_size);
+
+            int offset = 0;
+            while (offset < framed_size) {
+                int cs = (framed_size - offset > 60000) ? 60000 : (framed_size - offset);
+                sendto(m_udpSocket, (const char*)(framed + offset), cs, 0,
+                       (sockaddr*)&m_serverAddr, sizeof(m_serverAddr));
+                offset += cs;
+            }
+            free(framed);
         }
         free(fixed);
         DriverLog("[UDP] Fixed keyframe: inserted IDR start code at offset %d", pps_data_end);
         return;
     }
 
-    // Normal send (P-frames or already-correct keyframes)
-    int offset = 0;
-    while (offset < size) {
-        int chunkSize = (size - offset > 60000) ? 60000 : (size - offset);
-        sendto(m_udpSocket, (const char*)(data + offset), chunkSize, 0,
-               (sockaddr*)&m_serverAddr, sizeof(m_serverAddr));
-        offset += chunkSize;
+    // Frame the packet with a 4-byte big-endian length prefix so the receiver
+    // can reconstruct the exact libx264 AVPacket (one full frame, including all
+    // of its slices) regardless of UDP datagram boundaries. FFmpeg decodes the
+    // in-band SPS/PPS/IDR Annex B stream directly.
+    int framed_size = size + 4;
+    uint8_t* framed = (uint8_t*)malloc(framed_size);
+    if (framed) {
+        framed[0] = (uint8_t)((size >> 24) & 0xFF);
+        framed[1] = (uint8_t)((size >> 16) & 0xFF);
+        framed[2] = (uint8_t)((size >> 8) & 0xFF);
+        framed[3] = (uint8_t)(size & 0xFF);
+        memcpy(framed + 4, data, size);
+
+        int offset = 0;
+        while (offset < framed_size) {
+            int chunkSize = (framed_size - offset > 60000) ? 60000 : (framed_size - offset);
+            sendto(m_udpSocket, (const char*)(framed + offset), chunkSize, 0,
+                   (sockaddr*)&m_serverAddr, sizeof(m_serverAddr));
+            offset += chunkSize;
+        }
+        free(framed);
     }
+    DriverLog("[UDP] Sent framed packet: payload=%d bytes", size);
 }
 
 bool HmdDriver::InitializeUDP()

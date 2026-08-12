@@ -97,6 +97,7 @@ public class VrActivity extends AppCompatActivity implements PopupMenu.OnMenuIte
   private int cameraHeight = 480;
 
   private static final int UDP_DISCOVERY_PORT = 42070;
+  private static final int VIDEO_PORT = 42069;
   private static final int DISCOVERY_INTERVAL_MS = 500;
   private volatile boolean discoveryRunning = false;
   private Thread discoveryThread = null;
@@ -436,6 +437,13 @@ public class VrActivity extends AppCompatActivity implements PopupMenu.OnMenuIte
     public void onSurfaceCreated(GL10 gl10, EGLConfig eglConfig) {
       nativeOnSurfaceCreated(nativeApp);
 
+      // Start video receiver on default port 9003
+      if (!videoReceiverStarted) {
+        nativeStartVideoReceiver(nativeApp, VIDEO_PORT);
+        videoReceiverStarted = true;
+        Log.i(TAG, "Video receiver started on port " + VIDEO_PORT);
+      }
+
       // Always create texture first (starts black), camera is optional
       if (checkCameraPermission() && !cameraTexturePassed) {
         int textureId = nativeCreateCameraTexture(nativeApp);
@@ -458,6 +466,11 @@ public class VrActivity extends AppCompatActivity implements PopupMenu.OnMenuIte
         }
       } catch (Exception e) {
         // Texture not ready or invalidated - skip frame, don't crash
+      }
+
+      // Update video texture every frame
+      if (videoReceiverStarted) {
+        nativeUpdateVideoTexture(nativeApp);
       }
 
       nativeOnDrawFrame(nativeApp);
@@ -577,6 +590,16 @@ public class VrActivity extends AppCompatActivity implements PopupMenu.OnMenuIte
   private native void nativeResetCameraTexture(long nativeApp);
 
   private native void nativeSetEyeTexture(long nativeApp, int eye, int textureId);
+
+  private native void nativeStartVideoReceiver(long nativeApp, int port);
+
+  private native void nativeStopVideoReceiver(long nativeApp);
+
+  private native void nativeUpdateVideoTexture(long nativeApp);
+
+  private native boolean nativeHasVideoFrame(long nativeApp);
+
+  private boolean videoReceiverStarted = false;
 
   public void updateCameraTexture() {
     try {

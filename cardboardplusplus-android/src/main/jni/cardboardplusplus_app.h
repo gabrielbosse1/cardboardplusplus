@@ -29,6 +29,9 @@
 #include "cardboard.h"
 #include "util.h"
 
+#include "VideoReceiver.h"
+#include "H264Decoder.h"
+
 namespace ndk_cardboardplusplus {
 
 /**
@@ -99,7 +102,12 @@ class CardboardPlusPlusApp {
 
   void SetEyeTexture(int eye, int textureId);
 
-  private:
+  void StartVideoReceiver(int port);
+  void StopVideoReceiver();
+  bool HasVideoFrame();
+  void UpdateVideoTexture();
+
+ private:
   /**
    * Default near clip plane z-axis coordinate.
    */
@@ -192,6 +200,14 @@ class CardboardPlusPlusApp {
   Matrix4x4 head_view_;
 
   TexturedMesh quad_;
+
+  // Video streaming
+  std::unique_ptr<VideoReceiver> video_receiver_;
+  std::unique_ptr<H264Decoder> h264_decoder_;
+  GLuint video_texture_;
+  bool video_receiver_started_;
+  int video_width_;
+  int video_height_;
 };
 
 }  // namespace ndk_cardboardplusplus
