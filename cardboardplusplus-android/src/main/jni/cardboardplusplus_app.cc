@@ -214,6 +214,25 @@ void CardboardPlusPlusApp::OnDrawFrame() {
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
   }
 
+  // The eye texture descriptions default to a side-by-side split (left half for
+  // the left eye, right half for the right eye) which is correct for SBS video.
+  // The camera passthrough draws the full image into each eye's framebuffer, so
+  // for that case we must sample the whole texture in both eyes and let Cardboard
+  // handle the IPD via the distortion meshes.
+  const bool camera_pass =
+      camera_texture_initialized_ && show_camera_texture_;
+  if (camera_pass) {
+    left_eye_texture_description_.left_u = 0.0f;
+    left_eye_texture_description_.right_u = 1.0f;
+    right_eye_texture_description_.left_u = 0.0f;
+    right_eye_texture_description_.right_u = 1.0f;
+  } else {
+    left_eye_texture_description_.left_u = 0.0f;
+    left_eye_texture_description_.right_u = 0.5f;
+    right_eye_texture_description_.left_u = 0.5f;
+    right_eye_texture_description_.right_u = 1.0f;
+  }
+
   // Render with distortion
   CardboardDistortionRenderer_renderEyeToDisplay(
       distortion_renderer_, /* target_display = */ 0, /* x = */ 0, /* y = */ 0,
