@@ -136,6 +136,7 @@ VideoEncoder::VideoEncoder()
     , m_bitrate(0)
     , m_frameCount(0)
     , m_pSoftwareFrameBuffer(nullptr)
+    , m_pHwDeviceCtx(nullptr)
     , m_hasValidFrame(false)
     , m_pConversionRT(nullptr)
     , m_pConversionRTV(nullptr)
@@ -253,64 +254,104 @@ bool VideoEncoder::InitializeFFmpeg()
 {
     ENCODER_LOG("Initializing FFmpeg H264 encoder...");
 
-    const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_H264);
-    if (!codec) {
-        ENCODER_ERROR("H264 encoder not found! Trying alternative encoders...");
+    // Prefer hardware (GPU) encoders for throughput; fall back to libx264.
+    // h264_amf = AMD, h264_nvenc = NVIDIA, h264_qsv = Intel.
+    const char* codecCandidates[] = { "h264_amf", "h264_nvenc", "h264_qsv", "libx264" };
+    const AVCodec* codec = nullptr;
 
-        codec = avcodec_find_encoder_by_name("libx264");
-        if (!codec) {
-            codec = avcodec_find_encoder_by_name("h264_nvenc");
-            if (!codec) {
-                codec = avcodec_find_encoder_by_name("h264_qsv");
-                if (!codec) {
-                    ENCODER_ERROR("No H264 encoder available!");
-                    return false;
+    for (const char* name : codecCandidates) {
+        const AVCodec* c = avcodec_find_encoder_by_name(name);
+        if (!c) {
+            ENCODER_LOG("Encoder %s not available, skipping", name);
+            continue;
+        }
+
+        m_pCodecContext = avcodec_alloc_context3(c);
+        if (!m_pCodecContext) {
+            ENCODER_ERROR("Failed to allocate codec context for %s!", name);
+            continue;
+        }
+
+        m_pCodecContext->width = m_width;
+        m_pCodecContext->height = m_height;
+        m_pCodecContext->time_base = { 1, m_fps };
+        m_pCodecContext->framerate = { m_fps, 1 };
+        m_pCodecContext->gop_size = 10;
+        m_pCodecContext->max_b_frames = 0;
+        m_pCodecContext->delay = 0;
+        m_pCodecContext->pix_fmt = AV_PIX_FMT_NV12;
+        m_pCodecContext->bit_rate = m_bitrate;
+        m_pCodecContext->rc_min_rate = m_bitrate;
+        m_pCodecContext->rc_max_rate = m_bitrate;
+        m_pCodecContext->rc_buffer_size = m_bitrate / 2;
+
+        bool isLibx264 = (strcmp(name, "libx264") == 0);
+        bool isAmf     = (strcmp(name, "h264_amf") == 0);
+
+        if (isAmf) {
+            // AMF requires a D3D11 hardware-device context. Wrap the driver's
+            // existing ID3D11Device so AMF encodes on the same GPU (no extra device).
+            AVBufferRef* hwdev = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA);
+            if (hwdev) {
+                AVD3D11VADeviceContext* d3d11va = (AVD3D11VADeviceContext*)hwdev->data;
+                d3d11va->device = m_pDevice;
+                m_pDevice->AddRef();
+                if (av_hwdevice_ctx_init(hwdev) == 0) {
+                    m_pHwDeviceCtx = hwdev;
+                    m_pCodecContext->hw_device_ctx = av_buffer_ref(hwdev);
                 } else {
-                    ENCODER_LOG("Found QSV H264 encoder");
+                    ENCODER_ERROR("Failed to init D3D11VA hw device for AMF");
+                    av_buffer_unref(&hwdev);
                 }
             } else {
-                ENCODER_LOG("Found NVIDIA NVENC H264 encoder");
+                ENCODER_ERROR("Failed to allocate D3D11VA hw device for AMF");
             }
+
+            // AMF low-latency options (unknown names are ignored safely).
+            av_opt_set(m_pCodecContext->priv_data, "usage", "ultralowlatency", 0);
+            av_opt_set(m_pCodecContext->priv_data, "rc", "cbr", 0);
+            av_opt_set(m_pCodecContext->priv_data, "profile", "baseline", 0);
+        } else if (isLibx264) {
+            av_opt_set(m_pCodecContext->priv_data, "preset", "ultrafast", 0);
+            av_opt_set(m_pCodecContext->priv_data, "tune", "zerolatency", 0);
+            av_opt_set(m_pCodecContext->priv_data, "profile", "baseline", 0);
         } else {
-            ENCODER_LOG("Found libx264 H264 encoder");
+            // h264_nvenc / h264_qsv: vendor-valid preset + baseline profile.
+            const char* hwPreset = (strcmp(name, "h264_nvenc") == 0) ? "fast" : "veryfast";
+            av_opt_set(m_pCodecContext->priv_data, "preset", hwPreset, 0);
+            av_opt_set(m_pCodecContext->priv_data, "profile", "baseline", 0);
         }
-    } else {
-        ENCODER_LOG("Found H264 encoder: %s", codec->name);
+
+        int ret = avcodec_open2(m_pCodecContext, c, nullptr);
+        if (ret < 0) {
+            char errbuf[AV_ERROR_MAX_STRING_SIZE];
+            av_strerror(ret, errbuf, sizeof(errbuf));
+            ENCODER_ERROR("Failed to open codec %s: %s", name, errbuf);
+            if (m_pCodecContext->hw_device_ctx) {
+                av_buffer_unref(&m_pCodecContext->hw_device_ctx);
+            }
+            if (m_pHwDeviceCtx) {
+                av_buffer_unref(&m_pHwDeviceCtx);
+            }
+            avcodec_free_context(&m_pCodecContext);
+            m_pCodecContext = nullptr;
+            continue;
+        }
+
+        codec = c;
+        m_useGpuEncoding = !isLibx264;
+        ENCODER_LOG("Opened H264 encoder: %s (%s)", name,
+                    m_useGpuEncoding ? "hardware/GPU" : "software");
+        break;
+    }
+
+    if (!codec || !m_pCodecContext) {
+        ENCODER_ERROR("No usable H264 encoder found!");
+        return false;
     }
 
     ENCODER_LOG("Encoder name: %s, long name: %s",
                 codec->name, codec->long_name ? codec->long_name : "N/A");
-
-    m_pCodecContext = avcodec_alloc_context3(codec);
-    if (!m_pCodecContext) {
-        ENCODER_ERROR("Failed to allocate codec context!");
-        return false;
-    }
-
-    m_pCodecContext->width = m_width;
-    m_pCodecContext->height = m_height;
-    m_pCodecContext->time_base = { 1, m_fps };
-    m_pCodecContext->framerate = { m_fps, 1 };
-    m_pCodecContext->gop_size = 10;
-    m_pCodecContext->max_b_frames = 0;
-    m_pCodecContext->pix_fmt = AV_PIX_FMT_NV12;
-
-    av_opt_set(m_pCodecContext->priv_data, "preset", "fast", 0);
-    av_opt_set(m_pCodecContext->priv_data, "tune", "zerolatency", 0);
-    av_opt_set(m_pCodecContext->priv_data, "profile", "baseline", 0);
-    av_opt_set_int(m_pCodecContext->priv_data, "rc", 0, 0);
-    
-    m_pCodecContext->bit_rate = m_bitrate;
-    m_pCodecContext->rc_min_rate = m_bitrate;
-    m_pCodecContext->rc_max_rate = m_bitrate;
-    m_pCodecContext->rc_buffer_size = m_bitrate / 2;
-    m_pCodecContext->delay = 0;
-
-    ENCODER_LOG("Codec config - bitrate: %d, gop: %d, max_b_frames: %d",
-                m_pCodecContext->bit_rate, m_pCodecContext->gop_size, m_pCodecContext->max_b_frames);
-
-    ENCODER_LOG("Using software encoding with NV12 pix_fmt...");
-    m_pCodecContext->pix_fmt = AV_PIX_FMT_NV12;
 
     // Create staging texture for CPU readback (BGRA8)
     D3D11_TEXTURE2D_DESC stagingDesc = {};
@@ -349,14 +390,6 @@ bool VideoEncoder::InitializeFFmpeg()
         return false;
     }
 
-    int ret = avcodec_open2(m_pCodecContext, codec, nullptr);
-    if (ret < 0) {
-        ENCODER_ERROR("Failed to open codec! Error code: %d", ret);
-        char errbuf[AV_ERROR_MAX_STRING_SIZE];
-        av_strerror(ret, errbuf, sizeof(errbuf));
-        ENCODER_ERROR("Error message: %s", errbuf);
-        return false;
-    }
     ENCODER_LOG("Codec opened successfully!");
     ENCODER_LOG("  Selected pix_fmt: %d (%s)",
                 m_pCodecContext->pix_fmt,
@@ -413,6 +446,11 @@ void VideoEncoder::CleanupFFmpeg()
     if (m_pCodecContext) {
         avcodec_free_context(&m_pCodecContext);
         m_pCodecContext = nullptr;
+    }
+
+    if (m_pHwDeviceCtx) {
+        av_buffer_unref(&m_pHwDeviceCtx);
+        m_pHwDeviceCtx = nullptr;
     }
 
     ENCODER_LOG("FFmpeg resources cleaned up.");

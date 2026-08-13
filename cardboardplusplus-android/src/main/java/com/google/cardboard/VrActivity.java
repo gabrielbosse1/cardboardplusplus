@@ -136,6 +136,9 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
     // 3. Stop camera hardware and release texture so it gets recreated fresh on resume
     cameraController.onPause();
 
+    // 3b. Tear down the video decoder + receiver.
+    videoManager.onPause();
+
     // 4. Stop GL thread LAST
     glView.onPause();
   }
@@ -278,6 +281,12 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
 
   private native int nativeCreateCameraTexture(long nativeApp);
 
+  private native int nativeCreateVideoTexture(long nativeApp);
+
+  private native void nativeSetVideoDecoder(long nativeApp, Object decoder);
+
+  private native void nativeOnVideoActive(long nativeApp);
+
   private native void nativeResetCameraTexture(long nativeApp);
 
   private native void nativeSetEyeTexture(long nativeApp, int eye, int textureId);
@@ -337,6 +346,21 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
   @Override
   public int createCameraTexture() {
     return nativeCreateCameraTexture(nativeApp);
+  }
+
+  @Override
+  public int createVideoTexture() {
+    return nativeCreateVideoTexture(nativeApp);
+  }
+
+  @Override
+  public void setVideoDecoder(Object decoder) {
+    nativeSetVideoDecoder(nativeApp, decoder);
+  }
+
+  @Override
+  public void onVideoActive() {
+    nativeOnVideoActive(nativeApp);
   }
 
   @Override

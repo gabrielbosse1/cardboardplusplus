@@ -104,17 +104,24 @@ class CardboardPlusPlusApp {
 
   void SetEyeTexture(int eye, int textureId);
 
+  // MediaCodec-backed video path. The UDP receiver still runs in native code,
+  // but decoded frames are forwarded to a Java MediaCodec (which owns a
+  // SurfaceTexture/OES texture) via JNI. The GL thread samples that OES texture.
+  int CreateVideoTexture();
+  void SetVideoDecoder(JNIEnv* env, jobject decoder);
+  void OnVideoActive();
+
   void StartVideoReceiver(int port);
   void StopVideoReceiver();
   bool HasVideoFrame();
   void UpdateVideoTexture();
 
   /**
-   * Runs the FFmpeg decode loop off the GL render thread. Pulls H.264 packets
-   * from the receiver, decodes them and publishes the newest RGBA frame into a
-   * double-buffered slot consumed by UpdateVideoTexture. This keeps the
-   * (expensive) software decode and YUV->RGBA conversion off the render
-   * critical path so the GL thread only does the small texture upload.
+   * Runs the frame-forwarding loop off the GL render thread. Pulls H.264
+   * access units from the receiver and hands them to the Java MediaCodec
+   * decoder (via JNI). The actual decode + YUV->RGBA + GPU upload all happen on
+   * the codec/SurfaceTexture side, so the GL render thread is never blocked by
+   * decoding.
    */
   void DecodeLoop();
 
@@ -158,8 +165,15 @@ class CardboardPlusPlusApp {
    */
   void DrawEyeQuad(GLuint texture_id);
 
+  /**
+   * Returns true if the H.264 access unit's first NAL unit is a keyframe
+   * (SPS type 7 or IDR type 5), matching VideoReceiver's keyframe detection.
+   */
+  static bool IsKeyframe(const uint8_t* data, int size);
+
   jobject java_asset_mgr_;
   AAssetManager* asset_mgr_;
+  JavaVM* java_vm_;
 
   CardboardHeadTracker* head_tracker_;
   CardboardLensDistortion* lens_distortion_;
@@ -202,6 +216,12 @@ class CardboardPlusPlusApp {
   int camera_height_;
   bool camera_texture_initialized_;
   bool show_camera_texture_;
+
+  // Java MediaCodec decoder handle (global JNI ref) + cached method id for
+  // feeding it H.264 access units from the native decode-forwarding thread.
+  jobject video_decoder_obj_ = nullptr;
+  jmethodID mid_feed_video_ = nullptr;
+  bool video_active_ = false;
 
   GLuint left_eye_custom_texture_;
   GLuint right_eye_custom_texture_;

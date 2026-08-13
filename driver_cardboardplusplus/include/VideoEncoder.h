@@ -9,6 +9,7 @@ struct AVCodecContext;
 struct AVFrame;
 struct AVPacket;
 struct SwsContext;
+struct AVBufferRef;
 
 class VideoEncoder
 {
@@ -56,6 +57,7 @@ private:
     ID3D11DeviceContext* m_pContext;
 
     AVCodecContext* m_pCodecContext;
+    AVBufferRef* m_pHwDeviceCtx;
     AVFrame* m_pFrame;
     AVPacket* m_pPacket;
     SwsContext* m_pConvertContext;

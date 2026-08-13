@@ -36,6 +36,7 @@ public class VrRenderer implements GLSurfaceView.Renderer {
   public void onSurfaceCreated(GL10 gl10, EGLConfig eglConfig) {
     bridge.onSurfaceCreated();
 
+    videoManager.onSurfaceCreated();
     videoManager.start();
 
     if (permissionManager.isCameraGranted() && !cameraController.isTexturePassed()) {

@@ -66,6 +66,8 @@ public:
 private:
     bool InitializeVideoEncoder();
     void ShutdownVideoEncoder();
+    bool ApplyHardwareCap(int capW, int capH);
+    void ClampEncoderToCap();
 
     // UDP networking
     bool InitializeUDP();
@@ -93,6 +95,18 @@ private:
     bool m_encoderInitialized;
     int64_t m_encoderPts;
     uint32_t m_lastEncodedPid;
+
+    // Encoder configuration (mutable so it can be clamped to the phone's decoder cap)
+    int m_encoderW = 2880;
+    int m_encoderH = 1620;
+    int m_encoderFps = 60;
+    int m_encoderBitrate = 20000000;
+    bool m_encoderUseGpu = false;
+    int m_pendingCapW = 0;
+    int m_pendingCapH = 0;
+    std::mutex m_encoderMutex;
+    int m_presentCount = 0;
+    long long m_lastPresentLogNs = 0;
 
     // Per-eye submit layer tracking for SBS compositing
     SubmitLayerInfo m_submitLayers[2];

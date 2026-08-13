@@ -28,6 +28,12 @@ public interface NativeBridge {
 
   int createCameraTexture();
 
+  int createVideoTexture();
+
+  void setVideoDecoder(Object decoder);
+
+  void onVideoActive();
+
   void resetCameraTexture();
 
   void setEyeTexture(int eye, int textureId);

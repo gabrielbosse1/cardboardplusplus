@@ -413,6 +413,20 @@ void HmdDriver::SubmitLayer(const SubmitLayerPerEye_t(&perEye)[2])
 
 void HmdDriver::Present(vr::SharedTextureHandle_t syncTexture)
 {
+    // Count every Present SteamVR issues (compositor rate), independent of whether
+    // we actually encode, so we can see if the stream is Present-bound or encode-bound.
+    m_presentCount++;
+    {
+        long long nowNs = std::chrono::steady_clock::now().time_since_epoch().count();
+        if (m_lastPresentLogNs == 0) m_lastPresentLogNs = nowNs;
+        if (nowNs - m_lastPresentLogNs >= 1'000'000'000LL) {
+            double presentFps = m_presentCount * 1e9 / (nowNs - m_lastPresentLogNs);
+            DriverLog("Present rate: %.1f fps (count=%d)", presentFps, m_presentCount);
+            m_presentCount = 0;
+            m_lastPresentLogNs = nowNs;
+        }
+    }
+
     DriverLog("Present called! syncTexture=%llu, hasSubmit=%s",
         (uint64_t)syncTexture, m_hasSubmit ? "yes" : "no");
 
@@ -440,11 +454,15 @@ void HmdDriver::Present(vr::SharedTextureHandle_t syncTexture)
 
     // Encode SBS - no mutex, no OpenSharedResource, just read directly
     if (pLeftTex && pRightTex) {
+        std::lock_guard<std::mutex> lock(m_encoderMutex);
+        if (!m_encoderInitialized || !m_pVideoEncoder) return;
         DriverLog("Encoding SBS: left=%llu right=%llu pts=%lld",
             (uint64_t)m_submitLayers[0].hTexture, (uint64_t)m_submitLayers[1].hTexture, m_encoderPts);
         m_pVideoEncoder->EncodeFrameSBS(pLeftTex, pRightTex, m_encoderPts);
         m_encoderPts++;
     } else if (pLeftTex) {
+        std::lock_guard<std::mutex> lock(m_encoderMutex);
+        if (!m_encoderInitialized || !m_pVideoEncoder) return;
         m_pVideoEncoder->EncodeFrame(pLeftTex, m_encoderPts);
         m_encoderPts++;
     }
@@ -481,12 +499,19 @@ bool HmdDriver::InitializeVideoEncoder()
         return false;
     }
 
-    // SBS resolution: 1440x1620 per eye -> 2880x1620
-    int width = 2880;
-    int height = 1620;
-    int fps = 60;
-    int bitrate = 20000000;
-    bool useGpuEncoding = false;
+    // SBS resolution: 1440x1620 per eye -> 2880x1620 (defaults, clamped to decoder cap)
+    m_encoderW = 2880;
+    m_encoderH = 1620;
+    m_encoderFps = 60;
+    m_encoderBitrate = 20000000;
+    m_encoderUseGpu = false;
+    ClampEncoderToCap();
+
+    int width = m_encoderW;
+    int height = m_encoderH;
+    int fps = m_encoderFps;
+    int bitrate = m_encoderBitrate;
+    bool useGpuEncoding = m_encoderUseGpu;
 
     DriverLog("Encoder configuration:");
     DriverLog("  Resolution: %dx%d (SBS: %dx%d per eye)", width, height, width / 2, height);
@@ -523,6 +548,90 @@ void HmdDriver::ShutdownVideoEncoder()
 
     m_encoderInitialized = false;
     DriverLog("Video Encoder shutdown complete.");
+}
+
+void HmdDriver::ClampEncoderToCap()
+{
+    if (m_pendingCapW <= 0 || m_pendingCapH <= 0) {
+        return;
+    }
+
+    double scale = 1.0;
+    double sx = (double)m_pendingCapW / (double)m_encoderW;
+    double sy = (double)m_pendingCapH / (double)m_encoderH;
+    if (sx < scale) scale = sx;
+    if (sy < scale) scale = sy;
+
+    if (scale >= 0.999) {
+        return;
+    }
+
+    int newW = (int)(m_encoderW * scale);
+    int newH = (int)(m_encoderH * scale);
+    // Align down to 16 (H.264 macroblock requirement)
+    newW = (newW / 16) * 16;
+    newH = (newH / 16) * 16;
+
+    if (newW > 0 && newH > 0) {
+        DriverLog("Clamping encoder to hardware cap %dx%d: %dx%d -> %dx%d",
+                  m_pendingCapW, m_pendingCapH, m_encoderW, m_encoderH, newW, newH);
+        m_encoderW = newW;
+        m_encoderH = newH;
+    }
+}
+
+bool HmdDriver::ApplyHardwareCap(int capW, int capH)
+{
+    std::lock_guard<std::mutex> lock(m_encoderMutex);
+
+    m_pendingCapW = capW;
+    m_pendingCapH = capH;
+
+    if (!m_encoderInitialized || !m_pVideoEncoder) {
+        // Encoder not up yet; cap will be applied at initialization time.
+        DriverLog("Hardware cap %dx%d received (encoder not ready, applied on init)", capW, capH);
+        return true;
+    }
+
+    int oldW = m_encoderW;
+    int oldH = m_encoderH;
+    ClampEncoderToCap();
+
+    if (m_encoderW == oldW && m_encoderH == oldH) {
+        DriverLog("Hardware cap %dx%d >= current encoder %dx%d, no change", capW, capH, oldW, oldH);
+        return false;
+    }
+
+    DriverLog("Re-initializing encoder under hardware cap %dx%d: %dx%d -> %dx%d",
+              capW, capH, oldW, oldH, m_encoderW, m_encoderH);
+
+    m_pVideoEncoder->Shutdown();
+    delete m_pVideoEncoder;
+    m_pVideoEncoder = nullptr;
+    m_encoderInitialized = false;
+
+    m_pVideoEncoder = new VideoEncoder();
+    if (!m_pVideoEncoder) {
+        DriverLog("Failed to allocate VideoEncoder during cap re-init!");
+        return false;
+    }
+
+    m_pVideoEncoder->SetEncodedPacketCallback([this](uint8_t* data, int size, int64_t pts, bool keyframe) {
+        OnEncodedPacket(data, size, pts, keyframe);
+    });
+
+    if (!m_pVideoEncoder->Initialize(pD3D11Device, pD3D11DeviceContext,
+                                     m_encoderW, m_encoderH, m_encoderFps, m_encoderBitrate, m_encoderUseGpu)) {
+        DriverLog("VideoEncoder re-init failed under cap!");
+        delete m_pVideoEncoder;
+        m_pVideoEncoder = nullptr;
+        return false;
+    }
+
+    m_encoderInitialized = true;
+    m_encoderPts = 0;
+    DriverLog("Encoder re-initialized at %dx%d under hardware cap", m_encoderW, m_encoderH);
+    return true;
 }
 
 void HmdDriver::OnEncodedPacket(uint8_t* data, int size, int64_t pts, bool keyframe)
@@ -776,6 +885,17 @@ void HmdDriver::DiscoveryThreadFunc()
 
             DriverLog("Discovery packet received from %s:%d (size=%d, data='%s')",
                       senderIpStr, ntohs(senderAddr.sin_port), bytesReceived, buffer);
+
+            if (strncmp(buffer, "CARDBOARD_CAP", 13) == 0) {
+                // Phone is reporting its hardware decoder cap; no ACK needed.
+                int capW = 0;
+                int capH = 0;
+                if (sscanf_s(buffer, "CARDBOARD_CAP %d %d", &capW, &capH) == 2) {
+                    DriverLog("Hardware decoder cap received from %s: %dx%d", senderIpStr, capW, capH);
+                    ApplyHardwareCap(capW, capH);
+                }
+                continue;
+            }
 
             // Switch data target to the phone's IP
             SwitchDataTarget(senderIpStr);

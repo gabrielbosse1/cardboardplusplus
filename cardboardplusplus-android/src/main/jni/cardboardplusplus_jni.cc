@@ -101,6 +101,21 @@ JNI_METHOD(jint, nativeCreateCameraTexture)
   return native(native_app)->CreateCameraTexture();
 }
 
+JNI_METHOD(jint, nativeCreateVideoTexture)
+(JNIEnv* /*env*/, jobject /*obj*/, jlong native_app) {
+  return native(native_app)->CreateVideoTexture();
+}
+
+JNI_METHOD(void, nativeSetVideoDecoder)
+(JNIEnv* env, jobject /*obj*/, jlong native_app, jobject decoder) {
+  native(native_app)->SetVideoDecoder(env, decoder);
+}
+
+JNI_METHOD(void, nativeOnVideoActive)
+(JNIEnv* /*env*/, jobject /*obj*/, jlong native_app) {
+  native(native_app)->OnVideoActive();
+}
+
 JNI_METHOD(void, nativeResetCameraTexture)
 (JNIEnv* /*env*/, jobject /*obj*/, jlong native_app) {
   native(native_app)->ResetCameraTexture();

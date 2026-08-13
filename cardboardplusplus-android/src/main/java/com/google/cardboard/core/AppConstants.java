@@ -20,6 +20,6 @@ public final class AppConstants {
   public static final int MIN_CAMERA_HEIGHT = 480;
 
   // Default video stream dimensions (matches native defaults)
-  public static final int DEFAULT_VIDEO_WIDTH = 2880;
-  public static final int DEFAULT_VIDEO_HEIGHT = 1620;
+  public static final int DEFAULT_VIDEO_WIDTH = 1920;
+  public static final int DEFAULT_VIDEO_HEIGHT = 1080;
 }
