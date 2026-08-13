@@ -15,66 +15,48 @@
  */
 package com.google.cardboard;
 
-import android.Manifest;
 import android.annotation.SuppressLint;
-import android.content.Context;
 import android.content.Intent;
-import android.content.pm.PackageManager;
 import android.content.res.AssetManager;
-import android.graphics.ImageFormat;
-import android.graphics.SurfaceTexture;
-import android.net.Uri;
+import androidx.annotation.NonNull;
 import android.opengl.GLSurfaceView;
 import android.os.Build.VERSION;
 import android.os.Build.VERSION_CODES;
 import android.os.Bundle;
-import android.os.Handler;
-import android.os.HandlerThread;
 import android.provider.Settings;
-import android.util.Size;
-import android.view.Surface;
-import androidx.appcompat.app.AppCompatActivity;
 import android.util.Log;
-import android.view.MenuInflater;
-import android.view.MenuItem;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
-import android.widget.PopupMenu;
 import android.widget.Toast;
-import androidx.annotation.NonNull;
-import androidx.core.app.ActivityCompat;
-import java.nio.ByteBuffer;
-import javax.microedition.khronos.egl.EGLConfig;
-import javax.microedition.khronos.opengles.GL10;
-import android.hardware.camera2.CameraAccessException;
-import android.hardware.camera2.CameraCaptureSession;
-import android.hardware.camera2.CameraCharacteristics;
-import android.hardware.camera2.CameraDevice;
-import android.hardware.camera2.CameraManager;
-import android.hardware.camera2.CaptureRequest;
-import java.net.DatagramPacket;
-import java.net.DatagramSocket;
-import java.net.InetAddress;
+import androidx.appcompat.app.AppCompatActivity;
+import com.google.cardboard.camera.CameraController;
+import com.google.cardboard.codec.CodecSelector;
+import com.google.cardboard.core.AppConstants;
+import com.google.cardboard.discovery.DiscoveryManager;
+import com.google.cardboard.permissions.PermissionManager;
+import com.google.cardboard.render.VrRenderer;
+import com.google.cardboard.settings.AppSettings;
+import com.google.cardboard.settings.SettingsMenuController;
+import com.google.cardboard.streaming.CameraStreamer;
+import com.google.cardboard.video.VideoManager;
 
 /**
- * A Google Cardboard VR NDK sample application.
+ * Entry point / orchestrator for the Cardboard++ VR app.
  *
- * <p>This is the main Activity for the sample application. It initializes a GLSurfaceView to allow
- * rendering.
+ * <p>This Activity owns the native app instance and the JNI surface (native methods are hard-bound
+ * to this class name in the C++ layer), and wires together the extracted subsystems: camera, video
+ * receiver, discovery, permissions, settings and rendering. Subsystem behaviour lives in their own
+ * packages and is reached through {@link NativeBridge}.
  */
 // TODO(b/184737638): Remove decorator once the AndroidX migration is completed.
 @SuppressWarnings("deprecation")
-public class VrActivity extends AppCompatActivity implements PopupMenu.OnMenuItemClickListener {
+public class VrActivity extends AppCompatActivity implements NativeBridge {
   static {
     System.loadLibrary("cardboard_jni");
   }
 
   private static final String TAG = VrActivity.class.getSimpleName();
-
-  // Permission request codes
-  private static final int PERMISSIONS_REQUEST_CODE = 2;
-  private static final int CAMERA_PERMISSIONS_REQUEST_CODE = 3;
 
   // Opaque native pointer to the native CardboardApp instance.
   // This object is owned by the VrActivity instance and passed to the native methods.
@@ -82,25 +64,13 @@ public class VrActivity extends AppCompatActivity implements PopupMenu.OnMenuIte
 
   private GLSurfaceView glView;
 
-  // Camera2 related members
-  private CameraManager cameraManager;
-  private CameraDevice cameraDevice;
-  private CameraCaptureSession captureSession;
-  private SurfaceTexture cameraSurfaceTexture;
-  private Surface cameraSurface;
-  private HandlerThread cameraThread;
-  private Handler cameraHandler;
-  private boolean cameraInitialized = false;
-  private boolean cameraTexturePassed = false;
-  private final Object cameraLock = new Object();
-  private int cameraWidth = 640;
-  private int cameraHeight = 480;
-
-  private static final int UDP_DISCOVERY_PORT = 42070;
-  private static final int VIDEO_PORT = 42069;
-  private static final int DISCOVERY_INTERVAL_MS = 500;
-  private volatile boolean discoveryRunning = false;
-  private Thread discoveryThread = null;
+  private PermissionManager permissionManager;
+  private CameraController cameraController;
+  private VideoManager videoManager;
+  private DiscoveryManager discoveryManager;
+  private AppSettings appSettings;
+  private CodecSelector codecSelector;
+  private CameraStreamer cameraStreamer;
 
   @SuppressLint("ClickableViewAccessibility")
   @Override
@@ -109,20 +79,25 @@ public class VrActivity extends AppCompatActivity implements PopupMenu.OnMenuIte
 
     nativeApp = nativeOnCreate(getAssets());
 
+    appSettings = new AppSettings(this);
+    codecSelector = new CodecSelector(appSettings);
+    cameraStreamer = new CameraStreamer(appSettings);
+    permissionManager = new PermissionManager(this);
+    cameraController = new CameraController(this, this);
+    videoManager = new VideoManager(this);
+    discoveryManager = new DiscoveryManager();
+
     setContentView(R.layout.activity_vr);
     glView = findViewById(R.id.surface_view);
     glView.setEGLContextClientVersion(2);
-    Renderer renderer = new Renderer();
-    glView.setRenderer(renderer);
+    glView.setRenderer(
+        new VrRenderer(this, cameraController, videoManager, permissionManager));
     glView.setRenderMode(GLSurfaceView.RENDERMODE_CONTINUOUSLY);
     glView.setOnTouchListener(
         (v, event) -> {
           if (event.getAction() == MotionEvent.ACTION_DOWN) {
             // Signal a trigger event.
-            glView.queueEvent(
-                () -> {
-                  nativeOnTriggerEvent(nativeApp);
-                });
+            glView.queueEvent(() -> onTriggerEvent());
             return true;
           }
           return false;
@@ -148,96 +123,18 @@ public class VrActivity extends AppCompatActivity implements PopupMenu.OnMenuIte
     getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
   }
 
-  private boolean checkCameraPermission() {
-    return ActivityCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
-        == PackageManager.PERMISSION_GRANTED;
-  }
-
-  private void requestCameraPermission() {
-    ActivityCompat.requestPermissions(this,
-        new String[] {Manifest.permission.CAMERA}, CAMERA_PERMISSIONS_REQUEST_CODE);
-  }
-
-  private void createCaptureSession() {
-    if (cameraDevice == null || cameraSurface == null) {
-      return;
-    }
-    try {
-      final CaptureRequest.Builder captureRequestBuilder =
-          cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
-      captureRequestBuilder.addTarget(cameraSurface);
-
-      cameraDevice.createCaptureSession(
-          new java.util.ArrayList<Surface>() {{ add(cameraSurface); }},
-          new CameraCaptureSession.StateCallback() {
-            @Override
-            public void onConfigured(CameraCaptureSession session) {
-              synchronized (cameraLock) {
-                if (!cameraInitialized || cameraDevice == null) {
-                  session.close();
-                  return;
-                }
-                captureSession = session;
-              }
-              try {
-                captureRequestBuilder.set(CaptureRequest.CONTROL_AF_MODE,
-                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
-                captureRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE,
-                    CaptureRequest.CONTROL_AE_MODE_ON);
-                session.setRepeatingRequest(captureRequestBuilder.build(), null, cameraHandler);
-              } catch (Exception e) {
-                Log.w(TAG, "Failed to start preview: " + e.getMessage());
-              }
-            }
-
-            @Override
-            public void onConfigureFailed(CameraCaptureSession session) {
-              Log.w(TAG, "Camera configuration failed");
-            }
-          },
-          cameraHandler);
-    } catch (Exception e) {
-      Log.w(TAG, "Failed to create capture session: " + e.getMessage());
-    }
-  }
-
   @Override
   protected void onPause() {
     super.onPause();
 
-    // 1. Tell native to stop head tracking and camera rendering FIRST
-    nativeOnPause(nativeApp);
-    nativeResetCameraTexture(nativeApp);
-    stopDiscovery();
+    // 1. Tell native to stop head tracking FIRST
+    onNativePause();
 
-    // 2. Stop camera hardware
-    synchronized (cameraLock) {
-      cameraInitialized = false;
-      if (captureSession != null) {
-        try { captureSession.close(); } catch (Exception e) {}
-        captureSession = null;
-      }
-      if (cameraDevice != null) {
-        try { cameraDevice.close(); } catch (Exception e) {}
-        cameraDevice = null;
-      }
-      if (cameraThread != null) {
-        cameraThread.quitSafely();
-        cameraThread = null;
-      }
-      cameraHandler = null;
-    }
+    // 2. Stop discovery
+    discoveryManager.stopDiscovery();
 
-    // 3. Release texture so it gets recreated fresh on resume
-    if (cameraSurface != null) {
-      try { cameraSurface.release(); } catch (Exception e) {}
-      cameraSurface = null;
-    }
-    if (cameraSurfaceTexture != null) {
-      try { cameraSurfaceTexture.release(); } catch (Exception e) {}
-      cameraSurfaceTexture = null;
-    }
-    cameraTexturePassed = false;
+    // 3. Stop camera hardware and release texture so it gets recreated fresh on resume
+    cameraController.onPause();
 
     // 4. Stop GL thread LAST
     glView.onPause();
@@ -251,58 +148,37 @@ public class VrActivity extends AppCompatActivity implements PopupMenu.OnMenuIte
     // the application will request them. For Android Q and above, READ_EXTERNAL_STORAGE is optional
     // and scoped storage will be used instead. If it is provided (but not checked) and there are
     // device parameters saved in external storage those will be migrated to scoped storage.
-    if (VERSION.SDK_INT < VERSION_CODES.Q && !isReadExternalStorageEnabled()) {
-      requestPermissions();
+    if (VERSION.SDK_INT < VERSION_CODES.Q && !permissionManager.isReadExternalStorageGranted()) {
+      permissionManager.requestReadExternalStorage();
       return;
     }
 
     // Check camera permission
-    if (!checkCameraPermission()) {
-      requestCameraPermission();
+    if (!permissionManager.isCameraGranted()) {
+      permissionManager.requestCamera();
       return;
     }
 
     glView.onResume();
-    nativeOnResume(nativeApp);
+    onNativeResume();
 
-    startDiscovery();
+    discoveryManager.startDiscovery();
 
     // Queue camera setup on GL thread (guards prevent duplicates)
-    glView.queueEvent(() -> {
-      if (!cameraTexturePassed) {
-        int textureId = nativeCreateCameraTexture(nativeApp);
-        ensureCameraTexture(textureId);
-      }
-      openCamera();
-    });
+    glView.queueEvent(
+        () -> {
+          if (!cameraController.isTexturePassed()) {
+            int textureId = createCameraTexture();
+            cameraController.ensureCameraTexture(textureId);
+          }
+          cameraController.openCamera();
+        });
   }
 
   @Override
   protected void onDestroy() {
     super.onDestroy();
-    // Release camera resources
-    if (captureSession != null) {
-      captureSession.close();
-      captureSession = null;
-    }
-    if (cameraDevice != null) {
-      cameraDevice.close();
-      cameraDevice = null;
-    }
-    if (cameraSurface != null) {
-      cameraSurface.release();
-      cameraSurface = null;
-    }
-    if (cameraSurfaceTexture != null) {
-      cameraSurfaceTexture.release();
-      cameraSurfaceTexture = null;
-    }
-    if (cameraThread != null) {
-      cameraThread.quitSafely();
-      cameraThread = null;
-    }
-    cameraInitialized = false;
-    cameraTexturePassed = false;
+    cameraController.release();
     nativeOnDestroy(nativeApp);
     nativeApp = 0;
   }
@@ -315,168 +191,6 @@ public class VrActivity extends AppCompatActivity implements PopupMenu.OnMenuIte
     }
   }
 
-  private void ensureCameraTexture(int textureId) {
-    if (cameraSurfaceTexture == null) {
-      cameraSurfaceTexture = new SurfaceTexture(textureId);
-      cameraSurfaceTexture.setDefaultBufferSize(cameraWidth, cameraHeight);
-      cameraSurface = new Surface(cameraSurfaceTexture);
-      cameraTexturePassed = true;
-      nativeOnCameraTextureInitialized(nativeApp, textureId, cameraWidth, cameraHeight);
-      Log.i(TAG, "Camera texture created: " + textureId);
-    }
-  }
-
-  @SuppressLint("MissingPermission")
-  private void openCamera() {
-    synchronized (cameraLock) {
-      if (cameraInitialized) {
-        return;
-      }
-    }
-
-    // Initialize camera manager
-    cameraManager = (CameraManager) getSystemService(Context.CAMERA_SERVICE);
-    if (cameraManager == null) {
-      Log.w(TAG, "CameraManager not available");
-      return;
-    }
-
-    try {
-      String[] cameraIds = cameraManager.getCameraIdList();
-      String backCameraId = null;
-      for (String id : cameraIds) {
-        CameraCharacteristics characteristics = cameraManager.getCameraCharacteristics(id);
-        Integer facing = characteristics.get(CameraCharacteristics.LENS_FACING);
-        if (facing != null && facing == CameraCharacteristics.LENS_FACING_BACK) {
-          backCameraId = id;
-          break;
-        }
-      }
-
-      if (backCameraId == null) {
-        Log.w(TAG, "No back camera found");
-        return;
-      }
-
-      CameraCharacteristics characteristics = cameraManager.getCameraCharacteristics(backCameraId);
-      android.hardware.camera2.params.StreamConfigurationMap map =
-          characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
-      Size[] outputSizes = map.getOutputSizes(SurfaceTexture.class);
-
-      if (outputSizes != null && outputSizes.length > 0) {
-        for (Size size : outputSizes) {
-          if (size.getWidth() >= 640 && size.getHeight() >= 480) {
-            cameraWidth = size.getWidth();
-            cameraHeight = size.getHeight();
-            break;
-          }
-        }
-      }
-
-      if (cameraSurfaceTexture != null) {
-        cameraSurfaceTexture.setDefaultBufferSize(cameraWidth, cameraHeight);
-      }
-
-      synchronized (cameraLock) {
-        cameraThread = new HandlerThread("CameraThread");
-        cameraThread.start();
-        cameraHandler = new Handler(cameraThread.getLooper());
-      }
-
-      // Open camera
-      cameraManager.openCamera(backCameraId, new CameraDevice.StateCallback() {
-        @Override
-        public void onOpened(CameraDevice camera) {
-          synchronized (cameraLock) {
-            if (!cameraInitialized) {
-              cameraDevice = camera;
-              try {
-                createCaptureSession();
-                cameraInitialized = true;
-              } catch (Exception e) {
-                Log.w(TAG, "Session setup failed: " + e.getMessage());
-                camera.close();
-                cameraDevice = null;
-              }
-            } else {
-              camera.close();
-            }
-          }
-        }
-
-        @Override
-        public void onDisconnected(CameraDevice camera) {
-          synchronized (cameraLock) {
-            camera.close();
-            if (cameraDevice == camera) {
-              cameraDevice = null;
-            }
-          }
-        }
-
-        @Override
-        public void onError(CameraDevice camera, int error) {
-          synchronized (cameraLock) {
-            camera.close();
-            if (cameraDevice == camera) {
-              cameraDevice = null;
-            }
-          }
-        }
-      }, cameraHandler);
-
-      Log.i(TAG, "Camera opening, size: " + cameraWidth + "x" + cameraHeight);
-
-    } catch (Exception e) {
-      Log.w(TAG, "Could not open camera: " + e.getMessage());
-    }
-  }
-
-  private class Renderer implements GLSurfaceView.Renderer {
-    @Override
-    public void onSurfaceCreated(GL10 gl10, EGLConfig eglConfig) {
-      nativeOnSurfaceCreated(nativeApp);
-
-      // Start video receiver on default port 9003
-      if (!videoReceiverStarted) {
-        nativeStartVideoReceiver(nativeApp, VIDEO_PORT);
-        videoReceiverStarted = true;
-        Log.i(TAG, "Video receiver started on port " + VIDEO_PORT);
-      }
-
-      // Always create texture first (starts black), camera is optional
-      if (checkCameraPermission() && !cameraTexturePassed) {
-        int textureId = nativeCreateCameraTexture(nativeApp);
-        ensureCameraTexture(textureId);
-        openCamera();
-      }
-    }
-
-    @Override
-    public void onSurfaceChanged(GL10 gl10, int width, int height) {
-      nativeSetScreenParams(nativeApp, width, height);
-    }
-
-    @Override
-    public void onDrawFrame(GL10 gl10) {
-      // Update camera texture safely - must be called on GL thread
-      try {
-        if (cameraSurfaceTexture != null) {
-          cameraSurfaceTexture.updateTexImage();
-        }
-      } catch (Exception e) {
-        // Texture not ready or invalidated - skip frame, don't crash
-      }
-
-      // Update video texture every frame
-      if (videoReceiverStarted) {
-        nativeUpdateVideoTexture(nativeApp);
-      }
-
-      nativeOnDrawFrame(nativeApp);
-    }
-  }
-
   /** Callback for when close button is pressed. */
   public void closeSample(View view) {
     Log.d(TAG, "Leaving VR sample");
@@ -485,36 +199,7 @@ public class VrActivity extends AppCompatActivity implements PopupMenu.OnMenuIte
 
   /** Callback for when settings_menu button is pressed. */
   public void showSettings(View view) {
-    PopupMenu popup = new PopupMenu(this, view);
-    MenuInflater inflater = popup.getMenuInflater();
-    inflater.inflate(R.menu.settings_menu, popup.getMenu());
-    popup.setOnMenuItemClickListener(this);
-    popup.show();
-  }
-
-  @Override
-  public boolean onMenuItemClick(MenuItem item) {
-    if (item.getItemId() == R.id.switch_viewer) {
-      nativeSwitchViewer(nativeApp);
-      return true;
-    }
-    return false;
-  }
-
-  /**
-   * Checks for READ_EXTERNAL_STORAGE permission.
-   *
-   * @return whether the READ_EXTERNAL_STORAGE is already granted.
-   */
-  private boolean isReadExternalStorageEnabled() {
-    return ActivityCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE)
-        == PackageManager.PERMISSION_GRANTED;
-  }
-
-  /** Handles the requests for activity permission to READ_EXTERNAL_STORAGE. */
-  private void requestPermissions() {
-    final String[] permissions = new String[] {Manifest.permission.READ_EXTERNAL_STORAGE};
-    ActivityCompat.requestPermissions(this, permissions, PERMISSIONS_REQUEST_CODE);
+    new SettingsMenuController(view, this).show();
   }
 
   /**
@@ -527,21 +212,21 @@ public class VrActivity extends AppCompatActivity implements PopupMenu.OnMenuIte
   public void onRequestPermissionsResult(
       int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
     super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-    if (requestCode == PERMISSIONS_REQUEST_CODE) {
-      if (!isReadExternalStorageEnabled()) {
+    if (requestCode == AppConstants.PERMISSIONS_REQUEST_CODE) {
+      if (!permissionManager.isReadExternalStorageGranted()) {
         Toast.makeText(this, R.string.read_storage_permission, Toast.LENGTH_LONG).show();
-        if (!ActivityCompat.shouldShowRequestPermissionRationale(
-            this, Manifest.permission.READ_EXTERNAL_STORAGE)) {
+        if (!permissionManager.shouldShowStorageRationale()) {
           launchPermissionsSettings();
         }
         finish();
       }
-    } else if (requestCode == CAMERA_PERMISSIONS_REQUEST_CODE) {
-      if (checkCameraPermission()) {
+    } else if (requestCode == AppConstants.CAMERA_PERMISSIONS_REQUEST_CODE) {
+      if (permissionManager.isCameraGranted()) {
         // Camera will be initialized in onSurfaceCreated when GL context is ready
         Log.i(TAG, "Camera permission granted, will initialize on GL thread");
       } else {
-        Toast.makeText(this, "Camera permission is required for passthrough", Toast.LENGTH_LONG).show();
+        Toast.makeText(this, "Camera permission is required for passthrough", Toast.LENGTH_LONG)
+            .show();
       }
     }
   }
@@ -549,7 +234,7 @@ public class VrActivity extends AppCompatActivity implements PopupMenu.OnMenuIte
   private void launchPermissionsSettings() {
     Intent intent = new Intent();
     intent.setAction(Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
-    intent.setData(Uri.fromParts("package", getPackageName(), null));
+    intent.setData(android.net.Uri.fromParts("package", getPackageName(), null));
     startActivity(intent);
   }
 
@@ -564,6 +249,11 @@ public class VrActivity extends AppCompatActivity implements PopupMenu.OnMenuIte
                 | View.SYSTEM_UI_FLAG_FULLSCREEN
                 | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
   }
+
+  // ---------------------------------------------------------------------------
+  // Native glue (JNI). Method names are bound to Java_com_google_cardboard_VrActivity_*
+  // in the C++ layer, so these declarations must remain in this class.
+  // ---------------------------------------------------------------------------
 
   private native long nativeOnCreate(AssetManager assetManager);
 
@@ -583,7 +273,8 @@ public class VrActivity extends AppCompatActivity implements PopupMenu.OnMenuIte
 
   private native void nativeSwitchViewer(long nativeApp);
 
-  private native void nativeOnCameraTextureInitialized(long nativeApp, int textureId, int width, int height);
+  private native void nativeOnCameraTextureInitialized(
+      long nativeApp, int textureId, int width, int height);
 
   private native int nativeCreateCameraTexture(long nativeApp);
 
@@ -599,72 +290,82 @@ public class VrActivity extends AppCompatActivity implements PopupMenu.OnMenuIte
 
   private native boolean nativeHasVideoFrame(long nativeApp);
 
-  private boolean videoReceiverStarted = false;
+  // ---------------------------------------------------------------------------
+  // NativeBridge implementation
+  // ---------------------------------------------------------------------------
 
-  public void updateCameraTexture() {
-    try {
-      if (cameraSurfaceTexture != null) {
-        cameraSurfaceTexture.updateTexImage();
-      }
-    } catch (Exception e) {
-      // skip
-    }
+  @Override
+  public void onSurfaceCreated() {
+    nativeOnSurfaceCreated(nativeApp);
   }
 
-  private void startDiscovery() {
-    if (discoveryThread != null && discoveryThread.isAlive()) {
-      return;
-    }
-    discoveryRunning = true;
-    discoveryThread = new Thread(() -> {
-      try {
-        DatagramSocket socket = new DatagramSocket();
-        socket.setBroadcast(true);
-        socket.setSoTimeout(1000);
-
-        byte[] sendData = "CARDBOARD_DISCOVERY".getBytes();
-        byte[] recvBuffer = new byte[64];
-
-        while (discoveryRunning) {
-          DatagramPacket sendPacket = new DatagramPacket(
-              sendData, sendData.length, InetAddress.getByName("255.255.255.255"), UDP_DISCOVERY_PORT);
-          socket.send(sendPacket);
-          Log.d(TAG, "Discovery broadcast sent");
-
-          try {
-            DatagramPacket recvPacket = new DatagramPacket(recvBuffer, recvBuffer.length);
-            socket.receive(recvPacket);
-            String response = new String(recvPacket.getData(), 0, recvPacket.getLength());
-            Log.d(TAG, "Discovery response: " + response + " from " + recvPacket.getAddress());
-            if ("ACK".equals(response)) {
-              discoveryRunning = false;
-              Log.i(TAG, "Discovery successful, driver connected");
-              break;
-            }
-          } catch (Exception e) {
-          }
-
-          if (discoveryRunning) {
-            Thread.sleep(DISCOVERY_INTERVAL_MS);
-          }
-        }
-
-        socket.close();
-      } catch (Exception e) {
-        Log.e(TAG, "Discovery error: " + e.getMessage());
-      }
-    });
-    discoveryThread.start();
+  @Override
+  public void onDrawFrame() {
+    nativeOnDrawFrame(nativeApp);
   }
 
-  private void stopDiscovery() {
-    discoveryRunning = false;
-    if (discoveryThread != null) {
-      try {
-        discoveryThread.join(2000);
-      } catch (InterruptedException e) {
-      }
-      discoveryThread = null;
-    }
+  @Override
+  public void onTriggerEvent() {
+    nativeOnTriggerEvent(nativeApp);
+  }
+
+  @Override
+  public void onNativePause() {
+    nativeOnPause(nativeApp);
+  }
+
+  @Override
+  public void onNativeResume() {
+    nativeOnResume(nativeApp);
+  }
+
+  @Override
+  public void setScreenParams(int width, int height) {
+    nativeSetScreenParams(nativeApp, width, height);
+  }
+
+  @Override
+  public void switchViewer() {
+    nativeSwitchViewer(nativeApp);
+  }
+
+  @Override
+  public void onCameraTextureInitialized(int textureId, int width, int height) {
+    nativeOnCameraTextureInitialized(nativeApp, textureId, width, height);
+  }
+
+  @Override
+  public int createCameraTexture() {
+    return nativeCreateCameraTexture(nativeApp);
+  }
+
+  @Override
+  public void resetCameraTexture() {
+    nativeResetCameraTexture(nativeApp);
+  }
+
+  @Override
+  public void setEyeTexture(int eye, int textureId) {
+    nativeSetEyeTexture(nativeApp, eye, textureId);
+  }
+
+  @Override
+  public void startVideoReceiver(int port) {
+    nativeStartVideoReceiver(nativeApp, port);
+  }
+
+  @Override
+  public void stopVideoReceiver() {
+    nativeStopVideoReceiver(nativeApp);
+  }
+
+  @Override
+  public void updateVideoTexture() {
+    nativeUpdateVideoTexture(nativeApp);
+  }
+
+  @Override
+  public boolean hasVideoFrame() {
+    return nativeHasVideoFrame(nativeApp);
   }
 }

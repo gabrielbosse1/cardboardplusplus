@@ -20,7 +20,9 @@
 #include <android/asset_manager.h>
 #include <jni.h>
 
+#include <chrono>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -106,6 +108,15 @@ class CardboardPlusPlusApp {
   void StopVideoReceiver();
   bool HasVideoFrame();
   void UpdateVideoTexture();
+
+  /**
+   * Runs the FFmpeg decode loop off the GL render thread. Pulls H.264 packets
+   * from the receiver, decodes them and publishes the newest RGBA frame into a
+   * double-buffered slot consumed by UpdateVideoTexture. This keeps the
+   * (expensive) software decode and YUV->RGBA conversion off the render
+   * critical path so the GL thread only does the small texture upload.
+   */
+  void DecodeLoop();
 
  private:
   /**
@@ -208,6 +219,25 @@ class CardboardPlusPlusApp {
   bool video_receiver_started_;
   int video_width_;
   int video_height_;
+
+  // Decode thread + latest-frame handoff (decouples decode from the GL thread).
+  std::thread decode_thread_;
+  bool decode_thread_running_ = false;
+  std::mutex video_frame_mutex_;
+  // Two RGBA buffers the decode thread alternates between. The GL thread uploads
+  // the published one directly (no extra copy), so the decode thread only
+  // reuses a slot once the GL thread has released it (see held_slot_).
+  std::shared_ptr<std::vector<uint8_t>> video_buf_a_;
+  std::shared_ptr<std::vector<uint8_t>> video_buf_b_;
+  std::shared_ptr<std::vector<uint8_t>> video_latest_;
+  int video_latest_slot_ = -1;  // 0 = buf_a, 1 = buf_b, -1 = none
+  int held_slot_ = -1;          // slot the GL thread is currently uploading from
+  int video_latest_w_ = 0;
+  int video_latest_h_ = 0;
+  bool video_latest_ready_ = false;
+  // Currently allocated GPU texture size (for glTexSubImage2D vs realloc).
+  int video_tex_w_ = 0;
+  int video_tex_h_ = 0;
 };
 
 }  // namespace ndk_cardboardplusplus

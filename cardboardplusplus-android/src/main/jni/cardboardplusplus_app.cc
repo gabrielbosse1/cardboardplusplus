@@ -118,6 +118,14 @@ CardboardPlusPlusApp::CardboardPlusPlusApp(JavaVM* vm, jobject obj,
 }
 
 CardboardPlusPlusApp::~CardboardPlusPlusApp() {
+  decode_thread_running_ = false;
+  if (decode_thread_.joinable()) {
+    decode_thread_.join();
+  }
+  if (video_texture_ != 0) {
+    glDeleteTextures(1, &video_texture_);
+    video_texture_ = 0;
+  }
   CardboardHeadTracker_destroy(head_tracker_);
   CardboardLensDistortion_destroy(lens_distortion_);
   CardboardDistortionRenderer_destroy(distortion_renderer_);
@@ -162,6 +170,27 @@ void CardboardPlusPlusApp::OnSurfaceCreated(JNIEnv* env) {
 
   CARDBOARDPLUSPLUS_CHECK(quad_.Initialize(tex_position_param_, tex_tex_coord_param_,
                                         "Quad.obj", asset_mgr_));
+
+  // (Re)create the video texture here. The GL context is destroyed and recreated
+  // on every pause/resume, which invalidates previously allocated texture ids,
+  // so this must run on each surface (re)creation rather than only once in
+  // StartVideoReceiver. This is what kept the SBS frame frozen after an onResume.
+  if (video_texture_ != 0) {
+    glDeleteTextures(1, &video_texture_);
+    video_texture_ = 0;
+  }
+  glGenTextures(1, &video_texture_);
+  glBindTexture(GL_TEXTURE_2D, video_texture_);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  if (video_width_ > 0 && video_height_ > 0) {
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, video_width_, video_height_, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    video_tex_w_ = video_width_;
+    video_tex_h_ = video_height_;
+  }
 
   CHECKGLERROR("OnSurfaceCreated");
 }
@@ -513,18 +542,14 @@ void CardboardPlusPlusApp::StartVideoReceiver(int port) {
   video_receiver_->Start(port);
   video_receiver_started_ = true;
 
-  glGenTextures(1, &video_texture_);
-  glBindTexture(GL_TEXTURE_2D, video_texture_);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-  if (video_width_ > 0 && video_height_ > 0) {
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, video_width_, video_height_,
-                 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-  }
-
+  // The video texture itself is (re)created in OnSurfaceCreated because the GL
+  // context is recreated on every pause/resume, which invalidates it.
   h264_decoder_->Initialize(video_width_, video_height_);
+
+  // Run H.264 decode + YUV->RGBA on a dedicated thread so the GL render thread
+  // is never blocked by the (expensive) software decoder.
+  decode_thread_running_ = true;
+  decode_thread_ = std::thread(&CardboardPlusPlusApp::DecodeLoop, this);
 
   LOGD("Video receiver started, texture=%d", video_texture_);
 }
@@ -536,12 +561,27 @@ void CardboardPlusPlusApp::StopVideoReceiver() {
 
   LOGD("Stopping video receiver");
 
+  decode_thread_running_ = false;
+  if (decode_thread_.joinable()) {
+    decode_thread_.join();
+  }
+
   video_receiver_->Stop();
   h264_decoder_->Shutdown();
 
   if (video_texture_) {
     glDeleteTextures(1, &video_texture_);
     video_texture_ = 0;
+    video_tex_w_ = 0;
+    video_tex_h_ = 0;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(video_frame_mutex_);
+    video_latest_.reset();
+    video_buf_a_.reset();
+    video_buf_b_.reset();
+    video_latest_ready_ = false;
   }
 
   video_receiver_started_ = false;
@@ -556,24 +596,75 @@ bool CardboardPlusPlusApp::HasVideoFrame() {
 void CardboardPlusPlusApp::UpdateVideoTexture() {
   if (!video_receiver_started_ || !video_texture_) return;
 
-  uint8_t* frame_data = nullptr;
-  int frame_size = 0;
+  // The heavy H.264 decode + YUV->RGBA conversion now runs on the dedicated
+  // decode thread (see DecodeLoop). Here on the GL thread we only grab the
+  // newest decoded frame and upload it. glTexSubImage2D reuses the texture
+  // storage allocated in OnSurfaceCreated instead of reallocating ~18 MB every
+  // frame (the old glTexImage2D path stalled the GPU pipeline each tick).
+  std::shared_ptr<std::vector<uint8_t>> frame;
+  int w = 0;
+  int h = 0;
+  int slot = -1;
+  {
+    std::lock_guard<std::mutex> lock(video_frame_mutex_);
+    if (!video_latest_ready_) {
+      return;  // No new decoded frame; keep showing the last one.
+    }
+    frame = video_latest_;
+    w = video_latest_w_;
+    h = video_latest_h_;
+    slot = video_latest_slot_;
+    video_latest_ready_ = false;
+    // Claim this slot so the decode thread won't overwrite it mid-upload.
+    held_slot_ = slot;
+  }
 
-  // Decode and drain every frame the receiver queued since the last tick.
-  // Previously only a single frame was pulled per tick, so the fast receive
-  // thread's extra frames were dropped - and a dropped P-frame decodes
-  // against the wrong reference, corrupting the image.
-  bool got_rgba = false;
-  int rgba_width = 0;
-  int rgba_height = 0;
-  uint8_t* rgba_data = nullptr;
+  if (!frame || frame->empty() || w <= 0 || h <= 0) {
+    std::lock_guard<std::mutex> lock(video_frame_mutex_);
+    held_slot_ = -1;
+    return;
+  }
 
-  while (video_receiver_->GetFrame(&frame_data, &frame_size)) {
-    LOGD("Got frame, size=%d", frame_size);
+  // Reallocate GPU texture storage only when the stream resolution changes.
+  if (w != video_tex_w_ || h != video_tex_h_) {
+    LOGD("Video texture size changed: %dx%d -> %dx%d, reallocating",
+         video_tex_w_, video_tex_h_, w, h);
+    glBindTexture(GL_TEXTURE_2D, video_texture_);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, nullptr);
+    video_tex_w_ = w;
+    video_tex_h_ = h;
+  }
+
+  // Upload directly from the published buffer (no intermediate copy).
+  glBindTexture(GL_TEXTURE_2D, video_texture_);
+  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE,
+                  frame->data());
+
+  SetEyeTexture(0, video_texture_);
+  SetEyeTexture(1, video_texture_);
+
+  // Release the slot so the decode thread can reuse it.
+  {
+    std::lock_guard<std::mutex> lock(video_frame_mutex_);
+    held_slot_ = -1;
+  }
+}
+
+void CardboardPlusPlusApp::DecodeLoop() {
+  LOGD("Decode loop started");
+  while (decode_thread_running_) {
+    uint8_t* frame_data = nullptr;
+    int frame_size = 0;
+    if (!video_receiver_->GetFrame(&frame_data, &frame_size)) {
+      // No packet queued yet; yield briefly instead of busy-spinning.
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      continue;
+    }
+
     if (!h264_decoder_->DecodePacket(frame_data, frame_size)) {
       continue;
     }
-    LOGD("Decoded packet, has_frame=%d", h264_decoder_->HasDecodedFrame());
     if (!h264_decoder_->HasDecodedFrame()) {
       continue;
     }
@@ -581,44 +672,52 @@ void CardboardPlusPlusApp::UpdateVideoTexture() {
     int width = 0;
     int height = 0;
     int rgba_size = 0;
-    if (h264_decoder_->GetRGBAFrame(&rgba_data, &rgba_size, &width, &height)) {
-      got_rgba = true;
-      rgba_width = width;
-      rgba_height = height;
-    } else {
-      LOGE("GetRGBAFrame failed!");
+    uint8_t* rgba_data = nullptr;
+    if (!h264_decoder_->GetRGBAFrame(&rgba_data, &rgba_size, &width, &height)) {
+      continue;
+    }
+
+    // Handle a stream resolution change by reinitializing the decoder.
+    if (width != video_width_ || height != video_height_) {
+      LOGD("Frame dimensions changed: %dx%d -> %dx%d, reinitializing decoder",
+           video_width_, video_height_, width, height);
+      h264_decoder_->Shutdown();
+      if (!h264_decoder_->Initialize(width, height)) {
+        LOGE("Failed to reinitialize decoder with new dimensions");
+        continue;
+      }
+      video_width_ = width;
+      video_height_ = height;
+    }
+
+    // Write into whichever slot the GL thread is NOT currently holding as latest,
+    // then publish it. The GL thread uploads the published buffer directly, so we
+    // must not reuse that slot until the GL thread releases it (held_slot_).
+    const int other_idx = (video_latest_slot_ == 0) ? 1 : 0;
+    std::shared_ptr<std::vector<uint8_t>>& other =
+        (other_idx == 0) ? video_buf_a_ : video_buf_b_;
+    const size_t need = static_cast<size_t>(width) * height * 4;
+    if (!other || other->size() != need) {
+      other = std::make_shared<std::vector<uint8_t>>(need);
+    }
+    memcpy(other->data(), rgba_data, need);
+
+    {
+      std::unique_lock<std::mutex> lock(video_frame_mutex_);
+      // Wait until the GL thread has finished uploading from this slot.
+      while (held_slot_ == other_idx) {
+        lock.unlock();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        lock.lock();
+      }
+      video_latest_ = other;
+      video_latest_slot_ = other_idx;
+      video_latest_w_ = width;
+      video_latest_h_ = height;
+      video_latest_ready_ = true;
     }
   }
-
-  if (!got_rgba || !rgba_data || rgba_width <= 0 || rgba_height <= 0) {
-    return;
-  }
-
-  if (rgba_width != video_width_ || rgba_height != video_height_) {
-    LOGD("Frame dimensions changed: %dx%d -> %dx%d, reinitializing decoder",
-         video_width_, video_height_, rgba_width, rgba_height);
-    h264_decoder_->Shutdown();
-    if (!h264_decoder_->Initialize(rgba_width, rgba_height)) {
-      LOGE("Failed to reinitialize decoder with new dimensions");
-      return;
-    }
-    video_width_ = rgba_width;
-    video_height_ = rgba_height;
-    glBindTexture(GL_TEXTURE_2D, video_texture_);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, video_width_, video_height_,
-                 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-    // The RGBA buffer was freed by Shutdown(); skip upload this frame.
-    return;
-  }
-
-  LOGD("Uploading RGBA to GL: tex=%d, size=%dx%d", video_texture_, rgba_width, rgba_height);
-  glBindTexture(GL_TEXTURE_2D, video_texture_);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, rgba_width, rgba_height,
-               0, GL_RGBA, GL_UNSIGNED_BYTE, rgba_data);
-  LOGD("glTexImage2D done");
-
-  SetEyeTexture(0, video_texture_);
-  SetEyeTexture(1, video_texture_);
+  LOGD("Decode loop ended");
 }
 
 }  // namespace ndk_cardboardplusplus

@@ -1,0 +1,14 @@
+package com.google.cardboard.util;
+
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+
+/** Networking static helpers. */
+public final class NetworkUtils {
+  private NetworkUtils() {}
+
+  /** Broadcast address used for PC discovery. */
+  public static InetAddress getBroadcastAddress() throws UnknownHostException {
+    return InetAddress.getByName("255.255.255.255");
+  }
+}
