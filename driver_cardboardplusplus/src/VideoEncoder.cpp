@@ -149,7 +149,19 @@ VideoEncoder::VideoEncoder()
     , m_pLeftStaging(nullptr)
     , m_pRightStaging(nullptr)
     , m_pSingleStaging(nullptr)
+    , m_encSumUs(0)
+    , m_encMaxUs(0)
+    , m_encCount(0)
+    , m_lastCallUs(0)
+    , m_intervalSumUs(0)
+    , m_intervalMaxUs(0)
+    , m_intervalCount(0)
+    , m_lastFrameHash(0)
+    , m_dupCount(0)
+    , m_summaryFrames(0)
+    , m_summaryInterval(120)
 {
+    QueryPerformanceFrequency(&m_perfFreq);
 }
 
 VideoEncoder::~VideoEncoder()
@@ -847,10 +859,26 @@ bool VideoEncoder::EncodeFrameSBS(ID3D11Texture2D* pLeft, ID3D11Texture2D* pRigh
         return false;
     }
 
+    LARGE_INTEGER t0, t1;
+    QueryPerformanceCounter(&t0);
+    if (m_lastCallUs != 0) {
+        int64_t intervalUs = ((t0.QuadPart - m_lastCallUs) * 1000000) / m_perfFreq.QuadPart;
+        m_intervalSumUs += intervalUs;
+        if (intervalUs > m_intervalMaxUs) m_intervalMaxUs = intervalUs;
+        m_intervalCount++;
+    }
+    m_lastCallUs = t0.QuadPart;
+
     if (!ComposeSBS(pLeft, pRight)) {
         ENCODER_ERROR("Failed to compose SBS frame!");
         return false;
     }
+
+    // Detect duplicate/stale capture (image-in-image symptom: same readback twice)
+    uint32_t hash = ComputeFrameHash();
+    if (m_lastFrameHash != 0 && hash == m_lastFrameHash) m_dupCount++;
+    m_lastFrameHash = hash;
+    m_summaryFrames++;
 
     m_pFrame->pts = pts;
     m_hasValidFrame = true;
@@ -863,6 +891,20 @@ bool VideoEncoder::EncodeFrameSBS(ID3D11Texture2D* pLeft, ID3D11Texture2D* pRigh
     if (!ReceiveEncodedPackets()) {
         ENCODER_ERROR("Failed to receive SBS encoded packets!");
         return false;
+    }
+
+    QueryPerformanceCounter(&t1);
+    int64_t elapsedUs = ((t1.QuadPart - t0.QuadPart) * 1000000) / m_perfFreq.QuadPart;
+    m_encSumUs += elapsedUs;
+    if (elapsedUs > m_encMaxUs) m_encMaxUs = elapsedUs;
+    m_encCount++;
+
+    if (elapsedUs > 40000) {
+        ENCODER_LOG("[TELEMETRY] SLOW frame: %lldus encode (exceeds frame budget -> eye texture may be overwritten mid-readback)", (long long)elapsedUs);
+    }
+
+    if (m_encCount > 0 && (m_encCount % m_summaryInterval == 0)) {
+        LogTelemetrySummary();
     }
 
     return true;
@@ -964,4 +1006,32 @@ void VideoEncoder::LogFFmpegVersion()
                 AV_VERSION_MAJOR(swscale_version()),
                 AV_VERSION_MINOR(swscale_version()),
                 AV_VERSION_MICRO(swscale_version()));
+}
+
+uint32_t VideoEncoder::ComputeFrameHash()
+{
+    if (!m_pSoftwareFrameBuffer) return 0;
+    const uint8_t* p = m_pSoftwareFrameBuffer;
+    int total = m_width * m_height * 3 / 2; // valid NV12 region only
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < total; i += 1024) {
+        h ^= p[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+void VideoEncoder::LogTelemetrySummary()
+{
+    int64_t frames = m_encCount > 0 ? m_encCount : 1;
+    int64_t avgEnc = m_encSumUs / frames;
+    int64_t avgInt = m_intervalCount > 0 ? m_intervalSumUs / m_intervalCount : 0;
+    double dupRate = m_summaryFrames > 0 ? (100.0 * m_dupCount / m_summaryFrames) : 0.0;
+    ENCODER_LOG("[TELEMETRY] frames=%lld avgEncode=%lldus maxEncode=%lldus avgInterval=%lldus maxInterval=%lldus dups=%d dupRate=%.1f%%",
+                (long long)m_encCount, (long long)avgEnc, (long long)m_encMaxUs,
+                (long long)avgInt, (long long)m_intervalMaxUs,
+                m_dupCount, dupRate);
+    m_encSumUs = 0; m_encMaxUs = 0; m_encCount = 0;
+    m_intervalSumUs = 0; m_intervalMaxUs = 0; m_intervalCount = 0;
+    m_dupCount = 0; m_summaryFrames = 0;
 }

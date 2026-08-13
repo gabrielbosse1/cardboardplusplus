@@ -91,4 +91,21 @@ private:
     ID3D11Texture2D* m_pLeftStaging;
     ID3D11Texture2D* m_pRightStaging;
     ID3D11Texture2D* m_pSingleStaging;
+
+    // Telemetry for diagnosing capture/encode stalls (image-in-image artifact)
+    LARGE_INTEGER m_perfFreq;
+    int64_t m_encSumUs;
+    int64_t m_encMaxUs;
+    int64_t m_encCount;
+    int64_t m_lastCallUs;
+    int64_t m_intervalSumUs;
+    int64_t m_intervalMaxUs;
+    int64_t m_intervalCount;
+    uint32_t m_lastFrameHash;
+    int m_dupCount;
+    int64_t m_summaryFrames;
+    int m_summaryInterval;
+
+    uint32_t ComputeFrameHash();
+    void LogTelemetrySummary();
 };
