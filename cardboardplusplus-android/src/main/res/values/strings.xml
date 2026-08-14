@@ -22,4 +22,20 @@
             description="Short text shown on the settings menu to let the user switch viewer.
                          [CHAR_LIMIT=30]">
             Switch Cardboard viewer</string>
+    <string name="set_pc_ip"
+            description="Short text shown on the settings menu to let the user enter the PC driver IP.
+                         [CHAR_LIMIT=30]">
+            PC IP address</string>
+    <string name="pc_ip_dialog_title"
+            description="Title of the dialog used to set the PC driver IP. [CHAR_LIMIT=30]">
+            Enter PC IP address</string>
+    <string name="pc_ip_hint"
+            description="Hint shown inside the PC IP input field. [CHAR_LIMIT=30]">
+            100.117.27.126</string>
+    <string name="pc_ip_ok"
+            description="Text of the confirm button in the PC IP dialog. [CHAR_LIMIT=20]">
+            Save</string>
+    <string name="pc_ip_cancel"
+            description="Text of the cancel button in the PC IP dialog. [CHAR_LIMIT=20]">
+            Cancel</string>
 </resources>

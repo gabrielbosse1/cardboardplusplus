@@ -84,8 +84,11 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
     cameraStreamer = new CameraStreamer(appSettings);
     permissionManager = new PermissionManager(this);
     cameraController = new CameraController(this, this);
-    videoManager = new VideoManager(this);
-    discoveryManager = new DiscoveryManager();
+    videoManager = new VideoManager(this, appSettings);
+    discoveryManager = new DiscoveryManager(appSettings);
+    // If the video stream stalls (e.g. SteamVR restarted behind the running phone),
+    // re-broadcast discovery so the PC driver re-routes video to this phone.
+    videoManager.setReconnectAction(() -> discoveryManager.startDiscovery());
 
     setContentView(R.layout.activity_vr);
     glView = findViewById(R.id.surface_view);
@@ -202,7 +205,7 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
 
   /** Callback for when settings_menu button is pressed. */
   public void showSettings(View view) {
-    new SettingsMenuController(view, this).show();
+    new SettingsMenuController(view, this, appSettings).show();
   }
 
   /**

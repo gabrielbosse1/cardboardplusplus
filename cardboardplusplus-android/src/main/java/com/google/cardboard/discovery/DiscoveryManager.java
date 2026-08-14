@@ -2,6 +2,7 @@ package com.google.cardboard.discovery;
 
 import android.util.Log;
 import com.google.cardboard.core.AppConstants;
+import com.google.cardboard.settings.AppSettings;
 import com.google.cardboard.util.NetworkUtils;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
@@ -12,8 +13,14 @@ public class DiscoveryManager {
   private static final String DISCOVERY_MESSAGE = "CARDBOARD_DISCOVERY";
   private static final String ACK = "ACK";
 
+  private final AppSettings appSettings;
+
   private volatile boolean discoveryRunning = false;
   private Thread discoveryThread = null;
+
+  public DiscoveryManager(AppSettings appSettings) {
+    this.appSettings = appSettings;
+  }
 
   public void startDiscovery() {
     if (discoveryThread != null && discoveryThread.isAlive()) {
@@ -36,10 +43,10 @@ public class DiscoveryManager {
                       new DatagramPacket(
                           sendData,
                           sendData.length,
-                          NetworkUtils.getBroadcastAddress(),
+                          NetworkUtils.getPcOrBroadcastAddress(appSettings.getPcIp()),
                           AppConstants.UDP_DISCOVERY_PORT);
                   socket.send(sendPacket);
-                  Log.d(TAG, "Discovery broadcast sent");
+                  Log.d(TAG, "Discovery sent to " + sendPacket.getAddress().getHostAddress());
 
                   try {
                     DatagramPacket recvPacket =

@@ -11,4 +11,12 @@ public final class NetworkUtils {
   public static InetAddress getBroadcastAddress() throws UnknownHostException {
     return InetAddress.getByName("255.255.255.255");
   }
+
+  /** Return the configured PC IP if non-empty, otherwise fall back to broadcast. */
+  public static InetAddress getPcOrBroadcastAddress(String pcIp) throws UnknownHostException {
+    if (pcIp != null && !pcIp.trim().isEmpty()) {
+      return InetAddress.getByName(pcIp.trim());
+    }
+    return getBroadcastAddress();
+  }
 }

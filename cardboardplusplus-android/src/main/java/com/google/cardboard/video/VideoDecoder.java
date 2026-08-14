@@ -5,6 +5,7 @@ import android.media.MediaFormat;
 import android.graphics.SurfaceTexture;
 import android.os.Build;
 import android.os.Build.VERSION_CODES;
+import android.os.SystemClock;
 import android.util.Log;
 import android.view.Surface;
 import com.google.cardboard.NativeBridge;
@@ -34,6 +35,7 @@ public class VideoDecoder {
   // thread before sampling the texture. Avoids calling updateTexImage() before
   // the codec has produced a frame (which races with the codec's surface connect).
   private volatile boolean frameAvailable = false;
+  private volatile long lastFrameAtMs = 0;
   private boolean frameRendered = false;
   private int updateCount = 0;
   private int decodedFrames = 0;
@@ -108,12 +110,18 @@ public class VideoDecoder {
     }
   }
 
+  /** Time (elapsedRealtime ms) of the last received frame; 0 if none yet. */
+  public long getLastFrameAtMs() {
+    return lastFrameAtMs;
+  }
+
   /**
    * Feed one H.264 access unit (annexb, start-code prefixed). The decoder is configured lazily once
    * SPS and PPS have been observed in the stream.
    */
   public synchronized void feedFrame(byte[] data, boolean isKey) {
     if (data == null || data.length == 0) return;
+    lastFrameAtMs = SystemClock.elapsedRealtime();
 
     // Refresh SPS/PPS whenever present so a resolution change from the PC
     // (e.g. the encoder re-inits after applying the phone's hardware cap) is

@@ -3,9 +3,12 @@ package com.google.cardboard.video;
 import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
 import android.media.MediaCodecList;
+import android.os.SystemClock;
 import android.util.Log;
 import com.google.cardboard.NativeBridge;
 import com.google.cardboard.core.AppConstants;
+import com.google.cardboard.settings.AppSettings;
+import com.google.cardboard.util.NetworkUtils;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
@@ -19,11 +22,28 @@ public class VideoManager {
   private static final String TAG = VideoManager.class.getSimpleName();
 
   private final NativeBridge bridge;
+  private final AppSettings appSettings;
   private VideoDecoder decoder;
   private boolean surfaceCreated = false;
 
-  public VideoManager(NativeBridge bridge) {
+  // Re-broadcast CARDBOARD_DISCOVERY to re-point the PC's video target if the
+  // stream stalls (e.g. SteamVR restarted while the phone is still running).
+  // The PC only forwards video after it hears a discovery packet, so a double
+  // failure (PC restart + reappearing target reset to 127.0.0.1) leaves the
+  // phone with no stream and no way to reconnect until the app restarts.
+  private Runnable reconnectAction;
+  private final Object watchdogLock = new Object();
+  private Thread watchdogThread = null;
+  private boolean watchdogRunning = false;
+
+  public VideoManager(NativeBridge bridge, AppSettings appSettings) {
     this.bridge = bridge;
+    this.appSettings = appSettings;
+  }
+
+  /** Called by the activity when the user re-runs discovery (e.g. after a PC restart). */
+  public void setReconnectAction(Runnable reconnectAction) {
+    this.reconnectAction = reconnectAction;
   }
 
   /** Create the OES texture and MediaCodec decoder. Must run on the GL thread. */
@@ -49,6 +69,71 @@ public class VideoManager {
     int[] cap = queryDecoderCap();
     Log.i(TAG, "Hardware decoder cap: " + cap[0] + "x" + cap[1]);
     sendCapToPc(cap[0], cap[1]);
+    startWatchdog();
+  }
+
+  /**
+   * Re-broadcast discovery whenever no video frame has arrived for a while. The PC only streams to
+   * the phone after receiving a discovery packet, so if SteamVR restarted (or the app reconnected
+   * to a different PC IP), the phone would otherwise sit with a dead channel until the app restarts.
+   */
+  private void startWatchdog() {
+    synchronized (watchdogLock) {
+      if (watchdogRunning || watchdogThread != null) {
+        return;
+      }
+      watchdogRunning = true;
+      watchdogThread =
+          new Thread(
+              () -> {
+                final long STALL_MS = 3000;
+                final long POLL_MS = 500;
+                long lastAnnounceMs = 0;
+                long lastFrameSeenAt = 0;
+                boolean wasStalled = false;
+                while (watchdogRunning) {
+                  try {
+                    Thread.sleep(POLL_MS);
+                  } catch (InterruptedException e) {
+                    break;
+                  }
+                  VideoDecoder d = decoder;
+                  if (d == null) {
+                    continue;
+                  }
+                  long last = d.getLastFrameAtMs();
+                  if (last > lastFrameSeenAt) {
+                    lastFrameSeenAt = last;
+                  }
+                  boolean stalled = lastFrameSeenAt > 0
+                      && (SystemClock.elapsedRealtime() - lastFrameSeenAt) > STALL_MS;
+                  if (stalled) {
+                    // Re-broadcast at most every 5s while the channel is dead.
+                    long now = SystemClock.elapsedRealtime();
+                    if (!wasStalled || now - lastAnnounceMs > 5000) {
+                      Log.w(TAG, "No video frames for >" + STALL_MS + "ms; re-broadcast discovery");
+                      lastAnnounceMs = now;
+                      if (reconnectAction != null) {
+                        reconnectAction.run();
+                      }
+                    }
+                  }
+                  wasStalled = stalled;
+                }
+              });
+      watchdogThread.setDaemon(true);
+      watchdogThread.start();
+    }
+  }
+
+  private void stopWatchdog() {
+    synchronized (watchdogLock) {
+      watchdogRunning = false;
+      if (watchdogThread != null) {
+        watchdogThread.interrupt();
+        watchdogThread = null;
+      }
+    }
   }
 
   /**
@@ -79,13 +164,13 @@ public class VideoManager {
     return new int[] {maxW, maxH};
   }
 
-  /** Broadcast the decoder cap to the PC over the discovery UDP channel. */
+  /** Send the decoder cap to the PC over the discovery UDP channel (broadcast or direct IP). */
   private void sendCapToPc(int width, int height) {
     new Thread(
             () -> {
               try (DatagramSocket socket = new DatagramSocket()) {
                 socket.setBroadcast(true);
-                InetAddress addr = InetAddress.getByName("255.255.255.255");
+                InetAddress addr = NetworkUtils.getPcOrBroadcastAddress(appSettings.getPcIp());
                 String msg = "CARDBOARD_CAP " + width + " " + height;
                 byte[] data = msg.getBytes();
                 // Send a few times in case the PC isn't listening yet.
@@ -94,7 +179,7 @@ public class VideoManager {
                       new DatagramPacket(data, data.length, addr, AppConstants.UDP_DISCOVERY_PORT));
                   Thread.sleep(500);
                 }
-                Log.i(TAG, "Sent decoder cap to PC: " + msg);
+                Log.i(TAG, "Sent decoder cap to PC (" + addr.getHostAddress() + "): " + msg);
               } catch (Exception e) {
                 Log.w(TAG, "Failed to send decoder cap to PC", e);
               }
@@ -111,6 +196,7 @@ public class VideoManager {
 
   /** Tear down the decoder and stop the receiver. Call on pause. */
   public void onPause() {
+    stopWatchdog();
     if (decoder != null) {
       decoder.release();
       decoder = null;

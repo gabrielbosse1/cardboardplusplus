@@ -16,6 +16,7 @@ public class AppSettings {
   private static final String KEY_FRAME_RATE = "frame_rate";
   private static final String KEY_BITRATE_KBPS = "bitrate_kbps";
   private static final String KEY_CODEC = "codec";
+  private static final String KEY_PC_IP = "pc_ip";
 
   private final SharedPreferences prefs;
 
@@ -24,6 +25,7 @@ public class AppSettings {
   private int frameRate;
   private int bitrateKbps;
   private VideoCodec codec;
+  private String pcIp;
 
   public AppSettings(Context context) {
     this.prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
@@ -36,6 +38,7 @@ public class AppSettings {
     frameRate = prefs.getInt(KEY_FRAME_RATE, 60);
     bitrateKbps = prefs.getInt(KEY_BITRATE_KBPS, 20000);
     codec = VideoCodec.fromName(prefs.getString(KEY_CODEC, VideoCodec.H264.name()));
+    pcIp = prefs.getString(KEY_PC_IP, "");
   }
 
   public int getVideoWidth() {
@@ -56,6 +59,16 @@ public class AppSettings {
 
   public VideoCodec getCodec() {
     return codec;
+  }
+
+  /** PC driver IP for direct (non-broadcast) discovery. Empty = auto-discovery. */
+  public String getPcIp() {
+    return pcIp;
+  }
+
+  public void setPcIp(String ip) {
+    pcIp = (ip == null) ? "" : ip.trim();
+    prefs.edit().putString(KEY_PC_IP, pcIp).apply();
   }
 
   public void setVideoResolution(int width, int height) {
