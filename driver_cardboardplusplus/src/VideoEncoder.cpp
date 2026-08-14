@@ -8,8 +8,10 @@
 
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libavcodec/bsf.h>
 #include <libavformat/avformat.h>
 #include <libavutil/opt.h>
+#include <libavutil/mem.h>
 #include <libavutil/pixfmt.h>
 #include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
@@ -126,6 +128,7 @@ VideoEncoder::VideoEncoder()
     , m_pCodecContext(nullptr)
     , m_pFrame(nullptr)
     , m_pPacket(nullptr)
+    , m_pBsfCtx(nullptr)
     , m_pConvertContext(nullptr)
     , m_pStagingTexture(nullptr)
     , m_initialized(false)
@@ -284,6 +287,11 @@ bool VideoEncoder::InitializeFFmpeg()
         m_pCodecContext->rc_min_rate = m_bitrate;
         m_pCodecContext->rc_max_rate = m_bitrate;
         m_pCodecContext->rc_buffer_size = m_bitrate / 2;
+        // Force SPS/PPS into extradata (AVCC): hardware encoders (AMF/NVENC/
+        // QSV) otherwise emit length-prefixed NALs without any start codes,
+        // which the phone's decoder cannot parse. The h264_mp4toannexb BSF
+        // below restores a start-code (Annex B) stream for the wire.
+        m_pCodecContext->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
         bool isLibx264 = (strcmp(name, "libx264") == 0);
         bool isAmf     = (strcmp(name, "h264_amf") == 0);
@@ -291,14 +299,18 @@ bool VideoEncoder::InitializeFFmpeg()
         if (isAmf) {
             // AMF requires a D3D11 hardware-device context. Wrap the driver's
             // existing ID3D11Device so AMF encodes on the same GPU (no extra device).
+            // Note: av_hwdevice_ctx_alloc() returns a buffer whose data is an
+            // AVHWDeviceContext; the D3D11VA-specific context is at hwctx->hwctx.
             AVBufferRef* hwdev = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA);
             if (hwdev) {
-                AVD3D11VADeviceContext* d3d11va = (AVD3D11VADeviceContext*)hwdev->data;
+                AVD3D11VADeviceContext* d3d11va =
+                    (AVD3D11VADeviceContext*)((AVHWDeviceContext*)hwdev->data)->hwctx;
                 d3d11va->device = m_pDevice;
                 m_pDevice->AddRef();
                 if (av_hwdevice_ctx_init(hwdev) == 0) {
                     m_pHwDeviceCtx = hwdev;
                     m_pCodecContext->hw_device_ctx = av_buffer_ref(hwdev);
+                    ENCODER_LOG("Wrapped driver ID3D11Device for AMF");
                 } else {
                     ENCODER_ERROR("Failed to init D3D11VA hw device for AMF");
                     av_buffer_unref(&hwdev);
@@ -348,6 +360,36 @@ bool VideoEncoder::InitializeFFmpeg()
     if (!codec || !m_pCodecContext) {
         ENCODER_ERROR("No usable H264 encoder found!");
         return false;
+    }
+
+    // With AV_CODEC_FLAG_GLOBAL_HEADER the encoder emits length-prefixed
+    // (AVCC) packets + avcC extradata. Convert to Annex B (start codes) and
+    // re-insert SPS/PPS in-band so the phone's decoder can configure itself.
+    m_pBsfCtx = nullptr;
+    if (m_pCodecContext->extradata && m_pCodecContext->extradata_size > 0) {
+        const AVBitStreamFilter* bsf = av_bsf_get_by_name("h264_mp4toannexb");
+        if (bsf) {
+            int bret = av_bsf_alloc(bsf, &m_pBsfCtx);
+            if (bret >= 0) {
+                AVCodecParameters* par = m_pBsfCtx->par_in;
+                par->codec_id = AV_CODEC_ID_H264;
+                par->extradata = (uint8_t*)av_memdup(m_pCodecContext->extradata,
+                                                     m_pCodecContext->extradata_size);
+                par->extradata_size = m_pCodecContext->extradata_size;
+                bret = av_bsf_init(m_pBsfCtx);
+                if (bret >= 0) {
+                    ENCODER_LOG("h264_mp4toannexb BSF enabled (Annex B on the wire)");
+                } else {
+                    av_bsf_free(&m_pBsfCtx);
+                    m_pBsfCtx = nullptr;
+                    ENCODER_ERROR("Failed to init h264_mp4toannexb BSF!");
+                }
+            } else {
+                ENCODER_ERROR("Failed to allocate h264_mp4toannexb BSF!");
+            }
+        }
+    } else {
+        ENCODER_LOG("No encoder extradata available; BSF skipped");
     }
 
     ENCODER_LOG("Encoder name: %s, long name: %s",
@@ -427,6 +469,11 @@ bool VideoEncoder::InitializeFFmpeg()
 void VideoEncoder::CleanupFFmpeg()
 {
     ENCODER_LOG("Cleaning up FFmpeg resources...");
+
+    if (m_pBsfCtx) {
+        av_bsf_free(&m_pBsfCtx);
+        m_pBsfCtx = nullptr;
+    }
 
     if (m_pPacket) {
         av_packet_free(&m_pPacket);
@@ -996,6 +1043,25 @@ bool VideoEncoder::ReceiveEncodedPackets()
     int ret;
     while ((ret = avcodec_receive_packet(m_pCodecContext, m_pPacket)) >= 0) {
         bool keyframe = (m_pPacket->flags & AV_PKT_FLAG_KEY) != 0;
+
+        if (m_pBsfCtx) {
+            // Convert AVCC (length-prefixed) -> Annex B (start codes).
+            // av_bsf_send_packet() takes ownership of m_pPacket.
+            if (av_bsf_send_packet(m_pBsfCtx, m_pPacket) == 0) {
+                AVPacket* filtered = av_packet_alloc();
+                while (av_bsf_receive_packet(m_pBsfCtx, filtered) >= 0) {
+                    if (m_encodedPacketCallback) {
+                        m_encodedPacketCallback(filtered->data, filtered->size,
+                                                filtered->pts, keyframe);
+                    }
+                    av_packet_unref(filtered);
+                }
+                av_packet_free(&filtered);
+            }
+            // m_pPacket is consumed by the BSF; reset for next receive.
+            av_packet_unref(m_pPacket);
+            continue;
+        }
 
         if (m_encodedPacketCallback) {
             m_encodedPacketCallback(m_pPacket->data, m_pPacket->size,

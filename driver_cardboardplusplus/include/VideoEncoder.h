@@ -8,6 +8,7 @@
 struct AVCodecContext;
 struct AVFrame;
 struct AVPacket;
+struct AVBSFContext;
 struct SwsContext;
 struct AVBufferRef;
 
@@ -60,6 +61,7 @@ private:
     AVBufferRef* m_pHwDeviceCtx;
     AVFrame* m_pFrame;
     AVPacket* m_pPacket;
+    AVBSFContext* m_pBsfCtx;
     SwsContext* m_pConvertContext;
 
     ID3D11Texture2D* m_pStagingTexture;

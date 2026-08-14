@@ -636,8 +636,15 @@ bool HmdDriver::ApplyHardwareCap(int capW, int capH)
 
 void HmdDriver::OnEncodedPacket(uint8_t* data, int size, int64_t pts, bool keyframe)
 {
-    DriverLog("[Encoded] size=%d, pts=%lld, keyframe=%s, data[0]=0x%02X",
-              size, pts, keyframe ? "YES" : "NO", data[0]);
+    if (keyframe && size >= 8) {
+        DriverLog("[Encoded] size=%d, pts=%lld, keyframe=YES, first16=%02X %02X %02X %02X %02X %02X %02X %02X",
+                  size, pts,
+                  data[0], data[1], data[2], data[3],
+                  data[4], data[5], data[6], data[7]);
+    } else {
+        DriverLog("[Encoded] size=%d, pts=%lld, keyframe=%s, data[0]=0x%02X",
+                  size, pts, keyframe ? "YES" : "NO", data[0]);
+    }
 
     if (!m_udpInitialized || m_udpSocket == INVALID_SOCKET || size <= 0) {
         return;
