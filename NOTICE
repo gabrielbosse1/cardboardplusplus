@@ -1,9 +1,30 @@
 Cardboard++
-Copyright 2026 Gabriel Cordeiro Bosse
+Copyright (C) 2026 Gabriel Cordeiro Bosse
 
-This product includes software developed by Google LLC.
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 
-Google Cardboard SDK
-Copyright 2019 Google LLC
-Licensed under the Apache License, Version 2.0
-https://github.com/google/cardboard
+This product includes software developed by:
+
+  Google LLC
+  Google Cardboard SDK
+  Copyright 2019 Google LLC
+  Licensed under the Apache License, Version 2.0
+  https://github.com/google/cardboard
+
+  FFmpeg
+  Copyright (c) 2000-2026 the FFmpeg developers
+  Licensed under GNU Lesser General Public License v2.1 or later
+  https://ffmpeg.org/legal.html
+
+  libx264
+  Copyright (C) 2003-2026 x264 project
+  Licensed under GNU General Public License v2 or later
+  https://www.videolan.org/developers/x264.html
+
+  OpenVR
+  Copyright (c) 2015 Valve Corporation
+  Licensed under the BSD 3-Clause License
+  https://github.com/ValveSoftware/openvr
