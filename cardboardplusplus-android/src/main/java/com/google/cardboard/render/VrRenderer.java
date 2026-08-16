@@ -3,6 +3,7 @@ package com.google.cardboard.render;
 import android.opengl.GLSurfaceView;
 import android.util.Log;
 import com.google.cardboard.NativeBridge;
+import com.google.cardboard.bridge.BridgeClient;
 import com.google.cardboard.camera.CameraController;
 import com.google.cardboard.permissions.PermissionManager;
 import com.google.cardboard.video.VideoManager;
@@ -17,6 +18,7 @@ public class VrRenderer implements GLSurfaceView.Renderer {
   private final CameraController cameraController;
   private final VideoManager videoManager;
   private final PermissionManager permissionManager;
+  private final BridgeClient bridgeClient;
 
   private long frameCount_ = 0;
   private long lastFpsLog_ = 0;
@@ -25,11 +27,13 @@ public class VrRenderer implements GLSurfaceView.Renderer {
       NativeBridge bridge,
       CameraController cameraController,
       VideoManager videoManager,
-      PermissionManager permissionManager) {
+      PermissionManager permissionManager,
+      BridgeClient bridgeClient) {
     this.bridge = bridge;
     this.cameraController = cameraController;
     this.videoManager = videoManager;
     this.permissionManager = permissionManager;
+    this.bridgeClient = bridgeClient;
   }
 
   @Override
@@ -59,9 +63,12 @@ public class VrRenderer implements GLSurfaceView.Renderer {
       lastFpsLog_ = now;
     } else if (now - lastFpsLog_ >= 1_000_000_000L) {
       double fps = frameCount_ * 1e9 / (now - lastFpsLog_);
-      Log.i("VrRenderer", "FPS=" + fps + " frames=" + frameCount_);
+      Log.i(TAG, "FPS=" + fps + " frames=" + frameCount_);
       frameCount_ = 0;
       lastFpsLog_ = now;
+    }
+    if (bridgeClient != null) {
+      bridgeClient.onFrame();
     }
     cameraController.updateCameraTexture();
     videoManager.updateTexture();

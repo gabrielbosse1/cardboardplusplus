@@ -1,6 +1,5 @@
 #include <DeviceProvider.h>
 
-// Device provider entry point. Registers controller and HMD drivers with SteamVR.
 EVRInitError DeviceProvider::Init(IVRDriverContext* pDriverContext)
 {
     EVRInitError initError = InitServerDriverContext(pDriverContext);
@@ -9,13 +8,19 @@ EVRInitError DeviceProvider::Init(IVRDriverContext* pDriverContext)
         return initError;
     }
     
-    VRDriverLog()->Log("Initializing example controller"); //this is how you log out Steam's log file.
+    VRDriverLog()->Log("Initializing Cardboard++ driver");
+
+    bridgeConnection = new BridgeConnection();
+    if (!bridgeConnection->Initialize()) {
+        VRDriverLog()->Log("WARNING: Bridge connection initialization failed. Streaming will be disabled.");
+    }
 
     controllerDriver = new ControllerDriver();
-    VRServerDriverHost()->TrackedDeviceAdded("example_controller", TrackedDeviceClass_Controller, controllerDriver); //add all your devices like this.
+    VRServerDriverHost()->TrackedDeviceAdded("example_controller", TrackedDeviceClass_Controller, controllerDriver);
 
-    VRDriverLog()->Log("Initializing example virtual HMD");
+    VRDriverLog()->Log("Initializing Cardboard++ virtual HMD");
     hmdDriver = new HmdDriver();
+    hmdDriver->SetBridgeConnection(bridgeConnection);
     VRServerDriverHost()->TrackedDeviceAdded("example_virtual_hmd", TrackedDeviceClass_HMD, hmdDriver);
 
     return vr::VRInitError_None;
@@ -27,7 +32,10 @@ void DeviceProvider::Cleanup()
     controllerDriver = NULL;
     delete hmdDriver;
     hmdDriver = NULL;
+    delete bridgeConnection;
+    bridgeConnection = NULL;
 }
+
 const char* const* DeviceProvider::GetInterfaceVersions()
 {
     return k_InterfaceVersions;

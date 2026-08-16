@@ -40,6 +40,7 @@ import com.google.cardboard.settings.AppSettings;
 import com.google.cardboard.settings.SettingsMenuController;
 import com.google.cardboard.streaming.CameraStreamer;
 import com.google.cardboard.video.VideoManager;
+import com.google.cardboard.bridge.BridgeClient;
 
 /**
  * Entry point / orchestrator for the Cardboard++ VR app.
@@ -71,6 +72,7 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
   private AppSettings appSettings;
   private CodecSelector codecSelector;
   private CameraStreamer cameraStreamer;
+  private BridgeClient bridgeClient;
 
   @SuppressLint("ClickableViewAccessibility")
   @Override
@@ -90,11 +92,14 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
     // re-broadcast discovery so the PC driver re-routes video to this phone.
     videoManager.setReconnectAction(() -> discoveryManager.startDiscovery());
 
+    // Bridge TCP client: connects to PC bridge for FPS reporting and control
+    bridgeClient = new BridgeClient(appSettings);
+
     setContentView(R.layout.activity_vr);
     glView = findViewById(R.id.surface_view);
     glView.setEGLContextClientVersion(2);
     glView.setRenderer(
-        new VrRenderer(this, cameraController, videoManager, permissionManager));
+        new VrRenderer(this, cameraController, videoManager, permissionManager, bridgeClient));
     glView.setRenderMode(GLSurfaceView.RENDERMODE_CONTINUOUSLY);
     glView.setOnTouchListener(
         (v, event) -> {
@@ -133,8 +138,9 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
     // 1. Tell native to stop head tracking FIRST
     onNativePause();
 
-    // 2. Stop discovery
+    // 2. Stop discovery and bridge client
     discoveryManager.stopDiscovery();
+    bridgeClient.stop();
 
     // 3. Stop camera hardware and release texture so it gets recreated fresh on resume
     cameraController.onPause();
@@ -168,6 +174,7 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
     glView.onResume();
     onNativeResume();
 
+    bridgeClient.start();
     discoveryManager.startDiscovery();
 
     // Queue camera setup on GL thread (guards prevent duplicates)
@@ -184,6 +191,7 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
   @Override
   protected void onDestroy() {
     super.onDestroy();
+    bridgeClient.stop();
     cameraController.release();
     nativeOnDestroy(nativeApp);
     nativeApp = 0;

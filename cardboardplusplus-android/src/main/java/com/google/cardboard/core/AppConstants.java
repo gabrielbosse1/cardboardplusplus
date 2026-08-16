@@ -11,6 +11,7 @@ public final class AppConstants {
   // Network ports
   public static final int UDP_DISCOVERY_PORT = 42070;
   public static final int VIDEO_PORT = 42069;
+  public static final int BRIDGE_TCP_PORT = 42072;
   public static final int DISCOVERY_INTERVAL_MS = 500;
 
   // Camera defaults
@@ -20,6 +21,6 @@ public final class AppConstants {
   public static final int MIN_CAMERA_HEIGHT = 480;
 
   // Default video stream dimensions (matches native defaults)
-  public static final int DEFAULT_VIDEO_WIDTH = 1920;
-  public static final int DEFAULT_VIDEO_HEIGHT = 1080;
+  public static final int DEFAULT_VIDEO_WIDTH = 2880;
+  public static final int DEFAULT_VIDEO_HEIGHT = 1620;
 }

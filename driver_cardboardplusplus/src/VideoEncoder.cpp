@@ -126,19 +126,18 @@ VideoEncoder::VideoEncoder()
     : m_pDevice(nullptr)
     , m_pContext(nullptr)
     , m_pCodecContext(nullptr)
-    , m_pFrame(nullptr)
+    , m_pFrame{nullptr, nullptr}
     , m_pPacket(nullptr)
     , m_pBsfCtx(nullptr)
     , m_pConvertContext(nullptr)
-    , m_pStagingTexture(nullptr)
+    , m_pStagingTexture{nullptr, nullptr}
     , m_initialized(false)
-    , m_useGpuEncoding(false)
     , m_width(0)
     , m_height(0)
     , m_fps(0)
     , m_bitrate(0)
     , m_frameCount(0)
-    , m_pSoftwareFrameBuffer(nullptr)
+    , m_pSoftwareFrameBuffer{nullptr, nullptr}
     , m_pHwDeviceCtx(nullptr)
     , m_hasValidFrame(false)
     , m_pConversionRT(nullptr)
@@ -164,6 +163,7 @@ VideoEncoder::VideoEncoder()
     , m_dupCount(0)
     , m_summaryFrames(0)
     , m_summaryInterval(120)
+    , m_bufferIndex(0)
 {
     QueryPerformanceFrequency(&m_perfFreq);
 }
@@ -174,14 +174,13 @@ VideoEncoder::~VideoEncoder()
 }
 
 bool VideoEncoder::Initialize(ID3D11Device* pDevice, ID3D11DeviceContext* pContext,
-                             int width, int height, int fps, int bitrate, bool useGpuEncoding)
+                             int width, int height, int fps, int bitrate)
 {
     ENCODER_LOG("========================================");
     ENCODER_LOG("Initializing VideoEncoder");
     ENCODER_LOG("  Resolution: %dx%d", width, height);
     ENCODER_LOG("  FPS: %d", fps);
     ENCODER_LOG("  Bitrate: %d kbps", bitrate / 1000);
-    ENCODER_LOG("  GPU Encoding: %s", useGpuEncoding ? "YES" : "NO");
     ENCODER_LOG("========================================");
 
     if (m_initialized) {
@@ -205,7 +204,6 @@ bool VideoEncoder::Initialize(ID3D11Device* pDevice, ID3D11DeviceContext* pConte
     m_height = height;
     m_fps = fps;
     m_bitrate = bitrate;
-    m_useGpuEncoding = useGpuEncoding;
     m_frameCount = 0;
 
     LogFFmpegVersion();
@@ -230,7 +228,7 @@ bool VideoEncoder::Initialize(ID3D11Device* pDevice, ID3D11DeviceContext* pConte
 
 void VideoEncoder::Shutdown()
 {
-    if (!m_initialized && !m_pCodecContext && !m_pFrame && !m_pPacket) {
+    if (!m_initialized && !m_pCodecContext && !m_pFrame[0] && !m_pFrame[1] && !m_pPacket) {
         return;
     }
 
@@ -239,14 +237,18 @@ void VideoEncoder::Shutdown()
     CleanupShaderConversion();
     CleanupFFmpeg();
 
-    if (m_pStagingTexture) {
-        m_pStagingTexture->Release();
-        m_pStagingTexture = nullptr;
+    for (int i = 0; i < 2; i++) {
+        if (m_pStagingTexture[i]) {
+            m_pStagingTexture[i]->Release();
+            m_pStagingTexture[i] = nullptr;
+        }
     }
 
-    if (m_pSoftwareFrameBuffer) {
-        av_free(m_pSoftwareFrameBuffer);
-        m_pSoftwareFrameBuffer = nullptr;
+    for (int i = 0; i < 2; i++) {
+        if (m_pSoftwareFrameBuffer[i]) {
+            av_free(m_pSoftwareFrameBuffer[i]);
+            m_pSoftwareFrameBuffer[i] = nullptr;
+        }
     }
 
     m_initialized = false;
@@ -351,9 +353,8 @@ bool VideoEncoder::InitializeFFmpeg()
         }
 
         codec = c;
-        m_useGpuEncoding = !isLibx264;
         ENCODER_LOG("Opened H264 encoder: %s (%s)", name,
-                    m_useGpuEncoding ? "hardware/GPU" : "software");
+                    isLibx264 ? "software" : "hardware/GPU");
         break;
     }
 
@@ -406,12 +407,17 @@ bool VideoEncoder::InitializeFFmpeg()
     stagingDesc.Usage = D3D11_USAGE_STAGING;
     stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
 
-    HRESULT hr = m_pDevice->CreateTexture2D(&stagingDesc, nullptr, &m_pStagingTexture);
+    HRESULT hr = m_pDevice->CreateTexture2D(&stagingDesc, nullptr, &m_pStagingTexture[0]);
     if (FAILED(hr)) {
-        ENCODER_ERROR("Failed to create staging texture! HRESULT: 0x%x", hr);
+        ENCODER_ERROR("Failed to create staging texture [0]! HRESULT: 0x%x", hr);
         return false;
     }
-    ENCODER_LOG("Staging texture created successfully");
+    hr = m_pDevice->CreateTexture2D(&stagingDesc, nullptr, &m_pStagingTexture[1]);
+    if (FAILED(hr)) {
+        ENCODER_ERROR("Failed to create staging texture [1]! HRESULT: 0x%x", hr);
+        return false;
+    }
+    ENCODER_LOG("Staging textures created successfully (double-buffered)");
 
     // Create swscale context for BGRA -> NV12 conversion
     m_pConvertContext = sws_getContext(
@@ -426,9 +432,14 @@ bool VideoEncoder::InitializeFFmpeg()
     }
     ENCODER_LOG("SWScale context created for BGRA -> NV12 conversion");
 
-    m_pSoftwareFrameBuffer = (uint8_t*)av_malloc(m_width * m_height * 4);
-    if (!m_pSoftwareFrameBuffer) {
-        ENCODER_ERROR("Failed to allocate software frame buffer!");
+    m_pSoftwareFrameBuffer[0] = (uint8_t*)av_malloc(m_width * m_height * 4);
+    if (!m_pSoftwareFrameBuffer[0]) {
+        ENCODER_ERROR("Failed to allocate software frame buffer [0]!");
+        return false;
+    }
+    m_pSoftwareFrameBuffer[1] = (uint8_t*)av_malloc(m_width * m_height * 4);
+    if (!m_pSoftwareFrameBuffer[1]) {
+        ENCODER_ERROR("Failed to allocate software frame buffer [1]!");
         return false;
     }
 
@@ -437,19 +448,21 @@ bool VideoEncoder::InitializeFFmpeg()
                 m_pCodecContext->pix_fmt,
                 av_get_pix_fmt_name(m_pCodecContext->pix_fmt));
 
-    m_pFrame = av_frame_alloc();
-    if (!m_pFrame) {
-        ENCODER_ERROR("Failed to allocate frame!");
-        return false;
-    }
+    for (int i = 0; i < 2; i++) {
+        m_pFrame[i] = av_frame_alloc();
+        if (!m_pFrame[i]) {
+            ENCODER_ERROR("Failed to allocate frame [%d]!", i);
+            return false;
+        }
 
-    m_pFrame->format = AV_PIX_FMT_NV12;
-    m_pFrame->data[0] = m_pSoftwareFrameBuffer;
-    m_pFrame->linesize[0] = m_width;
-    m_pFrame->data[1] = m_pSoftwareFrameBuffer + m_width * m_height;
-    m_pFrame->linesize[1] = m_width;
-    m_pFrame->width = m_width;
-    m_pFrame->height = m_height;
+        m_pFrame[i]->format = AV_PIX_FMT_NV12;
+        m_pFrame[i]->data[0] = m_pSoftwareFrameBuffer[i];
+        m_pFrame[i]->linesize[0] = m_width;
+        m_pFrame[i]->data[1] = m_pSoftwareFrameBuffer[i] + m_width * m_height;
+        m_pFrame[i]->linesize[1] = m_width;
+        m_pFrame[i]->width = m_width;
+        m_pFrame[i]->height = m_height;
+    }
 
     m_pPacket = av_packet_alloc();
     if (!m_pPacket) {
@@ -480,9 +493,11 @@ void VideoEncoder::CleanupFFmpeg()
         m_pPacket = nullptr;
     }
 
-    if (m_pFrame) {
-        av_frame_free(&m_pFrame);
-        m_pFrame = nullptr;
+    for (int i = 0; i < 2; i++) {
+        if (m_pFrame[i]) {
+            av_frame_free(&m_pFrame[i]);
+            m_pFrame[i] = nullptr;
+        }
     }
 
     if (m_pConvertContext) {
@@ -725,10 +740,10 @@ void VideoEncoder::SetupBlitPipeline(ID3D11ShaderResourceView* pSRV)
 bool VideoEncoder::ReadBackConversionRT()
 {
     // Copy conversion RT to staging texture
-    m_pContext->CopySubresourceRegion(m_pStagingTexture, 0, 0, 0, 0, m_pConversionRT, 0, nullptr);
+    m_pContext->CopySubresourceRegion(m_pStagingTexture[m_bufferIndex], 0, 0, 0, 0, m_pConversionRT, 0, nullptr);
 
     D3D11_MAPPED_SUBRESOURCE mapped;
-    HRESULT hr = m_pContext->Map(m_pStagingTexture, 0, D3D11_MAP_READ, 0, &mapped);
+    HRESULT hr = m_pContext->Map(m_pStagingTexture[m_bufferIndex], 0, D3D11_MAP_READ, 0, &mapped);
     if (FAILED(hr)) {
         ENCODER_ERROR("Failed to map staging texture! HRESULT: 0x%x", hr);
         return false;
@@ -738,13 +753,13 @@ bool VideoEncoder::ReadBackConversionRT()
     uint8_t* srcSlice[1] = { (uint8_t*)mapped.pData };
     int srcStride[1] = { static_cast<int>(mapped.RowPitch) };
 
-    uint8_t* dstSlice[2] = { m_pSoftwareFrameBuffer, m_pSoftwareFrameBuffer + m_width * m_height };
+    uint8_t* dstSlice[2] = { m_pSoftwareFrameBuffer[m_bufferIndex], m_pSoftwareFrameBuffer[m_bufferIndex] + m_width * m_height };
     int dstStride[2] = { m_width, m_width };
 
     int ret = sws_scale(m_pConvertContext, srcSlice, srcStride, 0, m_height,
                         dstSlice, dstStride);
 
-    m_pContext->Unmap(m_pStagingTexture, 0);
+    m_pContext->Unmap(m_pStagingTexture[m_bufferIndex], 0);
 
     if (ret != m_height) {
         ENCODER_ERROR("swscale conversion failed! Returned %d, expected %d", ret, m_height);
@@ -916,7 +931,7 @@ bool VideoEncoder::EncodeFrame(ID3D11Texture2D* pTexture, int64_t pts)
         return false;
     }
 
-    m_pFrame->pts = pts;
+    m_pFrame[m_bufferIndex]->pts = pts;
     m_hasValidFrame = true;
 
     if (!SendFrameToEncoder()) {
@@ -928,6 +943,8 @@ bool VideoEncoder::EncodeFrame(ID3D11Texture2D* pTexture, int64_t pts)
         ENCODER_ERROR("Failed to receive encoded packets!");
         return false;
     }
+
+    m_bufferIndex = 1 - m_bufferIndex;
 
     return true;
 }
@@ -965,7 +982,7 @@ bool VideoEncoder::EncodeFrameSBS(ID3D11Texture2D* pLeft, ID3D11Texture2D* pRigh
     m_lastFrameHash = hash;
     m_summaryFrames++;
 
-    m_pFrame->pts = pts;
+    m_pFrame[m_bufferIndex]->pts = pts;
     m_hasValidFrame = true;
 
     if (!SendFrameToEncoder()) {
@@ -977,6 +994,8 @@ bool VideoEncoder::EncodeFrameSBS(ID3D11Texture2D* pLeft, ID3D11Texture2D* pRigh
         ENCODER_ERROR("Failed to receive SBS encoded packets!");
         return false;
     }
+
+    m_bufferIndex = 1 - m_bufferIndex;
 
     QueryPerformanceCounter(&t1);
     int64_t elapsedUs = ((t1.QuadPart - t0.QuadPart) * 1000000) / m_perfFreq.QuadPart;
@@ -1003,19 +1022,19 @@ bool VideoEncoder::ConvertTextureToFrame(ID3D11Texture2D* pTexture)
     // BGRA8 at matching resolution -> direct copy + sws_scale
     if (desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM &&
         desc.Width == (UINT)m_width && desc.Height == (UINT)m_height) {
-        m_pContext->CopySubresourceRegion(m_pStagingTexture, 0, 0, 0, 0, pTexture, 0, nullptr);
+        m_pContext->CopySubresourceRegion(m_pStagingTexture[m_bufferIndex], 0, 0, 0, 0, pTexture, 0, nullptr);
 
         D3D11_MAPPED_SUBRESOURCE mapped;
-        HRESULT hr = m_pContext->Map(m_pStagingTexture, 0, D3D11_MAP_READ, 0, &mapped);
+        HRESULT hr = m_pContext->Map(m_pStagingTexture[m_bufferIndex], 0, D3D11_MAP_READ, 0, &mapped);
         if (FAILED(hr)) return false;
 
         uint8_t* srcSlice[1] = { (uint8_t*)mapped.pData };
         int srcStride[1] = { static_cast<int>(mapped.RowPitch) };
-        uint8_t* dstSlice[2] = { m_pSoftwareFrameBuffer, m_pSoftwareFrameBuffer + m_width * m_height };
+        uint8_t* dstSlice[2] = { m_pSoftwareFrameBuffer[m_bufferIndex], m_pSoftwareFrameBuffer[m_bufferIndex] + m_width * m_height };
         int dstStride[2] = { m_width, m_width };
 
         int ret = sws_scale(m_pConvertContext, srcSlice, srcStride, 0, m_height, dstSlice, dstStride);
-        m_pContext->Unmap(m_pStagingTexture, 0);
+        m_pContext->Unmap(m_pStagingTexture[m_bufferIndex], 0);
         return (ret == m_height);
     }
 
@@ -1025,7 +1044,7 @@ bool VideoEncoder::ConvertTextureToFrame(ID3D11Texture2D* pTexture)
 
 bool VideoEncoder::SendFrameToEncoder()
 {
-    int ret = avcodec_send_frame(m_pCodecContext, m_pFrame);
+    int ret = avcodec_send_frame(m_pCodecContext, m_pFrame[m_bufferIndex]);
     if (ret < 0) {
         ENCODER_ERROR("avcodec_send_frame failed! Error code: %d", ret);
         char errbuf[AV_ERROR_MAX_STRING_SIZE];
@@ -1114,8 +1133,8 @@ void VideoEncoder::LogFFmpegVersion()
 
 uint32_t VideoEncoder::ComputeFrameHash()
 {
-    if (!m_pSoftwareFrameBuffer) return 0;
-    const uint8_t* p = m_pSoftwareFrameBuffer;
+    if (!m_pSoftwareFrameBuffer[m_bufferIndex]) return 0;
+    const uint8_t* p = m_pSoftwareFrameBuffer[m_bufferIndex];
     int total = m_width * m_height * 3 / 2; // valid NV12 region only
     uint32_t h = 2166136261u;
     for (int i = 0; i < total; i += 1024) {

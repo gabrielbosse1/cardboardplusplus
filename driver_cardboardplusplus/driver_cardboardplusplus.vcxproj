@@ -19,6 +19,7 @@
     </ProjectConfiguration>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="include\BridgeConnection.h" />
     <ClInclude Include="include\ControllerDriver.h" />
     <ClInclude Include="include\DeviceProvider.h" />
     <ClInclude Include="include\HmdDriver.h" />
@@ -28,6 +29,7 @@
     <ClInclude Include="include\openvr_driver.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="src\BridgeConnection.cpp" />
     <ClCompile Include="src\ControllerDriver.cpp" />
     <ClCompile Include="src\DeviceFactory.cpp" />
     <ClCompile Include="src\DeviceProvider.cpp" />

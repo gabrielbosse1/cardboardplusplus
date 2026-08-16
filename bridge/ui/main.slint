@@ -1,0 +1,371 @@
+import { Button, VerticalBox, HorizontalBox, ComboBox, GroupBox, Slider, LineEdit, CheckBox, TabWidget } from "std-widgets.slint";
+
+export component StatusIndicator inherits Rectangle {
+    in property <string> label: "";
+    in property <string> value: "";
+    in property <bool> active: false;
+
+    height: 30px;
+    horizontal-stretch: 0;
+
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        spacing: 6px;
+        alignment: start;
+
+        Rectangle {
+            width: 8px;
+            height: 8px;
+            border-radius: 4px;
+            background: active ? #4CAF50 : #757575;
+        }
+
+        Text {
+            text: root.label;
+            color: #B0B0B0;
+            font-size: 12px;
+            vertical-alignment: center;
+        }
+
+        Text {
+            text: root.value;
+            color: #FFFFFF;
+            font-size: 12px;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+    }
+}
+
+export component TopBar inherits Rectangle {
+    in property <float> compositor-fps: 0.0;
+    in property <float> encoder-fps: 0.0;
+    in property <bool> driver-connected: false;
+    in property <bool> phone-connected: false;
+    in property <float> phone-fps: 0.0;
+    in property <float> phone-fps-1low: 0.0;
+
+    background: #1E1E2E;
+    height: 40px;
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        spacing: 24px;
+
+        StatusIndicator {
+            label: "VR:";
+            value: root.driver-connected ? Math.round(root.compositor-fps) + " fps" : "N/A";
+            active: root.driver-connected && root.compositor-fps > 0;
+        }
+
+        StatusIndicator {
+            label: "Encoder:";
+            value: root.encoder-fps > 0 ? Math.round(root.encoder-fps) + " fps" : "Off";
+            active: root.encoder-fps > 0;
+        }
+
+        StatusIndicator {
+            label: "Driver:";
+            value: root.driver-connected ? "OK" : "Down";
+            active: root.driver-connected;
+        }
+
+        StatusIndicator {
+            label: "Phone:";
+            value: root.phone-connected ? Math.round(root.phone-fps) + " fps (1%:" + Math.round(root.phone-fps-1low) + ")" : "N/A";
+            active: root.phone-connected;
+        }
+
+        Rectangle { horizontal-stretch: 1; }
+    }
+}
+
+export component TabButton inherits Rectangle {
+    in property <string> label: "";
+    in property <bool> selected: false;
+    callback clicked;
+
+    height: 40px;
+    background: selected ? #3D3D5C : transparent;
+
+    TouchArea {
+        clicked => { root.clicked(); }
+    }
+
+    horizontal-stretch: 0;
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+
+        Text {
+            text: root.label;
+            color: selected ? #FFFFFF : #A0A0A0;
+            font-size: 13px;
+            font-weight: selected ? 700 : 400;
+            vertical-alignment: center;
+        }
+    }
+}
+
+export component LeftSidebar inherits Rectangle {
+    in property <int> current-tab: 0;
+    callback tab-changed(int);
+
+    background: #252538;
+    width: 180px;
+
+    VerticalLayout {
+        padding: 8px;
+        spacing: 2px;
+
+        TabButton {
+            label: "Streaming";
+            selected: root.current-tab == 0;
+            clicked => { root.tab-changed(0); }
+        }
+
+        TabButton {
+            label: "Hand Tracking";
+            selected: root.current-tab == 1;
+            clicked => { root.tab-changed(1); }
+        }
+
+        TabButton {
+            label: "Diagnostics";
+            selected: root.current-tab == 2;
+            clicked => { root.tab-changed(2); }
+        }
+
+        TabButton {
+            label: "General";
+            selected: root.current-tab == 3;
+            clicked => { root.tab-changed(3); }
+        }
+
+        Rectangle { vertical-stretch: 1; }
+    }
+}
+
+export component StreamingTab inherits VerticalLayout {
+    in property <bool> driver-connected: false;
+    in property <bool> phone-connected: false;
+    in property <bool> streaming: false;
+    callback start-stream;
+    callback stop-stream;
+
+    padding: 24px;
+    spacing: 16px;
+
+    Text {
+        text: "Streaming";
+        font-size: 20px;
+        font-weight: 700;
+        color: #FFFFFF;
+    }
+
+    Rectangle {
+        background: #2A2A3E;
+        border-radius: 8px;
+        vertical-stretch: 0;
+
+        VerticalLayout {
+            padding: 16px;
+            spacing: 12px;
+
+            HorizontalLayout {
+                spacing: 12px;
+                alignment: start;
+
+                if !streaming && driver-connected:
+                    Button {
+                        text: "Start Stream";
+                        primary: true;
+                        clicked => { root.start-stream(); }
+                    }
+
+                if streaming:
+                    Button {
+                        text: "Stop Stream";
+                        clicked => { root.stop-stream(); }
+                    }
+            }
+        }
+    }
+}
+
+export component HandTrackingTab inherits VerticalLayout {
+    padding: 24px;
+    spacing: 16px;
+
+    Text {
+        text: "Hand Tracking";
+        font-size: 20px;
+        font-weight: 700;
+        color: #FFFFFF;
+    }
+
+    Rectangle {
+        background: #2A2A3E;
+        border-radius: 8px;
+        height: 60px;
+
+        HorizontalLayout {
+            padding: 16px;
+            alignment: start;
+
+            Text {
+                text: "Hand tracking settings will appear here.";
+                color: #808080;
+                font-size: 14px;
+                vertical-alignment: center;
+            }
+        }
+    }
+}
+
+export component DiagnosticsTab inherits VerticalLayout {
+    padding: 24px;
+    spacing: 16px;
+
+    Text {
+        text: "Diagnostics";
+        font-size: 20px;
+        font-weight: 700;
+        color: #FFFFFF;
+    }
+
+    Rectangle {
+        background: #2A2A3E;
+        border-radius: 8px;
+        height: 60px;
+
+        HorizontalLayout {
+            padding: 16px;
+            alignment: start;
+
+            Text {
+                text: "Diagnostics information will appear here.";
+                color: #808080;
+                font-size: 14px;
+                vertical-alignment: center;
+            }
+        }
+    }
+}
+
+export component GeneralTab inherits VerticalLayout {
+    padding: 24px;
+    spacing: 16px;
+
+    Text {
+        text: "General";
+        font-size: 20px;
+        font-weight: 700;
+        color: #FFFFFF;
+    }
+
+    Rectangle {
+        background: #2A2A3E;
+        border-radius: 8px;
+        height: 60px;
+
+        HorizontalLayout {
+            padding: 16px;
+            alignment: start;
+
+            Text {
+                text: "General settings will appear here.";
+                color: #808080;
+                font-size: 14px;
+                vertical-alignment: center;
+            }
+        }
+    }
+}
+
+export component BottomBar inherits Rectangle {
+    background: #1A1A2E;
+    height: 28px;
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+
+        Text {
+            text: "Cardboard++ Bridge v1.0.0";
+            color: #606060;
+            font-size: 11px;
+            vertical-alignment: center;
+        }
+
+        Rectangle { horizontal-stretch: 1; }
+
+        Text {
+            text: "github.com/gabrielbosse1/cardboardplusplus";
+            color: #606060;
+            font-size: 11px;
+            vertical-alignment: center;
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "Cardboard++ Bridge";
+    background: #1E1E2E;
+    preferred-width: 900px;
+    preferred-height: 600px;
+
+    in property <float> compositor-fps: 0.0;
+    in property <float> encoder-fps: 0.0;
+    in property <bool> driver-connected: false;
+    in property <bool> phone-connected: false;
+    in property <float> phone-fps: 0.0;
+    in property <float> phone-fps-1low: 0.0;
+    in property <bool> streaming: false;
+
+    property <int> current-tab: 0;
+
+    callback start-stream;
+    callback stop-stream;
+
+    VerticalLayout {
+        TopBar {
+            compositor-fps: root.compositor-fps;
+            encoder-fps: root.encoder-fps;
+            driver-connected: root.driver-connected;
+            phone-connected: root.phone-connected;
+            phone-fps: root.phone-fps;
+            phone-fps-1low: root.phone-fps-1low;
+        }
+
+        HorizontalLayout {
+            vertical-stretch: 1;
+
+            LeftSidebar {
+                current-tab: root.current-tab;
+                tab-changed(t) => { root.current-tab = t; }
+            }
+
+            Rectangle {
+                background: #1E1E2E;
+                horizontal-stretch: 1;
+
+                if root.current-tab == 0: StreamingTab {
+                    driver-connected: root.driver-connected;
+                    phone-connected: root.phone-connected;
+                    streaming: root.streaming;
+                    start-stream => { root.start-stream(); }
+                    stop-stream => { root.stop-stream(); }
+                }
+                if root.current-tab == 1: HandTrackingTab {}
+                if root.current-tab == 2: DiagnosticsTab {}
+                if root.current-tab == 3: GeneralTab {}
+            }
+        }
+
+        BottomBar {}
+    }
+}

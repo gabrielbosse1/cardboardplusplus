@@ -83,6 +83,17 @@ EVRInitError HmdDriver::Activate(uint32_t unObjectId)
         DriverLog("WARNING: Discovery initialization failed. Phone auto-detection will be disabled.");
     }
 
+    if (m_bridgeConnection) {
+        m_bridgeConnection->OnStreamAuthorizationChanged = [this](bool authorized) {
+            DriverLog("Bridge authorization changed: %s", authorized ? "AUTHORIZED" : "DENIED");
+        };
+    }
+
+    // Start background encoding thread
+    m_encodingThreadRunning = true;
+    m_encodingThread = std::thread(&HmdDriver::EncodingThreadFunc, this);
+    DriverLog("Background encoding thread started");
+
     // Set HMD properties
     PropertyContainerHandle_t props = VRProperties()->TrackedDeviceToPropertyContainer(driverId);
 
@@ -128,6 +139,26 @@ void HmdDriver::Deactivate()
 {
 	// Clean up resources and reset state.
     DriverLog("HmdDriver::Deactivate called");
+
+    // Stop background encoding thread
+    m_encodingThreadRunning = false;
+    m_encodingCv.notify_all();
+    if (m_encodingThread.joinable()) {
+        m_encodingThread.join();
+    }
+    DriverLog("Background encoding thread stopped");
+
+    // Release sync texture if held in pending encode
+    if (m_pendingEncode.pSyncMutex) {
+        m_pendingEncode.pSyncMutex->ReleaseSync(0);
+        m_pendingEncode.pSyncMutex->Release();
+        m_pendingEncode.pSyncMutex = nullptr;
+    }
+    if (m_pendingEncode.pSyncTexture) {
+        m_pendingEncode.pSyncTexture->Release();
+        m_pendingEncode.pSyncTexture = nullptr;
+    }
+    m_pendingEncode.hSyncHandle = nullptr;
 
     ShutdownDiscovery();
     ShutdownUDP();
@@ -202,9 +233,13 @@ DriverPose_t HmdDriver::GetPose()
 
 void HmdDriver::RunFrame()
 {
-    // Update the server with our current pose each frame so compositor knows this HMD is present.
     DriverPose_t pose = GetPose();
     VRServerDriverHost()->TrackedDevicePoseUpdated(driverId, pose, sizeof(DriverPose_t));
+
+    if (m_bridgeConnection) {
+        m_bridgeConnection->SetCompositorFps(m_measuredPresentFps.load());
+        m_bridgeConnection->SetEncoderFps(m_measuredEncoderFps.load());
+    }
 }
 
 // IVRDisplayComponent implementations
@@ -228,8 +263,8 @@ bool HmdDriver::IsDisplayRealDisplay()
 
 void HmdDriver::GetRecommendedRenderTargetSize( uint32_t *pnWidth, uint32_t *pnHeight )
 {
-    if (pnWidth) *pnWidth = 1920 / 2; // single-eye recommended width
-    if (pnHeight) *pnHeight = 1080; // single-eye recommended height
+    if (pnWidth) *pnWidth = m_encoderW / 2;
+    if (pnHeight) *pnHeight = m_encoderH;
 }
 
 void HmdDriver::GetEyeOutputViewport( EVREye eEye, uint32_t *pnX, uint32_t *pnY, uint32_t *pnWidth, uint32_t *pnHeight )
@@ -270,7 +305,6 @@ DistortionCoordinates_t HmdDriver::ComputeDistortion( EVREye eEye, float fU, flo
 
 void HmdDriver::CreateSwapTextureSet(uint32_t unPid, const SwapTextureSetDesc_t* pSwapTextureSetDesc, SwapTextureSet_t* pOutSwapTextureSet)
 {
-	// Create a shared texture that the application can render into.
     DriverLog("CreateSwapTextureSet called: width=%d, height=%d, format=%d, samples=%d",
         pSwapTextureSetDesc->nWidth, pSwapTextureSetDesc->nHeight, pSwapTextureSetDesc->nFormat, pSwapTextureSetDesc->nSampleCount);
 
@@ -279,67 +313,56 @@ void HmdDriver::CreateSwapTextureSet(uint32_t unPid, const SwapTextureSetDesc_t*
     desc.Height = pSwapTextureSetDesc->nHeight;
     desc.MipLevels = 1;
     desc.ArraySize = 1;
-    desc.Format = (DXGI_FORMAT)pSwapTextureSetDesc->nFormat;  // Use SteamVR's exact format
+    desc.Format = (DXGI_FORMAT)pSwapTextureSetDesc->nFormat;
     desc.SampleDesc.Count = 1;
     desc.SampleDesc.Quality = 0;
     desc.Usage = D3D11_USAGE_DEFAULT;
     desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     desc.CPUAccessFlags = 0;
-    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;  // No keyed mutex
+    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
 
-    DriverLog("Creating texture: %dx%d format=%d flags=SHARED", desc.Width, desc.Height, desc.Format);
+    DriverLog("Creating 3 textures for true triple buffering: %dx%d format=%d", desc.Width, desc.Height, desc.Format);
 
-    ID3D11Texture2D* pTexture = nullptr;
-    HRESULT hr = pD3D11Device->CreateTexture2D(&desc, nullptr, &pTexture);
+    for (int i = 0; i < 3; i++) {
+        ID3D11Texture2D* pTexture = nullptr;
+        HRESULT hr = pD3D11Device->CreateTexture2D(&desc, nullptr, &pTexture);
 
-    if (FAILED(hr)) {
-        DriverLog("Failed to create texture! HRESULT: 0x%x", hr);
-        return;
+        if (FAILED(hr)) {
+            DriverLog("Failed to create texture %d! HRESULT: 0x%x", i, hr);
+            return;
+        }
+
+        IDXGIResource* pDXGIResource = nullptr;
+        hr = pTexture->QueryInterface(__uuidof(IDXGIResource), (void**)&pDXGIResource);
+        if (FAILED(hr)) {
+            DriverLog("Failed to get DXGI resource for texture %d! HRESULT: 0x%x", i, hr);
+            pTexture->Release();
+            return;
+        }
+
+        HANDLE hSharedHandle = nullptr;
+        hr = pDXGIResource->GetSharedHandle(&hSharedHandle);
+        pDXGIResource->Release();
+
+        if (FAILED(hr)) {
+            DriverLog("Failed to get shared handle for texture %d! HRESULT: 0x%x", i, hr);
+            pTexture->Release();
+            return;
+        }
+
+        pOutSwapTextureSet->rSharedTextureHandles[i] = (vr::SharedTextureHandle_t)hSharedHandle;
+        DriverLog("Texture %d: handle=%llu", i, (uint64_t)hSharedHandle);
+
+        SwapTextureSet sts;
+        sts.pTexture = pTexture;
+        sts.hSharedHandle = hSharedHandle;
+        sts.pKeyedMutex = nullptr;
+
+        m_swapTextureSets[unPid].push_back(sts);
+        m_textureHandleMap[(vr::SharedTextureHandle_t)hSharedHandle] = pTexture;
     }
 
-    IDXGIResource* pDXGIResource = nullptr;
-    hr = pTexture->QueryInterface(__uuidof(IDXGIResource), (void**)&pDXGIResource);
-    if (FAILED(hr)) {
-        DriverLog("Failed to get DXGI resource! HRESULT: 0x%x", hr);
-        pTexture->Release();
-        return;
-    }
-
-    HANDLE hSharedHandle = nullptr;
-    hr = pDXGIResource->GetSharedHandle(&hSharedHandle);
-    pDXGIResource->Release();
-
-    if (FAILED(hr)) {
-        DriverLog("Failed to get shared handle! HRESULT: 0x%x", hr);
-        pTexture->Release();
-        return;
-    }
-
-    DriverLog("Created texture with shared handle: %llu", (uint64_t)hSharedHandle);
-
-    // Return the shared handle for all 3 buffers (triple buffered)
-    pOutSwapTextureSet->rSharedTextureHandles[0] = (vr::SharedTextureHandle_t)hSharedHandle;
-    pOutSwapTextureSet->rSharedTextureHandles[1] = (vr::SharedTextureHandle_t)hSharedHandle;
-    pOutSwapTextureSet->rSharedTextureHandles[2] = (vr::SharedTextureHandle_t)hSharedHandle;
     pOutSwapTextureSet->unTextureFlags = 0;
-
-    // Store for later lookup in SubmitLayer
-    SwapTextureSet sts;
-    sts.pTexture = pTexture;
-    sts.hSharedHandle = hSharedHandle;
-    sts.pKeyedMutex = nullptr;
-
-    auto it = m_swapTextureSets.find(unPid);
-    if (it == m_swapTextureSets.end()) {
-        std::vector<SwapTextureSet> vec;
-        vec.push_back(sts);
-        m_swapTextureSets[unPid] = vec;
-    } else {
-        it->second.push_back(sts);
-    }
-
-    // Map handle -> texture for quick lookup in SubmitLayer
-    m_textureHandleMap[(vr::SharedTextureHandle_t)hSharedHandle] = pTexture;
 }
 
 void HmdDriver::DestroySwapTextureSet(vr::SharedTextureHandle_t sharedTextureHandle)
@@ -393,10 +416,14 @@ void HmdDriver::DestroyAllSwapTextureSets(uint32_t unPid)
 
 void HmdDriver::GetNextSwapTextureSetIndex(vr::SharedTextureHandle_t sharedTextureHandles[2], uint32_t(*pIndices)[2])
 {
-	// We just return index 0 for both eyes.
     DriverLog("GetNextSwapTextureSetIndex called");
-    (*pIndices)[0] = 0;
-    (*pIndices)[1] = 0;
+
+    // Round-robin through 3 textures for true triple buffering.
+    // This ensures the app, compositor, and encoder each own a different texture simultaneously.
+    m_currentSwapSetIndex = (m_currentSwapSetIndex + 1) % 3;
+    (*pIndices)[0] = m_currentSwapSetIndex;
+    (*pIndices)[1] = m_currentSwapSetIndex;
+    DriverLog("Next swap set index: %d", m_currentSwapSetIndex);
 }
 
 void HmdDriver::SubmitLayer(const SubmitLayerPerEye_t(&perEye)[2])
@@ -421,6 +448,7 @@ void HmdDriver::Present(vr::SharedTextureHandle_t syncTexture)
         if (m_lastPresentLogNs == 0) m_lastPresentLogNs = nowNs;
         if (nowNs - m_lastPresentLogNs >= 1'000'000'000LL) {
             double presentFps = m_presentCount * 1e9 / (nowNs - m_lastPresentLogNs);
+            m_measuredPresentFps.store(static_cast<float>(presentFps));
             DriverLog("Present rate: %.1f fps (count=%d)", presentFps, m_presentCount);
             m_presentCount = 0;
             m_lastPresentLogNs = nowNs;
@@ -430,7 +458,49 @@ void HmdDriver::Present(vr::SharedTextureHandle_t syncTexture)
     DriverLog("Present called! syncTexture=%llu, hasSubmit=%s",
         (uint64_t)syncTexture, m_hasSubmit ? "yes" : "no");
 
+    // Acquire the sync texture's keyed mutex to synchronize with the compositor.
+    // This tells SteamVR we're processing this frame.
+    IDXGIKeyedMutex* pSyncMutex = nullptr;
+    ID3D11Texture2D* pSyncTexture = nullptr;
+    HANDLE hSyncHandle = nullptr;
+    if (syncTexture) {
+        HANDLE hSync = (HANDLE)syncTexture;
+        if (hSync != INVALID_HANDLE_VALUE) {
+            ID3D11Texture2D* pSyncTex = nullptr;
+            HRESULT hr = pD3D11Device->OpenSharedResource(hSync, __uuidof(ID3D11Texture2D), (void**)&pSyncTex);
+            if (SUCCEEDED(hr)) {
+                hr = pSyncTex->QueryInterface(__uuidof(IDXGIKeyedMutex), (void**)&pSyncMutex);
+                if (SUCCEEDED(hr)) {
+                    pSyncTexture = pSyncTex;
+                    hSyncHandle = hSync;
+                    hr = pSyncMutex->AcquireSync(0, 16);
+                    if (FAILED(hr)) {
+                        DriverLog("AcquireSync failed! HRESULT: 0x%x (timeout or already acquired)", hr);
+                        pSyncMutex->Release();
+                        pSyncMutex = nullptr;
+                        pSyncTex->Release();
+                        pSyncTexture = nullptr;
+                        hSyncHandle = nullptr;
+                    }
+                } else {
+                    DriverLog("QueryInterface for IDXGIKeyedMutex failed! HRESULT: 0x%x", hr);
+                    pSyncTex->Release();
+                }
+            } else {
+                DriverLog("OpenSharedResource for sync texture failed! HRESULT: 0x%x", hr);
+            }
+        }
+    }
+
     if (!m_hasSubmit || !m_encoderInitialized || !m_pVideoEncoder) {
+        // Release sync texture if we have nothing to encode
+        if (pSyncMutex) {
+            pSyncMutex->ReleaseSync(0);
+            pSyncMutex->Release();
+        }
+        if (pSyncTexture) {
+            pSyncTexture->Release();
+        }
         return;
     }
 
@@ -449,22 +519,35 @@ void HmdDriver::Present(vr::SharedTextureHandle_t syncTexture)
         (uint64_t)m_submitLayers[1].hTexture, pRightTex ? "FOUND" : "NOT FOUND",
         m_textureHandleMap.size());
 
-    // Flush GPU pipeline to ensure we see vrcompositor's writes
-    pD3D11DeviceContext->Flush();
-
-    // Encode SBS - no mutex, no OpenSharedResource, just read directly
+    // Save texture pointers for encoding on background thread.
+    // PostPresent() will signal the encoding thread.
     if (pLeftTex && pRightTex) {
-        std::lock_guard<std::mutex> lock(m_encoderMutex);
-        if (!m_encoderInitialized || !m_pVideoEncoder) return;
-        DriverLog("Encoding SBS: left=%llu right=%llu pts=%lld",
-            (uint64_t)m_submitLayers[0].hTexture, (uint64_t)m_submitLayers[1].hTexture, m_encoderPts);
-        m_pVideoEncoder->EncodeFrameSBS(pLeftTex, pRightTex, m_encoderPts);
+        m_pendingEncode.pLeftTex = pLeftTex;
+        m_pendingEncode.pRightTex = pRightTex;
+        m_pendingEncode.pts = m_encoderPts;
+        m_pendingEncode.pSyncMutex = pSyncMutex;
+        m_pendingEncode.pSyncTexture = pSyncTexture;
+        m_pendingEncode.hSyncHandle = hSyncHandle;
         m_encoderPts++;
+        m_hasPendingEncode = true;
     } else if (pLeftTex) {
-        std::lock_guard<std::mutex> lock(m_encoderMutex);
-        if (!m_encoderInitialized || !m_pVideoEncoder) return;
-        m_pVideoEncoder->EncodeFrame(pLeftTex, m_encoderPts);
+        m_pendingEncode.pLeftTex = pLeftTex;
+        m_pendingEncode.pRightTex = nullptr;
+        m_pendingEncode.pts = m_encoderPts;
+        m_pendingEncode.pSyncMutex = pSyncMutex;
+        m_pendingEncode.pSyncTexture = pSyncTexture;
+        m_pendingEncode.hSyncHandle = hSyncHandle;
         m_encoderPts++;
+        m_hasPendingEncode = true;
+    } else {
+        // No textures to encode, release sync texture
+        if (pSyncMutex) {
+            pSyncMutex->ReleaseSync(0);
+            pSyncMutex->Release();
+        }
+        if (pSyncTexture) {
+            pSyncTexture->Release();
+        }
     }
 
     m_hasSubmit = false;
@@ -472,8 +555,26 @@ void HmdDriver::Present(vr::SharedTextureHandle_t syncTexture)
 
 void HmdDriver::PostPresent()
 {
-	// This is called after Present returns, allowing the driver to take more time until vsync after they've successfully acquired the sync texture in Present. We can use this to do any additional work needed before the next frame.
     DriverLog("PostPresent called");
+
+    if (!m_hasPendingEncode) {
+        return;
+    }
+
+    m_hasPendingEncode = false;
+
+    // Flush GPU to ensure the compositor's writes to the textures are visible
+    pD3D11DeviceContext->Flush();
+
+    // Signal the background encoding thread to encode the pending frame.
+    // This returns immediately so the compositor is not blocked.
+    DriverLog("Signaling encoding thread: left=%llu right=%llu pts=%lld",
+        (uint64_t)m_pendingEncode.pLeftTex, (uint64_t)m_pendingEncode.pRightTex, m_pendingEncode.pts);
+    {
+        std::lock_guard<std::mutex> lock(m_encodingMutex);
+        m_encodingWorkReady = true;
+    }
+    m_encodingCv.notify_one();
 }
 
 void HmdDriver::GetFrameTiming(DriverDirectMode_FrameTiming* pFrameTiming)
@@ -504,26 +605,23 @@ bool HmdDriver::InitializeVideoEncoder()
     m_encoderH = 1620;
     m_encoderFps = 60;
     m_encoderBitrate = 20000000;
-    m_encoderUseGpu = false;
     ClampEncoderToCap();
 
     int width = m_encoderW;
     int height = m_encoderH;
     int fps = m_encoderFps;
     int bitrate = m_encoderBitrate;
-    bool useGpuEncoding = m_encoderUseGpu;
 
     DriverLog("Encoder configuration:");
     DriverLog("  Resolution: %dx%d (SBS: %dx%d per eye)", width, height, width / 2, height);
     DriverLog("  FPS: %d", fps);
     DriverLog("  Bitrate: %d bps (%d kbps)", bitrate, bitrate / 1000);
-    DriverLog("  GPU Encoding: %s", useGpuEncoding ? "YES" : "NO");
 
     m_pVideoEncoder->SetEncodedPacketCallback([this](uint8_t* data, int size, int64_t pts, bool keyframe) {
         OnEncodedPacket(data, size, pts, keyframe);
     });
 
-    if (!m_pVideoEncoder->Initialize(pD3D11Device, pD3D11DeviceContext, width, height, fps, bitrate, useGpuEncoding)) {
+    if (!m_pVideoEncoder->Initialize(pD3D11Device, pD3D11DeviceContext, width, height, fps, bitrate)) {
         DriverLog("VideoEncoder::Initialize failed!");
         delete m_pVideoEncoder;
         m_pVideoEncoder = nullptr;
@@ -621,7 +719,7 @@ bool HmdDriver::ApplyHardwareCap(int capW, int capH)
     });
 
     if (!m_pVideoEncoder->Initialize(pD3D11Device, pD3D11DeviceContext,
-                                     m_encoderW, m_encoderH, m_encoderFps, m_encoderBitrate, m_encoderUseGpu)) {
+                                     m_encoderW, m_encoderH, m_encoderFps, m_encoderBitrate)) {
         DriverLog("VideoEncoder re-init failed under cap!");
         delete m_pVideoEncoder;
         m_pVideoEncoder = nullptr;
@@ -636,6 +734,17 @@ bool HmdDriver::ApplyHardwareCap(int capW, int capH)
 
 void HmdDriver::OnEncodedPacket(uint8_t* data, int size, int64_t pts, bool keyframe)
 {
+    m_encodeFrameCount++;
+    {
+        long long nowNs = std::chrono::steady_clock::now().time_since_epoch().count();
+        if (m_lastEncodeLogNs == 0) m_lastEncodeLogNs = nowNs;
+        if (nowNs - m_lastEncodeLogNs >= 1'000'000'000LL) {
+            double measuredFps = m_encodeFrameCount * 1e9 / (nowNs - m_lastEncodeLogNs);
+            m_measuredEncoderFps.store(static_cast<float>(measuredFps));
+            m_encodeFrameCount = 0;
+            m_lastEncodeLogNs = nowNs;
+        }
+    }
     if (keyframe && size >= 8) {
         DriverLog("[Encoded] size=%d, pts=%lld, keyframe=YES, first16=%02X %02X %02X %02X %02X %02X %02X %02X",
                   size, pts,
@@ -647,6 +756,11 @@ void HmdDriver::OnEncodedPacket(uint8_t* data, int size, int64_t pts, bool keyfr
     }
 
     if (!m_udpInitialized || m_udpSocket == INVALID_SOCKET || size <= 0) {
+        return;
+    }
+
+    if (m_bridgeConnection && !m_bridgeConnection->IsStreamAuthorized()) {
+        DriverLog("[UDP] Stream not authorized by bridge, skipping send");
         return;
     }
 
@@ -749,6 +863,56 @@ void HmdDriver::OnEncodedPacket(uint8_t* data, int size, int64_t pts, bool keyfr
         free(framed);
     }
     DriverLog("[UDP] Sent framed packet: payload=%d bytes", size);
+}
+
+void HmdDriver::EncodingThreadFunc()
+{
+    DriverLog("Encoding thread running");
+
+    while (m_encodingThreadRunning) {
+        PendingEncode work;
+
+        // Wait for work
+        {
+            std::unique_lock<std::mutex> lock(m_encodingMutex);
+            m_encodingCv.wait(lock, [this] {
+                return m_encodingWorkReady.load() || !m_encodingThreadRunning.load();
+            });
+
+            if (!m_encodingThreadRunning && !m_encodingWorkReady) break;
+
+            // Grab work
+            work = m_pendingEncode;
+            m_pendingEncode = PendingEncode();
+            m_encodingWorkReady = false;
+        }
+
+        if (!work.pLeftTex) continue;
+
+        // Encode on this background thread (off the compositor thread)
+        {
+            std::lock_guard<std::mutex> lock(m_encoderMutex);
+            if (m_encoderInitialized && m_pVideoEncoder) {
+                if (work.pLeftTex && work.pRightTex) {
+                    m_pVideoEncoder->EncodeFrameSBS(work.pLeftTex, work.pRightTex, work.pts);
+                } else {
+                    m_pVideoEncoder->EncodeFrame(work.pLeftTex, work.pts);
+                }
+            }
+        }
+
+        // Release the sync texture AFTER encoding is done.
+        // This signals to the compositor that we're done with this frame.
+        if (work.pSyncMutex) {
+            work.pSyncMutex->ReleaseSync(0);
+            work.pSyncMutex->Release();
+        }
+        if (work.pSyncTexture) {
+            work.pSyncTexture->Release();
+        }
+    }
+
+    DriverLog("Encoding thread exiting");
 }
 
 bool HmdDriver::InitializeUDP()
