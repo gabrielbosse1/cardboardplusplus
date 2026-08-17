@@ -11,9 +11,26 @@ D3D11 uses a **deferred command buffer model**: calls like `CopySubresourceRegio
 
 **The problem:** `Flush()` alone does NOT guarantee the GPU has *finished* executing. It only guarantees the commands have been *submitted*. To truly wait for completion, you'd need a query or fence. However, in practice, `Map()` on a staging texture (`ReadBackConversionRT()`, `VideoEncoder.cpp:731`) will block until the GPU is done writing, so it works — but it's an implicit stall, not an explicit one.
 
-### 2. ~~Is encoding locking Present() until it finishes?~~ FIXED
+### 2. Is encoding locking Present() until it finishes?
 
-Encoding now happens in `PostPresent()`, which runs after Present returns and has the budget until the next vsync.
+**Yes, and it's a significant issue.**
+
+`Present()` (`HmdDriver.cpp:414`) runs on the **SteamVR compositor thread**. At line 461, it synchronously calls:
+```
+m_pVideoEncoder->EncodeFrameSBS(pLeftTex, pRightTex, m_encoderPts);
+```
+
+This blocks the compositor thread for the entire encode duration, which includes:
+- GPU shader pass (`ComposeSBS`) — fast, ~0.1ms
+- GPU→CPU readback (`ReadBackConversionRT`) — **pipeline stall**, GPU must finish rendering
+- CPU pixel conversion (`sws_scale`) — **CPU work**, several ms at 2880x1620
+- FFmpeg encode (`avcodec_send_frame` / `avcodec_receive_packet`) — fast with HW encoder, slower with libx264
+- BSF conversion (`av_bsf_*`) — minor overhead
+- Packet fixup + UDP send (`OnEncodedPacket`) — minor overhead
+
+**Why this is bad:** SteamVR's compositor targets 90fps (11.1ms budget). If encoding takes 5-10ms, you're eating most of the frame budget. The compositor will miss its vsync, causing **dropped frames and stuttering in VR**.
+
+**Why it exists:** The driver needs the texture pointers from SteamVR. `PostPresent()` exists (line 473) specifically for this — it's called after Present returns and allows the driver to do work until the next vsync. The encoding should happen there, not in `Present()`.
 
 ### 3. What is a fullscreen triangle?
 
@@ -99,13 +116,20 @@ The BSF correctly converts the format. The problem is that the BSF + the manual 
 
 ## Redundant Work & Problems Found
 
-### ~~Problem 2: CPU-side BGRA→NV12 conversion via sws_scale~~ (kept, but mitigated by async)
-- **Location:** `VideoEncoder.cpp` — `sws_scale()` converts BGRA8→NV12 on CPU
-- **Mitigation:** Encoding now runs on a background thread, so CPU conversion no longer blocks the compositor
+### Problem 1: Synchronous encoding in Present() blocks the compositor
+- **Location:** `HmdDriver.cpp:461` — `EncodeFrameSBS()` called synchronously from `Present()`
+- **Issue:** Blocks SteamVR's compositor thread for the entire encode duration (GPU readback + CPU conversion + encoding). Should use `PostPresent()` or a separate thread.
+- **Impact:** Frame drops, VR stuttering
 
-### ~~Problem 3: GPU readback pipeline stall~~ (kept, but mitigated by async)
+### Problem 2: CPU-side BGRA→NV12 conversion via sws_scale
+- **Location:** `VideoEncoder.cpp:744` — `sws_scale()` converts BGRA8→NV12 on CPU
+- **Issue:** At 2880x1620, this processes ~4.6M pixels on the CPU every frame. The GPU already has the data and can do this conversion faster.
+- **Impact:** Unnecessary CPU load, higher latency, wasted GPU idle time
+
+### Problem 3: GPU readback pipeline stall
 - **Location:** `VideoEncoder.cpp:728-735` — `CopySubresourceRegion` + `Map()` on staging texture
-- **Mitigation:** GPU readback now runs on background encoding thread, no longer blocking compositor
+- **Issue:** `Map()` on a `D3D11_USAGE_STAGING` texture with `D3D11_CPU_ACCESS_READ` blocks until the GPU finishes all pending work. This is a hard pipeline stall.
+- **Impact:** Adds latency proportional to GPU frame time
 
 ### Problem 4: Manual keyframe fixup duplicates BSF work
 - **Location:** `HmdDriver.cpp:659-726` — Manual NAL scanning and IDR start code insertion
@@ -132,8 +156,10 @@ The BSF correctly converts the format. The problem is that the BSF + the manual 
 - **Issue:** These are named "staging" but are actually `DEFAULT` usage (GPU-only). The actual CPU-readable staging is `m_pStagingTexture`. The naming is confusing and the intermediate copies add GPU overhead.
 - **Impact:** Extra GPU copies, confusing naming
 
-### ~~Problem 9: No double-buffering or async encoding~~ FIXED
-- Double-buffered staging textures, software frame buffers, and AVFrames. Frame N can encode while frame N+1 is captured.
+### Problem 9: No double-buffering or async encoding
+- **Location:** `VideoEncoder.cpp` — Single `m_pFrame`, single `m_pStagingTexture`
+- **Issue:** If encoding takes longer than one frame interval, the next frame overwrites the staging texture before encoding finishes. The telemetry at line 987 logs when this happens ("SLOW frame"), but there's no mitigation.
+- **Impact:** Frame corruption under load, "image-in-image" artifacts
 
 ### Problem 10: Flush() is not sufficient for synchronization
 - **Location:** `HmdDriver.cpp:453` — `pD3D11DeviceContext->Flush()`
@@ -145,17 +171,35 @@ The BSF correctly converts the format. The problem is that the BSF + the manual 
 - **Issue:** `OMGetRenderTargets` + `RSGetViewports` called every frame, with COM reference counting. This is defensive but adds overhead and suggests the encoder doesn't own its rendering state properly.
 - **Impact:** Minor per-frame overhead, code complexity
 
-### ~~Problem 12: No frame pacing or timing control~~ FIXED
-- **Location:** `HmdDriver.cpp` — Encode triggered by `PostPresent()`
-- **Fix:** Encoding now runs on a dedicated background thread. PostPresent() signals the thread and returns immediately, so the compositor is never blocked. The sync texture keyed mutex is released after encoding completes, properly synchronizing with SteamVR's compositor.
+### Problem 12: No frame pacing or timing control
+- **Location:** `HmdDriver.cpp:461` — Encode triggered by `Present()` with no frame interval control
+- **Issue:** The encode rate is whatever SteamVR's compositor rate is (typically 90fps). The encoder might not be able to keep up, or might waste resources encoding at higher rate than the network can deliver.
+- **Impact:** Network congestion, unnecessary encode work
 
-### Problem 13: Hardcoded resolution values — partially fixed
+### Problem 13: Hardcoded 1920x1080 values are stale and mismatched
 - **Location:**
-  - `AppConstants.java:23-24` — `DEFAULT_VIDEO_WIDTH = 2880`, `DEFAULT_VIDEO_HEIGHT = 1620`
-- **Issue (resolved):** The hardcoded values now match the actual encoder resolution (2880x1620 SBS). The mismatch between `GetWindowBounds()`, `GetRecommendedRenderTargetSize()`, and `AppConstants` has been corrected.
-- **Remaining:** `DEFAULT_VIDEO_WIDTH`/`DEFAULT_VIDEO_HEIGHT` still exist in `AppConstants.java`. They could be removed entirely since `VideoDecoder.java` already parses resolution from the SPS in the stream, but they now serve as sensible defaults.
+  - `HmdDriver.cpp:215-216` — `GetWindowBounds()` returns 1920x1080
+  - `HmdDriver.cpp:231-232` — `GetRecommendedRenderTargetSize()` returns 960x1080 per eye
+  - `AppConstants.java:23-24` — `DEFAULT_VIDEO_WIDTH = 1920`, `DEFAULT_VIDEO_HEIGHT = 1080`
+- **Issue:** Three different hardcoded values that don't match each other or the actual encoder (2880x1620 SBS, 1440x1620 per eye). `GetWindowBounds()` is ignored since `IsDisplayOnDesktop()` returns false. `GetRecommendedRenderTargetSize()` tells SteamVR to render at 960x1080 per eye but the encoder reads at 1440x1620 — SteamVR renders less pixels than the encoder expects. `AppConstants` Java defaults aren't used by the encoder at all.
+- **Fix:**
+  - Remove `DEFAULT_VIDEO_WIDTH`/`DEFAULT_VIDEO_HEIGHT` from `AppConstants.java`. The Android side should get its dimensions from the actual stream (SPS parsing in `VideoDecoder.java` already does this).
+  - `GetRecommendedRenderTargetSize()` should return the per-eye encoder resolution (m_encoderW/2, m_encoderH) so SteamVR renders at the resolution the encoder actually uses.
+  - `GetWindowBounds()` should match or be removed if `IsDisplayOnDesktop()` is false (it's ignored anyway).
+- **Impact:** SteamVR renders at wrong resolution, wasted GPU cycles rendering pixels that get upscaled, or missing pixels that get downscaled
 
-### Problem 15: Manual H.264 NAL parsing should use a library
+### Problem 14: Triple buffering is fake — same handle for all 3 slots
+- **Location:** `HmdDriver.cpp:320-323`
+- **Issue:** `CreateSwapTextureSet()` creates a single texture and returns the same `hSharedHandle` for all 3 slots of the `SwapTextureSet`. True triple buffering requires 3 separate textures so the app, compositor, and encoder can each own one simultaneously. With a single texture, the encoder can read while the app is mid-write, causing torn/corrupted frames.
+- **Impact:** Race conditions, potential frame corruption under load
+
+### Problem 15: Dead flag `m_encoderUseGpu` — does nothing
+- **Location:** `HmdDriver.h:104`, `HmdDriver.cpp:507`, `HmdDriver.cpp:514`, `VideoEncoder.cpp:135`, `VideoEncoder.cpp:208`, `VideoEncoder.cpp:354`
+- **Issue:** `m_encoderUseGpu` is hardcoded `false`, passed to `VideoEncoder::Initialize()` as `useGpuEncoding`, which sets `m_useGpuEncoding`. But `m_useGpuEncoding` is only read for a log message (`VideoEncoder.cpp:355-356`). The actual encoder selection loop (`VideoEncoder.cpp:262-358`) tries hardware encoders regardless of this flag. The flag has zero effect on behavior — it just prints "GPU Encoding: NO" in logs even when a hardware encoder is being used.
+- **Fix:** Remove `m_encoderUseGpu` from `HmdDriver.h`, `HmdDriver.cpp`, and `useGpuEncoding` parameter from `VideoEncoder::Initialize()`. The encoder should auto-detect hardware availability without a manual flag.
+- **Impact:** Misleading logs, dead code path
+
+### Problem 16: Manual H.264 NAL parsing should use a library
 - **Location:** `HmdDriver.cpp:659-726` — Manual byte-scanning for NAL start codes, PPS detection, IDR insertion
 - **Issue:** The keyframe fixup manually scans raw bytes for `00 00 00 01` start codes and NAL type bits. This is fragile H.264 bitstream parsing that duplicates what FFmpeg's BSF already does. If the encoder changes output format, this breaks silently.
 - **Fix:** Use FFmpeg's existing NAL parsing APIs or a dedicated H.264 bitstream library:

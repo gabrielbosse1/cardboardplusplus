@@ -21,7 +21,7 @@ public:
     ~VideoEncoder();
 
     bool Initialize(ID3D11Device* pDevice, ID3D11DeviceContext* pContext,
-                    int width, int height, int fps, int bitrate);
+                    int width, int height, int fps, int bitrate, bool useGpuEncoding);
     
     void Shutdown();
 
@@ -59,14 +59,15 @@ private:
 
     AVCodecContext* m_pCodecContext;
     AVBufferRef* m_pHwDeviceCtx;
-    AVFrame* m_pFrame[2];
+    AVFrame* m_pFrame;
     AVPacket* m_pPacket;
     AVBSFContext* m_pBsfCtx;
     SwsContext* m_pConvertContext;
 
-    ID3D11Texture2D* m_pStagingTexture[2];
+    ID3D11Texture2D* m_pStagingTexture;
 
     bool m_initialized;
+    bool m_useGpuEncoding;
     int m_width;
     int m_height;
     int m_fps;
@@ -75,8 +76,7 @@ private:
 
     EncodedPacketCallback m_encodedPacketCallback;
 
-    uint8_t* m_pSoftwareFrameBuffer[2];
-    int m_bufferIndex = 0;
+    uint8_t* m_pSoftwareFrameBuffer;
     bool m_hasValidFrame;
 
     // Shader-based format conversion (for R10G10B10A2_UNORM textures)
