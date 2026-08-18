@@ -71,11 +71,17 @@ float4 main(PSIn input) : SV_Target {
 }
 )";
 
-// SBS compose pixel shader - chooses left or right eye based on x coordinate
+// SBS compose pixel shader - chooses left or right eye based on x coordinate.
+// Each layer draws with its own source sub-rect (VRTextureBounds) so partial
+// overlays are placed correctly. leftRect/rightRect = (offsetU, offsetV, scaleU, scaleV).
 static const char* kSBSPSSource = R"(
 Texture2D<float4> leftEye : register(t0);
 Texture2D<float4> rightEye : register(t1);
 SamplerState samp : register(s0);
+cbuffer Bounds : register(b0) {
+    float4 leftRect;   // x=offsetU, y=offsetV, z=scaleU, w=scaleV
+    float4 rightRect;
+};
 
 struct PSIn {
     float4 pos : SV_Position;
@@ -92,12 +98,10 @@ float4 linearToSrgb(float4 c) {
 float4 main(PSIn input) : SV_Target {
     float4 c;
     if (input.uv.x < 0.5) {
-        // Left eye: remap UV from [0, 0.5) to [0, 1]
-        float2 leftUV = float2(input.uv.x * 2.0, input.uv.y);
+        float2 leftUV = leftRect.xy + float2(input.uv.x * 2.0, input.uv.y) * leftRect.zw;
         c = leftEye.Sample(samp, leftUV);
     } else {
-        // Right eye: remap UV from [0.5, 1] to [0, 1]
-        float2 rightUV = float2((input.uv.x - 0.5) * 2.0, input.uv.y);
+        float2 rightUV = rightRect.xy + float2((input.uv.x - 0.5) * 2.0, input.uv.y) * rightRect.zw;
         c = rightEye.Sample(samp, rightUV);
     }
     return linearToSrgb(c);
@@ -147,6 +151,8 @@ VideoEncoder::VideoEncoder()
     , m_pBlitPS(nullptr)
     , m_pBlitSampler(nullptr)
     , m_pBlitBlend(nullptr)
+    , m_pLayerBlend(nullptr)
+    , m_pBoundsCB(nullptr)
     , m_pBlitInputLayout(nullptr)
     , m_pBlitVertexBuffer(nullptr)
     , m_shaderConversionReady(false)
@@ -208,6 +214,29 @@ bool VideoEncoder::Initialize(ID3D11Device* pDevice, ID3D11DeviceContext* pConte
     m_useGpuEncoding = useGpuEncoding;
     m_frameCount = 0;
 
+    // Create a SECOND D3D11 device for the encoding thread. This device
+    // is independent from the compositor's device, so the encoding thread
+    // can use D3D11 without contention while Present() runs on device 1.
+    D3D_FEATURE_LEVEL featureLevel;
+    HRESULT hr2 = D3D11CreateDevice(
+        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+        0, nullptr, 0, D3D11_SDK_VERSION,
+        &m_pEncDevice, &featureLevel, &m_pEncContext);
+    if (FAILED(hr2)) {
+        ENCODER_ERROR("Failed to create encoding D3D11 device! HRESULT: 0x%x", hr2);
+        ENCODER_ERROR("Falling back to compositor device (will cause contention)");
+        m_pEncDevice = nullptr;
+        m_pEncContext = nullptr;
+    } else {
+        ENCODER_LOG("Created second D3D11 device for encoding thread (feature level: 0x%x)", featureLevel);
+    }
+
+    // Point GPU resources at the encoding device if available, else compositor device.
+    ID3D11Device* gpuDevice = m_pEncDevice ? m_pEncDevice : m_pDevice;
+    ID3D11DeviceContext* gpuContext = m_pEncContext ? m_pEncContext : m_pContext;
+    m_pDevice = gpuDevice;
+    m_pContext = gpuContext;
+
     LogFFmpegVersion();
 
     if (!InitializeFFmpeg()) {
@@ -249,8 +278,56 @@ void VideoEncoder::Shutdown()
         m_pSoftwareFrameBuffer = nullptr;
     }
 
+    ReleaseEyeTextures();
+
+    if (m_pEncContext) { m_pEncContext->Release(); m_pEncContext = nullptr; }
+    if (m_pEncDevice) { m_pEncDevice->Release(); m_pEncDevice = nullptr; }
+
     m_initialized = false;
     ENCODER_LOG("VideoEncoder shutdown complete.");
+}
+
+bool VideoEncoder::OpenSharedEyeTextures(const std::vector<std::pair<HANDLE, HANDLE>>& handles,
+                                           std::vector<ID3D11Texture2D*>& outLeft,
+                                           std::vector<ID3D11Texture2D*>& outRight)
+{
+    ReleaseEyeTextures();
+
+    ID3D11Device* dev = m_pEncDevice ? m_pEncDevice : m_pDevice;
+    if (!dev || handles.empty()) return false;
+
+    m_encEyeLefts.reserve(handles.size());
+    m_encEyeRights.reserve(handles.size());
+    for (const auto& h : handles) {
+        if (!h.first || !h.second) return false;
+        ID3D11Texture2D* pL = nullptr;
+        ID3D11Texture2D* pR = nullptr;
+        HRESULT hr = dev->OpenSharedResource(h.first, __uuidof(ID3D11Texture2D), (void**)&pL);
+        if (FAILED(hr)) {
+            ENCODER_ERROR("OpenSharedResource(left) failed! HRESULT: 0x%x", hr);
+            return false;
+        }
+        hr = dev->OpenSharedResource(h.second, __uuidof(ID3D11Texture2D), (void**)&pR);
+        if (FAILED(hr)) {
+            ENCODER_ERROR("OpenSharedResource(right) failed! HRESULT: 0x%x", hr);
+            pL->Release();
+            return false;
+        }
+        m_encEyeLefts.push_back(pL);
+        m_encEyeRights.push_back(pR);
+    }
+
+    outLeft = m_encEyeLefts;
+    outRight = m_encEyeRights;
+    return true;
+}
+
+void VideoEncoder::ReleaseEyeTextures()
+{
+    for (auto* t : m_encEyeLefts) { if (t) t->Release(); }
+    for (auto* t : m_encEyeRights) { if (t) t->Release(); }
+    m_encEyeLefts.clear();
+    m_encEyeRights.clear();
 }
 
 bool VideoEncoder::InitializeFFmpeg()
@@ -586,7 +663,7 @@ bool VideoEncoder::InitializeShaderConversion()
         return false;
     }
 
-    // Create blend state (no blending)
+    // Create blend state (no blending) — used by the simple blit/convert paths.
     D3D11_BLEND_DESC blendDesc = {};
     blendDesc.RenderTarget[0].BlendEnable = FALSE;
     blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
@@ -594,6 +671,41 @@ bool VideoEncoder::InitializeShaderConversion()
     hr = m_pDevice->CreateBlendState(&blendDesc, &m_pBlitBlend);
     if (FAILED(hr)) {
         ENCODER_ERROR("Failed to create blend state! HRESULT: 0x%x", hr);
+        vsBlob->Release();
+        psBlob->Release();
+        return false;
+    }
+
+    // Create blend state for stacking layers (alpha over): later layers blend on
+    // top of earlier ones using each eye texture's own alpha channel.
+    D3D11_BLEND_DESC layerBlendDesc = {};
+    layerBlendDesc.RenderTarget[0].BlendEnable = TRUE;
+    layerBlendDesc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+    layerBlendDesc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    layerBlendDesc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    layerBlendDesc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_SRC_ALPHA;
+    layerBlendDesc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+    layerBlendDesc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    layerBlendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+
+    hr = m_pDevice->CreateBlendState(&layerBlendDesc, &m_pLayerBlend);
+    if (FAILED(hr)) {
+        ENCODER_ERROR("Failed to create layer blend state! HRESULT: 0x%x", hr);
+        vsBlob->Release();
+        psBlob->Release();
+        return false;
+    }
+
+    // Constant buffer carrying the per-layer source sub-rect (VRTextureBounds)
+    // consumed by the SBS pixel shader.
+    D3D11_BUFFER_DESC cbDesc = {};
+    cbDesc.ByteWidth = sizeof(float) * 8; // two float4
+    cbDesc.Usage = D3D11_USAGE_DYNAMIC;
+    cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    hr = m_pDevice->CreateBuffer(&cbDesc, nullptr, &m_pBoundsCB);
+    if (FAILED(hr)) {
+        ENCODER_ERROR("Failed to create bounds constant buffer! HRESULT: 0x%x", hr);
         vsBlob->Release();
         psBlob->Release();
         return false;
@@ -677,6 +789,8 @@ void VideoEncoder::CleanupShaderConversion()
     if (m_pSBSPS) { m_pSBSPS->Release(); m_pSBSPS = nullptr; }
     if (m_pBlitSampler) { m_pBlitSampler->Release(); m_pBlitSampler = nullptr; }
     if (m_pBlitBlend) { m_pBlitBlend->Release(); m_pBlitBlend = nullptr; }
+    if (m_pLayerBlend) { m_pLayerBlend->Release(); m_pLayerBlend = nullptr; }
+    if (m_pBoundsCB) { m_pBoundsCB->Release(); m_pBoundsCB = nullptr; }
     if (m_pBlitInputLayout) { m_pBlitInputLayout->Release(); m_pBlitInputLayout = nullptr; }
     if (m_pBlitVertexBuffer) { m_pBlitVertexBuffer->Release(); m_pBlitVertexBuffer = nullptr; }
     if (m_pLeftStaging) { m_pLeftStaging->Release(); m_pLeftStaging = nullptr; }
@@ -722,9 +836,10 @@ void VideoEncoder::SetupBlitPipeline(ID3D11ShaderResourceView* pSRV)
     m_pContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 }
 
-bool VideoEncoder::ReadBackConversionRT()
+bool VideoEncoder::ReadBackBegin()
 {
-    // Copy conversion RT to staging texture
+    // D3D11 only: Copy conversion RT to staging texture and map it for CPU read.
+    // Caller must call sws_scale on mapped data, then call ReadBackEnd().
     m_pContext->CopySubresourceRegion(m_pStagingTexture, 0, 0, 0, 0, m_pConversionRT, 0, nullptr);
 
     D3D11_MAPPED_SUBRESOURCE mapped;
@@ -734,9 +849,90 @@ bool VideoEncoder::ReadBackConversionRT()
         return false;
     }
 
-    // Convert BGRA8 -> NV12
-    uint8_t* srcSlice[1] = { (uint8_t*)mapped.pData };
-    int srcStride[1] = { static_cast<int>(mapped.RowPitch) };
+    m_mappedRowPitch = mapped.RowPitch;
+    m_mappedData = mapped.pData;
+    return true;
+}
+
+bool VideoEncoder::ReadBackEnd()
+{
+    // D3D11 only: unmap the staging texture after CPU read is done.
+    m_pContext->Unmap(m_pStagingTexture, 0);
+    m_mappedData = nullptr;
+    return true;
+}
+
+bool VideoEncoder::ReadbackToBuffer()
+{
+    // D3D11: CopySubresourceRegion + Map + memcpy to CPU buffer + Unmap.
+    // All D3D11 calls happen here so the caller never needs a mutex.
+    // The CPU buffer is consumed later by SwsConvert.
+    if (!m_initialized) {
+        ENCODER_ERROR("ReadbackToBuffer called without valid encoder!");
+        return false;
+    }
+
+    m_pContext->CopySubresourceRegion(m_pStagingTexture, 0, 0, 0, 0, m_pConversionRT, 0, nullptr);
+
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    HRESULT hr = m_pContext->Map(m_pStagingTexture, 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr)) {
+        ENCODER_ERROR("Failed to map staging texture in ReadbackToBuffer! HRESULT: 0x%x", hr);
+        return false;
+    }
+
+    int bufSize = m_height * mapped.RowPitch;
+    if (!m_pReadbackBuffer || m_readbackBufferSize < bufSize) {
+        delete[] m_pReadbackBuffer;
+        m_pReadbackBuffer = new uint8_t[bufSize];
+        m_readbackBufferSize = bufSize;
+    }
+    m_readbackRowPitch = mapped.RowPitch;
+
+    // Copy row by row (staging RowPitch may differ from our expected stride)
+    for (int y = 0; y < m_height; y++) {
+        memcpy(m_pReadbackBuffer + y * m_width * 4,
+               (uint8_t*)mapped.pData + y * mapped.RowPitch,
+               m_width * 4);
+    }
+
+    // DIAG (Test A): detect black frames. m_pConversionRT is B8G8R8A8_UNORM, so the
+    // mapped BGRA data lets us sample luminance. A near-zero mean means the encoder
+    // is about to stream a black frame (confirms the layer compositing produced black).
+#ifdef DRIVER_DIAG
+    {
+        const uint8_t* p = (const uint8_t*)mapped.pData;
+        uint64_t sum = 0;
+        int n = 0;
+        for (int y = 0; y < m_height; y += 8) {
+            const uint8_t* row = p + (size_t)y * mapped.RowPitch;
+            for (int x = 0; x < m_width; x += 8) {
+                const uint8_t* px = row + x * 4;
+                sum += (uint64_t)px[0] + px[1] + px[2]; // B + G + R
+                n++;
+            }
+        }
+        if (n > 0) {
+            uint64_t mean = sum / (uint64_t)n;
+            if (mean < 4) { // average channel < ~4/255
+                ENCODER_LOG("[DIAG BLACK FRAME] meanRGB=%llu n=%d Lfmt=0x%x Rfmt=0x%x",
+                    (unsigned long long)mean, n, m_lastLeftFmt, m_lastRightFmt);
+            }
+        }
+    }
+#endif
+
+    m_pContext->Unmap(m_pStagingTexture, 0);
+    return true;
+}
+
+bool VideoEncoder::ReadBackConversionRT()
+{
+    if (!ReadBackBegin()) return false;
+
+    // CPU-only: convert BGRA8 -> NV12
+    uint8_t* srcSlice[1] = { (uint8_t*)m_mappedData };
+    int srcStride[1] = { static_cast<int>(m_mappedRowPitch) };
 
     uint8_t* dstSlice[2] = { m_pSoftwareFrameBuffer, m_pSoftwareFrameBuffer + m_width * m_height };
     int dstStride[2] = { m_width, m_width };
@@ -744,7 +940,7 @@ bool VideoEncoder::ReadBackConversionRT()
     int ret = sws_scale(m_pConvertContext, srcSlice, srcStride, 0, m_height,
                         dstSlice, dstStride);
 
-    m_pContext->Unmap(m_pStagingTexture, 0);
+    if (!ReadBackEnd()) return false;
 
     if (ret != m_height) {
         ENCODER_ERROR("swscale conversion failed! Returned %d, expected %d", ret, m_height);
@@ -809,18 +1005,14 @@ bool VideoEncoder::ConvertViaShader(ID3D11Texture2D* pSource)
     return ReadBackConversionRT();
 }
 
-bool VideoEncoder::ComposeSBS(ID3D11Texture2D* pLeft, ID3D11Texture2D* pRight)
+bool VideoEncoder::ComposeSBSLayer(ID3D11Texture2D* pLeft, ID3D11Texture2D* pRight,
+                                     const LayerBounds& leftBounds, const LayerBounds& rightBounds,
+                                     ID3D11BlendState* blendState)
 {
-    if (!m_shaderConversionReady) {
-        ENCODER_ERROR("Shader conversion not ready for SBS compositing!");
-        return false;
-    }
-
     D3D11_TEXTURE2D_DESC leftDesc, rightDesc;
     pLeft->GetDesc(&leftDesc);
     pRight->GetDesc(&rightDesc);
 
-    // Create SRVs directly from source textures
     D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
     srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
     srvDesc.Texture2D.MipLevels = 1;
@@ -833,7 +1025,6 @@ bool VideoEncoder::ComposeSBS(ID3D11Texture2D* pLeft, ID3D11Texture2D* pRight)
         ENCODER_ERROR("Failed to create left eye SRV! HRESULT: 0x%x", hr);
         return false;
     }
-
     srvDesc.Format = rightDesc.Format;
     ID3D11ShaderResourceView* pRightSRV = nullptr;
     hr = m_pDevice->CreateShaderResourceView(pRight, &srvDesc, &pRightSRV);
@@ -842,6 +1033,68 @@ bool VideoEncoder::ComposeSBS(ID3D11Texture2D* pLeft, ID3D11Texture2D* pRight)
         pLeftSRV->Release();
         return false;
     }
+
+    // Upload this layer's source sub-rect (VRTextureBounds) to the bounds CB,
+    // consumed by the SBS pixel shader as (offsetU, offsetV, scaleU, scaleV).
+    float rects[8] = {
+        leftBounds.uMin, leftBounds.vMin, leftBounds.uMax - leftBounds.uMin, leftBounds.vMax - leftBounds.vMin,
+        rightBounds.uMin, rightBounds.vMin, rightBounds.uMax - rightBounds.uMin, rightBounds.vMax - rightBounds.vMin
+    };
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    hr = m_pContext->Map(m_pBoundsCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (SUCCEEDED(hr)) {
+        memcpy(mapped.pData, rects, sizeof(rects));
+        m_pContext->Unmap(m_pBoundsCB, 0);
+    }
+
+    ID3D11ShaderResourceView* srvs[2] = { pLeftSRV, pRightSRV };
+    m_pContext->PSSetShaderResources(0, 2, srvs);
+    m_pContext->PSSetConstantBuffers(0, 1, &m_pBoundsCB);
+
+    float blendFactor[4] = { 0, 0, 0, 0 };
+    m_pContext->OMSetBlendState(blendState ? blendState : m_pLayerBlend, blendFactor, 0xFFFFFFFF);
+
+    m_pContext->Draw(3, 0);
+
+    ID3D11ShaderResourceView* nullSRVs[2] = { nullptr, nullptr };
+    m_pContext->PSSetShaderResources(0, 2, nullSRVs);
+
+    pLeftSRV->Release();
+    pRightSRV->Release();
+    return true;
+}
+
+bool VideoEncoder::ComposeSBSGPU(const std::vector<ID3D11Texture2D*>& lefts,
+                                 const std::vector<ID3D11Texture2D*>& rights,
+                                 const std::vector<LayerBounds>& leftBounds,
+                                 const std::vector<LayerBounds>& rightBounds)
+{
+    if (!m_initialized) {
+        ENCODER_ERROR("ComposeSBSGPU called without valid encoder!");
+        return false;
+    }
+    if (lefts.empty() || rights.empty() || lefts.size() != rights.size()) {
+        ENCODER_ERROR("ComposeSBSGPU called with invalid/mismatched layer counts!");
+        return false;
+    }
+
+    // DIAG (Test A): record eye formats + sample log every ~120 composes (H6 check)
+    D3D11_TEXTURE2D_DESC dL = {}, dR = {};
+    lefts.front()->GetDesc(&dL);
+    rights.front()->GetDesc(&dR);
+    m_lastLeftFmt = (uint32_t)dL.Format;
+    m_lastRightFmt = (uint32_t)dR.Format;
+#ifdef DRIVER_DIAG
+    {
+        static int s_composeDiag = 0;
+        if (++s_composeDiag % 120 == 0) {
+            ENCODER_LOG("[DIAG compose] layers=%zu L fmt=0x%x (%ux%u) R fmt=0x%x (%ux%u)",
+                lefts.size(),
+                (uint32_t)dL.Format, dL.Width, dL.Height,
+                (uint32_t)dR.Format, dR.Width, dR.Height);
+        }
+    }
+#endif
 
     // Save current render state
     ID3D11RenderTargetView* pOldRTV = nullptr;
@@ -852,8 +1105,8 @@ bool VideoEncoder::ComposeSBS(ID3D11Texture2D* pLeft, ID3D11Texture2D* pRight)
     UINT numViewports = 1;
     m_pContext->RSGetViewports(&numViewports, &oldViewport);
 
-    // Clear and set conversion RT
-    float clearColor[4] = { 0, 0, 0, 1 };
+    // Clear to transparent black and set the SBS conversion RT once.
+    float clearColor[4] = { 0, 0, 0, 0 };
     m_pContext->ClearRenderTargetView(m_pConversionRTV, clearColor);
     m_pContext->OMSetRenderTargets(1, &m_pConversionRTV, nullptr);
 
@@ -864,32 +1117,28 @@ bool VideoEncoder::ComposeSBS(ID3D11Texture2D* pLeft, ID3D11Texture2D* pRight)
     vp.MaxDepth = 1.0f;
     m_pContext->RSSetViewports(1, &vp);
 
-    // Use SBS pixel shader with both eye textures
     m_pContext->VSSetShader(m_pBlitVS, nullptr, 0);
     m_pContext->PSSetShader(m_pSBSPS, nullptr, 0);
-
-    // Bind both eye textures and sampler
-    ID3D11ShaderResourceView* srvs[2] = { pLeftSRV, pRightSRV };
-    m_pContext->PSSetShaderResources(0, 2, srvs);
     m_pContext->PSSetSamplers(0, 1, &m_pBlitSampler);
-
-    // Set blend state
-    float blendFactor[4] = { 0, 0, 0, 0 };
-    m_pContext->OMSetBlendState(m_pBlitBlend, blendFactor, 0xFFFFFFFF);
-
-    // Set input layout and vertex buffer
     m_pContext->IASetInputLayout(m_pBlitInputLayout);
     UINT stride = 12;
     UINT offset = 0;
     m_pContext->IASetVertexBuffers(0, 1, &m_pBlitVertexBuffer, &stride, &offset);
     m_pContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
-    // Draw fullscreen triangle (SBS shader composites both eyes in one pass)
-    m_pContext->Draw(3, 0);
-
-    // Unbind SRVs
-    ID3D11ShaderResourceView* nullSRVs[2] = { nullptr, nullptr };
-    m_pContext->PSSetShaderResources(0, 2, nullSRVs);
+    // Composite every layer in submission order (painter's algorithm): the first
+    // (scene) is drawn opaque (alpha ignored) so it always fills the frame, later
+    // layers (overlays) alpha-blend on top. Drawing the base opaque also avoids the
+    // eye textures' alpha channel (often 0) making the scene invisible/black.
+    size_t n = lefts.size();
+    for (size_t i = 0; i < n; i++) {
+        const LayerBounds& lbL = (i < leftBounds.size()) ? leftBounds[i] : LayerBounds{};
+        const LayerBounds& lbR = (i < rightBounds.size()) ? rightBounds[i] : LayerBounds{};
+        ID3D11BlendState* blend = (i == 0) ? m_pBlitBlend : m_pLayerBlend;
+        if (!ComposeSBSLayer(lefts[i], rights[i], lbL, lbR, blend)) {
+            ENCODER_ERROR("Failed to compose SBS layer %zu!", i);
+        }
+    }
 
     // Restore render state
     m_pContext->OMSetRenderTargets(1, &pOldRTV, pOldDSV);
@@ -897,11 +1146,146 @@ bool VideoEncoder::ComposeSBS(ID3D11Texture2D* pLeft, ID3D11Texture2D* pRight)
 
     if (pOldRTV) pOldRTV->Release();
     if (pOldDSV) pOldDSV->Release();
-    pLeftSRV->Release();
-    pRightSRV->Release();
 
-    // Read back and convert to NV12
-    return ReadBackConversionRT();
+    return true;
+}
+
+bool VideoEncoder::FinishFrame(int64_t pts)
+{
+    if (!m_initialized) {
+        ENCODER_ERROR("FinishFrame called without valid encoder!");
+        return false;
+    }
+
+    LARGE_INTEGER t0, t1;
+    QueryPerformanceCounter(&t0);
+    if (m_lastCallUs != 0) {
+        int64_t intervalUs = ((t0.QuadPart - m_lastCallUs) * 1000000) / m_perfFreq.QuadPart;
+        m_intervalSumUs += intervalUs;
+        if (intervalUs > m_intervalMaxUs) m_intervalMaxUs = intervalUs;
+        m_intervalCount++;
+    }
+    m_lastCallUs = t0.QuadPart;
+
+    if (!ReadBackConversionRT()) {
+        ENCODER_ERROR("Failed to read back conversion RT!");
+        return false;
+    }
+
+    // Detect duplicate/stale capture (image-in-image symptom: same readback twice)
+    uint32_t hash = ComputeFrameHash();
+    if (m_lastFrameHash != 0 && hash == m_lastFrameHash) m_dupCount++;
+    m_lastFrameHash = hash;
+    m_summaryFrames++;
+
+    m_pFrame->pts = pts;
+    m_hasValidFrame = true;
+
+    if (!SendFrameToEncoder()) {
+        ENCODER_ERROR("Failed to send SBS frame to encoder!");
+        return false;
+    }
+
+    if (!ReceiveEncodedPackets()) {
+        ENCODER_ERROR("Failed to receive SBS encoded packets!");
+        return false;
+    }
+
+    QueryPerformanceCounter(&t1);
+    int64_t elapsedUs = ((t1.QuadPart - t0.QuadPart) * 1000000) / m_perfFreq.QuadPart;
+    m_encSumUs += elapsedUs;
+    if (elapsedUs > m_encMaxUs) m_encMaxUs = elapsedUs;
+    m_encCount++;
+
+    if (elapsedUs > 40000) {
+        ENCODER_LOG("[TELEMETRY] SLOW frame: %lldus encode (exceeds frame budget)", (long long)elapsedUs);
+    }
+
+    if (m_encCount > 0 && (m_encCount % m_summaryInterval == 0)) {
+        LogTelemetrySummary();
+    }
+
+    return true;
+}
+
+bool VideoEncoder::SwsConvert()
+{
+    // CPU-only: convert BGRA→NV12 using the readback buffer (populated by ReadbackToBuffer).
+    uint8_t* srcData = m_pReadbackBuffer;
+    int srcPitch = m_width * 4;
+
+    if (!srcData) {
+        ENCODER_ERROR("SwsConvert called without readback data!");
+        return false;
+    }
+
+    uint8_t* srcSlice[1] = { srcData };
+    int srcStride[1] = { srcPitch };
+
+    uint8_t* dstSlice[2] = { m_pSoftwareFrameBuffer, m_pSoftwareFrameBuffer + m_width * m_height };
+    int dstStride[2] = { m_width, m_width };
+
+    int ret = sws_scale(m_pConvertContext, srcSlice, srcStride, 0, m_height,
+                        dstSlice, dstStride);
+
+    if (ret != m_height) {
+        ENCODER_ERROR("swscale conversion failed! Returned %d, expected %d", ret, m_height);
+        return false;
+    }
+
+    return true;
+}
+
+bool VideoEncoder::FinishEncode(int64_t pts)
+{
+    if (!m_initialized) {
+        ENCODER_ERROR("FinishEncode called without valid encoder!");
+        return false;
+    }
+
+    LARGE_INTEGER t0, t1;
+    QueryPerformanceCounter(&t0);
+    if (m_lastCallUs != 0) {
+        int64_t intervalUs = ((t0.QuadPart - m_lastCallUs) * 1000000) / m_perfFreq.QuadPart;
+        m_intervalSumUs += intervalUs;
+        if (intervalUs > m_intervalMaxUs) m_intervalMaxUs = intervalUs;
+        m_intervalCount++;
+    }
+    m_lastCallUs = t0.QuadPart;
+
+    uint32_t hash = ComputeFrameHash();
+    if (m_lastFrameHash != 0 && hash == m_lastFrameHash) m_dupCount++;
+    m_lastFrameHash = hash;
+    m_summaryFrames++;
+
+    m_pFrame->pts = pts;
+    m_hasValidFrame = true;
+
+    if (!SendFrameToEncoder()) {
+        ENCODER_ERROR("Failed to send SBS frame to encoder!");
+        return false;
+    }
+
+    if (!ReceiveEncodedPackets()) {
+        ENCODER_ERROR("Failed to receive SBS encoded packets!");
+        return false;
+    }
+
+    QueryPerformanceCounter(&t1);
+    int64_t elapsedUs = ((t1.QuadPart - t0.QuadPart) * 1000000) / m_perfFreq.QuadPart;
+    m_encSumUs += elapsedUs;
+    if (elapsedUs > m_encMaxUs) m_encMaxUs = elapsedUs;
+    m_encCount++;
+
+    if (elapsedUs > 40000) {
+        ENCODER_LOG("[TELEMETRY] SLOW frame: %lldus encode (exceeds frame budget)", (long long)elapsedUs);
+    }
+
+    if (m_encCount > 0 && (m_encCount % m_summaryInterval == 0)) {
+        LogTelemetrySummary();
+    }
+
+    return true;
 }
 
 bool VideoEncoder::EncodeFrame(ID3D11Texture2D* pTexture, int64_t pts)
@@ -934,65 +1318,11 @@ bool VideoEncoder::EncodeFrame(ID3D11Texture2D* pTexture, int64_t pts)
 
 bool VideoEncoder::EncodeFrameSBS(ID3D11Texture2D* pLeft, ID3D11Texture2D* pRight, int64_t pts)
 {
-    if (!m_initialized) {
-        ENCODER_ERROR("EncodeFrameSBS called without valid encoder!");
+    if (!ComposeSBSGPU({ pLeft }, { pRight }, { LayerBounds{} }, { LayerBounds{} })) {
         return false;
     }
 
-    if (!pLeft || !pRight) {
-        ENCODER_ERROR("EncodeFrameSBS called with null eye textures!");
-        return false;
-    }
-
-    LARGE_INTEGER t0, t1;
-    QueryPerformanceCounter(&t0);
-    if (m_lastCallUs != 0) {
-        int64_t intervalUs = ((t0.QuadPart - m_lastCallUs) * 1000000) / m_perfFreq.QuadPart;
-        m_intervalSumUs += intervalUs;
-        if (intervalUs > m_intervalMaxUs) m_intervalMaxUs = intervalUs;
-        m_intervalCount++;
-    }
-    m_lastCallUs = t0.QuadPart;
-
-    if (!ComposeSBS(pLeft, pRight)) {
-        ENCODER_ERROR("Failed to compose SBS frame!");
-        return false;
-    }
-
-    // Detect duplicate/stale capture (image-in-image symptom: same readback twice)
-    uint32_t hash = ComputeFrameHash();
-    if (m_lastFrameHash != 0 && hash == m_lastFrameHash) m_dupCount++;
-    m_lastFrameHash = hash;
-    m_summaryFrames++;
-
-    m_pFrame->pts = pts;
-    m_hasValidFrame = true;
-
-    if (!SendFrameToEncoder()) {
-        ENCODER_ERROR("Failed to send SBS frame to encoder!");
-        return false;
-    }
-
-    if (!ReceiveEncodedPackets()) {
-        ENCODER_ERROR("Failed to receive SBS encoded packets!");
-        return false;
-    }
-
-    QueryPerformanceCounter(&t1);
-    int64_t elapsedUs = ((t1.QuadPart - t0.QuadPart) * 1000000) / m_perfFreq.QuadPart;
-    m_encSumUs += elapsedUs;
-    if (elapsedUs > m_encMaxUs) m_encMaxUs = elapsedUs;
-    m_encCount++;
-
-    if (elapsedUs > 40000) {
-        ENCODER_LOG("[TELEMETRY] SLOW frame: %lldus encode (exceeds frame budget -> eye texture may be overwritten mid-readback)", (long long)elapsedUs);
-    }
-
-    if (m_encCount > 0 && (m_encCount % m_summaryInterval == 0)) {
-        LogTelemetrySummary();
-    }
-
-    return true;
+    return FinishFrame(pts);
 }
 
 bool VideoEncoder::ConvertTextureToFrame(ID3D11Texture2D* pTexture)

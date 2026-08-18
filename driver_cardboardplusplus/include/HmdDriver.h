@@ -10,23 +10,50 @@
 #include "VideoEncoder.h"
 #include <map>
 #include <vector>
+#include <utility>
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
+#include <memory>
 
 #pragma comment(lib, "ws2_32.lib")
 
 using namespace vr;
 
+// A real triple-buffered swap texture set. Three distinct shared textures
+// so the app, compositor, and driver can each own a buffer simultaneously.
 struct SwapTextureSet {
-    ID3D11Texture2D* pTexture;
-    HANDLE hSharedHandle;
-    IDXGIKeyedMutex* pKeyedMutex;
+    ID3D11Texture2D* pTextures[3];
+    HANDLE hSharedHandles[3];
+    uint32_t nextIndex; // round-robin index handed out by GetNextSwapTextureSetIndex
 };
 
-// Per-eye submit layer info from SteamVR
+// Per SubmitLayer call: both eyes + each eye's valid bounds.
+// SteamVR calls SubmitLayer once per layer; the driver must composite all of
+// them in submission order (see FLICKER_ISSUE_MAP.md §10 — H1 fix).
 struct SubmitLayerInfo {
-    vr::SharedTextureHandle_t hTexture;
+    vr::SharedTextureHandle_t hTextureLeft;
+    vr::SharedTextureHandle_t hTextureRight;
+    vr::VRTextureBounds_t boundsLeft;
+    vr::VRTextureBounds_t boundsRight;
+};
+
+// A frame queued for the background encoder thread.
+struct PendingFrame {
+    ID3D11Texture2D* pLeft;
+    ID3D11Texture2D* pRight;
+    int64_t pts;
+    bool valid;
+    // One entry per submitted layer, opened on the encoding thread's own D3D11
+    // device and composited in submission order (painter's algorithm).
+    struct PendingLayer {
+        HANDLE hLeft = nullptr;
+        HANDLE hRight = nullptr;
+        vr::VRTextureBounds_t boundsLeft;
+        vr::VRTextureBounds_t boundsRight;
+    };
+    std::vector<PendingLayer> layers;
 };
 
 /** Virtual HMD device driver for SteamVR. Presents as a display to OpenVR. */
@@ -79,17 +106,44 @@ private:
     void DiscoveryThreadFunc();
     void SwitchDataTarget(const char* phoneIp);
 
+    // Background encoding loop
+    void EncodingThreadFunc();
+    void EncodePendingFrame(const PendingFrame& frame);
+    bool AcquireSyncTexture(vr::SharedTextureHandle_t syncTexture);
+    void ReleaseSyncTexture();
+
     uint32_t driverId;
 
     ID3D11Device* pD3D11Device;
     ID3D11DeviceContext* pD3D11DeviceContext;
 
-    std::map<uint32_t, std::vector<SwapTextureSet>> m_swapTextureSets;
+    std::map<uint32_t, std::vector<std::shared_ptr<SwapTextureSet>>> m_swapTextureSets;
     // Map from SharedTextureHandle to the actual D3D11 texture
     std::map<vr::SharedTextureHandle_t, ID3D11Texture2D*> m_textureHandleMap;
-    // Map from SharedTextureHandle to the keyed mutex for synchronization
-    std::map<vr::SharedTextureHandle_t, IDXGIKeyedMutex*> m_mutexHandleMap;
+    // Map from SharedTextureHandle to the owning swap texture set (for index rotation)
+    std::map<vr::SharedTextureHandle_t, std::shared_ptr<SwapTextureSet>> m_setByHandle;
     uint32_t m_currentSwapSetIndex;
+
+    // Cached compositor sync texture (opened once, per Valve's recommendation)
+    HANDLE m_cachedSyncHandle;
+    ID3D11Texture2D* m_pSyncTexture;
+    IDXGIKeyedMutex* m_pSyncMutex;
+    bool m_syncAcquired;
+
+    // Background encoder thread
+    std::thread m_encodingThread;
+    std::atomic<bool> m_encodingRunning;
+    std::mutex m_encodeMutex;
+    std::condition_variable m_encodeCv;
+    bool m_frameQueued;
+    PendingFrame m_pendingFrame;
+    // Signaled by the encoder thread when it has finished ALL GPU/CPU work
+    // for the previous frame (including readback), so Present can safely
+    // queue new GPU work on the shared D3D11 context.
+    std::mutex m_encodeDoneMutex;
+    std::condition_variable m_encodeDoneCv;
+    bool m_encodeDone;
+    void WaitEncoderIdle();
 
     VideoEncoder* m_pVideoEncoder;
     bool m_encoderInitialized;
@@ -105,17 +159,37 @@ private:
     int m_pendingCapW = 0;
     int m_pendingCapH = 0;
     std::mutex m_encoderMutex;
+
+    // Private owned copies of eye textures so Present() can release the sync
+    // texture immediately after a fast GPU copy, instead of doing the full
+    // ComposeSBSGPU on the compositor thread.
+    // One (left,right) pair per submitted layer; shared with the encoding
+    // thread's second D3D11 device and composited in order there.
+    struct LayerCopy {
+        ID3D11Texture2D* pLeft = nullptr;
+        HANDLE hLeft = nullptr;
+        ID3D11Texture2D* pRight = nullptr;
+        HANDLE hRight = nullptr;
+        int width = 0;
+        int height = 0;
+        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    };
+    std::vector<LayerCopy> m_layerCopies;
+    bool EnsureLayerCopies(const std::vector<SubmitLayerInfo>& layers);
+    std::atomic<bool> m_sceneTearingDown{false};  // Set during DestroyAllSwapTextureSets
     int m_presentCount = 0;
     long long m_lastPresentLogNs = 0;
 
-    // Per-eye submit layer tracking for SBS compositing
-    SubmitLayerInfo m_submitLayers[2];
+    // Accumulated SubmitLayer calls since the last Present (composited together,
+    // in submission order, as one SBS frame).
+    std::vector<SubmitLayerInfo> m_submitLayers;
     bool m_hasSubmit;
 
     // UDP socket
     SOCKET m_udpSocket;
     sockaddr_in m_serverAddr;
     bool m_udpInitialized;
+    uint32_t m_udpDroppedFrames;
 
     // UDP discovery socket
     SOCKET m_discoverySocket;
