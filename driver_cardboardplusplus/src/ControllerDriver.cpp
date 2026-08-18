@@ -1,26 +1,29 @@
-#include <ControllerDriver.h>
+#include "ControllerDriver.h"
 #include <chrono>
 #include <cmath>
+#include <cstring>
+
+using namespace vr;
 
 // Controller driver implementation. Exposes joystick/trackpad to SteamVR.
 EVRInitError ControllerDriver::Activate(uint32_t unObjectId)
 {
 	// TODO: Check if every Property is okay to be recognized as a Vive controller.
 	// Original example code from finallyfunctional/openvr-driver-example
-	driverId = unObjectId; //unique ID for your driver
+	m_driverId = unObjectId; //unique ID for your driver
 
-	PropertyContainerHandle_t props = VRProperties()->TrackedDeviceToPropertyContainer(driverId); //this gets a container object where you store all the information about your driver
+	PropertyContainerHandle_t props = VRProperties()->TrackedDeviceToPropertyContainer(m_driverId); //this gets a container object where you store all the information about your driver
 
 	VRProperties()->SetStringProperty(props, Prop_RenderModelName_String, "vr_controller_vive_1_5");
 	VRProperties()->SetStringProperty(props, Prop_InputProfilePath_String, "{example}/input/controller_profile.json"); //tell OpenVR where to get your driver's Input Profile
 	VRProperties()->SetInt32Property(props, Prop_ControllerRoleHint_Int32, ETrackedControllerRole::TrackedControllerRole_LeftHand); //tells OpenVR what kind of device this is
-	VRDriverInput()->CreateScalarComponent(props, "/input/joystick/y", &joystickYHandle, EVRScalarType::VRScalarType_Absolute,
+	VRDriverInput()->CreateScalarComponent(props, "/input/joystick/y", &m_joystickYHandle, EVRScalarType::VRScalarType_Absolute,
 		EVRScalarUnits::VRScalarUnits_NormalizedTwoSided); //sets up handler you'll use to send joystick commands to OpenVR with, in the Y direction (forward/backward)
-	VRDriverInput()->CreateScalarComponent(props, "/input/trackpad/y", &trackpadYHandle, EVRScalarType::VRScalarType_Absolute,
+	VRDriverInput()->CreateScalarComponent(props, "/input/trackpad/y", &m_trackpadYHandle, EVRScalarType::VRScalarType_Absolute,
 		EVRScalarUnits::VRScalarUnits_NormalizedTwoSided); //sets up handler you'll use to send trackpad commands to OpenVR with, in the Y direction
-	VRDriverInput()->CreateScalarComponent(props, "/input/joystick/x", &joystickXHandle, EVRScalarType::VRScalarType_Absolute,
+	VRDriverInput()->CreateScalarComponent(props, "/input/joystick/x", &m_joystickXHandle, EVRScalarType::VRScalarType_Absolute,
 		EVRScalarUnits::VRScalarUnits_NormalizedTwoSided); //Why VRScalarType_Absolute? Take a look at the comments on EVRScalarType.
-	VRDriverInput()->CreateScalarComponent(props, "/input/trackpad/x", &trackpadXHandle, EVRScalarType::VRScalarType_Absolute,
+	VRDriverInput()->CreateScalarComponent(props, "/input/trackpad/x", &m_trackpadXHandle, EVRScalarType::VRScalarType_Absolute,
 		EVRScalarUnits::VRScalarUnits_NormalizedTwoSided); //Why VRScalarUnits_NormalizedTwoSided? Take a look at the comments on EVRScalarUnits.
 	
 	//The following properites are ones I tried out because I saw them in other samples, but I found they were not needed to get the sample working.
@@ -75,16 +78,16 @@ void ControllerDriver::RunFrame()
 	// TODO: Replace the following code with real input data from your hardware. This is just an example of how to send input data to OpenVR.
 	// Original example code from finallyfunctional/openvr-driver-example
 	//Since we used VRScalarUnits_NormalizedTwoSided as the unit, the range is -1 to 1.
-	VRDriverInput()->UpdateScalarComponent(joystickYHandle, 0.95f, 0); //move forward
-	VRDriverInput()->UpdateScalarComponent(trackpadYHandle, 0.95f, 0); //move foward
-	VRDriverInput()->UpdateScalarComponent(joystickXHandle, 0.0f, 0); //change the value to move sideways
-	VRDriverInput()->UpdateScalarComponent(trackpadXHandle, 0.0f, 0); //change the value to move sideways
+	VRDriverInput()->UpdateScalarComponent(m_joystickYHandle, 0.95f, 0); //move forward
+	VRDriverInput()->UpdateScalarComponent(m_trackpadYHandle, 0.95f, 0); //move foward
+	VRDriverInput()->UpdateScalarComponent(m_joystickXHandle, 0.0f, 0); //change the value to move sideways
+	VRDriverInput()->UpdateScalarComponent(m_trackpadXHandle, 0.0f, 0); //change the value to move sideways
 }
 
 void ControllerDriver::Deactivate()
 {
 	// Clean up any state you need to here. This will be called when the driver is unloaded.
-	driverId = k_unTrackedDeviceIndexInvalid;
+	m_driverId = k_unTrackedDeviceIndexInvalid;
 }
 
 void* ControllerDriver::GetComponent(const char* pchComponentNameAndVersion)

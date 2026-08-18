@@ -56,10 +56,25 @@ struct PendingFrame {
     std::vector<PendingLayer> layers;
 };
 
-/** Virtual HMD device driver for SteamVR. Presents as a display to OpenVR. */
+/**
+ * Virtual HMD device driver for SteamVR. Presents as a display to OpenVR.
+ *
+ * The implementation is deliberately split across one translation unit per
+ * concern so each subsystem can be reviewed on its own:
+ *   - HmdDriver.cpp      device lifecycle + SteamVR probe/pose/display methods
+ *   - DirectMode.cpp     swap texture sets + Present/SubmitLayer compositing
+ *   - EncoderSetup.cpp   encoder lifecycle + hardware-cap reconfiguration
+ *   - EncodingThread.cpp the background GPU-readback + encode thread loop
+ *   - UdpTransport.cpp   H264 framing + UDP streaming to the bridge
+ *   - Discovery.cpp      phone broadcast discovery + cap negotiation
+ *
+ * Every subsystem touched below is owned by this class (raw pointers are the
+ * pre-existing ownership model; they are released in Deactivate / Shutdown).
+ */
 class HmdDriver : public ITrackedDeviceServerDriver, public IVRDisplayComponent, public IVRDriverDirectModeComponent
 {
 public:
+    // ITrackedDeviceServerDriver
     EVRInitError Activate(uint32_t unObjectId);
     void Deactivate();
     void EnterStandby();
@@ -87,50 +102,53 @@ public:
     void PostPresent() override;
     void GetFrameTiming(DriverDirectMode_FrameTiming* pFrameTiming) override;
 
+    // Encoder surface used by the encoder subsystem (callback into this class).
     VideoEncoder* GetVideoEncoder() { return m_pVideoEncoder; }
     void OnEncodedPacket(uint8_t* data, int size, int64_t pts, bool keyframe);
 
 private:
+    // ---- encoder lifecycle / configuration ----
     bool InitializeVideoEncoder();
     void ShutdownVideoEncoder();
     bool ApplyHardwareCap(int capW, int capH);
     void ClampEncoderToCap();
 
-    // UDP networking
+    // ---- UDP transport (video streaming to the bridge) ----
     bool InitializeUDP();
     void ShutdownUDP();
 
-    // UDP discovery
+    // ---- phone discovery (broadcast + cap negotiation) ----
     bool InitializeDiscovery();
     void ShutdownDiscovery();
     void DiscoveryThreadFunc();
     void SwitchDataTarget(const char* phoneIp);
 
-    // Background encoding loop
+    // ---- background encoding loop + compositor sync-texture handshake ----
     void EncodingThreadFunc();
     void EncodePendingFrame(const PendingFrame& frame);
     bool AcquireSyncTexture(vr::SharedTextureHandle_t syncTexture);
     void ReleaseSyncTexture();
+    void WaitEncoderIdle();
 
-    uint32_t driverId;
+    // ---- device identity / shared D3D11 device ----
+    uint32_t m_driverId;
+    ID3D11Device* m_pD3D11Device;
+    ID3D11DeviceContext* m_pD3D11DeviceContext;
 
-    ID3D11Device* pD3D11Device;
-    ID3D11DeviceContext* pD3D11DeviceContext;
-
+    // ---- swap-texture-set bookkeeping (per process pid) ----
     std::map<uint32_t, std::vector<std::shared_ptr<SwapTextureSet>>> m_swapTextureSets;
-    // Map from SharedTextureHandle to the actual D3D11 texture
+    // Map from SharedTextureHandle to the actual D3D11 texture.
     std::map<vr::SharedTextureHandle_t, ID3D11Texture2D*> m_textureHandleMap;
-    // Map from SharedTextureHandle to the owning swap texture set (for index rotation)
+    // Map from SharedTextureHandle to the owning swap texture set (for index rotation).
     std::map<vr::SharedTextureHandle_t, std::shared_ptr<SwapTextureSet>> m_setByHandle;
-    uint32_t m_currentSwapSetIndex;
 
-    // Cached compositor sync texture (opened once, per Valve's recommendation)
+    // ---- cached compositor sync texture (opened once, per Valve's recommendation) ----
     HANDLE m_cachedSyncHandle;
     ID3D11Texture2D* m_pSyncTexture;
     IDXGIKeyedMutex* m_pSyncMutex;
     bool m_syncAcquired;
 
-    // Background encoder thread
+    // ---- background encoder thread handshake ----
     std::thread m_encodingThread;
     std::atomic<bool> m_encodingRunning;
     std::mutex m_encodeMutex;
@@ -143,14 +161,11 @@ private:
     std::mutex m_encodeDoneMutex;
     std::condition_variable m_encodeDoneCv;
     bool m_encodeDone;
-    void WaitEncoderIdle();
 
+    // ---- encoder state (mutable so it can be clamped to the phone's cap) ----
     VideoEncoder* m_pVideoEncoder;
     bool m_encoderInitialized;
     int64_t m_encoderPts;
-    uint32_t m_lastEncodedPid;
-
-    // Encoder configuration (mutable so it can be clamped to the phone's decoder cap)
     int m_encoderW = 2880;
     int m_encoderH = 1620;
     int m_encoderFps = 60;
@@ -176,7 +191,9 @@ private:
     };
     std::vector<LayerCopy> m_layerCopies;
     bool EnsureLayerCopies(const std::vector<SubmitLayerInfo>& layers);
-    std::atomic<bool> m_sceneTearingDown{false};  // Set during DestroyAllSwapTextureSets
+    std::atomic<bool> m_sceneTearingDown{false};  // set during DestroyAllSwapTextureSets
+
+    // Present-rate pacing diagnostics.
     int m_presentCount = 0;
     long long m_lastPresentLogNs = 0;
 
@@ -185,13 +202,13 @@ private:
     std::vector<SubmitLayerInfo> m_submitLayers;
     bool m_hasSubmit;
 
-    // UDP socket
+    // ---- UDP socket (video stream to the bridge) ----
     SOCKET m_udpSocket;
     sockaddr_in m_serverAddr;
     bool m_udpInitialized;
     uint32_t m_udpDroppedFrames;
 
-    // UDP discovery socket
+    // ---- UDP discovery socket (phone broadcast) ----
     SOCKET m_discoverySocket;
     bool m_discoveryInitialized;
     std::atomic<bool> m_discoveryRunning;

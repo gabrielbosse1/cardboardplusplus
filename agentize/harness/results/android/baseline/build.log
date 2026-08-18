@@ -1,0 +1,163 @@
+﻿To honour the JVM settings for this build a single-use Daemon process will be forked. For more on this, please refer to https://docs.gradle.org/8.14.3/userguide/gradle_daemon.html#sec:disabling_the_daemon in the Gradle documentation.
+Daemon will be stopped at the end of the build 
+> Task :app:preBuild UP-TO-DATE
+> Task :app:preDebugBuild UP-TO-DATE
+> Task :app:mergeDebugNativeDebugMetadata NO-SOURCE
+> Task :app:javaPreCompileDebug UP-TO-DATE
+> Task :sdk:preBuild UP-TO-DATE
+> Task :sdk:preDebugBuild UP-TO-DATE
+> Task :sdk:writeDebugAarMetadata UP-TO-DATE
+> Task :app:checkDebugAarMetadata UP-TO-DATE
+> Task :sdk:processDebugNavigationResources UP-TO-DATE
+> Task :app:processDebugNavigationResources UP-TO-DATE
+> Task :app:compileDebugNavigationResources UP-TO-DATE
+> Task :app:generateDebugResValues UP-TO-DATE
+> Task :sdk:generateDebugResValues UP-TO-DATE
+> Task :sdk:generateDebugResources UP-TO-DATE
+> Task :sdk:packageDebugResources UP-TO-DATE
+> Task :app:mapDebugSourceSetPaths UP-TO-DATE
+> Task :app:generateDebugResources UP-TO-DATE
+> Task :app:mergeDebugResources UP-TO-DATE
+> Task :app:packageDebugResources UP-TO-DATE
+> Task :app:parseDebugLocalResources UP-TO-DATE
+> Task :app:createDebugCompatibleScreenManifests UP-TO-DATE
+> Task :app:extractDeepLinksDebug UP-TO-DATE
+> Task :sdk:extractDeepLinksDebug UP-TO-DATE
+> Task :sdk:processDebugManifest UP-TO-DATE
+> Task :app:processDebugMainManifest UP-TO-DATE
+> Task :app:processDebugManifest UP-TO-DATE
+> Task :app:processDebugManifestForPackage UP-TO-DATE
+> Task :sdk:compileDebugLibraryResources UP-TO-DATE
+> Task :sdk:parseDebugLocalResources UP-TO-DATE
+> Task :sdk:generateDebugRFile UP-TO-DATE
+> Task :app:processDebugResources UP-TO-DATE
+> Task :sdk:extractDebugProto UP-TO-DATE
+> Task :sdk:extractIncludeDebugProto UP-TO-DATE
+> Task :sdk:generateDebugProto UP-TO-DATE
+> Task :sdk:javaPreCompileDebug UP-TO-DATE
+> Task :sdk:compileDebugJavaWithJavac UP-TO-DATE
+> Task :sdk:bundleLibCompileToJarDebug UP-TO-DATE
+> Task :app:compileDebugJavaWithJavac UP-TO-DATE
+> Task :app:mergeDebugShaders UP-TO-DATE
+> Task :app:compileDebugShaders NO-SOURCE
+> Task :app:generateDebugAssets UP-TO-DATE
+> Task :sdk:mergeDebugShaders UP-TO-DATE
+> Task :sdk:compileDebugShaders NO-SOURCE
+> Task :sdk:generateDebugAssets UP-TO-DATE
+> Task :sdk:mergeDebugAssets UP-TO-DATE
+> Task :app:mergeDebugAssets UP-TO-DATE
+> Task :app:compressDebugAssets UP-TO-DATE
+> Task :app:processDebugJavaRes NO-SOURCE
+> Task :sdk:processDebugJavaRes UP-TO-DATE
+> Task :app:mergeDebugJavaResource UP-TO-DATE
+> Task :app:checkDebugDuplicateClasses UP-TO-DATE
+> Task :app:desugarDebugFileDependencies UP-TO-DATE
+> Task :app:mergeExtDexDebug UP-TO-DATE
+> Task :sdk:bundleLibRuntimeToDirDebug UP-TO-DATE
+> Task :app:dexBuilderDebug UP-TO-DATE
+> Task :app:mergeProjectDexDebug UP-TO-DATE
+> Task :app:mergeLibDexDebug UP-TO-DATE
+> Task :app:configureCMakeDebug[arm64-v8a]
+> Task :sdk:preReleaseBuild UP-TO-DATE
+> Task :sdk:checkReleaseAarMetadata UP-TO-DATE
+> Task :sdk:configureCMakeRelWithDebInfo[arm64-v8a]
+> Task :sdk:buildCMakeRelWithDebInfo[arm64-v8a]
+> Task :sdk:configureCMakeRelWithDebInfo[armeabi-v7a]
+> Task :sdk:buildCMakeRelWithDebInfo[armeabi-v7a]
+> Task :sdk:mergeReleaseJniLibFolders UP-TO-DATE
+> Task :sdk:mergeReleaseNativeLibs UP-TO-DATE
+> Task :sdk:stripReleaseDebugSymbols UP-TO-DATE
+> Task :sdk:copyReleaseJniLibsProjectAndLocalJars UP-TO-DATE
+> Task :sdk:generateReleaseResValues UP-TO-DATE
+> Task :sdk:extractDeepLinksForAarRelease UP-TO-DATE
+> Task :sdk:extractIncludeReleaseProto UP-TO-DATE
+> Task :sdk:extractReleaseProto UP-TO-DATE
+> Task :sdk:generateReleaseProto UP-TO-DATE
+> Task :sdk:generateReleaseResources UP-TO-DATE
+> Task :sdk:packageReleaseResources UP-TO-DATE
+> Task :sdk:processReleaseNavigationResources UP-TO-DATE
+> Task :sdk:parseReleaseLocalResources UP-TO-DATE
+> Task :sdk:generateReleaseRFile UP-TO-DATE
+> Task :sdk:extractReleaseAnnotations UP-TO-DATE
+> Task :sdk:mergeReleaseShaders UP-TO-DATE
+> Task :sdk:compileReleaseShaders NO-SOURCE
+> Task :sdk:generateReleaseAssets UP-TO-DATE
+> Task :sdk:mergeReleaseAssets UP-TO-DATE
+> Task :sdk:javaPreCompileRelease UP-TO-DATE
+> Task :sdk:compileReleaseJavaWithJavac UP-TO-DATE
+> Task :sdk:mergeReleaseGeneratedProguardFiles UP-TO-DATE
+> Task :sdk:mergeReleaseConsumerProguardFiles UP-TO-DATE
+> Task :sdk:prepareLintJarForPublish UP-TO-DATE
+> Task :sdk:prepareReleaseArtProfile UP-TO-DATE
+> Task :sdk:processReleaseManifest UP-TO-DATE
+> Task :sdk:extractProguardFiles UP-TO-DATE
+> Task :sdk:generateReleaseLibraryProguardRules UP-TO-DATE
+> Task :sdk:processReleaseJavaRes UP-TO-DATE
+> Task :sdk:mergeReleaseJavaResource UP-TO-DATE
+> Task :sdk:minifyReleaseWithR8 UP-TO-DATE
+> Task :sdk:syncReleaseLibJars UP-TO-DATE
+> Task :sdk:writeReleaseAarMetadata UP-TO-DATE
+> Task :sdk:bundleReleaseAar UP-TO-DATE
+> Task :sdk:mapReleaseSourceSetPaths UP-TO-DATE
+> Task :sdk:mergeReleaseResources UP-TO-DATE
+> Task :sdk:verifyReleaseResources UP-TO-DATE
+> Task :sdk:assembleRelease UP-TO-DATE
+> Task :app:extractNdk UP-TO-DATE
+> Task :app:buildCMakeDebug[arm64-v8a]
+> Task :app:configureCMakeDebug[armeabi-v7a]
+
+> Task :app:buildCMakeDebug[armeabi-v7a]
+C/C++: ninja: Entering directory `C:\Users\admin000\cardboardplusplus\agentize\work\android\cardboardplusplus-android\.cxx\Debug\175d6x5k\armeabi-v7a'
+C/C++: C:/Users/admin000/cardboardplusplus/agentize/work/android/cardboardplusplus-android/src/main/jni/cardboardplusplus_app.cc:135:53: warning: unused parameter 'env' [-Wunused-parameter]
+C/C++:   135 | void CardboardPlusPlusApp::OnSurfaceCreated(JNIEnv* env) {
+C/C++:       |                                                     ^
+C/C++: In file included from C:/Users/admin000/cardboardplusplus/agentize/work/android/cardboardplusplus-android/src/main/jni/cardboardplusplus_app.cc:17:
+C/C++: C:/Users/admin000/cardboardplusplus/agentize/work/android/cardboardplusplus-android/src/main/jni/cardboardplusplus_app.h:240:7: warning: private field 'video_width_' is not used [-Wunused-private-field]
+C/C++:   240 |   int video_width_;
+C/C++:       |       ^
+C/C++: C:/Users/admin000/cardboardplusplus/agentize/work/android/cardboardplusplus-android/src/main/jni/cardboardplusplus_app.h:241:7: warning: private field 'video_height_' is not used [-Wunused-private-field]
+C/C++:   241 |   int video_height_;
+C/C++:       |       ^
+C/C++: C:/Users/admin000/cardboardplusplus/agentize/work/android/cardboardplusplus-android/src/main/jni/cardboardplusplus_app.h:253:7: warning: private field 'video_latest_slot_' is not used [-Wunused-private-field]
+C/C++:   253 |   int video_latest_slot_ = -1;  // 0 = buf_a, 1 = buf_b, -1 = none
+C/C++:       |       ^
+C/C++: C:/Users/admin000/cardboardplusplus/agentize/work/android/cardboardplusplus-android/src/main/jni/cardboardplusplus_app.h:254:7: warning: private field 'held_slot_' is not used [-Wunused-private-field]
+C/C++:   254 |   int held_slot_ = -1;          // slot the GL thread is currently uploading from
+C/C++:       |       ^
+C/C++: C:/Users/admin000/cardboardplusplus/agentize/work/android/cardboardplusplus-android/src/main/jni/cardboardplusplus_app.h:255:7: warning: private field 'video_latest_w_' is not used [-Wunused-private-field]
+C/C++:   255 |   int video_latest_w_ = 0;
+C/C++:       |       ^
+C/C++: C:/Users/admin000/cardboardplusplus/agentize/work/android/cardboardplusplus-android/src/main/jni/cardboardplusplus_app.h:256:7: warning: private field 'video_latest_h_' is not used [-Wunused-private-field]
+C/C++:   256 |   int video_latest_h_ = 0;
+C/C++:       |       ^
+C/C++: C:/Users/admin000/cardboardplusplus/agentize/work/android/cardboardplusplus-android/src/main/jni/cardboardplusplus_app.h:257:8: warning: private field 'video_latest_ready_' is not used [-Wunused-private-field]
+C/C++:   257 |   bool video_latest_ready_ = false;
+C/C++:       |        ^
+C/C++: C:/Users/admin000/cardboardplusplus/agentize/work/android/cardboardplusplus-android/src/main/jni/cardboardplusplus_app.h:259:7: warning: private field 'video_tex_w_' is not used [-Wunused-private-field]
+C/C++:   259 |   int video_tex_w_ = 0;
+C/C++:       |       ^
+C/C++: C:/Users/admin000/cardboardplusplus/agentize/work/android/cardboardplusplus-android/src/main/jni/cardboardplusplus_app.h:260:7: warning: private field 'video_tex_h_' is not used [-Wunused-private-field]
+C/C++:   260 |   int video_tex_h_ = 0;
+C/C++:       |       ^
+C/C++: 10 warnings generated.
+
+> Task :app:mergeDebugJniLibFolders UP-TO-DATE
+> Task :sdk:configureCMakeDebug[arm64-v8a]
+> Task :sdk:buildCMakeDebug[arm64-v8a]
+> Task :sdk:configureCMakeDebug[armeabi-v7a]
+> Task :sdk:buildCMakeDebug[armeabi-v7a]
+> Task :sdk:mergeDebugJniLibFolders
+> Task :sdk:mergeDebugNativeLibs
+> Task :app:validateSigningDebug
+> Task :app:writeDebugAppMetadata
+> Task :sdk:copyDebugJniLibsProjectOnly
+> Task :app:writeDebugSigningConfigVersions
+> Task :app:mergeDebugNativeLibs
+> Task :app:stripDebugDebugSymbols
+> Task :app:packageDebug
+> Task :app:createDebugApkListingFileRedirect
+> Task :app:assembleDebug
+
+BUILD SUCCESSFUL in 29s
+107 actionable tasks: 22 executed, 85 up-to-date
+

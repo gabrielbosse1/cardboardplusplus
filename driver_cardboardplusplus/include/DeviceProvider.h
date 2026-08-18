@@ -1,7 +1,7 @@
 #pragma once
-#include <ControllerDriver.h>
-#include <HmdDriver.h>
-#include <openvr_driver.h>
+#include "ControllerDriver.h"
+#include "HmdDriver.h"
+#include "openvr_driver.h"
 #include <windows.h>
 
 using namespace vr;
@@ -54,6 +54,6 @@ public:
 	void LeaveStandby();
 
 private:
-	ControllerDriver* controllerDriver; //this provider only provides this one controller driver.
-	HmdDriver* hmdDriver; //virtual HMD device
+	ControllerDriver* m_controllerDriver; //this provider only provides this one controller driver.
+	HmdDriver* m_hmdDriver; //virtual HMD device
 };

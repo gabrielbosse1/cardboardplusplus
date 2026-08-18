@@ -1,4 +1,9 @@
-#include <DeviceProvider.h>
+#include "DeviceProvider.h"
+#include "ControllerDriver.h"
+#include "HmdDriver.h"
+#include "openvr_driver.h"
+
+using namespace vr;
 
 // Device provider entry point. Registers controller and HMD drivers with SteamVR.
 EVRInitError DeviceProvider::Init(IVRDriverContext* pDriverContext)
@@ -11,22 +16,22 @@ EVRInitError DeviceProvider::Init(IVRDriverContext* pDriverContext)
     
     VRDriverLog()->Log("Initializing example controller"); //this is how you log out Steam's log file.
 
-    controllerDriver = new ControllerDriver();
-    VRServerDriverHost()->TrackedDeviceAdded("example_controller", TrackedDeviceClass_Controller, controllerDriver); //add all your devices like this.
+    m_controllerDriver = new ControllerDriver();
+    VRServerDriverHost()->TrackedDeviceAdded("example_controller", TrackedDeviceClass_Controller, m_controllerDriver); //add all your devices like this.
 
     VRDriverLog()->Log("Initializing example virtual HMD");
-    hmdDriver = new HmdDriver();
-    VRServerDriverHost()->TrackedDeviceAdded("example_virtual_hmd", TrackedDeviceClass_HMD, hmdDriver);
+    m_hmdDriver = new HmdDriver();
+    VRServerDriverHost()->TrackedDeviceAdded("example_virtual_hmd", TrackedDeviceClass_HMD, m_hmdDriver);
 
     return vr::VRInitError_None;
 }
 
 void DeviceProvider::Cleanup()
 {
-    delete controllerDriver;
-    controllerDriver = NULL;
-    delete hmdDriver;
-    hmdDriver = NULL;
+    delete m_controllerDriver;
+    m_controllerDriver = NULL;
+    delete m_hmdDriver;
+    m_hmdDriver = NULL;
 }
 const char* const* DeviceProvider::GetInterfaceVersions()
 {
@@ -35,8 +40,8 @@ const char* const* DeviceProvider::GetInterfaceVersions()
 
 void DeviceProvider::RunFrame()
 {
-    controllerDriver->RunFrame();
-    hmdDriver->RunFrame();
+    m_controllerDriver->RunFrame();
+    m_hmdDriver->RunFrame();
 }
 
 bool DeviceProvider::ShouldBlockStandbyMode()

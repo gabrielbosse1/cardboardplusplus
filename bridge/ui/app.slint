@@ -1,0 +1,1108 @@
+export global Theme {
+    in-out property <color> bg: #0B0E14;
+    in-out property <color> surface: #121723;
+    in-out property <color> surface2: #1A2130;
+    in-out property <color> surface3: #222B3D;
+    in-out property <color> border: #2A3345;
+    in-out property <color> text-hi: #E9EEF7;
+    in-out property <color> text-mid: #9AA7BD;
+    in-out property <color> text-dim: #5E6B81;
+    in-out property <color> accent: #8B5CF6;
+    in-out property <color> accent2: #22D3EE;
+    in-out property <color> ok: #34D399;
+    in-out property <color> warn: #FBBF24;
+    in-out property <color> err: #F87171;
+}
+
+export struct Tab {
+    index: int,
+    label: string,
+    icon: image,
+}
+
+export global BridgeState {
+    in-out property <int> current-tab: 0;
+
+    in-out property <bool> driver-connected: false;
+    in-out property <bool> phone-connected: false;
+    in-out property <bool> encoder-active: false;
+    in-out property <string> encoder-name: "auto";
+
+    in-out property <int> stream-fps: 0;
+    in-out property <int> latency-ms: 0;
+    in-out property <int> packets-total: 0;
+    in-out property <int> gyro-fps: 0;
+    in-out property <int> hand-fps: 0;
+    in-out property <int> hands-detected: 0;
+    in-out property <int> landmark-count: 21;
+
+    in-out property <bool> hand-enabled: false;
+    in-out property <int> hand-confidence: 82;
+
+    in-out property <int> video-width: 2880;
+    in-out property <int> video-height: 1620;
+    in-out property <int> fps: 60;
+    in-out property <int> bitrate: 20;
+    in-out property <int> encoder-index: 0;
+
+    in-out property <string> phone-ip: "0.0.0.0";
+    in-out property <string> log-text: "";
+    in-out property <string> app-version: "0.1.0";
+
+    callback apply-settings(int, int, int, int, int);
+}
+
+component GradientButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    callback clicked;
+
+    height: 40px;
+    border-radius: 10px;
+    background: root.enabled ? @linear-gradient(90deg, Theme.accent, Theme.accent2) : #2A3345;
+    opacity: root.enabled ? 1 : 0.6;
+
+    TouchArea {
+        width: 100%;
+        height: 100%;
+        mouse-cursor: pointer;
+        clicked => {
+            if root.enabled {
+                root.clicked();
+            }
+        }
+    }
+
+    Text {
+        width: 100%;
+        height: 100%;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        text: root.text;
+        color: #FFFFFF;
+        font-size: 13px;
+        font-weight: 600;
+    }
+}
+
+component Stepper inherits HorizontalLayout {
+    in property <string> label;
+    in-out property <int> value;
+    in property <int> min;
+    in property <int> max;
+    in property <int> step: 1;
+    in property <string> unit: "";
+    callback changed(int);
+
+    spacing: 10px;
+    height: 36px;
+    cross-axis-alignment: center;
+
+    Text {
+        text: root.label;
+        color: Theme.text-mid;
+        font-size: 13px;
+        vertical-alignment: center;
+        horizontal-stretch: 1;
+    }
+
+    Rectangle {
+        width: 120px;
+        height: 34px;
+        border-radius: 9px;
+        border-width: 1px;
+        border-color: Theme.border;
+        background: Theme.surface;
+
+        Text {
+            width: 100%;
+            height: 100%;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            text: "{root.value}{root.unit}";
+            color: Theme.text-hi;
+            font-size: 14px;
+            font-weight: 600;
+        }
+    }
+
+    Rectangle {
+        width: 34px;
+        height: 34px;
+        border-radius: 9px;
+        border-width: 1px;
+        border-color: Theme.border;
+        background: Theme.surface2;
+
+        TouchArea {
+            width: 100%;
+            height: 100%;
+            mouse-cursor: pointer;
+            clicked => {
+                if root.value - root.step >= root.min {
+                    root.value -= root.step;
+                    root.changed(root.value);
+                }
+            }
+        }
+
+        Text {
+            width: 100%;
+            height: 100%;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            text: "-";
+            color: Theme.text-hi;
+            font-size: 15px;
+        }
+    }
+
+    Rectangle {
+        width: 34px;
+        height: 34px;
+        border-radius: 9px;
+        border-width: 1px;
+        border-color: Theme.border;
+        background: Theme.surface2;
+
+        TouchArea {
+            width: 100%;
+            height: 100%;
+            mouse-cursor: pointer;
+            clicked => {
+                if root.value + root.step <= root.max {
+                    root.value += root.step;
+                    root.changed(root.value);
+                }
+            }
+        }
+
+        Text {
+            width: 100%;
+            height: 100%;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            text: "+";
+            color: Theme.text-hi;
+            font-size: 15px;
+        }
+    }
+}
+
+component Toggle inherits Rectangle {
+    in property <string> label;
+    in-out property <bool> checked;
+    callback changed(bool);
+
+    height: 30px;
+    border-radius: 15px;
+
+    HorizontalLayout {
+        spacing: 12px;
+        cross-axis-alignment: center;
+
+        Text {
+            text: root.label;
+            color: Theme.text-mid;
+            font-size: 13px;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+
+        Rectangle {
+            width: 46px;
+            height: 26px;
+            border-radius: 13px;
+            border-width: 1px;
+            border-color: Theme.border;
+            background: root.checked ? @linear-gradient(90deg, Theme.accent, Theme.accent2) : Theme.surface2;
+
+            Rectangle {
+                width: 19px;
+                height: 19px;
+                y: 2.5px;
+                x: root.checked ? 24px : 2px;
+                border-radius: 9.5px;
+                background: #FFFFFF;
+
+                animate x {
+                    duration: 150ms;
+                }
+            }
+
+            TouchArea {
+                width: 100%;
+                height: 100%;
+                mouse-cursor: pointer;
+                clicked => {
+                    root.checked = !root.checked;
+                    root.changed(root.checked);
+                }
+            }
+        }
+    }
+}
+
+component Pill inherits Rectangle {
+    in property <string> text;
+    in property <bool> active;
+    callback clicked;
+
+    height: 34px;
+    border-radius: 9px;
+    border-width: 1px;
+    border-color: root.active ? Theme.accent : Theme.border;
+    background: root.active ? @linear-gradient(90deg, Theme.accent, Theme.accent2) : Theme.surface2;
+
+    TouchArea {
+        width: 100%;
+        height: 100%;
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked();
+        }
+    }
+
+    Text {
+        x: 14px;
+        y: 0;
+        width: 100%;
+        height: 100%;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        text: root.text;
+        color: root.active ? #FFFFFF : Theme.text-mid;
+        font-size: 12px;
+        font-weight: root.active ? 600 : 400;
+    }
+}
+
+component StatusPill inherits Rectangle {
+    in property <string> label;
+    in property <bool> ok;
+
+    height: 26px;
+    border-radius: 13px;
+    border-width: 1px;
+    border-color: root.ok ? Theme.ok : Theme.err;
+    background: Theme.surface2;
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 6px;
+        cross-axis-alignment: center;
+
+        Rectangle {
+            width: 8px;
+            height: 8px;
+            border-radius: 4px;
+            background: root.ok ? Theme.ok : Theme.err;
+        }
+
+        Text {
+            text: root.label;
+            color: root.ok ? Theme.text-hi : Theme.text-dim;
+            font-size: 12px;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component Card inherits Rectangle {
+    in property <string> title;
+    in property <string> hint: "";
+
+    background: Theme.surface;
+    border-width: 1px;
+    border-color: Theme.border;
+    border-radius: 14px;
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 12px;
+
+        Text {
+            text: root.title;
+            color: Theme.text-hi;
+            font-size: 13px;
+            font-weight: 600;
+        }
+
+        if root.hint != "" : Text {
+            text: root.hint;
+            color: Theme.text-dim;
+            font-size: 11px;
+        }
+
+        @children
+    }
+}
+
+component Metric inherits Rectangle {
+    in property <string> label;
+    in property <string> value: "";
+    in property <color> value-color: Theme.text-hi;
+
+    height: 78px;
+    border-radius: 12px;
+    border-width: 1px;
+    border-color: Theme.border;
+    background: Theme.surface2;
+
+    VerticalLayout {
+        padding: 10px;
+        spacing: 4px;
+        alignment: center;
+
+        Text {
+            text: root.value;
+            color: root.value-color;
+            font-size: 20px;
+            font-weight: 700;
+            horizontal-alignment: center;
+        }
+
+        Text {
+            text: root.label;
+            color: Theme.text-dim;
+            font-size: 11px;
+            horizontal-alignment: center;
+        }
+    }
+}
+
+component TabButton inherits Rectangle {
+    in property <string> label;
+    in property <image> icon;
+    in property <bool> active;
+    callback clicked;
+
+    height: 44px;
+    border-radius: 10px;
+    background: root.active ? @linear-gradient(90deg, Theme.accent, Theme.accent2) : transparent;
+
+    Rectangle {
+        x: 0;
+        width: 3px;
+        height: 20px;
+        y: (parent.height - 20px) / 2;
+        border-radius: 2px;
+        background: root.active ? #FFFFFF : transparent;
+    }
+
+    HorizontalLayout {
+        padding: 4px;
+        padding-left: 16px;
+        spacing: 12px;
+        height: 100%;
+
+        Image {
+            width: 21px;
+            height: 21px;
+            source: root.icon;
+            colorize: root.active ? #FFFFFF : Theme.text-dim;
+            vertical-alignment: center;
+        }
+
+        Text {
+            text: root.label;
+            color: root.active ? #FFFFFF : Theme.text-dim;
+            font-size: 13px;
+            vertical-alignment: center;
+        }
+    }
+
+    TouchArea {
+        width: 100%;
+        height: 100%;
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+component TopBar inherits Rectangle {
+    height: 62px;
+    background: Theme.surface;
+
+    Rectangle {
+        width: 100%;
+        height: 1px;
+        y: parent.height - 1px;
+        background: Theme.border;
+    }
+
+    HorizontalLayout {
+        padding-left: 18px;
+        padding-right: 18px;
+        spacing: 13px;
+        cross-axis-alignment: center;
+
+        Image {
+            source: @image-url("icons/logo.svg");
+            width: 32px;
+            height: 32px;
+        }
+
+        VerticalLayout {
+            spacing: 1px;
+
+            Text {
+                text: "Cardboard++ Bridge";
+                color: Theme.text-hi;
+                font-size: 15px;
+                font-weight: 700;
+            }
+
+            Text {
+                text: "Control plane for the streaming driver";
+                color: Theme.text-dim;
+                font-size: 11px;
+            }
+        }
+
+        Rectangle {
+            horizontal-stretch: 1;
+        }
+
+        StatusPill {
+            label: "Driver";
+            ok: BridgeState.driver-connected;
+        }
+
+        StatusPill {
+            label: "Phone";
+            ok: BridgeState.phone-connected;
+        }
+
+        StatusPill {
+            label: "Encoder";
+            ok: BridgeState.encoder-active;
+        }
+    }
+}
+
+component Sidebar inherits Rectangle {
+    width: 216px;
+    background: Theme.surface;
+
+    Rectangle {
+        width: 1px;
+        x: parent.width - 1px;
+        height: 100%;
+        background: Theme.border;
+    }
+
+    VerticalLayout {
+        padding: 14px;
+        spacing: 6px;
+
+        Text {
+            text: "CONTROL PLANE";
+            color: Theme.text-dim;
+            font-size: 10px;
+        }
+
+        for t in [
+            { index: 0, label: "Stream", icon: @image-url("icons/stream.svg") },
+            { index: 1, label: "Hand Tracking", icon: @image-url("icons/hand.svg") },
+            { index: 2, label: "Diagnostics", icon: @image-url("icons/diagnostics.svg") },
+            { index: 3, label: "General", icon: @image-url("icons/general.svg") },
+        ] : TabButton {
+            label: t.label;
+            icon: t.icon;
+            active: BridgeState.current-tab == t.index;
+            clicked => {
+                BridgeState.current-tab = t.index;
+            }
+        }
+
+        Rectangle {
+            height: 1px;
+            horizontal-stretch: 1;
+            background: Theme.border;
+        }
+
+        Text {
+            text: "Video stays direct:\nPC → phone (UDP 42069)";
+            color: Theme.text-dim;
+            font-size: 10px;
+            wrap: word-wrap;
+        }
+    }
+}
+
+component BottomBar inherits Rectangle {
+    height: 28px;
+    background: #07090D;
+
+    Rectangle {
+        width: 100%;
+        height: 1px;
+        background: Theme.border;
+    }
+
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        spacing: 8px;
+
+        Text {
+            text: "Cardboard++ Bridge  ·  v{BridgeState.app-version}";
+            color: Theme.text-dim;
+            font-size: 11px;
+            vertical-alignment: center;
+        }
+
+        Rectangle {
+            horizontal-stretch: 1;
+        }
+
+        Text {
+            text: "GPL-3.0 · control plane for the SteamVR driver";
+            color: Theme.text-dim;
+            font-size: 11px;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component StreamPage inherits VerticalLayout {
+    spacing: 14px;
+    padding: 20px;
+
+    Text {
+        text: "Stream";
+        color: Theme.text-hi;
+        font-size: 22px;
+        font-weight: 700;
+    }
+
+    Card {
+        title: "Data path";
+        hint: "The bridge never touches the encoded video. Decoding stays on the phone via MediaCodec.";
+
+        HorizontalLayout {
+            spacing: 14px;
+
+            Rectangle {
+                horizontal-stretch: 1;
+                height: 64px;
+                border-radius: 12px;
+                border-width: 1px;
+                border-color: Theme.border;
+                background: Theme.surface2;
+
+                VerticalLayout {
+                    padding: 10px;
+                    spacing: 2px;
+                    alignment: center;
+
+                    Text {
+                        text: "PC · SteamVR driver";
+                        color: BridgeState.driver-connected ? Theme.text-hi : Theme.text-dim;
+                        font-size: 12px;
+                        font-weight: 600;
+                        horizontal-alignment: center;
+                    }
+
+                    Text {
+                        text: BridgeState.driver-connected ? "encoding & streaming" : "not connected";
+                        color: BridgeState.driver-connected ? Theme.ok : Theme.err;
+                        font-size: 11px;
+                        horizontal-alignment: center;
+                    }
+                }
+            }
+
+            Text {
+                text: "→";
+                color: Theme.text-mid;
+                font-size: 22px;
+                vertical-alignment: center;
+            }
+
+            Rectangle {
+                horizontal-stretch: 1;
+                height: 64px;
+                border-radius: 12px;
+                border-width: 1px;
+                border-color: Theme.border;
+                background: Theme.surface2;
+
+                VerticalLayout {
+                    padding: 10px;
+                    spacing: 2px;
+                    alignment: center;
+
+                    Text {
+                        text: "Phone · MediaCodec";
+                        color: BridgeState.phone-connected ? Theme.text-hi : Theme.text-dim;
+                        font-size: 12px;
+                        font-weight: 600;
+                        horizontal-alignment: center;
+                    }
+
+                    Text {
+                        text: "{BridgeState.video-width}×{BridgeState.video-height} @ {BridgeState.fps} fps";
+                        color: Theme.text-mid;
+                        font-size: 11px;
+                        horizontal-alignment: center;
+                    }
+                }
+            }
+        }
+
+        Text {
+            text: "UDP 42069 · 4-byte big-endian length + H.264 Annex-B frame";
+            color: Theme.text-dim;
+            font-size: 11px;
+        }
+    }
+
+    Card {
+        title: "Live session";
+
+        HorizontalLayout {
+            spacing: 12px;
+
+            Metric {
+                label: "Resolution (SBS)";
+                value: "{BridgeState.video-width}×{BridgeState.video-height}";
+                horizontal-stretch: 1;
+            }
+
+            Metric {
+                label: "Target FPS";
+                value: "{BridgeState.fps}";
+                horizontal-stretch: 1;
+            }
+
+            Metric {
+                label: "Bitrate";
+                value: "{BridgeState.bitrate} Mbps";
+                horizontal-stretch: 1;
+            }
+
+            Metric {
+                label: "Latency";
+                value: "{BridgeState.latency-ms} ms";
+                value-color: BridgeState.latency-ms < 60 ? Theme.ok : (BridgeState.latency-ms < 120 ? Theme.warn : Theme.err);
+                horizontal-stretch: 1;
+            }
+        }
+    }
+
+    Card {
+        title: "Preview tap";
+        hint: "A local preview of the stream needs the driver to support multiple targets. Currently the driver switches to a single phone IP, so the bridge only monitors the control plane.";
+
+        Rectangle {
+            height: 120px;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: Theme.border;
+            background: Theme.surface2;
+
+            VerticalLayout {
+                alignment: center;
+                spacing: 6px;
+
+                Image {
+                    source: @image-url("icons/stream.svg");
+                    width: 30px;
+                    height: 30px;
+                    colorize: Theme.text-dim;
+                }
+
+                Text {
+                    text: "TODO: attach viewer once driver supports fan-out";
+                    color: Theme.text-dim;
+                    font-size: 12px;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+    }
+}
+
+component HandPage inherits VerticalLayout {
+    spacing: 14px;
+    padding: 20px;
+
+    Text {
+        text: "Hand Tracking";
+        color: Theme.text-hi;
+        font-size: 22px;
+        font-weight: 700;
+    }
+
+    Card {
+        title: "Model";
+        hint: "MediaPipe runs on the phone (ML Kit / MediaPipe pipeline); the bridge receives landmark frames over the telemetry link and applies filters here, out of the SteamVR callback path.";
+
+        Toggle {
+            label: "Enable hand tracking on the phone";
+            checked: BridgeState.hand-enabled;
+            changed(b) => {
+                BridgeState.hand-enabled = b;
+            }
+        }
+
+        Stepper {
+            label: "Confidence threshold";
+            value: BridgeState.hand-confidence;
+            min: 10;
+            max: 99;
+            step: 1;
+            unit: "%";
+            changed(v) => {
+                BridgeState.hand-confidence = v;
+            }
+        }
+    }
+
+    Card {
+        title: "Status";
+
+        if !BridgeState.hand-enabled : Text {
+            text: "Hand tracking is disabled. Frames are not being requested from the phone.";
+            color: Theme.text-dim;
+            font-size: 12px;
+            wrap: word-wrap;
+        }
+
+        if BridgeState.hand-enabled && BridgeState.hands-detected == 0 : Text {
+            text: "No hands detected yet. Keep your hands in the phone camera frustum.";
+            color: Theme.warn;
+            font-size: 12px;
+            wrap: word-wrap;
+        }
+
+        if BridgeState.hand-enabled && BridgeState.hands-detected > 0 : Text {
+            text: "Tracking active.";
+            color: Theme.ok;
+            font-size: 12px;
+            wrap: word-wrap;
+        }
+
+        HorizontalLayout {
+            spacing: 12px;
+
+            Metric {
+                label: "Hand FPS";
+                value: "{BridgeState.hand-fps}";
+                horizontal-stretch: 1;
+            }
+
+            Metric {
+                label: "Hands detected";
+                value: "{BridgeState.hands-detected}";
+                horizontal-stretch: 1;
+            }
+
+            Metric {
+                label: "Landmarks / hand";
+                value: "{BridgeState.landmark-count}";
+                horizontal-stretch: 1;
+            }
+        }
+    }
+}
+
+component DiagnosticsPage inherits VerticalLayout {
+    spacing: 14px;
+    padding: 20px;
+
+    Text {
+        text: "Diagnostics";
+        color: Theme.text-hi;
+        font-size: 22px;
+        font-weight: 700;
+    }
+
+    HorizontalLayout {
+        spacing: 12px;
+
+        Metric {
+            label: "Stream FPS";
+            value: "{BridgeState.stream-fps}";
+            horizontal-stretch: 1;
+        }
+
+        Metric {
+            label: "Encoder";
+            value: BridgeState.encoder-name;
+            horizontal-stretch: 1;
+        }
+
+        Metric {
+            label: "Latency";
+            value: "{BridgeState.latency-ms} ms";
+            horizontal-stretch: 1;
+        }
+
+        Metric {
+            label: "Gyro rate";
+            value: "{BridgeState.gyro-fps}/s";
+            horizontal-stretch: 1;
+        }
+    }
+
+    HorizontalLayout {
+        spacing: 12px;
+
+        Metric {
+            label: "Hand FPS";
+            value: "{BridgeState.hand-fps}";
+            horizontal-stretch: 1;
+        }
+
+        Metric {
+            label: "Telemetry packets";
+            value: "{BridgeState.packets-total}";
+            horizontal-stretch: 1;
+        }
+
+        Metric {
+            label: "Phone address";
+            value: BridgeState.phone-ip;
+            horizontal-stretch: 1;
+        }
+    }
+
+    Card {
+        title: "Bridge log";
+        hint: "Newest entries on top.";
+
+        Rectangle {
+            width: 100%;
+            height: 240px;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: Theme.border;
+            background: #0A0D13;
+
+            Flickable {
+                width: 100%;
+                height: 100%;
+
+                Text {
+                    x: 12px;
+                    y: 8px;
+                    width: parent.width - 24px;
+                    wrap: word-wrap;
+                    text: BridgeState.log-text;
+                    color: Theme.text-mid;
+                    font-size: 12px;
+                    font-family: "Consolas";
+                }
+            }
+        }
+    }
+}
+
+component GeneralPage inherits VerticalLayout {
+    spacing: 14px;
+    padding: 20px;
+
+    Text {
+        text: "General";
+        color: Theme.text-hi;
+        font-size: 22px;
+        font-weight: 700;
+    }
+
+    Card {
+        title: "Encoder";
+
+        HorizontalLayout {
+            spacing: 10px;
+
+            Pill {
+                text: "Auto";
+                active: BridgeState.encoder-index == 0;
+                clicked => {
+                    BridgeState.encoder-index = 0;
+                }
+            }
+
+            Pill {
+                text: "AMF";
+                active: BridgeState.encoder-index == 1;
+                clicked => {
+                    BridgeState.encoder-index = 1;
+                }
+            }
+
+            Pill {
+                text: "NVENC";
+                active: BridgeState.encoder-index == 2;
+                clicked => {
+                    BridgeState.encoder-index = 2;
+                }
+            }
+
+            Pill {
+                text: "QSV";
+                active: BridgeState.encoder-index == 3;
+                clicked => {
+                    BridgeState.encoder-index = 3;
+                }
+            }
+
+            Pill {
+                text: "libx264";
+                active: BridgeState.encoder-index == 4;
+                clicked => {
+                    BridgeState.encoder-index = 4;
+                }
+            }
+        }
+
+        Text {
+            text: "Driver auto-detects AMF → NVENC → QSV → libx264. Picking a specific one pins the encoder selection.";
+            color: Theme.text-dim;
+            font-size: 11px;
+            wrap: word-wrap;
+        }
+    }
+
+    Card {
+        title: "Streaming settings";
+        hint: "Resolution is clamped by the phone's hardware decoder cap. Settings are pushed to the driver over UDP 42070.";
+
+        VerticalLayout {
+            spacing: 12px;
+
+            Stepper {
+                label: "Resolution width (SBS)";
+                value: BridgeState.video-width;
+                min: 1280;
+                max: 5760;
+                step: 160;
+                changed(v) => {
+                    BridgeState.video-width = v;
+                }
+            }
+
+            Stepper {
+                label: "Resolution height";
+                value: BridgeState.video-height;
+                min: 720;
+                max: 3240;
+                step: 90;
+                changed(v) => {
+                    BridgeState.video-height = v;
+                }
+            }
+
+            Stepper {
+                label: "Target FPS";
+                value: BridgeState.fps;
+                min: 15;
+                max: 120;
+                step: 5;
+                changed(v) => {
+                    BridgeState.fps = v;
+                }
+            }
+
+            Stepper {
+                label: "Bitrate";
+                value: BridgeState.bitrate;
+                min: 2;
+                max: 100;
+                step: 2;
+                unit: " Mbps";
+                changed(v) => {
+                    BridgeState.bitrate = v;
+                }
+            }
+        }
+    }
+
+    Card {
+        title: "Phone";
+
+        HorizontalLayout {
+            spacing: 10px;
+            cross-axis-alignment: center;
+
+            Text {
+                text: "Telemetry uplink:";
+                color: Theme.text-mid;
+                font-size: 13px;
+                vertical-alignment: center;
+            }
+
+            Text {
+                text: BridgeState.phone-ip;
+                color: BridgeState.phone-connected ? Theme.text-hi : Theme.text-dim;
+                font-size: 13px;
+                font-weight: 600;
+                vertical-alignment: center;
+            }
+
+            Rectangle {
+                horizontal-stretch: 1;
+            }
+
+            StatusPill {
+                label: "reachable";
+                ok: BridgeState.phone-connected;
+            }
+        }
+
+        Text {
+            text: "Bridge listens on UDP 42071 for gyro, hand-tracking and ping frames. The video stream never enters the bridge.";
+            color: Theme.text-dim;
+            font-size: 11px;
+            wrap: word-wrap;
+        }
+    }
+
+    GradientButton {
+        text: "Apply to driver";
+        enabled: BridgeState.driver-connected;
+        clicked => {
+            BridgeState.apply-settings(BridgeState.video-width, BridgeState.video-height, BridgeState.fps, BridgeState.bitrate, BridgeState.encoder-index);
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "Cardboard++ Bridge";
+    preferred-width: 1160px;
+    preferred-height: 720px;
+    min-width: 940px;
+    min-height: 560px;
+
+    background: Theme.bg;
+
+    VerticalLayout {
+        TopBar {}
+
+        HorizontalLayout {
+            horizontal-stretch: 1;
+            vertical-stretch: 1;
+
+            Sidebar {}
+
+            Rectangle {
+                width: 720px;
+                horizontal-stretch: 1;
+                background: @linear-gradient(160deg, #0E1119, #0B0E14);
+
+                if BridgeState.current-tab == 0 : StreamPage {}
+                if BridgeState.current-tab == 1 : HandPage {}
+                if BridgeState.current-tab == 2 : DiagnosticsPage {}
+                if BridgeState.current-tab == 3 : GeneralPage {}
+            }
+        }
+
+        BottomBar {}
+    }
+}

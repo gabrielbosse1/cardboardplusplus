@@ -13,8 +13,10 @@ import com.google.cardboard.NativeBridge;
 import com.google.cardboard.R;
 
 /**
- * Owns the settings popup menu. Currently only "switch viewer" is implemented; the menu is the
- * natural home for the planned resolution / frame-rate / internet-speed / codec selectors.
+ * Owns the settings popup menu (switch viewer / set PC IP).
+ *
+ * <p>Binds the inflated {@code settings_menu} items to their actions. This is deliberately detached
+ * from {@code VrActivity} so adding a future menu item only touches this class plus the menu XML.
  */
 public class SettingsMenuController implements PopupMenu.OnMenuItemClickListener {
   private final View anchor;
@@ -50,22 +52,22 @@ public class SettingsMenuController implements PopupMenu.OnMenuItemClickListener
 
   private void showPcIpDialog() {
     Context context = anchor.getContext();
-    EditText input = new EditText(context);
-    input.setInputType(
+    EditText ipInput = new EditText(context);
+    ipInput.setInputType(
         InputType.TYPE_CLASS_TEXT
             | InputType.TYPE_TEXT_VARIATION_URI
             | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
-    input.setHint(R.string.pc_ip_hint);
-    input.setText(appSettings.getPcIp());
-    input.setSelectAllOnFocus(true);
-    input.setImeOptions(EditorInfo.IME_ACTION_DONE);
+    ipInput.setHint(R.string.pc_ip_hint);
+    ipInput.setText(appSettings.getPcIp());
+    ipInput.setSelectAllOnFocus(true);
+    ipInput.setImeOptions(EditorInfo.IME_ACTION_DONE);
 
     new AlertDialog.Builder(context)
         .setTitle(R.string.pc_ip_dialog_title)
-        .setView(input)
+        .setView(ipInput)
         .setPositiveButton(
             R.string.pc_ip_ok,
-            (dialog, which) -> appSettings.setPcIp(input.getText().toString().trim()))
+            (dialog, which) -> appSettings.setPcIp(ipInput.getText().toString().trim()))
         .setNegativeButton(R.string.pc_ip_cancel, null)
         .show();
   }

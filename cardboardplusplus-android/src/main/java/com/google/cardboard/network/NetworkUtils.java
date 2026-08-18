@@ -1,9 +1,14 @@
-package com.google.cardboard.util;
+package com.google.cardboard.network;
 
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 
-/** Networking static helpers. */
+/**
+ * Networking static helpers for PC discovery.
+ *
+ * <p>This package owns everything that decides, per broadcast cycle, who the phone talks to over
+ * UDP: the discovery broadcast address and the configured-PC-IP-vs-broadcast decision.
+ */
 public final class NetworkUtils {
   private NetworkUtils() {}
 

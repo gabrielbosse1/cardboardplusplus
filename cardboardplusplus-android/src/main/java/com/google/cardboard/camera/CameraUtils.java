@@ -1,4 +1,4 @@
-package com.google.cardboard.util;
+package com.google.cardboard.camera;
 
 import android.annotation.SuppressLint;
 import android.hardware.camera2.CameraAccessException;
@@ -7,7 +7,13 @@ import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.params.StreamConfigurationMap;
 import android.util.Size;
 
-/** Camera-related static helpers. */
+/**
+ * Camera-related static helpers used by {@link CameraController}.
+ *
+ * <p>Lives next to {@link CameraController} in the {@code camera} package because it exists only to
+ * serve the Camera2 lifecycle (device selection + output-size negotiation), not general purpose
+ * camera code.
+ */
 public final class CameraUtils {
   private CameraUtils() {}
 

@@ -1,0 +1,5 @@
+# Sandbox working copies of the modules — created by setup.ps1, never committed.
+/work/
+
+# Check-mode artifacts are transient diffs, not baselines.
+/harness/results/*/check/

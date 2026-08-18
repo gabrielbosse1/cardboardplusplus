@@ -1,5 +1,5 @@
 #pragma once
-#include <openvr_driver.h>
+#include "openvr_driver.h"
 #include <windows.h>
 
 using namespace vr;
@@ -66,10 +66,10 @@ public:
 
 private:
 
-	uint32_t driverId;
-	VRInputComponentHandle_t joystickYHandle;
-	VRInputComponentHandle_t trackpadYHandle;
-	VRInputComponentHandle_t joystickXHandle;
-	VRInputComponentHandle_t trackpadXHandle;
+	uint32_t m_driverId;
+	VRInputComponentHandle_t m_joystickYHandle;
+	VRInputComponentHandle_t m_trackpadYHandle;
+	VRInputComponentHandle_t m_joystickXHandle;
+	VRInputComponentHandle_t m_trackpadXHandle;
 
 };

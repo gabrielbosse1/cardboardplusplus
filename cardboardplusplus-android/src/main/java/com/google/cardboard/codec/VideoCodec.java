@@ -1,6 +1,12 @@
 package com.google.cardboard.codec;
 
-/** Supported video codecs for the PC -> phone stream. */
+/**
+ * Supported video codecs for the PC -> phone stream.
+ *
+ * <p>{@link #fromName} accepts either the wire name (e.g. {@code "h264"}) or the enum constant name
+ * ({@code "H264"}) and falls back to {@link #H264} for anything unknown so legacy/broken settings
+ * always resolve to the only codec the native decoder currently implements.
+ */
 public enum VideoCodec {
   H264("h264"),
   HEVC("hevc"),

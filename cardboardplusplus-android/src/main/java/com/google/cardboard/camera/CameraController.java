@@ -15,7 +15,6 @@ import android.util.Size;
 import android.view.Surface;
 import com.google.cardboard.NativeBridge;
 import com.google.cardboard.core.AppConstants;
-import com.google.cardboard.util.CameraUtils;
 import java.util.ArrayList;
 
 /**
@@ -115,49 +114,7 @@ public class CameraController {
         cameraHandler = new Handler(cameraThread.getLooper());
       }
 
-      cameraManager.openCamera(
-          backCameraId,
-          new CameraDevice.StateCallback() {
-            @Override
-            public void onOpened(CameraDevice camera) {
-              synchronized (cameraLock) {
-                if (!cameraInitialized) {
-                  cameraDevice = camera;
-                  try {
-                    createCaptureSession();
-                    cameraInitialized = true;
-                  } catch (Exception e) {
-                    Log.w(TAG, "Session setup failed: " + e.getMessage());
-                    camera.close();
-                    cameraDevice = null;
-                  }
-                } else {
-                  camera.close();
-                }
-              }
-            }
-
-            @Override
-            public void onDisconnected(CameraDevice camera) {
-              synchronized (cameraLock) {
-                camera.close();
-                if (cameraDevice == camera) {
-                  cameraDevice = null;
-                }
-              }
-            }
-
-            @Override
-            public void onError(CameraDevice camera, int error) {
-              synchronized (cameraLock) {
-                camera.close();
-                if (cameraDevice == camera) {
-                  cameraDevice = null;
-                }
-              }
-            }
-          },
-          cameraHandler);
+      cameraManager.openCamera(backCameraId, new CameraDeviceCallback(), cameraHandler);
 
       Log.i(TAG, "Camera opening, size: " + cameraWidth + "x" + cameraHeight);
     } catch (Exception e) {
@@ -180,33 +137,7 @@ public class CameraController {
               add(cameraSurface);
             }
           },
-          new CameraCaptureSession.StateCallback() {
-            @Override
-            public void onConfigured(CameraCaptureSession session) {
-              synchronized (cameraLock) {
-                if (!cameraInitialized || cameraDevice == null) {
-                  session.close();
-                  return;
-                }
-                captureSession = session;
-              }
-              try {
-                captureRequestBuilder.set(
-                    CaptureRequest.CONTROL_AF_MODE,
-                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
-                captureRequestBuilder.set(
-                    CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
-                session.setRepeatingRequest(captureRequestBuilder.build(), null, cameraHandler);
-              } catch (Exception e) {
-                Log.w(TAG, "Failed to start preview: " + e.getMessage());
-              }
-            }
-
-            @Override
-            public void onConfigureFailed(CameraCaptureSession session) {
-              Log.w(TAG, "Camera configuration failed");
-            }
-          },
+          new PreviewSessionCallback(captureRequestBuilder),
           cameraHandler);
     } catch (Exception e) {
       Log.w(TAG, "Failed to create capture session: " + e.getMessage());
@@ -287,5 +218,92 @@ public class CameraController {
       cameraSurfaceTexture = null;
     }
     cameraTexturePassed = false;
+  }
+
+  /**
+   * Carries the {@code openCamera} result back into the controller.
+   *
+   * <p>All state transitions are guarded by {@link #cameraLock}: only the first session set-up
+   * wins (a second open is closed immediately), and any device closure clears {@link #cameraDevice}
+   * so a later {@link #openCamera()} can retry.
+   */
+  private final class CameraDeviceCallback extends CameraDevice.StateCallback {
+    @Override
+    public void onOpened(CameraDevice camera) {
+      synchronized (cameraLock) {
+        if (!cameraInitialized) {
+          cameraDevice = camera;
+          try {
+            createCaptureSession();
+            cameraInitialized = true;
+          } catch (Exception e) {
+            Log.w(TAG, "Session setup failed: " + e.getMessage());
+            camera.close();
+            cameraDevice = null;
+          }
+        } else {
+          camera.close();
+        }
+      }
+    }
+
+    @Override
+    public void onDisconnected(CameraDevice camera) {
+      synchronized (cameraLock) {
+        camera.close();
+        if (cameraDevice == camera) {
+          cameraDevice = null;
+        }
+      }
+    }
+
+    @Override
+    public void onError(CameraDevice camera, int error) {
+      synchronized (cameraLock) {
+        camera.close();
+        if (cameraDevice == camera) {
+          cameraDevice = null;
+        }
+      }
+    }
+  }
+
+  /**
+   * Starts the repeating preview stream once the capture session is configured.
+   *
+   * <p>Holds the {@link CaptureRequest.Builder} created alongside the session so the auto-focus and
+   * auto-exposure settings the controller wants are applied when the stream starts. If the session
+   * is configured after the camera was already torn down, it is closed immediately instead.
+   */
+  private final class PreviewSessionCallback extends CameraCaptureSession.StateCallback {
+    private final CaptureRequest.Builder captureRequestBuilder;
+
+    PreviewSessionCallback(CaptureRequest.Builder captureRequestBuilder) {
+      this.captureRequestBuilder = captureRequestBuilder;
+    }
+
+    @Override
+    public void onConfigured(CameraCaptureSession session) {
+      synchronized (cameraLock) {
+        if (!cameraInitialized || cameraDevice == null) {
+          session.close();
+          return;
+        }
+        captureSession = session;
+      }
+      try {
+        captureRequestBuilder.set(
+            CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
+        captureRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
+        session.setRepeatingRequest(captureRequestBuilder.build(), null, cameraHandler);
+      } catch (Exception e) {
+        Log.w(TAG, "Failed to start preview: " + e.getMessage());
+      }
+    }
+
+    @Override
+    public void onConfigureFailed(CameraCaptureSession session) {
+      Log.w(TAG, "Camera configuration failed");
+    }
   }
 }
