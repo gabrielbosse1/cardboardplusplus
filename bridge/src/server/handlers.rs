@@ -27,11 +27,64 @@ pub fn handle(mut request: Request, core: &AppCore) {
         (Method::Get, "/health") => ok_json(&health_payload()),
         (Method::Get, "/status") => ok_json(&core.status()),
         (Method::Get, "/logs") => ok_json(&logs_payload(core, query.as_deref())),
+        (Method::Get, "/preview") => ok_json(&preview_payload(core)),
+        (Method::Post, "/preview") => set_preview(&mut request, core),
         (Method::Post, "/settings") => apply_settings(&mut request, core),
         _ => text(StatusCode(404), NOT_FOUND_BODY),
     };
 
     let _ = request.respond(response);
+}
+
+/// Current preview state: whether it is enabled and the driver's latest stats.
+fn preview_payload(core: &AppCore) -> serde_json::Value {
+    let s = core.status();
+    serde_json::json!({
+        "enabled": s.preview_enabled,
+        "driver": {
+            "fps": s.preview_driver_fps,
+            "bitrate_kbps": s.preview_bitrate_kbps,
+            "frames": s.preview_frames,
+            "drops": s.preview_drops,
+        },
+    })
+}
+
+/// POST /preview — toggle the local preview. Accepts `{"enabled": bool}` to
+/// switch the driver's localhost stream and/or `{"ffplay": true}` to open the
+/// ffplay viewer window.
+fn set_preview(request: &mut Request, core: &AppCore) -> Response<std::io::Cursor<Vec<u8>>> {
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct PreviewPayload {
+        enabled: Option<bool>,
+        #[serde(rename = "ffplay")]
+        open_ffplay: Option<bool>,
+    }
+
+    let body = read_body_bytes(request);
+    let parsed: PreviewPayload = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(_) => {
+            return json(
+                StatusCode(400),
+                &serde_json::json!({"error": "body must be JSON like {\"enabled\":true} or {\"ffplay\":true}"}),
+            );
+        }
+    };
+
+    if let Some(enabled) = parsed.enabled {
+        core.set_preview(enabled);
+    }
+    if parsed.open_ffplay.unwrap_or(false) {
+        core.open_ffplay_preview();
+    }
+
+    ok_json(&serde_json::json!({
+        "ok": true,
+        "preview": preview_payload(core),
+    }))
 }
 
 /// The endpoint index behaves like the page literal: served as raw text.

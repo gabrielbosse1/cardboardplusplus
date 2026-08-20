@@ -166,6 +166,11 @@ private:
 
     // CPU readback buffer (Populate in ReadbackToBuffer, consumed by SwsConvert)
     uint8_t* m_pReadbackBuffer = nullptr;
+
+    // Annex-B formatted SPS+PPS NALs extracted from codec extradata at init.
+    // Prepended to every keyframe that doesn't already start with SPS, so
+    // decoders can configure even when the BSF skips the prepend.
+    std::vector<uint8_t> m_spsPpsAnnexB;
     int m_readbackBufferSize = 0;
     int m_readbackRowPitch = 0;
 

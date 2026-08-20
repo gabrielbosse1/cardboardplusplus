@@ -11,4 +11,19 @@ build
 gitlog.json
 .externalNativeBuild
 
-hellocardboard-android/libraries/
+# MSVC intermediate directories
+driver_cardboardplusplus/*/x64/
+driver_cardboardplusplus/driver_c.*/
+
+# Rust build output
+bridge/target/
+
+# Android build outputs
+cardboardplusplus-android/build/
+cardboardplusplus-android/libraries/
+
+# Leftover test artifacts
+*.obj
+bridge_*.txt
+bridge/*.txt
+__pycache__/

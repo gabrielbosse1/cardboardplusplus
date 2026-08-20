@@ -141,6 +141,9 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
     // 2. Stop discovery
     discoveryManager.stopDiscovery();
 
+    // 2b. Stop camera streaming
+    cameraStreamer.stop();
+
     // 3. Stop camera hardware and release texture so it gets recreated fresh on resume
     cameraController.onPause();
 
@@ -173,7 +176,9 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
             int textureId = createCameraTexture();
             cameraController.ensureCameraTexture(textureId);
           }
+          cameraController.setFrameCallback(cameraStreamer);
           cameraController.openCamera();
+          cameraStreamer.start();
         });
   }
 

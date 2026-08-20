@@ -32,6 +32,18 @@ pub struct AppState {
     pub hand_fps: i32,
     pub hands_detected: i32,
     pub log: Vec<String>,
+    // -- local preview (BRIDGE_PREVIEW / BRIDGE_STATS over the discovery socket) --
+    pub preview_enabled: bool,
+    pub preview_driver_fps: i32,   // encoder fps reported by the driver
+    pub preview_bitrate_kbps: i32, // encoder bitrate reported by the driver
+    pub preview_frames: u64,       // framed packets the driver has sent
+    pub preview_drops: u64,        // packets the driver dropped on a full buffer
+    // -- camera viewer (JPEG frames from phone on UDP 42072) --
+    pub camera_connected: bool,
+    pub camera_frame: Option<(u32, u32, Vec<u8>)>,
+    pub camera_frame_time: Instant,
+    /// Hands detected by the bridge-side ONNX pipeline (separate from phone telemetry).
+    pub camera_detected_hands: usize,
     // -- private accounting used to derive the per-second fps figures above --
     gyro_pulse_count: u64,
     hand_pulse_count: u64,
@@ -54,6 +66,15 @@ impl Default for AppState {
             hands_detected: 0,
             // The very first line of every bridge log.
             log: vec!["bridge started".to_string()],
+            preview_enabled: false,
+            preview_driver_fps: 0,
+            preview_bitrate_kbps: 0,
+            preview_frames: 0,
+            preview_drops: 0,
+            camera_connected: false,
+            camera_frame: None,
+            camera_frame_time: Instant::now(),
+            camera_detected_hands: 0,
             gyro_pulse_count: 0,
             hand_pulse_count: 0,
             fps_window_started: Instant::now(),
@@ -102,6 +123,35 @@ impl AppState {
         self.hand_pulse_count += 1;
         self.hands_detected = hands as i32;
         self.packets_total += 1;
+    }
+
+    /// The driver's periodic BRIDGE_STATS landed: update the live preview
+    /// numbers the UI shows. The frames counter coming from the driver is
+    /// multi-target (it counts each phone copy too), which is fine for a
+    /// monitoring display.
+    pub fn note_preview_stats(&mut self, fps: i32, bitrate_kbps: i32, frames: u64, drops: u64) {
+        self.preview_driver_fps = fps;
+        self.preview_bitrate_kbps = bitrate_kbps;
+        self.preview_frames = frames;
+        self.preview_drops = drops;
+    }
+
+    /// Store the latest decoded camera frame (RGBA) for the viewer.
+    pub fn note_camera_frame(&mut self, w: u32, h: u32, rgba: Vec<u8>) {
+        self.camera_frame = Some((w, h, rgba));
+        self.camera_frame_time = Instant::now();
+        if !self.camera_connected {
+            self.camera_connected = true;
+            self.push_log("camera connected".into());
+        }
+    }
+
+    /// Mark camera as disconnected if no frames have arrived recently.
+    pub fn check_camera_liveness(&mut self) {
+        if self.camera_connected && self.camera_frame_time.elapsed().as_secs() > 3 {
+            self.camera_connected = false;
+            self.push_log("camera disconnected".into());
+        }
     }
 }
 

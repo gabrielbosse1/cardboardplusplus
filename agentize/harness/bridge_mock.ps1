@@ -12,8 +12,6 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-function Get-Ping { param([string]$s) "PING-OK" }
-
 function Invoke-Rest { param([string]$UrlSub, [string]$Method = 'GET', [string]$Body = $null)
     try {
         if ($Method -eq 'POST') {

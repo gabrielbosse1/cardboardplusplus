@@ -1,6 +1,7 @@
 #include "HmdDriver.h"
 #include "DriverLog.h"
 #include "CardboardWire.h"
+#include "H264Utils.h"
 #include <cstdlib>
 #include <cstring>
 
@@ -16,23 +17,6 @@ using namespace vr;
 // ---------------------------------------------------------------------------
 
 namespace {
-
-// 4-byte big-endian length prefix + the payload, in one malloc'd buffer.
-// Returns nullptr on allocation failure (caller must free the result).
-static uint8_t* BuildLengthPrefixedPacket(const uint8_t* data, int size, int* outFramedSize)
-{
-    int framedSize = size + 4;
-    uint8_t* framed = (uint8_t*)malloc(framedSize);
-    if (framed) {
-        framed[0] = (uint8_t)((size >> 24) & 0xFF);
-        framed[1] = (uint8_t)((size >> 16) & 0xFF);
-        framed[2] = (uint8_t)((size >> 8) & 0xFF);
-        framed[3] = (uint8_t)(size & 0xFF);
-        memcpy(framed + 4, data, size);
-    }
-    *outFramedSize = framedSize;
-    return framed;
-}
 
 // Chunked non-blocking send. On a full send buffer the frame is dropped and the
 // running drop counter incremented (logged every 30th drop). Returns after
@@ -58,50 +42,6 @@ static void SendFramedUdp(SOCKET socket, const sockaddr_in* addr,
         }
         offset += chunkSize;
     }
-}
-
-// libx264 keyframes: SPS and PPS have NAL start codes, but the IDR data follows
-// without one. This scans the packet for the PPS NAL (type 8) and returns the
-// byte offset where the IDR start code must be inserted, or -1 when no fix is
-// needed (IDR start code already present / no PPS found / not a keyframe).
-static int FindIdrInsertionPoint(const uint8_t* data, int size, bool keyframe)
-{
-    if (!keyframe || size <= 10) return -1;
-
-    int ppsDataEnd = -1;
-    for (int i = 0; i < size - 5; i++) {
-        if (data[i] == 0x00 && data[i+1] == 0x00 && data[i+2] == 0x00 &&
-            data[i+3] == 0x01 && (data[i+4] & 0x1F) == 8) {
-            // Found PPS start. Find next NAL start code or end of small PPS.
-            for (int j = i + 5; j < size - 3; j++) {
-                if (data[j] == 0x00 && data[j+1] == 0x00 &&
-                    ((data[j+2] == 0x01) || (data[j+2] == 0x00 && data[j+3] == 0x01))) {
-                    ppsDataEnd = j;
-                    break;
-                }
-            }
-            if (ppsDataEnd < 0) ppsDataEnd = i + 5 + 4; // assume short PPS
-            // Check if IDR start code already present. libx264 emits a 3-byte
-            // 00 00 01 65 start code after PPS, so accept both 3- and 4-byte forms.
-            bool idrScPresent = false;
-            if (ppsDataEnd + 3 < size &&
-                data[ppsDataEnd] == 0x00 && data[ppsDataEnd+1] == 0x00 &&
-                data[ppsDataEnd+2] == 0x01 &&
-                (data[ppsDataEnd+3] & 0x1F) == 5) {
-                idrScPresent = true; // 3-byte start code: 00 00 01 65
-            } else if (ppsDataEnd + 4 < size &&
-                data[ppsDataEnd] == 0x00 && data[ppsDataEnd+1] == 0x00 &&
-                data[ppsDataEnd+2] == 0x00 && data[ppsDataEnd+3] == 0x01 &&
-                (data[ppsDataEnd+4] & 0x1F) == 5) {
-                idrScPresent = true; // 4-byte start code: 00 00 00 01 65
-            }
-            if (idrScPresent) {
-                return -1; // IDR start code already present, no fix needed
-            }
-            return ppsDataEnd;
-        }
-    }
-    return -1; // no PPS NAL found
 }
 
 } // namespace
@@ -136,13 +76,21 @@ bool HmdDriver::InitializeUDP()
     u_long nonBlocking = 1;
     ioctlsocket(m_udpSocket, FIONBIO, &nonBlocking);
 
-    // Target: localhost:42069
+    // Preview target: localhost:42069 — always present so the bridge / ffplay
+    // can watch the stream without a phone connected. Fan-out to the phone's
+    // target (m_serverAddr) happens on top of this once discovery sets it.
+    m_previewAddr.sin_family = AF_INET;
+    m_previewAddr.sin_port = htons(wire::kDataPort);
+    inet_pton(AF_INET, "127.0.0.1", &m_previewAddr.sin_addr);
+
+    // Phone target starts empty; SwitchDataTarget fills it in on discovery.
     m_serverAddr.sin_family = AF_INET;
     m_serverAddr.sin_port = htons(wire::kDataPort);
-    inet_pton(AF_INET, "127.0.0.1", &m_serverAddr.sin_addr);
+    m_serverAddr.sin_addr.s_addr = INADDR_ANY;
+    m_hasPhoneTarget.store(false, std::memory_order_relaxed);
 
     m_udpInitialized = true;
-    DriverLog("UDP socket initialized. Sending to 127.0.0.1:%d", wire::kDataPort);
+    DriverLog("UDP socket initialized. Preview target 127.0.0.1:%d always on; phone target added on discovery", wire::kDataPort);
     return true;
 }
 
@@ -179,7 +127,7 @@ void HmdDriver::OnEncodedPacket(uint8_t* data, int size, int64_t pts, bool keyfr
     // libx264 keyframes: SPS and PPS have NAL start codes, but IDR data follows
     // without one. Insert IDR start code after PPS for a valid H264 stream.
     static const uint8_t kIdrPrefix[] = { 0x00, 0x00, 0x00, 0x01, 0x65 };
-    int ppsEnd = FindIdrInsertionPoint(data, size, keyframe);
+    int ppsEnd = h264::FindIdrInsertionPoint(data, size, keyframe);
 
     if (ppsEnd > 0) {
         // Build fixed buffer: [up to PPS end] + [IDR start code] + [remaining IDR data].
@@ -189,28 +137,43 @@ void HmdDriver::OnEncodedPacket(uint8_t* data, int size, int64_t pts, bool keyfr
         memcpy(fixed + ppsEnd, kIdrPrefix, 5);
         memcpy(fixed + ppsEnd + 5, data + ppsEnd, size - ppsEnd);
 
-        // Frame the fixed keyframe with a 4-byte big-endian length prefix so
-        // the receiver can reconstruct the exact AVPacket (one full frame).
+        // Phone: 4-byte length prefix so MediaCodec can reconstruct the AVPacket.
         int framedSize = 0;
-        uint8_t* framed = BuildLengthPrefixedPacket(fixed, fixedSize, &framedSize);
-        if (framed) {
-            SendFramedUdp(m_udpSocket, &m_serverAddr, framed, framedSize, &m_udpDroppedFrames);
-            free(framed);
-        }
+        uint8_t* framed = h264::BuildLengthPrefixedPacket(fixed, fixedSize, &framedSize);
+
+        // Preview: raw Annex-B (ffplay expects an unframed H.264 stream).
+        SendFannedOut(fixed, fixedSize, framed, framedSize);
+        free(framed);
         free(fixed);
         DriverLog("[UDP] Fixed keyframe: inserted IDR start code at offset %d", ppsEnd);
         return;
     }
 
-    // Frame the packet with a 4-byte big-endian length prefix so the receiver
-    // can reconstruct the exact libx264 AVPacket (one full frame, including all
-    // of its slices) regardless of UDP datagram boundaries. FFmpeg decodes the
-    // in-band SPS/PPS/IDR Annex B stream directly.
+    // Phone: 4-byte length prefix so the receiver can reconstruct the exact
+    // libx264 AVPacket (one full frame, including all of its slices) regardless
+    // of UDP datagram boundaries.
     int framedSize = 0;
-    uint8_t* framed = BuildLengthPrefixedPacket(data, size, &framedSize);
-    if (framed) {
-        SendFramedUdp(m_udpSocket, &m_serverAddr, framed, framedSize, &m_udpDroppedFrames);
-        free(framed);
-    }
+    uint8_t* framed = h264::BuildLengthPrefixedPacket(data, size, &framedSize);
+
+    // Preview: raw Annex-B — ffplay demuxes start codes directly.
+    SendFannedOut(data, size, framed, framedSize);
+    free(framed);
     DriverLog("[UDP] Sent framed packet: payload=%d bytes", size);
+}
+
+void HmdDriver::SendFannedOut(const uint8_t* raw, int rawSize,
+                               const uint8_t* framed, int framedSize)
+{
+    // Local preview copy — always on so the bridge / ffplay can watch the
+    // stream at any time without needing a phone connected. Raw Annex-B so
+    // ffplay demuxes start codes directly (no length prefix).
+    SendFramedUdp(m_udpSocket, &m_previewAddr, raw, rawSize, &m_udpDroppedFrames);
+    m_udpFramesSent.fetch_add(1, std::memory_order_relaxed);
+
+    // Phone copy (only while a real phone target is set). Length-prefixed so
+    // MediaCodec can reconstruct the exact AVPacket.
+    if (m_hasPhoneTarget.load(std::memory_order_relaxed)) {
+        SendFramedUdp(m_udpSocket, &m_serverAddr, framed, framedSize, &m_udpDroppedFrames);
+        m_udpFramesSent.fetch_add(1, std::memory_order_relaxed);
+    }
 }

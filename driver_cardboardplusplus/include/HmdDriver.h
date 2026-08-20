@@ -102,6 +102,10 @@ public:
     void PostPresent() override;
     void GetFrameTiming(DriverDirectMode_FrameTiming* pFrameTiming) override;
 
+    // Fan-out send: one framed packet to every active target (preview + phone).
+    void SendFannedOut(const uint8_t* raw, int rawSize,
+                       const uint8_t* framed, int framedSize);
+
     // Encoder surface used by the encoder subsystem (callback into this class).
     VideoEncoder* GetVideoEncoder() { return m_pVideoEncoder; }
     void OnEncodedPacket(uint8_t* data, int size, int64_t pts, bool keyframe);
@@ -122,6 +126,7 @@ private:
     void ShutdownDiscovery();
     void DiscoveryThreadFunc();
     void SwitchDataTarget(const char* phoneIp);
+    void SendBridgeStats(const sockaddr_in& addr); // periodic BRIDGE_STATS to the bridge
 
     // ---- background encoding loop + compositor sync-texture handshake ----
     void EncodingThreadFunc();
@@ -198,15 +203,21 @@ private:
     long long m_lastPresentLogNs = 0;
 
     // Accumulated SubmitLayer calls since the last Present (composited together,
-    // in submission order, as one SBS frame).
+    // in submission order, as one SBS frame). m_hasSubmit is atomic: SubmitLayer
+    // (compositor submit thread) writes it, Present (present thread) reads it.
     std::vector<SubmitLayerInfo> m_submitLayers;
-    bool m_hasSubmit;
+    std::mutex m_submitLayersMutex;
+    std::atomic<bool> m_hasSubmit{false};
 
     // ---- UDP socket (video stream to the bridge) ----
     SOCKET m_udpSocket;
-    sockaddr_in m_serverAddr;
+    sockaddr_in m_serverAddr;    // phone target; set by SwitchDataTarget on discovery
+    sockaddr_in m_previewAddr;   // permanent localhost preview target (127.0.0.1:42069)
+    std::atomic<bool> m_hasPhoneTarget{false};  // m_serverAddr holds a real phone
+    std::atomic<bool> m_previewEnabled{true};   // localhost preview send (BRIDGE_PREVIEW)
     bool m_udpInitialized;
     uint32_t m_udpDroppedFrames;
+    std::atomic<uint64_t> m_udpFramesSent{0};   // total framed packets actually sent
 
     // ---- UDP discovery socket (phone broadcast) ----
     SOCKET m_discoverySocket;
@@ -214,4 +225,5 @@ private:
     std::atomic<bool> m_discoveryRunning;
     std::thread m_discoveryThread;
     std::mutex m_targetIpMutex;
+    std::atomic<long long> m_lastPhonePacketMs{0};  // last time a phone packet was received (GetTickCount64)
 };

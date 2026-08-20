@@ -1,3 +1,5 @@
+import { ScrollView } from "std-widgets.slint";
+
 export global Theme {
     in-out property <color> bg: #0B0E14;
     in-out property <color> surface: #121723;
@@ -49,7 +51,19 @@ export global BridgeState {
     in-out property <string> log-text: "";
     in-out property <string> app-version: "0.1.0";
 
+    in-out property <bool> preview-enabled: false;
+    in-out property <int> preview-driver-fps: 0;
+    in-out property <int> preview-bitrate-kbps: 0;
+    in-out property <int> preview-frames: 0;
+    in-out property <int> preview-drops: 0;
+    in-out property <image> preview-frame: @image-url("icons/stream.svg");
+    in-out property <image> camera-frame: @image-url("icons/hand.svg");
+    in-out property <int> camera-fps: 0;
+    in-out property <bool> camera-connected: false;
+
     callback apply-settings(int, int, int, int, int);
+    callback toggle-preview(bool);
+    callback open-preview();
 }
 
 component GradientButton inherits Rectangle {
@@ -481,6 +495,11 @@ component TopBar inherits Rectangle {
             label: "Encoder";
             ok: BridgeState.encoder-active;
         }
+
+        StatusPill {
+            label: "Camera";
+            ok: BridgeState.camera-connected;
+        }
     }
 }
 
@@ -697,32 +716,109 @@ component StreamPage inherits VerticalLayout {
 
     Card {
         title: "Preview tap";
-        hint: "A local preview of the stream needs the driver to support multiple targets. Currently the driver switches to a single phone IP, so the bridge only monitors the control plane.";
+        hint: "The driver keeps a localhost copy (UDP 127.0.0.1:42069) alongside the phone stream. The bridge decodes and displays it here in real time.";
+
+        Toggle {
+            label: "Live local preview stream";
+            checked: BridgeState.preview-enabled;
+            changed(b) => {
+                BridgeState.toggle-preview(b);
+            }
+        }
 
         Rectangle {
-            height: 120px;
+            height: 74px;
             border-radius: 12px;
             border-width: 1px;
             border-color: Theme.border;
             background: Theme.surface2;
 
-            VerticalLayout {
-                alignment: center;
-                spacing: 6px;
+            HorizontalLayout {
+                padding: 10px;
+                spacing: 12px;
 
                 Image {
                     source: @image-url("icons/stream.svg");
                     width: 30px;
                     height: 30px;
-                    colorize: Theme.text-dim;
+                    colorize: Theme.ok;
                 }
 
-                Text {
-                    text: "TODO: attach viewer once driver supports fan-out";
-                    color: Theme.text-dim;
-                    font-size: 12px;
-                    horizontal-alignment: center;
+                VerticalLayout {
+                    spacing: 2px;
+
+                    Text {
+                        text: BridgeState.preview-enabled ? "Local preview: streaming" : "Local preview: off";
+                        color: BridgeState.preview-enabled ? Theme.ok : Theme.text-dim;
+                        font-size: 13px;
+                        font-weight: 600;
+                    }
+
+                    Text {
+                        text: "UDP 127.0.0.1:42069 · 4-byte big-endian length + H.264 Annex-B";
+                        color: Theme.text-dim;
+                        font-size: 11px;
+                    }
                 }
+
+                Rectangle {
+                    horizontal-stretch: 1;
+                }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 12px;
+
+            Metric {
+                label: "Driver FPS";
+                value: "{BridgeState.preview-driver-fps}";
+                horizontal-stretch: 1;
+            }
+
+            Metric {
+                label: "Bitrate";
+                value: "{BridgeState.preview-bitrate-kbps / 1000.0} Mbps";
+                horizontal-stretch: 1;
+            }
+
+            Metric {
+                label: "Frames sent";
+                value: "{BridgeState.preview-frames}";
+                horizontal-stretch: 1;
+            }
+
+            Metric {
+                label: "Dropped";
+                value: "{BridgeState.preview-drops}";
+                value-color: BridgeState.preview-drops > 0 ? Theme.warn : Theme.text-hi;
+                horizontal-stretch: 1;
+            }
+        }
+
+        Rectangle {
+            height: 270px;
+            border-radius: 12px;
+            clip: true;
+            background: #000;
+            border-width: 1px;
+            border-color: Theme.border;
+
+            if BridgeState.preview-enabled : Image {
+                source: BridgeState.preview-frame;
+                width: 100%;
+                height: 100%;
+                image-fit: cover;
+            }
+
+            if !BridgeState.preview-enabled : Text {
+                text: "Toggle preview on to see the live stream";
+                color: Theme.text-dim;
+                font-size: 13px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                width: 100%;
+                height: 100%;
             }
         }
     }
@@ -737,6 +833,37 @@ component HandPage inherits VerticalLayout {
         color: Theme.text-hi;
         font-size: 22px;
         font-weight: 700;
+    }
+
+    Card {
+        title: "Camera feed";
+        hint: "Live JPEG frames from the phone camera (UDP 42072). Hand skeleton overlay drawn in real time.";
+
+        Rectangle {
+            height: 420px;
+            border-radius: 12px;
+            clip: true;
+            background: #000;
+            border-width: 1px;
+            border-color: Theme.border;
+
+            Image {
+                source: BridgeState.camera-frame;
+                width: 100%;
+                height: 100%;
+                image-fit: contain;
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 12px;
+
+            Metric {
+                label: "Camera FPS";
+                value: "{BridgeState.camera-fps}";
+                horizontal-stretch: 1;
+            }
+        }
     }
 
     Card {
@@ -1094,12 +1221,41 @@ export component MainWindow inherits Window {
             Rectangle {
                 width: 720px;
                 horizontal-stretch: 1;
+                vertical-stretch: 1;
                 background: @linear-gradient(160deg, #0E1119, #0B0E14);
 
-                if BridgeState.current-tab == 0 : StreamPage {}
-                if BridgeState.current-tab == 1 : HandPage {}
-                if BridgeState.current-tab == 2 : DiagnosticsPage {}
-                if BridgeState.current-tab == 3 : GeneralPage {}
+                if BridgeState.current-tab == 0 : ScrollView {
+                    x: 0; y: 0;
+                    width: parent.width;
+                    height: parent.height;
+                    horizontal-scrollbar-policy: always-off;
+                    s0 := StreamPage {}
+                    viewport-height: s0.preferred-height;
+                }
+                if BridgeState.current-tab == 1 : ScrollView {
+                    x: 0; y: 0;
+                    width: parent.width;
+                    height: parent.height;
+                    horizontal-scrollbar-policy: always-off;
+                    s1 := HandPage {}
+                    viewport-height: s1.preferred-height;
+                }
+                if BridgeState.current-tab == 2 : ScrollView {
+                    x: 0; y: 0;
+                    width: parent.width;
+                    height: parent.height;
+                    horizontal-scrollbar-policy: always-off;
+                    s2 := DiagnosticsPage {}
+                    viewport-height: s2.preferred-height;
+                }
+                if BridgeState.current-tab == 3 : ScrollView {
+                    x: 0; y: 0;
+                    width: parent.width;
+                    height: parent.height;
+                    horizontal-scrollbar-policy: always-off;
+                    s3 := GeneralPage {}
+                    viewport-height: s3.preferred-height;
+                }
             }
         }
 

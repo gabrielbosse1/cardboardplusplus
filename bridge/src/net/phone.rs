@@ -114,3 +114,186 @@ pub fn send_to_phone(addr: SocketAddr, data: &[u8]) {
         let _ = sock.send_to(data, addr);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::AppState;
+    use crate::net::telemetry::{GyroSample, HandFrame, TelemetryPacket};
+    use std::sync::{Arc, Mutex};
+
+    fn fresh_state() -> SharedState {
+        Arc::new(Mutex::new(AppState::default()))
+    }
+
+    fn fake_src() -> SocketAddr {
+        "192.168.1.100:12345".parse().unwrap()
+    }
+
+    // --- apply_packet: Hello ---
+
+    #[test]
+    fn hello_sets_phone_connected() {
+        let state = fresh_state();
+        apply_packet(&state, TelemetryPacket::Hello, fake_src());
+        let s = state.lock().unwrap();
+        assert!(s.phone_connected);
+    }
+
+    #[test]
+    fn hello_records_phone_ip() {
+        let state = fresh_state();
+        apply_packet(&state, TelemetryPacket::Hello, fake_src());
+        let s = state.lock().unwrap();
+        assert_eq!(s.phone_ip, "192.168.1.100");
+    }
+
+    #[test]
+    fn hello_logs_on_first_connect() {
+        let state = fresh_state();
+        apply_packet(&state, TelemetryPacket::Hello, fake_src());
+        let s = state.lock().unwrap();
+        assert!(s.log.iter().any(|l| l.contains("phone hello")));
+    }
+
+    #[test]
+    fn hello_does_not_log_on_repeat() {
+        let state = fresh_state();
+        apply_packet(&state, TelemetryPacket::Hello, fake_src());
+        let count_first = state.lock().unwrap().log.len();
+        apply_packet(&state, TelemetryPacket::Hello, fake_src());
+        let count_second = state.lock().unwrap().log.len();
+        assert_eq!(count_first, count_second);
+    }
+
+    // --- apply_packet: Gyro ---
+
+    #[test]
+    fn gyro_sets_phone_connected() {
+        let state = fresh_state();
+        let sample = GyroSample::default();
+        apply_packet(&state, TelemetryPacket::Gyro(sample), fake_src());
+        let s = state.lock().unwrap();
+        assert!(s.phone_connected);
+    }
+
+    #[test]
+    fn gyro_increments_packets_total() {
+        let state = fresh_state();
+        let sample = GyroSample::default();
+        apply_packet(&state, TelemetryPacket::Gyro(sample), fake_src());
+        apply_packet(&state, TelemetryPacket::Gyro(sample), fake_src());
+        let s = state.lock().unwrap();
+        assert_eq!(s.packets_total, 2);
+    }
+
+    // --- apply_packet: Hand ---
+
+    #[test]
+    fn hand_sets_phone_connected_and_records_hands() {
+        let state = fresh_state();
+        let frame = HandFrame {
+            timestamp_ms: 100,
+            hands: 2,
+            landmarks_per_hand: 21,
+            confidence: 0.9,
+        };
+        apply_packet(&state, TelemetryPacket::Hand(frame), fake_src());
+        let s = state.lock().unwrap();
+        assert!(s.phone_connected);
+        assert_eq!(s.hands_detected, 2);
+    }
+
+    // --- apply_packet: Ping ---
+
+    #[test]
+    fn ping_sets_phone_connected() {
+        let state = fresh_state();
+        apply_packet(&state, TelemetryPacket::Ping, fake_src());
+        let s = state.lock().unwrap();
+        assert!(s.phone_connected);
+        assert_eq!(s.packets_total, 1);
+    }
+
+    // --- apply_packet: Unknown ---
+
+    #[test]
+    fn unknown_packet_does_not_set_phone_connected() {
+        let state = fresh_state();
+        apply_packet(&state, TelemetryPacket::Unknown, fake_src());
+        let s = state.lock().unwrap();
+        assert!(!s.phone_connected);
+    }
+
+    // --- mark_phone_gone_if_stale ---
+
+    #[test]
+    fn stale_phone_clears_connected_flag() {
+        let state = fresh_state();
+        {
+            let mut s = state.lock().unwrap();
+            s.phone_connected = true;
+        }
+        let stale_time = Some(Instant::now() - Duration::from_secs(10));
+        mark_phone_gone_if_stale(&state, stale_time);
+        let s = state.lock().unwrap();
+        assert!(!s.phone_connected);
+    }
+
+    #[test]
+    fn fresh_phone_keeps_connected_flag() {
+        let state = fresh_state();
+        {
+            let mut s = state.lock().unwrap();
+            s.phone_connected = true;
+        }
+        let fresh_time = Some(Instant::now());
+        mark_phone_gone_if_stale(&state, fresh_time);
+        let s = state.lock().unwrap();
+        assert!(s.phone_connected);
+    }
+
+    #[test]
+    fn never_received_hello_marks_phone_gone() {
+        let state = fresh_state();
+        mark_phone_gone_if_stale(&state, None);
+        let s = state.lock().unwrap();
+        assert!(!s.phone_connected);
+    }
+
+    #[test]
+    fn stale_phone_timeout_logs_once() {
+        let state = fresh_state();
+        {
+            let mut s = state.lock().unwrap();
+            s.phone_connected = true;
+        }
+        let stale_time = Some(Instant::now() - Duration::from_secs(10));
+        mark_phone_gone_if_stale(&state, stale_time);
+        let log_count_first = state.lock().unwrap().log.len();
+        mark_phone_gone_if_stale(&state, stale_time);
+        let log_count_second = state.lock().unwrap().log.len();
+        assert_eq!(log_count_first, log_count_second);
+    }
+
+    // --- Full lifecycle: hello -> timeout -> hello ---
+
+    #[test]
+    fn phone_lifecycle_connect_timeout_reconnect() {
+        let state = fresh_state();
+        let src = fake_src();
+
+        // Connect
+        apply_packet(&state, TelemetryPacket::Hello, src);
+        assert!(state.lock().unwrap().phone_connected);
+
+        // Timeout
+        let stale = Some(Instant::now() - Duration::from_secs(5));
+        mark_phone_gone_if_stale(&state, stale);
+        assert!(!state.lock().unwrap().phone_connected);
+
+        // Reconnect
+        apply_packet(&state, TelemetryPacket::Hello, src);
+        assert!(state.lock().unwrap().phone_connected);
+    }
+}

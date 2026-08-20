@@ -2,12 +2,15 @@ package com.google.cardboard.camera;
 
 import android.annotation.SuppressLint;
 import android.content.Context;
+import android.graphics.ImageFormat;
 import android.graphics.SurfaceTexture;
 import android.hardware.camera2.CameraCaptureSession;
 import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.CaptureRequest;
+import android.media.Image;
+import android.media.ImageReader;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.util.Log;
@@ -25,6 +28,11 @@ import java.util.ArrayList;
 public class CameraController {
   private static final String TAG = CameraController.class.getSimpleName();
 
+  /** Callback interface for raw camera frames. */
+  public interface FrameCallback {
+    void onFrame(Image image);
+  }
+
   private final Context context;
   private final NativeBridge bridge;
 
@@ -33,11 +41,13 @@ public class CameraController {
   private CameraCaptureSession captureSession;
   private SurfaceTexture cameraSurfaceTexture;
   private Surface cameraSurface;
+  private ImageReader imageReader;
   private HandlerThread cameraThread;
   private Handler cameraHandler;
   private boolean cameraInitialized = false;
   private boolean cameraTexturePassed = false;
   private final Object cameraLock = new Object();
+  private FrameCallback frameCallback;
 
   private int cameraWidth = AppConstants.DEFAULT_CAMERA_WIDTH;
   private int cameraHeight = AppConstants.DEFAULT_CAMERA_HEIGHT;
@@ -49,6 +59,11 @@ public class CameraController {
 
   public boolean isTexturePassed() {
     return cameraTexturePassed;
+  }
+
+  /** Register a callback to receive raw camera frames. Must be called before {@link #openCamera()}. */
+  public void setFrameCallback(FrameCallback callback) {
+    this.frameCallback = callback;
   }
 
   /** Creates the SurfaceTexture/Surface bound to the GL texture id and notifies native. */
@@ -127,14 +142,34 @@ public class CameraController {
       return;
     }
     try {
+      // Create ImageReader for raw frame access (YUV_420_888 gives NV21-like data).
+      imageReader =
+          ImageReader.newInstance(
+              cameraWidth, cameraHeight, ImageFormat.YUV_420_888, /*maxImages=*/ 2);
+      imageReader.setOnImageAvailableListener(
+          reader -> {
+            Image image = reader.acquireLatestImage();
+            if (image == null) return;
+            try {
+              if (frameCallback != null) {
+                frameCallback.onFrame(image);
+              }
+            } finally {
+              image.close();
+            }
+          },
+          cameraHandler);
+
       final CaptureRequest.Builder captureRequestBuilder =
           cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
       captureRequestBuilder.addTarget(cameraSurface);
+      captureRequestBuilder.addTarget(imageReader.getSurface());
 
       cameraDevice.createCaptureSession(
           new ArrayList<Surface>() {
             {
               add(cameraSurface);
+              add(imageReader.getSurface());
             }
           },
           new PreviewSessionCallback(captureRequestBuilder),
@@ -174,6 +209,13 @@ public class CameraController {
       cameraHandler = null;
     }
 
+    if (imageReader != null) {
+      try {
+        imageReader.close();
+      } catch (Exception e) {
+      }
+      imageReader = null;
+    }
     if (cameraSurface != null) {
       try {
         cameraSurface.release();
@@ -208,6 +250,10 @@ public class CameraController {
       }
       cameraInitialized = false;
       cameraHandler = null;
+    }
+    if (imageReader != null) {
+      imageReader.close();
+      imageReader = null;
     }
     if (cameraSurface != null) {
       cameraSurface.release();

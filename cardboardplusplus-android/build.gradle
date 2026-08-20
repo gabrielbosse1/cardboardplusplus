@@ -49,6 +49,7 @@ dependencies {
     implementation 'com.google.protobuf:protobuf-javalite:3.19.4'
     implementation project(":sdk")
     implementation 'io.github.jamaismagic.ffmpeg:ffmpeg-kit-lts-full-gpl-16kb:6.1.4'
+    testImplementation 'junit:junit:4.13.2'
 }
 
 // The dependencies for NDK builds live inside the .aar files so they need to

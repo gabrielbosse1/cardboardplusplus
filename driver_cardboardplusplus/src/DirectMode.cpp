@@ -16,7 +16,9 @@ using namespace vr;
 // DIAG (Test A, FLICKER_ISSUE_MAP.md §8/§10): counts SubmitLayer calls between
 // Presents and logs black-frame / format info to confirm multi-layer clobber (H1).
 // Toggle: comment out the line below to compile without the diagnostics.
-#define DRIVER_DIAG
+// NOTE: keep this OFF in production — every DIAG log is a synchronous file write
+// on the compositor thread and caused SteamVR frame-timing spikes.
+//#define DRIVER_DIAG
 #ifdef DRIVER_DIAG
 static std::atomic<int> g_submitLayerCount{ 0 };
 #endif
@@ -190,8 +192,18 @@ void HmdDriver::GetNextSwapTextureSetIndex(vr::SharedTextureHandle_t sharedTextu
 void HmdDriver::SubmitLayer(const SubmitLayerPerEye_t(&perEye)[2])
 {
 	// This is where the application submits the textures it rendered for each eye.
-    DriverLog("SubmitLayer called - left: %llu, right: %llu",
-        (uint64_t)perEye[0].hTexture, (uint64_t)perEye[1].hTexture);
+    // Diagnostic logging is DIAG-gated: every write here is synchronous file I/O
+    // on the compositor thread and caused SteamVR frame-timing spikes.
+    // (Flicker/pacing diagnostics live behind DRIVER_DIAG builds.)
+#ifdef DRIVER_DIAG
+    static long long lastLog = 0;
+    long long nowNs = std::chrono::steady_clock::now().time_since_epoch().count();
+    if (nowNs - lastLog >= 1'000'000'000LL) {
+        lastLog = nowNs;
+        DriverLog("SubmitLayer called - left: %llu, right: %llu",
+            (uint64_t)perEye[0].hTexture, (uint64_t)perEye[1].hTexture);
+    }
+#endif
 
     // Accumulate every layer; Present() composites them all in submission order.
     // (H1 fix — FLICKER_ISSUE_MAP.md §10: the driver used to keep only the LAST
@@ -202,9 +214,12 @@ void HmdDriver::SubmitLayer(const SubmitLayerPerEye_t(&perEye)[2])
     info.boundsLeft = perEye[0].bounds;
     info.boundsRight = perEye[1].bounds;
     // Guard against runaway growth if Present is somehow delayed.
-    if (m_submitLayers.size() < 16) {
-        m_submitLayers.push_back(info);
-        m_hasSubmit = true;
+    {
+        std::lock_guard<std::mutex> lock(m_submitLayersMutex);
+        if (m_submitLayers.size() < 16) {
+            m_submitLayers.push_back(info);
+            m_hasSubmit.store(true, std::memory_order_release);
+        }
     }
 #ifdef DRIVER_DIAG
     g_submitLayerCount++; // DIAG Test A
@@ -216,6 +231,7 @@ void HmdDriver::Present(vr::SharedTextureHandle_t syncTexture)
     // Count every Present SteamVR issues (compositor rate), independent of whether
     // we actually encode, so we can see if the stream is Present-bound or encode-bound.
     m_presentCount++;
+#ifdef DRIVER_DIAG
     {
         long long nowNs = std::chrono::steady_clock::now().time_since_epoch().count();
         if (m_lastPresentLogNs == 0) m_lastPresentLogNs = nowNs;
@@ -226,26 +242,40 @@ void HmdDriver::Present(vr::SharedTextureHandle_t syncTexture)
             m_lastPresentLogNs = nowNs;
         }
     }
+#endif
 
     if (!AcquireSyncTexture(syncTexture)) {
+#ifdef DRIVER_DIAG
         static int syncFailCount = 0;
         if (++syncFailCount <= 5 || syncFailCount % 30 == 0)
             DriverLog("Present SKIPPED: AcquireSync failed (count=%d)", syncFailCount);
+#endif
         return;
     }
 
-    if (!m_hasSubmit || !m_encoderInitialized || !m_pVideoEncoder) {
+    if (!m_hasSubmit.load(std::memory_order_acquire) || !m_encoderInitialized || !m_pVideoEncoder) {
+#ifdef DRIVER_DIAG
         static int skipCount = 0;
         if (++skipCount <= 5 || skipCount % 30 == 0)
             DriverLog("Present SKIPPED: hasSubmit=%d encInit=%d enc=%p (count=%d)",
-                      m_hasSubmit, m_encoderInitialized, m_pVideoEncoder, skipCount);
+                      (int)m_hasSubmit.load(std::memory_order_relaxed), m_encoderInitialized, m_pVideoEncoder, skipCount);
+#endif
         ReleaseSyncTexture();
         return;
     }
 
+    // Snapshot the submitted layers under the mutex so the compositor's submit
+    // thread can keep pushing the next frame while we composite this one.
+    std::vector<SubmitLayerInfo> submitted;
+    {
+        std::lock_guard<std::mutex> lock(m_submitLayersMutex);
+        submitted.swap(m_submitLayers);
+        m_submitLayers.clear();
+        m_hasSubmit.store(false, std::memory_order_release);
+    }
+
     // If a scene transition is tearing down swap textures, don't queue.
     if (m_sceneTearingDown) {
-        m_hasSubmit = false;
         ReleaseSyncTexture();
         return;
     }
@@ -255,9 +285,9 @@ void HmdDriver::Present(vr::SharedTextureHandle_t syncTexture)
     // If NONE are valid, drop the frame rather than streaming garbage.
     std::vector<SubmitLayerInfo> validLayers;
     std::vector<std::pair<ID3D11Texture2D*, ID3D11Texture2D*>> resolved;
-    validLayers.reserve(m_submitLayers.size());
-    resolved.reserve(m_submitLayers.size());
-    for (const auto& layer : m_submitLayers) {
+    validLayers.reserve(submitted.size());
+    resolved.reserve(submitted.size());
+    for (const auto& layer : submitted) {
         ID3D11Texture2D* pL = nullptr;
         ID3D11Texture2D* pR = nullptr;
         auto itL = m_textureHandleMap.find(layer.hTextureLeft);
@@ -271,12 +301,12 @@ void HmdDriver::Present(vr::SharedTextureHandle_t syncTexture)
     }
 
     if (resolved.empty()) {
+#ifdef DRIVER_DIAG
         static int mapFailCount = 0;
         if (++mapFailCount <= 5 || mapFailCount % 30 == 0)
             DriverLog("Map lookup FAILED: no valid layers of %zu submitted (map_size=%zu, count=%d)",
-                m_submitLayers.size(), m_textureHandleMap.size(), mapFailCount);
-        m_submitLayers.clear();
-        m_hasSubmit = false;
+                submitted.size(), m_textureHandleMap.size(), mapFailCount);
+#endif
         ReleaseSyncTexture();
         return;
     }
@@ -291,7 +321,7 @@ void HmdDriver::Present(vr::SharedTextureHandle_t syncTexture)
             resolved.front().second->GetDesc(&dR);
             int submits = g_submitLayerCount.exchange(0); // layers over last ~120 frames
             DriverLog("[DIAG Present] #%d AcquireOK=%d layers=%zu submits/120f=%d firstLfmt=0x%x(%ux%u) firstRfmt=0x%x(%ux%u)",
-                s_diagPresent, (int)(m_syncAcquired ? 1 : 0), m_submitLayers.size(), submits,
+                s_diagPresent, (int)(m_syncAcquired ? 1 : 0), submitted.size(), submits,
                 (uint32_t)dL.Format, dL.Width, dL.Height,
                 (uint32_t)dR.Format, dR.Width, dR.Height);
         }
@@ -302,11 +332,11 @@ void HmdDriver::Present(vr::SharedTextureHandle_t syncTexture)
     {
         std::lock_guard<std::mutex> lock(m_encodeDoneMutex);
         if (!m_encodeDone) {
+#ifdef DRIVER_DIAG
             static int dropCount = 0;
             if (++dropCount <= 5 || dropCount % 60 == 0)
                 DriverLog("Present DROPPED: encoder busy (drop=%d)", dropCount);
-            m_submitLayers.clear();
-            m_hasSubmit = false;
+#endif
             ReleaseSyncTexture();
             return;
         }
@@ -318,8 +348,6 @@ void HmdDriver::Present(vr::SharedTextureHandle_t syncTexture)
     {
         if (!EnsureLayerCopies(validLayers)) {
             DriverLog("Failed to create private eye copies on Present thread");
-            m_submitLayers.clear();
-            m_hasSubmit = false;
             ReleaseSyncTexture();
             return;
         }
@@ -356,8 +384,6 @@ void HmdDriver::Present(vr::SharedTextureHandle_t syncTexture)
         m_encodeDone = false;
     }
 
-    m_submitLayers.clear();
-    m_hasSubmit = false;
     ReleaseSyncTexture();
 }
 
@@ -497,5 +523,13 @@ void HmdDriver::WaitEncoderIdle()
 void HmdDriver::GetFrameTiming(DriverDirectMode_FrameTiming* pFrameTiming)
 {
 	// This is called to get additional frame timing stats from driver. Can be used to get the current framerate to optimize the encoder settings in real-time.
-    DriverLog("GetFrameTiming called");
+    // DIAG-gated: polled continuously by the compositor, and each log is sync file I/O.
+#ifdef DRIVER_DIAG
+    static long long lastLog = 0;
+    long long nowNs = std::chrono::steady_clock::now().time_since_epoch().count();
+    if (nowNs - lastLog >= 1'000'000'000LL) {
+        lastLog = nowNs;
+        DriverLog("GetFrameTiming called");
+    }
+#endif
 }

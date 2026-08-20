@@ -39,6 +39,87 @@ constexpr int kVelocityFilterCutoffFrequency = 6;
 
 constexpr uint64_t kPredictionTimeWithoutVsyncNanos = 50000000;
 
+// Walks a serialized cardboard::DeviceParams proto2 message, finds the
+// inter_lens_distance field (field 4, float), saves its value to *saved_ipd
+// and overwrites it with 0.0f in place. Returns true if the field was found.
+bool ZeroDeviceParamsIpd(uint8_t* data, int size, float* saved_ipd) {
+  constexpr uint32_t kInterLensDistanceField = 4;
+  constexpr uint32_t kWireTypeVarint = 0;
+  constexpr uint32_t kWireTypeFixed64 = 1;
+  constexpr uint32_t kWireTypeLengthDelimited = 2;
+  constexpr uint32_t kWireTypeFixed32 = 5;
+
+  auto read_varint = [data, size](int* pos, uint64_t* value) {
+    uint64_t result = 0;
+    int shift = 0;
+    while (*pos < size && shift < 64) {
+      uint8_t byte = data[*pos];
+      (*pos)++;
+      result |= static_cast<uint64_t>(byte & 0x7F) << shift;
+      if (!(byte & 0x80)) {
+        *value = result;
+        return true;
+      }
+      shift += 7;
+    }
+    return false;
+  };
+
+  int pos = 0;
+  while (pos < size) {
+    uint64_t tag;
+    if (!read_varint(&pos, &tag)) {
+      return false;
+    }
+    const uint32_t field = static_cast<uint32_t>(tag >> 3);
+    const uint32_t wire = static_cast<uint32_t>(tag & 0x7);
+    switch (wire) {
+      case kWireTypeVarint: {
+        uint64_t unused;
+        if (!read_varint(&pos, &unused)) {
+          return false;
+        }
+        break;
+      }
+      case kWireTypeFixed64: {
+        if (pos + 8 > size) {
+          return false;
+        }
+        pos += 8;
+        break;
+      }
+      case kWireTypeLengthDelimited: {
+        uint64_t length;
+        if (!read_varint(&pos, &length)) {
+          return false;
+        }
+        if (length > static_cast<uint64_t>(size) ||
+            pos + length > static_cast<uint64_t>(size)) {
+          return false;
+        }
+        pos += static_cast<int>(length);
+        break;
+      }
+      case kWireTypeFixed32: {
+        if (pos + 4 > size) {
+          return false;
+        }
+        if (field == kInterLensDistanceField) {
+          std::memcpy(saved_ipd, data + pos, sizeof(float));
+          const float zero = 0.0f;
+          std::memcpy(data + pos, &zero, sizeof(float));
+          return true;
+        }
+        pos += 4;
+        break;
+      }
+      default:
+        return false;
+    }
+  }
+  return false;
+}
+
 constexpr const char* kTexVertexShader =
     R"glsl(
     uniform mat4 u_MVPMatrix;
@@ -358,11 +439,22 @@ bool CardboardPlusPlusApp::UpdateDeviceParams() {
     return false;
   }
 
-  CardboardLensDistortion_destroy(lens_distortion_);
-  lens_distortion_ = CardboardLensDistortion_create(buffer, size, screen_width_,
-                                                    screen_height_);
-
+  // Save the viewer's real IPD (inter_lens_distance) before zeroing it so the
+  // lens distortion is built without eye separation; SteamVR applies the IPD.
+  std::vector<uint8_t> params(buffer, buffer + size);
   CardboardQrCode_destroy(buffer);
+  if (ZeroDeviceParamsIpd(params.data(), static_cast<int>(params.size()),
+                          &saved_ipd_meters_)) {
+    LOGD("Saved viewer IPD %.3fm; lens distortion built with IPD = 0",
+         saved_ipd_meters_);
+  } else {
+    LOGW("inter_lens_distance not found in device params; IPD left untouched");
+  }
+
+  CardboardLensDistortion_destroy(lens_distortion_);
+  lens_distortion_ = CardboardLensDistortion_create(
+      params.data(), static_cast<int>(params.size()), screen_width_,
+      screen_height_);
 
   GlSetup();
 
@@ -682,6 +774,10 @@ void CardboardPlusPlusApp::DecodeLoop() {
     java_vm_->DetachCurrentThread();
   }
   LOGD("Decode loop ended");
+}
+
+float CardboardPlusPlusApp::GetIpdMeters() const {
+  return saved_ipd_meters_;
 }
 
 }  // namespace ndk_cardboardplusplus

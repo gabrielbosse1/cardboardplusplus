@@ -14,6 +14,13 @@ using namespace vr;
 // answers "who is this device" questions and drives its activate/teardown.
 // ---------------------------------------------------------------------------
 
+// iGPU test (Intel IntelArc/UHD): stop handing SteamVR the direct-display-mode
+// present handshake by not exposing IVRDriverDirectModeComponent and advertising
+// Prop_HasDriverDirectModeComponent=false. Nothing will be streamed in this mode;
+// the encoder is fed exclusively through the Present path. Comment the line out
+// to restore direct mode.
+// #define DRIVER_NO_DIRECT_MODE
+
 EVRInitError HmdDriver::Activate(uint32_t unObjectId)
 {
     // When I wrote this code, only God and I understood it.
@@ -101,9 +108,13 @@ EVRInitError HmdDriver::Activate(uint32_t unObjectId)
     VRProperties()->SetFloatProperty(props, Prop_UserHeadToEyeDepthMeters_Float, 0.f);
     VRProperties()->SetBoolProperty(props, Prop_IsOnDesktop_Bool, false);
     VRProperties()->SetBoolProperty(props, Prop_DisplayDebugMode_Bool, false);
+#ifdef DRIVER_NO_DIRECT_MODE
+    VRProperties()->SetBoolProperty(props, Prop_HasDriverDirectModeComponent_Bool, false);
+    DriverLog("HMD properties set: HasDriverDirectModeComponent=false (DIRECT MODE DISABLED), IsDisplayOnDesktop=false, DebugMode=false");
+#else
     VRProperties()->SetBoolProperty(props, Prop_HasDriverDirectModeComponent_Bool, true);
-
     DriverLog("HMD properties set: HasDriverDirectModeComponent=true, IsDisplayOnDesktop=false, DebugMode=false");
+#endif
 
     // Eye-to-head transforms
     HmdMatrix34_t eyeToHeadLeft = { 0 };
@@ -183,10 +194,12 @@ void* HmdDriver::GetComponent(const char* pchComponentNameAndVersion)
     {
         return static_cast<IVRDisplayComponent*>(this);
     }
+#ifndef DRIVER_NO_DIRECT_MODE
     if (strcmp(pchComponentNameAndVersion, IVRDriverDirectModeComponent_Version) == 0)
     {
         return static_cast<IVRDriverDirectModeComponent*>(this);
     }
+#endif
     return NULL;
 }
 

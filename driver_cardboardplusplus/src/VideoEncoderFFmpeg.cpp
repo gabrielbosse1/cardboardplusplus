@@ -1,6 +1,7 @@
 #include "VideoEncoder.h"
 #include "VideoEncoderFFmpeg.h"
 #include "VideoEncoderLog.h"
+#include "H264Utils.h"
 #include <cstring>
 
 // ---------------------------------------------------------------------------
@@ -150,6 +151,39 @@ bool VideoEncoder::InitializeFFmpeg()
         }
     } else {
         ENCODER_LOG("No encoder extradata available; BSF skipped");
+    }
+
+    // Extract Annex-B formatted SPS+PPS NALs from codec extradata so we can
+    // prepend them to keyframes that don't already contain SPS.
+    m_spsPpsAnnexB.clear();
+    if (m_pCodecContext->extradata && m_pCodecContext->extradata_size > 0) {
+        const uint8_t* e = m_pCodecContext->extradata;
+        int esz = m_pCodecContext->extradata_size;
+
+        // Diagnostic: log first 16 bytes so we can identify the format.
+        if (esz >= 16) {
+            ENCODER_LOG("Extradata [%d bytes]: %02X %02X %02X %02X %02X %02X %02X %02X "
+                        "%02X %02X %02X %02X %02X %02X %02X %02X",
+                        esz, e[0],e[1],e[2],e[3],e[4],e[5],e[6],e[7],
+                        e[8],e[9],e[10],e[11],e[12],e[13],e[14],e[15]);
+        } else {
+            char hexBuf[64] = {};
+            int pos = 0;
+            for (int i = 0; i < esz && i < 16 && pos < 60; i++) {
+                pos += snprintf(hexBuf + pos, sizeof(hexBuf) - pos, " %02X", e[i]);
+            }
+            ENCODER_LOG("Extradata [%d bytes]:%s", esz, hexBuf);
+        }
+
+        m_spsPpsAnnexB = h264::ParseExtradataSpsPps(e, esz);
+
+        if (!m_spsPpsAnnexB.empty()) {
+            ENCODER_LOG("Extracted Annex-B SPS+PPS from extradata (%zu bytes)", m_spsPpsAnnexB.size());
+        } else {
+            ENCODER_LOG("WARNING: No SPS/PPS extracted from extradata (%d bytes) — keyframes may lack them", esz);
+        }
+    } else {
+        ENCODER_LOG("No extradata for SPS/PPS extraction (size=%d)", m_pCodecContext ? m_pCodecContext->extradata_size : -1);
     }
 
     ENCODER_LOG("Encoder name: %s, long name: %s",
@@ -418,6 +452,41 @@ bool VideoEncoder::SendFrameToEncoder()
 
 bool VideoEncoder::ReceiveEncodedPackets()
 {
+    // Helper: emit a packet through the callback, prepending Annex-B SPS+PPS
+    // to keyframes that don't already start with an SPS NAL (type 7).
+    // This handles the case where the h264_mp4toannexb BSF passes through
+    // encoder packets that already have start codes but lack in-band SPS/PPS.
+    auto emitWithSpsPps = [this](uint8_t* data, int size, int64_t pts, bool keyframe) {
+        if (!keyframe || m_spsPpsAnnexB.empty() || size < 5) {
+            if (m_encodedPacketCallback) {
+                m_encodedPacketCallback(data, size, pts, keyframe);
+            }
+            return;
+        }
+        // Check if the first NAL is already SPS (type 7) or IDR (type 5).
+        if (h264::AccessUnitHasSps(data, size)) {
+            if (m_encodedPacketCallback) {
+                m_encodedPacketCallback(data, size, pts, keyframe);
+            }
+            return;
+        }
+        // Prepend stored SPS+PPS NALs before the keyframe data.
+        int totalSize = (int)m_spsPpsAnnexB.size() + size;
+        uint8_t* combined = (uint8_t*)malloc(totalSize);
+        if (combined) {
+            memcpy(combined, m_spsPpsAnnexB.data(), m_spsPpsAnnexB.size());
+            memcpy(combined + m_spsPpsAnnexB.size(), data, size);
+            if (m_encodedPacketCallback) {
+                m_encodedPacketCallback(combined, totalSize, pts, keyframe);
+            }
+            free(combined);
+        } else {
+            if (m_encodedPacketCallback) {
+                m_encodedPacketCallback(data, size, pts, keyframe);
+            }
+        }
+    };
+
     int ret;
     while ((ret = avcodec_receive_packet(m_pCodecContext, m_pPacket)) >= 0) {
         bool keyframe = (m_pPacket->flags & AV_PKT_FLAG_KEY) != 0;
@@ -428,10 +497,8 @@ bool VideoEncoder::ReceiveEncodedPackets()
             if (av_bsf_send_packet(m_pBsfCtx, m_pPacket) == 0) {
                 AVPacket* filtered = av_packet_alloc();
                 while (av_bsf_receive_packet(m_pBsfCtx, filtered) >= 0) {
-                    if (m_encodedPacketCallback) {
-                        m_encodedPacketCallback(filtered->data, filtered->size,
-                                                filtered->pts, keyframe);
-                    }
+                    emitWithSpsPps(filtered->data, filtered->size,
+                                   filtered->pts, keyframe);
                     av_packet_unref(filtered);
                 }
                 av_packet_free(&filtered);
@@ -441,10 +508,8 @@ bool VideoEncoder::ReceiveEncodedPackets()
             continue;
         }
 
-        if (m_encodedPacketCallback) {
-            m_encodedPacketCallback(m_pPacket->data, m_pPacket->size,
-                                    m_pPacket->pts, keyframe);
-        }
+        emitWithSpsPps(m_pPacket->data, m_pPacket->size,
+                        m_pPacket->pts, keyframe);
 
         av_packet_unref(m_pPacket);
     }

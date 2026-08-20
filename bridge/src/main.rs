@@ -2,6 +2,7 @@ slint::include_modules!();
 
 mod app;
 mod core;
+mod hand_overlay;
 mod net;
 mod server;
 
@@ -46,22 +47,39 @@ fn run_window(core: Arc<AppCore>) {
     ui.global::<BridgeState>()
         .set_app_version(format!("v{}", core::APP_VERSION).into());
 
-    wire_apply_settings(&core, &ui);
+    wire_callbacks(&core, &ui);
     start_state_poller(core, ui.as_weak());
 
     println!("[bridge] running — press Ctrl+C to quit");
     ui.run().expect("bridge event loop failed");
 }
 
-/// Delegate the UI's `apply-settings` callback to the core, converting the
-/// Slint encoder index into the encoder name string the driver expects.
-fn wire_apply_settings(core: &AppCore, ui: &MainWindow) {
-    let core = core.clone();
-    ui.global::<BridgeState>()
-        .on_apply_settings(move |width, height, fps, bitrate, encoder_index| {
-            let encoder = EncoderChoice::from(encoder_index);
-            core.apply_settings(width, height, fps, bitrate, encoder.as_str());
+/// Delegate the UI's callbacks to the core, converting the Slint encoder index
+/// into the encoder name string the driver expects.
+fn wire_callbacks(core: &std::sync::Arc<AppCore>, ui: &MainWindow) {
+    {
+        let core = std::sync::Arc::clone(core);
+        ui.global::<BridgeState>()
+            .on_apply_settings(move |width, height, fps, bitrate, encoder_index| {
+                let encoder = EncoderChoice::from(encoder_index);
+                core.apply_settings(width, height, fps, bitrate, encoder.as_str());
+            });
+    }
+
+    {
+        let core = std::sync::Arc::clone(core);
+        ui.global::<BridgeState>()
+            .on_toggle_preview(move |enabled| {
+                core.set_preview(enabled);
+            });
+    }
+
+    {
+        let core = std::sync::Arc::clone(core);
+        ui.global::<BridgeState>().on_open_preview(move || {
+            core.open_ffplay_preview();
         });
+    }
 }
 
 /// Poll the core into the UI on a timer. The timer is leaked for the process
@@ -84,6 +102,18 @@ fn start_state_poller(core: Arc<AppCore>, weak: slint::Weak<MainWindow>) {
         global.set_gyro_fps(snap.gyro_fps);
         global.set_hand_fps(snap.hand_fps);
         global.set_hands_detected(snap.hands_detected);
+        global.set_preview_enabled(snap.preview_enabled);
+        global.set_preview_driver_fps(snap.preview_driver_fps);
+        global.set_preview_bitrate_kbps(snap.preview_bitrate_kbps);
+        global.set_preview_frames(snap.preview_frames as i32);
+        global.set_preview_drops(snap.preview_drops as i32);
+        global.set_camera_connected(snap.camera_connected);
+        if let Some(img) = core.take_preview_frame() {
+            global.set_preview_frame(img);
+        }
+        if let Some(img) = core.take_camera_frame() {
+            global.set_camera_frame(img);
+        }
         global.set_log_text(core.logs(200).join("\n").into());
     });
     Box::leak(Box::new(timer));

@@ -3,7 +3,9 @@
 //! contract — the driver discovery socket (42070), the telemetry uplink
 //! (42071) and the untouched-by-design video stream (42069).
 
+pub mod camera;
 pub mod driver;
+pub mod mediapipe;
 pub mod phone;
 pub mod telemetry;
 
@@ -13,6 +15,10 @@ pub const VIDEO_PORT: u16 = 42069;
 pub const DRIVER_DISCOVERY_PORT: u16 = 42070;
 /// Telemetry uplink from the phone (gyro / hand / ping / hello frames).
 pub const TELEMETRY_PORT: u16 = 42071;
+/// JPEG camera frames from the phone for MediaPipe hand detection.
+pub const CAMERA_PORT: u16 = 42072;
+/// TCP port for the Python MediaPipe hand-landmark server.
+pub const MEDIAPIPE_PORT: u16 = 42073;
 
 /// Which encoder the driver should use, in the same order the UI exposes them
 /// (index 0 = auto, then AMF, NVENC, QSV, libx264).

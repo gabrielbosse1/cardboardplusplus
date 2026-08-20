@@ -116,6 +116,8 @@ class CardboardPlusPlusApp {
   bool HasVideoFrame();
   void UpdateVideoTexture();
 
+  float GetIpdMeters() const;
+
   /**
    * Runs the frame-forwarding loop off the GL render thread. Pulls H.264
    * access units from the receiver and hands them to the Java MediaCodec
@@ -186,6 +188,8 @@ class CardboardPlusPlusApp {
   bool device_params_changed_;
   int screen_width_;
   int screen_height_;
+
+  float saved_ipd_meters_ = 0.0f;
 
   float projection_matrices_[2][16];
   float eye_matrices_[2][16];
