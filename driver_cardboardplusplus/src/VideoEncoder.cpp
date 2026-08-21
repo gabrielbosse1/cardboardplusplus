@@ -261,3 +261,8 @@ void VideoEncoder::SetEncodedPacketCallback(EncodedPacketCallback callback)
 {
     m_encodedPacketCallback = callback;
 }
+
+void VideoEncoder::SetTelemetryCallback(TelemetryCallback callback)
+{
+    m_telemetryCallback = callback;
+}

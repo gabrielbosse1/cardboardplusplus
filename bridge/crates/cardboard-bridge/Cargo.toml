@@ -1,0 +1,16 @@
+[package]
+name = "cardboard-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "Cardboard++ control plane: talks to the SteamVR driver and the phone, without touching the video stream"
+
+[dependencies]
+slint = "1.17"
+tiny_http = { version = "0.12", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+jpeg-decoder = "0.3"
+anyhow = "1"
+
+[build-dependencies]
+slint-build = "1.17"
