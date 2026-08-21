@@ -6,6 +6,7 @@
 #include <utility>
 #include <functional>
 #include <mutex>
+#include "BridgeProtocol.h"
 
 struct AVCodecContext;
 struct AVFrame;
@@ -18,6 +19,7 @@ class VideoEncoder
 {
 public:
     using EncodedPacketCallback = std::function<void(uint8_t* data, int size, int64_t pts, bool keyframe)>;
+    using TelemetryCallback = std::function<void(const cbpp::PayloadTelemetry&)>;
 
     // Per-layer valid sub-rectangle of the eye texture (VRTextureBounds_t equivalent).
     struct LayerBounds {
@@ -58,6 +60,8 @@ public:
     bool ReadbackToBuffer();  // D3D11: CopySubresourceRegion + Map + memcpy + Unmap (all in one)
 
     void SetEncodedPacketCallback(EncodedPacketCallback callback);
+    // Periodic encode stats summary (called ~1/s from the encode thread).
+    void SetTelemetryCallback(TelemetryCallback callback);
 
     bool IsInitialized() const { return m_initialized; }
     int GetWidth() const { return m_width; }
@@ -118,6 +122,7 @@ private:
     int64_t m_frameCount;
 
     EncodedPacketCallback m_encodedPacketCallback;
+    TelemetryCallback m_telemetryCallback;
 
     uint8_t* m_pSoftwareFrameBuffer;
     bool m_hasValidFrame;

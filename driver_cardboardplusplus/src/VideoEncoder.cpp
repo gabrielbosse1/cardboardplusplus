@@ -1,4 +1,4 @@
-#include "VideoEncoder.h"
+﻿#include "VideoEncoder.h"
 #include "VideoEncoderFFmpeg.h"
 #include "VideoEncoderLog.h"
 #include <dxgi.h>

@@ -164,6 +164,16 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
       return;
     }
 
+    startSession();
+  }
+
+  /**
+   * Actually start the VR session. Kept separate from {@link #onResume()} so the same path can be
+   * re-run from {@link #onRequestPermissionsResult} once a permission is granted — otherwise a
+   * first-run install (camera permission dialog) would leave the GL surface never resumed and the
+   * screen permanently black.
+   */
+  private void startSession() {
     glView.onResume();
     onNativeResume();
 
@@ -258,11 +268,15 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
           launchPermissionsSettings();
         }
         finish();
+      } else {
+        // Storage granted: re-run the rest of the resume flow (camera check -> start).
+        onResume();
       }
     } else if (requestCode == AppConstants.CAMERA_PERMISSIONS_REQUEST_CODE) {
       if (permissionManager.isCameraGranted()) {
-        // Camera will be initialized in onSurfaceCreated when GL context is ready
-        Log.i(TAG, "Camera permission granted, will initialize on GL thread");
+        // Camera will be initialized in onSurfaceCreated when GL context is ready.
+        Log.i(TAG, "Camera permission granted, starting session");
+        startSession();
       } else {
         Toast.makeText(this, "Camera permission is required for passthrough", Toast.LENGTH_LONG)
             .show();

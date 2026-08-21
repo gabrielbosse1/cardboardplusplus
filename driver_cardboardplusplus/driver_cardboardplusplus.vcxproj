@@ -27,6 +27,8 @@
     <ClInclude Include="include\DriverLog.h" />
     <ClInclude Include="include\VideoEncoderFFmpeg.h" />
     <ClInclude Include="include\VideoEncoderLog.h" />
+    <ClInclude Include="include\BridgeServer.h" />
+    <ClInclude Include="include\BridgeProtocol.h" />
     <ClInclude Include="include\openvr.h" />
     <ClInclude Include="include\openvr_capi.h" />
     <ClInclude Include="include\openvr_driver.h" />
@@ -45,6 +47,7 @@
     <ClCompile Include="src\VideoEncoder.cpp" />
     <ClCompile Include="src\VideoEncoderFFmpeg.cpp" />
     <ClCompile Include="src\VideoEncoderShaders.cpp" />
+    <ClCompile Include="src\BridgeServer.cpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="include\openvr_api.cs" />

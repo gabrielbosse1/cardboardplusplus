@@ -1,4 +1,4 @@
-#include "HmdDriver.h"
+﻿#include "HmdDriver.h"
 #include "DriverLog.h"
 #include <chrono>
 #include <cmath>
@@ -88,6 +88,10 @@ EVRInitError HmdDriver::Activate(uint32_t unObjectId)
     m_encodingRunning = true;
     m_encodingThread = std::thread(&HmdDriver::EncodingThreadFunc, this);
     DriverLog("Background encoding thread started");
+
+    if (!InitializeBridge()) {
+        DriverLog("WARNING: Bridge shared-memory initialization failed. Telemetry disabled.");
+    }
 
     // Set HMD properties
     PropertyContainerHandle_t props = VRProperties()->TrackedDeviceToPropertyContainer(m_driverId);
@@ -246,6 +250,14 @@ void HmdDriver::RunFrame()
     // Update the server with our current pose each frame so compositor knows this HMD is present.
     DriverPose_t pose = GetPose();
     VRServerDriverHost()->TrackedDevicePoseUpdated(m_driverId, pose, sizeof(DriverPose_t));
+
+    if (m_bridgeInitialized.load(std::memory_order_relaxed)) {
+        cbpp::PayloadSettingsChange s;
+        if (m_bridgeServer.PollSettings(s)) {
+            ApplyStreamSettings(s);
+        }
+        RunBridgeHeartbeat();
+    }
 }
 
 // IVRDisplayComponent implementations
@@ -307,4 +319,108 @@ DistortionCoordinates_t HmdDriver::ComputeDistortion( EVREye eEye, float fU, flo
     coordinates.rfRed[0] = fU;
     coordinates.rfRed[1] = fV;
     return coordinates;
+}
+
+void HmdDriver::RunBridgeHeartbeat()
+{
+    long long nowNs = std::chrono::steady_clock::now().time_since_epoch().count();
+    if (m_lastHeartbeatNs == 0) {
+        m_lastHeartbeatNs = nowNs;
+        return;
+    }
+    if (nowNs - m_lastHeartbeatNs >= 1'000'000'000LL) {
+        m_lastHeartbeatNs = nowNs;
+        if (m_bridgeServer.running()) {
+            m_bridgeServer.PublishStatus();
+        }
+    }
+}
+
+void HmdDriver::ApplyStreamSettings(const cbpp::PayloadSettingsChange& settings)
+{
+    std::lock_guard<std::mutex> lock(m_encoderMutex);
+
+    m_streamEnabled.store(settings.stream_enabled ? 1 : 0, std::memory_order_relaxed);
+    DriverLog("Bridge settings (seq=%llu): %ux%u @%u fps, %u kbps, encoder=%u, stream=%s",
+              (unsigned long long)settings.seq, settings.width, settings.height, settings.fps,
+              settings.bitrate_kbps, settings.encoder,
+              settings.stream_enabled ? "ON" : "OFF");
+
+    bool oldGpu = m_encoderUseGpu;
+    int oldW = m_encoderW;
+    int oldH = m_encoderH;
+    int oldFps = m_encoderFps;
+    int oldBitrate = m_encoderBitrate;
+
+    m_encoderW = (int)settings.width;
+    m_encoderH = (int)settings.height;
+    m_encoderFps = (int)settings.fps;
+    m_encoderBitrate = (int)settings.bitrate_kbps * 1000;
+    m_encoderUseGpu = (settings.encoder != 0);
+    ClampEncoderToCap();
+
+    if (!m_encoderInitialized || !m_pVideoEncoder) {
+        DriverLog("Bridge settings stored; encoder not up yet, applied on init.");
+        return;
+    }
+
+    bool meaningful = (m_encoderW != oldW || m_encoderH != oldH || m_encoderFps != oldFps ||
+                       m_encoderBitrate != oldBitrate || m_encoderUseGpu != oldGpu);
+    if (!meaningful)
+        return;
+
+    DriverLog("Re-initializing encoder at %dx%d @%d fps, %d kbps, gpu=%d (from bridge settings)",
+              m_encoderW, m_encoderH, m_encoderFps, m_encoderBitrate / 1000, m_encoderUseGpu ? 1 : 0);
+
+    m_pVideoEncoder->Shutdown();
+    delete m_pVideoEncoder;
+    m_pVideoEncoder = nullptr;
+    m_encoderInitialized = false;
+
+    m_pVideoEncoder = new VideoEncoder();
+    if (!m_pVideoEncoder) {
+        DriverLog("Failed to allocate VideoEncoder during bridge settings re-init!");
+        return;
+    }
+
+    m_pVideoEncoder->SetEncodedPacketCallback([this](uint8_t* data, int size, int64_t pts, bool keyframe) {
+        OnEncodedPacket(data, size, pts, keyframe);
+    });
+    m_pVideoEncoder->SetTelemetryCallback([this](const cbpp::PayloadTelemetry& t) {
+        if (m_bridgeInitialized.load(std::memory_order_relaxed) && m_bridgeServer.running()) {
+            m_bridgeServer.PublishTelemetry(t);
+        }
+    });
+
+    if (!m_pVideoEncoder->Initialize(m_pD3D11Device, m_pD3D11DeviceContext,
+                                     m_encoderW, m_encoderH, m_encoderFps, m_encoderBitrate, m_encoderUseGpu)) {
+        DriverLog("VideoEncoder re-init failed under bridge settings!");
+        delete m_pVideoEncoder;
+        m_pVideoEncoder = nullptr;
+        return;
+    }
+
+    m_encoderInitialized = true;
+    m_encoderPts = 0;
+    DriverLog("Encoder re-initialized at %dx%d from bridge settings", m_encoderW, m_encoderH);
+}
+
+bool HmdDriver::InitializeBridge()
+{
+    if (m_bridgeServer.Start()) {
+        m_bridgeInitialized.store(true, std::memory_order_relaxed);
+        DriverLog("Bridge shared-memory region created at %ls", cbpp::kRegionName);
+        m_bridgeServer.PublishStatus();
+        return true;
+    }
+    m_bridgeInitialized.store(false, std::memory_order_relaxed);
+    return false;
+}
+
+void HmdDriver::ShutdownBridge()
+{
+    m_bridgeInitialized.store(false, std::memory_order_relaxed);
+    m_bridgeServer.ShutdownCmdConsumer();
+    m_bridgeServer.Stop();
+    DriverLog("Bridge shared-memory regions released");
 }

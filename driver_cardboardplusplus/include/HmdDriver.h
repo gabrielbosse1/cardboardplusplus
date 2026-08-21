@@ -8,6 +8,7 @@
 #include <d3d11.h>
 #include "openvr_driver.h"
 #include "VideoEncoder.h"
+#include "BridgeServer.h"
 #include <map>
 #include <vector>
 #include <utility>
@@ -116,6 +117,12 @@ private:
     void ShutdownVideoEncoder();
     bool ApplyHardwareCap(int capW, int capH);
     void ClampEncoderToCap();
+    void ApplyStreamSettings(const cbpp::PayloadSettingsChange& settings);
+    void RunBridgeHeartbeat();
+
+    // Bridge telemetry
+    bool InitializeBridge();
+    void ShutdownBridge();
 
     // ---- UDP transport (video streaming to the bridge) ----
     bool InitializeUDP();
@@ -199,6 +206,10 @@ private:
     std::atomic<bool> m_sceneTearingDown{false};  // set during DestroyAllSwapTextureSets
 
     // Present-rate pacing diagnostics.
+
+    // Stream on/off switch; the Bridge is the single owner of this.
+    std::atomic<int> m_streamEnabled{ 1 };
+    long long m_lastHeartbeatNs = 0;
     int m_presentCount = 0;
     long long m_lastPresentLogNs = 0;
 
@@ -226,4 +237,8 @@ private:
     std::thread m_discoveryThread;
     std::mutex m_targetIpMutex;
     std::atomic<long long> m_lastPhonePacketMs{0};  // last time a phone packet was received (GetTickCount64)
+
+    // Shared-memory telemetry bridge (producer).
+    cbpp::BridgeServer m_bridgeServer;
+    std::atomic<bool> m_bridgeInitialized;
 };

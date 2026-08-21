@@ -77,6 +77,7 @@ public class VideoManager {
     }
   }
 
+
   /** Present the latest decoded frame into the GL OES texture. Call from the GL thread. */
   public void updateTexture() {
     if (decoder != null) {

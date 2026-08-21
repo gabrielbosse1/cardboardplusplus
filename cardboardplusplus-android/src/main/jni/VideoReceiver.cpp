@@ -166,16 +166,20 @@ void VideoReceiver::ReceiveLoop() {
       std::vector<uint8_t> frame(buffer.begin() + 4, buffer.begin() + 4 + frame_len);
       buffer.erase(buffer.begin(), buffer.begin() + 4 + frame_len);
 
-      // Detect keyframes from the payload's first NAL unit. libx264 emits
-      // SPS(7)/IDR(5) only inside keyframe packets; P-frame packets start with
-      // a slice (type 1) or SEI(6). This lets us drop whole GOPs without a
-      // keyframe flag on the wire.
+      // Detect keyframes by scanning the whole payload for any SPS(7) or
+      // IDR(5) NAL. libx264 emits AUD(9) before a keyframe, so checking only
+      // the first NAL would miss real keyframes and mark them as P-frames.
       bool is_key = false;
-      for (size_t i = 0; i + 3 < frame.size(); ++i) {
-        if (frame[i] == 0x00 && frame[i+1] == 0x00 && frame[i+2] == 0x01) {
+      for (size_t i = 0; i + 4 < frame.size(); ++i) {
+        if (frame[i] == 0x00 && frame[i+1] == 0x00 &&
+            frame[i+2] == 0x01 && frame[i+3] == 0x01) {
+          // 4-byte start code: NAL header at i+4
+          int nal_type = frame[i+4] & 0x1F;
+          if (nal_type == 5 || nal_type == 7) { is_key = true; break; }
+        } else if (frame[i] == 0x00 && frame[i+1] == 0x00 && frame[i+2] == 0x01) {
+          // 3-byte start code: NAL header at i+3
           int nal_type = frame[i+3] & 0x1F;
-          is_key = (nal_type == 5 || nal_type == 7);
-          break;
+          if (nal_type == 5 || nal_type == 7) { is_key = true; break; }
         }
       }
 
