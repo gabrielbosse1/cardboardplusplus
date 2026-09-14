@@ -18,6 +18,7 @@ import android.util.Size;
 import android.view.Surface;
 import com.google.cardboard.NativeBridge;
 import com.google.cardboard.core.AppConstants;
+import com.google.cardboard.core.DebugLog;
 import java.util.ArrayList;
 
 /**
@@ -27,6 +28,7 @@ import java.util.ArrayList;
  */
 public class CameraController {
   private static final String TAG = CameraController.class.getSimpleName();
+  private static final DebugLog DBG = new DebugLog(TAG);
 
   /** Callback interface for raw camera frames. */
   public interface FrameCallback {
@@ -74,7 +76,7 @@ public class CameraController {
       cameraSurface = new Surface(cameraSurfaceTexture);
       cameraTexturePassed = true;
       bridge.onCameraTextureInitialized(textureId, cameraWidth, cameraHeight);
-      Log.i(TAG, "Camera texture created: " + textureId);
+      DBG.i("Camera texture created: %d", textureId);
     }
   }
 

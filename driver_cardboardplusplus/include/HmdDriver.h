@@ -135,6 +135,11 @@ private:
     void SwitchDataTarget(const char* phoneIp);
     void SendBridgeStats(const sockaddr_in& addr); // periodic BRIDGE_STATS to the bridge
 
+    // ---- sensor data forwarding (bridge → driver via UDP 42074) ----
+    bool InitializeSensorSocket();
+    void ShutdownSensorSocket();
+    void SensorThreadFunc();
+
     // ---- background encoding loop + compositor sync-texture handshake ----
     void EncodingThreadFunc();
     void EncodePendingFrame(const PendingFrame& frame);
@@ -237,6 +242,27 @@ private:
     std::thread m_discoveryThread;
     std::mutex m_targetIpMutex;
     std::atomic<long long> m_lastPhonePacketMs{0};  // last time a phone packet was received (GetTickCount64)
+
+    // ---- UDP sensor socket (bridge → driver, port 42074) ----
+    SOCKET m_sensorSocket;
+    bool m_sensorInitialized;
+    std::atomic<bool> m_sensorRunning;
+    std::thread m_sensorThread;
+    // Latest sensor sample from the phone, written by the sensor thread, read by GetPose().
+    std::mutex m_sensorMutex;
+    float m_sensorGyro[3]{0, 0, 0};
+    float m_sensorAccel[3]{0, 0, 0};
+    float m_sensorMag[3]{0, 0, 0};
+    uint64_t m_sensorTimestampMs{0};
+    std::atomic<bool> m_hasSensorData{false};
+    // Fused rotation quaternion from tag 0x12 (TYPE_ROTATION_VECTOR).
+    // Already relative to the bridge's reference pose (bridge owns recenter).
+    float m_sensorQuat[4]{1, 0, 0, 0}; // [w, x, y, z] in OpenVR space
+    std::atomic<bool> m_hasQuaternion{false};
+    std::atomic<int64_t> m_lastSensorRecvMs{0};
+    std::atomic<int64_t> m_lastRotationRecvMs{0};
+    // Fake proximity sensor — always reports "wearing" so SteamVR never goes to standby.
+    vr::VRInputComponentHandle_t m_proximityHandle{0};
 
     // Shared-memory telemetry bridge (producer).
     cbpp::BridgeServer m_bridgeServer;

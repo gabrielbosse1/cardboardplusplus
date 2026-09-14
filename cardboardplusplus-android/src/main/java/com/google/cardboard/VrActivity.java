@@ -18,10 +18,15 @@ package com.google.cardboard;
 import android.annotation.SuppressLint;
 import android.content.Intent;
 import android.content.res.AssetManager;
+import android.hardware.Sensor;
+import android.hardware.SensorEvent;
+import android.hardware.SensorEventListener;
+import android.hardware.SensorManager;
 import android.opengl.GLSurfaceView;
 import android.os.Build.VERSION;
 import android.os.Build.VERSION_CODES;
 import android.os.Bundle;
+import android.os.PowerManager;
 import android.provider.Settings;
 import android.util.Log;
 import android.view.MotionEvent;
@@ -35,12 +40,14 @@ import androidx.appcompat.app.AppCompatActivity;
 import com.google.cardboard.camera.CameraController;
 import com.google.cardboard.codec.CodecSelector;
 import com.google.cardboard.core.AppConstants;
+import com.google.cardboard.core.DebugLog;
 import com.google.cardboard.discovery.DiscoveryManager;
 import com.google.cardboard.permissions.PermissionManager;
 import com.google.cardboard.render.VrRenderer;
 import com.google.cardboard.settings.AppSettings;
 import com.google.cardboard.settings.SettingsMenuController;
 import com.google.cardboard.streaming.CameraStreamer;
+import com.google.cardboard.telemetry.TelemetrySender;
 import com.google.cardboard.ui.ImmersiveMode;
 import com.google.cardboard.video.VideoManager;
 
@@ -60,6 +67,7 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
   }
 
   private static final String TAG = VrActivity.class.getSimpleName();
+  private static final DebugLog DBG = new DebugLog(TAG);
 
   // Opaque native pointer to the native CardboardApp instance.
   // This object is owned by the VrActivity instance and passed to the native methods.
@@ -76,6 +84,29 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
   // dependencies ready; neither is started in this version (see CameraStreamer).
   private CodecSelector codecSelector;
   private CameraStreamer cameraStreamer;
+  private TelemetrySender telemetrySender;
+
+  // Keeps the device awake while the VR session is active. FLAG_KEEP_SCREEN_ON alone is
+  // overridden by the proximity sensor on many OEMs (the phone reads "covered" inside the
+  // Cardboard viewer and the OS forces the screen off), so a wake lock is required.
+  private PowerManager.WakeLock wakeLock;
+  private SensorManager sensorManager;
+  private Sensor proximitySensor;
+  private final SensorEventListener proximityListener =
+      new SensorEventListener() {
+        @Override
+        public void onSensorChanged(SensorEvent event) {
+          if (event.sensor.getType() != Sensor.TYPE_PROXIMITY) return;
+          // Keep the wake lock held while the session is active. Some OEMs force the screen
+          // off when the proximity sensor reads "covered" (phone in the viewer); holding the
+          // lock on every "near" event defends against that. We deliberately never release here
+          // — the lock is released only in onPause() so the device can sleep once the app exits.
+          acquireWakeLock();
+        }
+
+        @Override
+        public void onAccuracyChanged(Sensor sensor, int accuracy) {}
+      };
 
   @SuppressLint("ClickableViewAccessibility")
   @Override
@@ -85,12 +116,20 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
     nativeApp = nativeOnCreate(getAssets());
 
     appSettings = new AppSettings(this);
+    DebugLog.setGlobalEnabled(appSettings.isDebugLogging());
+    DBG.i("VrActivity created, debug=%b", appSettings.isDebugLogging());
     codecSelector = new CodecSelector(appSettings);
     cameraStreamer = new CameraStreamer(appSettings);
+    telemetrySender = new TelemetrySender(this, appSettings);
     permissionManager = new PermissionManager(this);
     cameraController = new CameraController(this, this);
     videoManager = new VideoManager(this, appSettings);
     discoveryManager = new DiscoveryManager(appSettings);
+    // Pre-query the hardware decoder cap so the DiscoveryManager can announce it
+    // to the driver on the first ACK (using the same socket that proved connectivity).
+    int[] decoderCap = videoManager.queryDecoderCap();
+    discoveryManager.setDecoderCap(decoderCap[0], decoderCap[1]);
+    DBG.i("Decoder cap: %dx%d", decoderCap[0], decoderCap[1]);
     // If the video stream stalls (e.g. SteamVR restarted behind the running phone),
     // re-broadcast discovery so the PC driver re-routes video to this phone.
     videoManager.setReconnectAction(() -> discoveryManager.startDiscovery());
@@ -134,6 +173,7 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
   @Override
   protected void onPause() {
     super.onPause();
+    DBG.i("onPause");
 
     // 1. Tell native to stop head tracking FIRST
     onNativePause();
@@ -143,6 +183,17 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
 
     // 2b. Stop camera streaming
     cameraStreamer.stop();
+
+    // 2c. Stop telemetry
+    telemetrySender.stop();
+
+    // Release the wake lock and proximity listener so the device can sleep again.
+    if (sensorManager != null && proximitySensor != null) {
+      sensorManager.unregisterListener(proximityListener, proximitySensor);
+    }
+    if (wakeLock != null && wakeLock.isHeld()) {
+      wakeLock.release();
+    }
 
     // 3. Stop camera hardware and release texture so it gets recreated fresh on resume
     cameraController.onPause();
@@ -157,6 +208,8 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
   @Override
   protected void onResume() {
     super.onResume();
+    DebugLog.setGlobalEnabled(appSettings.isDebugLogging());
+    DBG.i("onResume, debug=%b", appSettings.isDebugLogging());
 
     // The rest of resume must not run until the app holds every permission it
     // NEEDS, so block early (and request them) if any is missing.
@@ -177,7 +230,24 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
     glView.onResume();
     onNativeResume();
 
+    // Keep the screen on for the whole VR session. The proximity listener refreshes this
+    // whenever the phone is inside the viewer (and releases it when taken out).
+    acquireWakeLock();
+    if (sensorManager == null) {
+      sensorManager = (SensorManager) getSystemService(SENSOR_SERVICE);
+    }
+    if (sensorManager != null && proximitySensor == null) {
+      proximitySensor = sensorManager.getDefaultSensor(Sensor.TYPE_PROXIMITY);
+    }
+    if (sensorManager != null && proximitySensor != null) {
+      sensorManager.registerListener(
+          proximityListener, proximitySensor, SensorManager.SENSOR_DELAY_NORMAL);
+    }
+
     discoveryManager.startDiscovery();
+
+    // Start telemetry (gyro/accel/mag → bridge)
+    telemetrySender.start();
 
     // Queue camera setup on GL thread (guards prevent duplicates)
     glView.queueEvent(
@@ -190,6 +260,26 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
           cameraController.openCamera();
           cameraStreamer.start();
         });
+  }
+
+  /**
+   * Acquires a screen-bright wake lock (idempotent). Held until {@link #onPause()}. This is what
+   * actually prevents the headset from going to standby inside the Cardboard viewer — the proximity
+   * sensor otherwise makes the OS turn the screen off.
+   */
+  @SuppressLint("Wakelock")
+  private void acquireWakeLock() {
+    if (wakeLock == null) {
+      PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+      if (pm == null) return;
+      wakeLock =
+          pm.newWakeLock(
+              PowerManager.SCREEN_BRIGHT_WAKE_LOCK | PowerManager.ON_AFTER_RELEASE, TAG);
+      wakeLock.setReferenceCounted(false);
+    }
+    if (!wakeLock.isHeld()) {
+      wakeLock.acquire();
+    }
   }
 
   /**
@@ -325,6 +415,8 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
 
   private native void nativeOnVideoActive(long nativeApp);
 
+  private native void nativeSetVideoVMax(long nativeApp, float vMax);
+
   private native void nativeResetCameraTexture(long nativeApp);
 
   private native void nativeSetEyeTexture(long nativeApp, int eye, int textureId);
@@ -399,6 +491,11 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
   @Override
   public void onVideoActive() {
     nativeOnVideoActive(nativeApp);
+  }
+
+  @Override
+  public void setVideoVMax(float vMax) {
+    nativeSetVideoVMax(nativeApp, vMax);
   }
 
   @Override

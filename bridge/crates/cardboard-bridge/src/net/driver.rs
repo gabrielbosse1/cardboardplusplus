@@ -117,6 +117,7 @@ enum DatagramHandled {
 
 fn handle_bridge_datagram(data: &[u8], last_ack: &mut Option<Instant>, state: &SharedState) -> DatagramHandled {
     let msg = String::from_utf8_lossy(data);
+    crate::debug_log!(state, "[driver] recv: {}", msg.trim());
     if msg.trim_start().starts_with("BRIDGE_ACK") {
         *last_ack = Some(Instant::now());
         if let Ok(mut s) = state.lock() {

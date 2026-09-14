@@ -9,6 +9,7 @@ import android.os.SystemClock;
 import android.util.Log;
 import android.view.Surface;
 import com.google.cardboard.NativeBridge;
+import com.google.cardboard.core.DebugLog;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 
@@ -21,6 +22,7 @@ import java.util.Arrays;
  */
 public class VideoDecoder {
   private static final String TAG = "VideoDecoder";
+  private static final DebugLog DBG = new DebugLog(TAG);
 
   private final NativeBridge bridge;
   private final int textureId;
@@ -56,7 +58,10 @@ public class VideoDecoder {
     int alignedW = (width + 15) & ~15;
     int alignedH = (height + 15) & ~15;
     surfaceTexture = new SurfaceTexture(textureId);
-    surfaceTexture.setDefaultBufferSize(alignedW, alignedH);
+    // Use actual video dimensions for the SurfaceTexture, not the macroblock-aligned
+    // dimensions. The codec outputs at alignedH but the bottom rows are uninitialized
+    // padding — showing them causes a green line artifact on both eyes.
+    surfaceTexture.setDefaultBufferSize(width, height);
     surface = new Surface(surfaceTexture);
     Log.i(TAG, "Created video OES texture=" + textureId + " " + width + "x" + height
         + " (aligned " + alignedW + "x" + alignedH + ")");
@@ -84,20 +89,18 @@ public class VideoDecoder {
         }
         updateCount++;
         if (updateCount % 60 == 0) {
-          Log.i(TAG, "updateVideoTexture #" + updateCount + " drained=" + drained
-              + " configured=" + configured + " decoderNull=" + (decoder == null));
+          DBG.i("updateVideoTexture #%d drained=%d configured=%b decoderNull=%b", updateCount, drained, configured, decoder == null);
         }
         long nowNs = System.nanoTime();
         if (nowNs - lastDecodeLogNs >= 1_000_000_000L) {
           double fps = decodedFrames * 1e9 / (nowNs - lastDecodeLogNs);
-          Log.i(TAG, "Decoded video FPS=" + Math.round(fps * 10) / 10.0
-              + " (frames=" + decodedFrames + ")");
+          DBG.i("Decoded video FPS=%.1f (frames=%d)", Math.round(fps * 10) / 10.0, decodedFrames);
           decodedFrames = 0;
           lastDecodeLogNs = nowNs;
         }
       } else if (updateCount % 60 == 0) {
         updateCount++;
-        Log.i(TAG, "updateVideoTexture #" + updateCount + " SKIP configured=" + configured);
+        DBG.i("updateVideoTexture #%d SKIP configured=%b", updateCount, configured);
       }
 
       if (frameRendered) {
@@ -222,21 +225,26 @@ public class VideoDecoder {
       try {
         android.media.MediaCodecInfo.VideoCapabilities vc =
             decoder.getCodecInfo().getCapabilitiesForType("video/avc").getVideoCapabilities();
-        Log.i(TAG, "Codec supported widths=" + vc.getSupportedWidths()
-            + " heights=" + vc.getSupportedHeights()
-            + " upper=" + vc.getSupportedWidths().getUpper()
-            + "x" + vc.getSupportedHeights().getUpper());
+        DBG.i("Codec supported widths=%s heights=%s upper=%dx%d", vc.getSupportedWidths(),
+            vc.getSupportedHeights(), vc.getSupportedWidths().getUpper(),
+            vc.getSupportedHeights().getUpper());
       } catch (Exception e) {
-        Log.w(TAG, "could not query video capabilities: " + e.getMessage());
+        DBG.w("could not query video capabilities: " + e.getMessage());
       }
       decoder.configure(format, surface, null, 0);
       if (surfaceTexture != null) {
-        surfaceTexture.setDefaultBufferSize(alignedW, alignedH);
+        surfaceTexture.setDefaultBufferSize(baseW, baseH);
       }
       decoder.start();
       configured = true;
       if (bridge != null) bridge.onVideoActive();
-      Log.i(TAG, "MediaCodec configured (SPS=" + sps.length + " PPS=" + pps.length + ")");
+      // Tell the OES shader to skip macroblock padding rows at the bottom of
+      // the decoded frame. The codec outputs at alignedH but only the top
+      // height rows contain valid content; the rest are green garbage.
+      float vMax = (float) height / (float) alignedH;
+      if (bridge != null) bridge.setVideoVMax(vMax);
+      Log.i(TAG, "MediaCodec configured (SPS=" + sps.length + " PPS=" + pps.length
+          + " vMax=" + vMax + ")");
       return true;
     } catch (Exception e) {
       Log.e(TAG, "MediaCodec configure failed: " + e.getMessage());

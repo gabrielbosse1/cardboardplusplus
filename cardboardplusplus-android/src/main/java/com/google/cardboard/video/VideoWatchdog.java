@@ -2,6 +2,7 @@ package com.google.cardboard.video;
 
 import android.os.SystemClock;
 import android.util.Log;
+import com.google.cardboard.core.DebugLog;
 import java.util.function.Supplier;
 
 /**
@@ -17,6 +18,7 @@ import java.util.function.Supplier;
  * internal lock to make start/stop idempotent.
  */
 final class VideoWatchdog {
+  private static final DebugLog DBG = new DebugLog("VideoWatchdog");
   // How long a silent video channel must be before we consider it stalled.
   private static final long STALL_MS = 3000;
   // Poll cadence for the decoder's last-frame timestamp.
@@ -86,7 +88,7 @@ final class VideoWatchdog {
         long now = SystemClock.elapsedRealtime();
         // Re-broadcast at most every REANNOUNCE_INTERVAL_MS while the channel is dead.
         if (!wasStalled || now - lastAnnounceMs > REANNOUNCE_INTERVAL_MS) {
-          Log.w(tag, "No video frames for >" + STALL_MS + "ms; re-broadcast discovery");
+          DBG.w("No video frames for >" + STALL_MS + "ms; re-broadcast discovery");
           lastAnnounceMs = now;
           if (reconnectAction != null) {
             reconnectAction.run();

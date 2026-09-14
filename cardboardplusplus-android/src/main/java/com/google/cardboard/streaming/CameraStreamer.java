@@ -7,6 +7,7 @@ import android.graphics.YuvImage;
 import android.media.Image;
 import android.util.Log;
 import com.google.cardboard.camera.CameraController;
+import com.google.cardboard.core.DebugLog;
 import com.google.cardboard.network.NetworkUtils;
 import com.google.cardboard.settings.AppSettings;
 import java.io.ByteArrayOutputStream;
@@ -17,6 +18,7 @@ import java.net.InetAddress;
 
 public class CameraStreamer implements CameraController.FrameCallback {
   private static final String TAG = CameraStreamer.class.getSimpleName();
+  private static final DebugLog DBG = new DebugLog(TAG);
   private static final int PC_PORT = 42072;
   private static final int TARGET_WIDTH = 320;
   private static final int TARGET_HEIGHT = 240;
@@ -114,7 +116,7 @@ public class CameraStreamer implements CameraController.FrameCallback {
       socket.send(packet);
       frameCount++;
       if (frameCount % 60 == 1) {
-        Log.i(TAG, "Sent " + frameCount + " frames, last size: " + jpegData.length + " bytes");
+        DBG.i("Sent %d frames, last size: %d bytes", frameCount, jpegData.length);
       }
     } catch (Exception e) {
       Log.w(TAG, "Frame send failed: " + e.getMessage());

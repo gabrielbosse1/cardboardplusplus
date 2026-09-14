@@ -62,6 +62,7 @@ fn process_frame(
     frame_count: u64,
     client: Option<&MediapipeClient>,
 ) {
+    crate::debug_log!(state, "[camera] frame #{frame_count}, {} bytes jpeg", jpeg_data.len());
     // Decode JPEG -> RGBA for the UI preview.
     let mut decoder = jpeg_decoder::Decoder::new(jpeg_data);
     let pixels: Vec<u8> = match decoder.decode() {

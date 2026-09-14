@@ -6,4 +6,6 @@
         android:title="@string/switch_viewer" />
     <item android:id="@+id/set_pc_ip"
         android:title="@string/set_pc_ip" />
+    <item android:id="@+id/toggle_debug"
+        android:title="@string/toggle_debug" />
 </menu>

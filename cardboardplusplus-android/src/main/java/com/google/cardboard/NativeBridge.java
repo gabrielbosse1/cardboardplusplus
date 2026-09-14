@@ -34,6 +34,8 @@ public interface NativeBridge {
 
   void onVideoActive();
 
+  void setVideoVMax(float vMax);
+
   void resetCameraTexture();
 
   void setEyeTexture(int eye, int textureId);

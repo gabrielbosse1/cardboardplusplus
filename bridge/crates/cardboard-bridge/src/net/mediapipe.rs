@@ -6,8 +6,9 @@
 //! containing up to 2 detected hands (21 landmarks each).
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// A single 3-D landmark in normalised image coordinates.
 #[derive(Debug, Clone, Copy, Default)]
@@ -32,6 +33,24 @@ pub struct MediapipeClient {
 }
 
 impl MediapipeClient {
+    /// Quick single-shot connect (no retries). Used to check if a server
+    /// is already running before attempting to spawn one.
+    pub fn try_once(port: u16) -> anyhow::Result<Self> {
+        let addr = format!("127.0.0.1:{port}");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let addr_clone = addr.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(TcpStream::connect(&addr_clone));
+        });
+        let stream = rx.recv_timeout(Duration::from_secs(2))
+            .map_err(|_| anyhow::anyhow!("connect timed out"))?
+            .map_err(|e| anyhow::anyhow!(e))?;
+        eprintln!("[mediapipe] connected to {addr}");
+        Ok(Self {
+            stream: Arc::new(Mutex::new(stream)),
+        })
+    }
+
     /// Connect to the Python server.  Retries a few times in case the
     /// child process is still starting up.
     pub fn connect(port: u16) -> anyhow::Result<Self> {
@@ -43,15 +62,30 @@ impl MediapipeClient {
         })
     }
 
-    fn try_connect(addr: &str, retries: u32, delay: std::time::Duration) -> anyhow::Result<TcpStream> {
+    fn try_connect(addr: &str, retries: u32, delay: Duration) -> anyhow::Result<TcpStream> {
+        let sock_addr = addr.to_socket_addrs()?.next().ok_or_else(|| anyhow::anyhow!("no addresses for {addr}"))?;
+        let connect_timeout = Duration::from_secs(2);
         for attempt in 0..retries {
-            match TcpStream::connect(addr) {
-                Ok(s) => return Ok(s),
-                Err(e) if attempt + 1 < retries => {
+            // Use a channel-based timeout: spawn connect in a thread, recv
+            // with timeout.  This avoids Windows issues where
+            // TcpStream::connect_timeout hangs on filtered localhost ports.
+            let (tx, rx) = std::sync::mpsc::channel();
+            let addr_str = addr.to_owned();
+            std::thread::spawn(move || {
+                let _ = tx.send(TcpStream::connect(&addr_str));
+            });
+            match rx.recv_timeout(connect_timeout) {
+                Ok(Ok(s)) => return Ok(s),
+                Ok(Err(e)) if attempt + 1 < retries => {
                     eprintln!("[mediapipe] connect attempt {} failed: {e}, retrying...", attempt + 1);
                     std::thread::sleep(delay);
                 }
-                Err(e) => return Err(e.into()),
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) if attempt + 1 < retries => {
+                    eprintln!("[mediapipe] connect attempt {} timed out, retrying...", attempt + 1);
+                    std::thread::sleep(delay);
+                }
+                Err(_) => return Err(anyhow::anyhow!("connect timed out")),
             }
         }
         unreachable!()

@@ -110,6 +110,7 @@ class CardboardPlusPlusApp {
   int CreateVideoTexture();
   void SetVideoDecoder(JNIEnv* env, jobject decoder);
   void OnVideoActive();
+  void SetVideoVMax(float v_max) { tex_vmax_value_ = v_max; }
 
   void StartVideoReceiver(int port);
   void StopVideoReceiver();
@@ -209,6 +210,8 @@ class CardboardPlusPlusApp {
   GLuint tex_tex_coord_param_;
   GLuint tex_mvp_param_;
   GLuint tex_texture_param_;
+  GLuint tex_vmax_param_;
+  float tex_vmax_value_ = 1.0f;
 
   GLuint left_eye_texture_;
   GLuint right_eye_texture_;

@@ -19,14 +19,14 @@ public class TelemetryEncodeTest {
 
     @Test
     public void gyroPacketHasCorrectTagAndLength() {
-        byte[] packet = buildGyroPacket(1234, new float[]{0.5f, -0.2f, 0.1f}, new float[]{1.0f, 9.8f, 0.0f});
+        byte[] packet = buildGyroPacket(1234, new float[]{0.5f, -0.2f, 0.1f}, new float[]{1.0f, 9.8f, 0.0f}, new float[]{22.1f, -45.3f, 11.7f});
         assertEquals(GYRO_TAG, packet[0]);
-        assertEquals(33, packet.length); // 1 + 8 + 6*4 = 33
+        assertEquals(45, packet.length); // 1 + 8 + 9*4 = 45
     }
 
     @Test
     public void gyroPacketTimestampIsLittleEndian() {
-        byte[] packet = buildGyroPacket(256, new float[]{0, 0, 0}, new float[]{0, 0, 0});
+        byte[] packet = buildGyroPacket(256, new float[]{0, 0, 0}, new float[]{0, 0, 0}, new float[]{0, 0, 0});
         // timestamp 256 = 0x0000000000000100 in LE
         assertEquals(0x00, packet[1]);
         assertEquals(0x01, packet[2]);
@@ -67,9 +67,22 @@ public class TelemetryEncodeTest {
 
     @Test
     public void gyroPacketWithZerosIsValid() {
-        byte[] packet = buildGyroPacket(0, new float[]{0, 0, 0}, new float[]{0, 0, 0});
-        assertEquals(33, packet.length);
+        byte[] packet = buildGyroPacket(0, new float[]{0, 0, 0}, new float[]{0, 0, 0}, new float[]{0, 0, 0});
+        assertEquals(45, packet.length);
         assertEquals(GYRO_TAG, packet[0]);
+    }
+
+    @Test
+    public void gyroPacketMagneticFieldIsAtCorrectOffset() {
+        float[] mag = {22.1f, -45.3f, 11.7f};
+        byte[] packet = buildGyroPacket(100, new float[]{0, 0, 0}, new float[]{0, 0, 0}, mag);
+        // Mag starts at offset 33 (1 tag + 8 timestamp + 9*4 accel/gyro = 33)
+        float parsedMag0 = ByteBuffer.wrap(packet, 33, 4).order(ByteOrder.LITTLE_ENDIAN).getFloat();
+        float parsedMag1 = ByteBuffer.wrap(packet, 37, 4).order(ByteOrder.LITTLE_ENDIAN).getFloat();
+        float parsedMag2 = ByteBuffer.wrap(packet, 41, 4).order(ByteOrder.LITTLE_ENDIAN).getFloat();
+        assertEquals(mag[0], parsedMag0, 0.001f);
+        assertEquals(mag[1], parsedMag1, 0.001f);
+        assertEquals(mag[2], parsedMag2, 0.001f);
     }
 
     @Test
@@ -80,12 +93,13 @@ public class TelemetryEncodeTest {
 
     // --- Builders ---
 
-    private byte[] buildGyroPacket(long timestampMs, float[] angVel, float[] accel) {
-        ByteBuffer buf = ByteBuffer.allocate(33).order(ByteOrder.LITTLE_ENDIAN);
+    private byte[] buildGyroPacket(long timestampMs, float[] angVel, float[] accel, float[] mag) {
+        ByteBuffer buf = ByteBuffer.allocate(45).order(ByteOrder.LITTLE_ENDIAN);
         buf.put(GYRO_TAG);
         buf.putLong(timestampMs);
         for (float v : angVel) buf.putFloat(v);
         for (float v : accel) buf.putFloat(v);
+        for (float v : mag) buf.putFloat(v);
         return buf.array();
     }
 

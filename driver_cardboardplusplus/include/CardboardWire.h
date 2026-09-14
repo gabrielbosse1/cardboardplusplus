@@ -56,4 +56,7 @@ namespace wire {
     // Format: "BRIDGE_STATS fps=<n> bitrate=<kbps> frames=<n> drops=<n>".
     static constexpr char kBridgeStats[] = "BRIDGE_STATS";
     static constexpr std::size_t kBridgeStatsLen = sizeof(kBridgeStats) - 1; // 12
+
+    // Bridge -> driver sensor data forwarding port (binary, same format as phone→bridge).
+    static constexpr int kSensorPort = 42074;
 }

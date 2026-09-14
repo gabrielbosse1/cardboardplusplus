@@ -6,11 +6,20 @@
 //! same way the driver link decays.
 
 use std::net::{SocketAddr, UdpSocket};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use crate::app::SharedState;
 use crate::net::telemetry::{self, TelemetryPacket};
-use crate::net::TELEMETRY_PORT;
+use crate::net::{SENSOR_PORT, TELEMETRY_PORT};
+
+/// Cached UDP socket for bridge→driver forwarding (created once, reused).
+// ponytail: UDP 42074 is latest-wins fire-and-forget; move to shm CmdProducer PublishPose if reliable delivery needed.
+static SENSOR_SOCK: OnceLock<UdpSocket> = OnceLock::new();
+
+fn sensor_sock() -> &'static UdpSocket {
+    SENSOR_SOCK.get_or_init(|| UdpSocket::bind("0.0.0.0:0").expect("sensor forward socket"))
+}
 
 /// Poll cadence while waiting for the next packet / liveness re-check.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -30,9 +39,9 @@ pub fn spawn(state: SharedState) {
             return;
         }
     };
-    // Block until a datagram lands; liveness is handled by the timeout below
-    // rather than by a read timeout, so no packet is ever dropped by one.
-    let _ = sock.set_read_timeout(Option::<Duration>::None);
+    // Use a short read timeout so the staleness check runs periodically even
+    // when no packets arrive, but never drop incoming data.
+    let _ = sock.set_read_timeout(Some(POLL_INTERVAL));
 
     if let Ok(mut s) = state.lock() {
         s.push_log(format!("telemetry listener on udp {TELEMETRY_PORT}"));
@@ -48,14 +57,23 @@ fn telemetry_loop(sock: UdpSocket, state: SharedState) {
     let mut last_seen = None::<Instant>;
 
     loop {
-        if let Ok((n, src)) = sock.recv_from(&mut buf) {
-            last_seen = Some(Instant::now());
-            let packet = telemetry::parse_packet(&buf[..n]);
-            apply_packet(&state, packet, src);
+        match sock.recv_from(&mut buf) {
+            Ok((n, src)) => {
+                last_seen = Some(Instant::now());
+                let packet = telemetry::parse_packet(&buf[..n]);
+                apply_packet(&state, packet, src);
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // No packet within POLL_INTERVAL — just check staleness.
+            }
+            Err(_) => {
+                // Transient error; retry immediately.
+            }
         }
 
         mark_phone_gone_if_stale(&state, last_seen);
-        std::thread::sleep(POLL_INTERVAL);
     }
 }
 
@@ -63,11 +81,18 @@ fn telemetry_loop(sock: UdpSocket, state: SharedState) {
 /// bare ping — refreshes the "phone is alive" flag; only the hello announces
 /// the phone's address in the log (once per connection).
 fn apply_packet(state: &SharedState, packet: TelemetryPacket, src: SocketAddr) {
+    // Determine forwarding outside the lock so the UDP send never blocks the UI.
+    let mut forward_gyro: Option<telemetry::GyroSample> = None;
+    let mut forward_rot: Option<telemetry::RotationSample> = None;
+
     if let Ok(mut s) = state.lock() {
         match packet {
             TelemetryPacket::Hello => {
-                if !s.phone_connected {
-                    s.phone_ip = src.ip().to_string();
+                let new_ip = src.ip().to_string();
+                if s.phone_ip != new_ip {
+                    s.phone_ip = new_ip;
+                    s.push_log(format!("phone hello from {src}"));
+                } else if !s.phone_connected {
                     s.push_log(format!("phone hello from {src}"));
                 }
                 s.phone_connected = true;
@@ -76,17 +101,48 @@ fn apply_packet(state: &SharedState, packet: TelemetryPacket, src: SocketAddr) {
                 s.packets_total += 1;
                 s.phone_connected = true;
             }
-            TelemetryPacket::Gyro(_sample) => {
-                s.note_gyro();
+            TelemetryPacket::Gyro(sample) => {
+                let ip = src.ip().to_string();
+                if s.phone_ip != ip {
+                    s.phone_ip = ip;
+                    s.push_log(format!("phone IP updated to {src} (gyro)"));
+                }
+                s.note_gyro(&sample);
                 s.phone_connected = true;
+                forward_gyro = Some(sample);
             }
             TelemetryPacket::Hand(frame) => {
                 s.note_hand(frame.hands);
                 s.phone_connected = true;
             }
+            TelemetryPacket::Rotation(sample) => {
+                let ip = src.ip().to_string();
+                if s.phone_ip != ip {
+                    s.phone_ip = ip;
+                    s.push_log(format!("phone IP updated to {src} (rotation)"));
+                }
+                s.phone_connected = true;
+                static ROT_DEBUG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let c = ROT_DEBUG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if c % 20 == 0 {
+                    eprintln!(
+                        "[rot-debug] phone quat=({:.4},{:.4},{:.4},{:.4}) ts={}",
+                        sample.quat[0], sample.quat[1], sample.quat[2], sample.quat[3], sample.timestamp_ms
+                    );
+                }
+                forward_rot = Some(sample);
+            }
             TelemetryPacket::Unknown => {}
         }
         s.recompute_fps();
+    }
+
+    if let Some(sample) = forward_gyro {
+        forward_sensor_to_driver(&sample);
+    }
+    if let Some(sample) = forward_rot {
+        crate::debug_log!(state, "[phone] rotation quat=({:.4},{:.4},{:.4},{:.4}) ts={}", sample.quat[0], sample.quat[1], sample.quat[2], sample.quat[3], sample.timestamp_ms);
+        forward_rotation_to_driver(&sample);
     }
 }
 
@@ -112,6 +168,45 @@ fn mark_phone_gone_if_stale(state: &SharedState, last_seen: Option<Instant>) {
 pub fn send_to_phone(addr: SocketAddr, data: &[u8]) {
     if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
         let _ = sock.send_to(data, addr);
+    }
+}
+
+/// Forward the latest sensor sample to the driver via UDP 42074. The packet
+/// format is identical to the phone→bridge format (tag 0x10, 45 bytes LE) so
+/// the driver can reuse the same parser. Fire-and-forget: a dropped packet is
+/// replaced by the next sample within ~20 ms.
+/// Reuses a single socket — the previous per-packet bind caused port exhaustion at 200 Hz.
+fn forward_sensor_to_driver(sample: &telemetry::GyroSample) {
+    let mut buf = Vec::with_capacity(45);
+    buf.push(0x10); // tag: gyro sample
+    buf.extend_from_slice(&sample.timestamp_ms.to_le_bytes());
+    for v in sample.angular_velocity {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in sample.acceleration {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in sample.magnetic_field {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    if let Err(e) = sensor_sock().send_to(&buf, format!("127.0.0.1:{SENSOR_PORT}")) {
+        eprintln!("[sensor-fwd] send_to 42074 failed: {e}");
+    }
+}
+
+/// Forward the fused rotation quaternion to the driver via UDP 42074.
+/// The phone already converts the game rotation vector to absolute OpenVR
+/// space (Y-up world, VR device frame), so the bridge passes it through
+/// untouched — pitch/roll stay gravity-level, no reference capture needed.
+fn forward_rotation_to_driver(sample: &telemetry::RotationSample) {
+    let mut buf = Vec::with_capacity(25);
+    buf.push(0x12);
+    buf.extend_from_slice(&sample.timestamp_ms.to_le_bytes());
+    for v in sample.quat {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    if let Err(e) = sensor_sock().send_to(&buf, format!("127.0.0.1:{SENSOR_PORT}")) {
+        eprintln!("[rot-fwd] send_to 42074 failed: {e}");
     }
 }
 

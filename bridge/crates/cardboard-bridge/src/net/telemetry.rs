@@ -1,8 +1,8 @@
 //! Wire format for the phone -> bridge telemetry link (UDP 42071).
 //!
 //! Binary packets are distinguished by their leading tag byte:
-//!   * `0x10` gyro sample — u64 timestamp_ms, 3x f32 angular velocity, 3x f32
-//!     acceleration (33 bytes total)
+//!   * `0x10` sensor sample — u64 timestamp_ms, 3x f32 angular velocity,
+//!     3x f32 acceleration, 3x f32 magnetic field (45 bytes total)
 //!   * `0x11` hand frame — u64 timestamp_ms, u8 hands, u8 landmarks/hand,
 //!     f32 confidence (15 bytes total)
 //!   * `0x20` ping — a bare tag byte, used only to keep the link alive
@@ -16,6 +16,7 @@ pub struct GyroSample {
     pub timestamp_ms: u64,
     pub angular_velocity: [f32; 3],
     pub acceleration: [f32; 3],
+    pub magnetic_field: [f32; 3],
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -27,19 +28,28 @@ pub struct HandFrame {
     pub confidence: f32,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RotationSample {
+    pub timestamp_ms: u64,
+    pub quat: [f32; 4], // [w, x, y, z]
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum TelemetryPacket {
     Gyro(GyroSample),
     Hand(HandFrame),
+    Rotation(RotationSample),
     Hello,
     Ping,
     Unknown,
 }
 
-/// Minimum length of a well-formed gyro packet (tag + 8 + 6*4 bytes).
-const GYRO_PACKET_LEN: usize = 33;
+/// Minimum length of a well-formed gyro packet (tag + 8 + 9*4 bytes = 45).
+const GYRO_PACKET_LEN: usize = 45;
 /// Minimum length of a well-formed hand packet (tag + 8 + 2 + 4 bytes).
 const HAND_PACKET_LEN: usize = 15;
+/// Minimum length of a rotation quaternion packet (tag + 8 + 4*4 bytes = 25).
+const ROTATION_PACKET_LEN: usize = 25;
 
 /// Parse one datagram into the coarsest packet type the bridge cares about.
 /// Malformed or unrecognised data yields `Unknown` rather than an error, so
@@ -52,6 +62,7 @@ pub fn parse_packet(buf: &[u8]) -> TelemetryPacket {
     match buf[0] {
         0x10 if buf.len() >= GYRO_PACKET_LEN => TelemetryPacket::Gyro(parse_gyro(buf)),
         0x11 if buf.len() >= HAND_PACKET_LEN => TelemetryPacket::Hand(parse_hand(buf)),
+        0x12 if buf.len() >= ROTATION_PACKET_LEN => TelemetryPacket::Rotation(parse_rotation(buf)),
         0x20 => TelemetryPacket::Ping,
         _ => {
             if is_phone_hello(buf) {
@@ -68,6 +79,7 @@ fn parse_gyro(buf: &[u8]) -> GyroSample {
         timestamp_ms: read_u64(&buf[1..9]),
         angular_velocity: [read_f32(buf, 9), read_f32(buf, 13), read_f32(buf, 17)],
         acceleration: [read_f32(buf, 21), read_f32(buf, 25), read_f32(buf, 29)],
+        magnetic_field: [read_f32(buf, 33), read_f32(buf, 37), read_f32(buf, 41)],
     }
 }
 
@@ -77,6 +89,13 @@ fn parse_hand(buf: &[u8]) -> HandFrame {
         hands: buf[9],
         landmarks_per_hand: buf[10],
         confidence: read_f32(buf, 11),
+    }
+}
+
+fn parse_rotation(buf: &[u8]) -> RotationSample {
+    RotationSample {
+        timestamp_ms: read_u64(&buf[1..9]),
+        quat: [read_f32(buf, 9), read_f32(buf, 13), read_f32(buf, 17), read_f32(buf, 21)],
     }
 }
 
@@ -116,7 +135,7 @@ mod tests {
     fn gyro_packet() -> Vec<u8> {
         let mut buf = vec![0x10];
         buf.extend_from_slice(&1234u64.to_le_bytes());
-        for value in [0.5f32, -0.2, 0.1, 1.0, 9.8, 0.0] {
+        for value in [0.5f32, -0.2, 0.1, 1.0, 9.8, 0.0, 22.1, -45.3, 11.7] {
             buf.extend_from_slice(&value.to_le_bytes());
         }
         buf
@@ -143,10 +162,12 @@ mod tests {
                 timestamp_ms,
                 angular_velocity,
                 acceleration,
+                magnetic_field,
             }) => {
                 assert_eq!(timestamp_ms, 1234);
                 assert_eq!(angular_velocity, [0.5, -0.2, 0.1]);
                 assert_eq!(acceleration, [1.0, 9.8, 0.0]);
+                assert_eq!(magnetic_field, [22.1, -45.3, 11.7]);
             }
             other => panic!("expected Gyro, got {other:?}"),
         }

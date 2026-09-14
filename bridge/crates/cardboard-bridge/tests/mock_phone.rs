@@ -14,13 +14,16 @@ const CAMERA_PORT: u16 = 42072;
 
 // --- Telemetry wire format builders (mirror the phone's encoding) ---
 
-fn build_gyro_packet(timestamp_ms: u64, ang_vel: [f32; 3], accel: [f32; 3]) -> Vec<u8> {
+fn build_gyro_packet(timestamp_ms: u64, ang_vel: [f32; 3], accel: [f32; 3], mag: [f32; 3]) -> Vec<u8> {
     let mut buf = vec![0x10]; // tag
     buf.extend_from_slice(&timestamp_ms.to_le_bytes());
     for v in ang_vel {
         buf.extend_from_slice(&v.to_le_bytes());
     }
     for v in accel {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in mag {
         buf.extend_from_slice(&v.to_le_bytes());
     }
     buf
@@ -47,14 +50,15 @@ fn build_hello_packet(version: u32) -> Vec<u8> {
 
 #[test]
 fn gyro_packet_roundtrip() {
-    let packet = build_gyro_packet(1234, [0.5, -0.2, 0.1], [1.0, 9.8, 0.0]);
-    assert_eq!(packet.len(), 33); // 1 + 8 + 6*4 = 33
+    let packet = build_gyro_packet(1234, [0.5, -0.2, 0.1], [1.0, 9.8, 0.0], [22.1, -45.3, 11.7]);
+    assert_eq!(packet.len(), 45); // 1 + 8 + 9*4 = 45
 
     match cardboard_bridge::net::telemetry::parse_packet(&packet) {
         cardboard_bridge::net::telemetry::TelemetryPacket::Gyro(sample) => {
             assert_eq!(sample.timestamp_ms, 1234);
             assert_eq!(sample.angular_velocity, [0.5, -0.2, 0.1]);
             assert_eq!(sample.acceleration, [1.0, 9.8, 0.0]);
+            assert_eq!(sample.magnetic_field, [22.1, -45.3, 11.7]);
         }
         other => panic!("expected Gyro, got {other:?}"),
     }
@@ -111,7 +115,7 @@ fn truncated_gyro_packet_is_rejected() {
     // 0x10 with too few bytes must not parse as gyro.
     let mut short = vec![0x10];
     short.extend_from_slice(&0u64.to_le_bytes());
-    // Missing the 6 f32 values (24 bytes).
+    // Missing the 9 f32 values (36 bytes).
     assert!(matches!(
         cardboard_bridge::net::telemetry::parse_packet(&short),
         cardboard_bridge::net::telemetry::TelemetryPacket::Unknown
@@ -126,7 +130,7 @@ fn app_state_tracks_telemetry_metrics() {
     assert_eq!(state.packets_total, 0);
     assert_eq!(state.hands_detected, 0);
 
-    state.note_gyro();
+    state.note_gyro(&cardboard_bridge::net::telemetry::GyroSample::default());
     state.note_hand(2);
     assert_eq!(state.packets_total, 2);
     assert_eq!(state.hands_detected, 2);
@@ -159,14 +163,14 @@ fn mock_phone_can_send_gyro_over_udp() {
     let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
     let target = sock.local_addr().unwrap();
 
-    let packet = build_gyro_packet(100, [1.0, 2.0, 3.0], [9.8, 0.0, 0.0]);
+    let packet = build_gyro_packet(100, [1.0, 2.0, 3.0], [9.8, 0.0, 0.0], [22.0, -45.0, 11.0]);
     let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
     sender.send_to(&packet, target).unwrap();
 
     let mut buf = [0u8; 65535];
     sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     let (n, _) = sock.recv_from(&mut buf).unwrap();
-    assert_eq!(n, 33);
+    assert_eq!(n, 45);
     assert_eq!(buf[0], 0x10); // gyro tag
 }
 

@@ -61,6 +61,16 @@ export global BridgeState {
     in-out property <int> camera-fps: 0;
     in-out property <bool> camera-connected: false;
 
+    in-out property <string> gyro-x: "0.00";
+    in-out property <string> gyro-y: "0.00";
+    in-out property <string> gyro-z: "0.00";
+    in-out property <string> accel-x: "0.00";
+    in-out property <string> accel-y: "0.00";
+    in-out property <string> accel-z: "0.00";
+    in-out property <string> mag-x: "0.00";
+    in-out property <string> mag-y: "0.00";
+    in-out property <string> mag-z: "0.00";
+
     callback apply-settings(int, int, int, int, int);
     callback toggle-preview(bool);
     callback open-preview();
@@ -854,16 +864,6 @@ component HandPage inherits VerticalLayout {
                 image-fit: contain;
             }
         }
-
-        HorizontalLayout {
-            spacing: 12px;
-
-            Metric {
-                label: "Camera FPS";
-                value: "{BridgeState.camera-fps}";
-                horizontal-stretch: 1;
-            }
-        }
     }
 
     Card {
@@ -917,12 +917,6 @@ component HandPage inherits VerticalLayout {
 
         HorizontalLayout {
             spacing: 12px;
-
-            Metric {
-                label: "Hand FPS";
-                value: "{BridgeState.hand-fps}";
-                horizontal-stretch: 1;
-            }
 
             Metric {
                 label: "Hands detected";

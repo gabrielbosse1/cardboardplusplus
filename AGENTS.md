@@ -6,6 +6,10 @@
 > stream + hand tracking ship together; protocol.rs is the single source of truth
 > for the wire layout, mirrored by BridgeProtocol.h).
 
+> **Debugging issues? Read `docs/LLM_DEBUG_GUIDE.md`.** It explains how to
+> enable debug logging on all three components, where to find logs, and how to
+> troubleshoot common problems (gyro, video, connectivity).
+
 **Core Principles:**
 1. **Ask before assuming** - always clarify when uncertain (with the question tool, not by stopping mid generation)
 2. **Websearch before guessing** - especially for OpenVR/SteamVR APIs (Every object name and function you will need)
@@ -362,7 +366,7 @@ push/PR → [android test] ─┘               └→ [release (on v* tags only
 Binary packets:
 | Tag | Type | Size | Payload |
 |-----|------|------|---------|
-| `0x10` | Gyro | 33B | u64 timestamp LE + 6×f32 LE (ang_vel + accel) |
+| `0x10` | Gyro | 45B | u64 timestamp LE + 9×f32 LE (ang_vel[3] + accel[3] + mag[3]); mag used for bridge diagnostics only (driver tracks via 0x12) |
 | `0x11` | Hand | 15B | u64 timestamp LE + u8 hands + u8 landmarks + f32 confidence LE |
 | `0x20` | Ping | 1B | bare tag byte |
 | text | Hello | variable | `"CARDBOARD_PHONE_HELLO vN"` |
@@ -435,3 +439,48 @@ wire constant, update ALL of:
 - [ ] Is your change the smallest possible diff that solves the problem?
 - [ ] Are you adding a new dependency? Is it truly necessary? (prefer stdlib)
 - [ ] Are you adding a new file? Does it belong in an existing folder?
+
+---
+
+## Mandatory End-to-End Testing
+
+After any code change, you MUST test the full stack when hardware is available.
+Don't just run unit tests — verify the real thing works.
+
+### What to test and how
+
+| Component | How to test | What to check |
+|-----------|------------|---------------|
+| **Bridge** | `cargo test --manifest-path bridge/crates/cardboard-bridge/Cargo.toml` | All tests pass |
+| **Bridge UI** | Run `bridge/target/debug/cardboard-bridge.exe`, open the window | Diagnostics tab shows live sensor values, status pills update |
+| **Driver** | Restart SteamVR, launch a VR app | HMD tracks head movement, no sine-wave bob |
+| **Phone app** | `adb install -r` the APK, launch the app | App starts, sends telemetry, green line is gone |
+| **Phone → Bridge** | Check bridge log for "phone connected", check gyro-fps > 0 | Telemetry packets arriving |
+| **Phone → Driver** | Move the phone, check SteamVR display | Head rotation matches phone movement |
+| **Video stream** | Launch VR app, check phone display | SBS video renders, no green line on bottom |
+
+### Test sequence after a change
+
+1. `cargo test` — unit tests pass
+2. `scripts\compile-all.ps1` — everything compiles
+3. `scripts\install-app.ps1` — APK on phone
+4. `scripts\install-driver.ps1` — DLL in SteamVR
+5. Launch bridge (`cardboard-bridge.exe`)
+6. Restart SteamVR
+7. Launch phone app
+8. Verify: bridge shows sensor data, driver tracks head, video renders clean
+
+### ADB phone connection
+
+If a phone is reachable on the network, always connect via ADB and install the
+latest build. Don't assume "it's already installed" — the user expects to test
+the latest code. Use:
+
+```
+$adb = "C:\Users\admin000\AppData\Local\Android\Sdk\platform-tools\adb.exe"
+& $adb connect "<ip>:<port>"
+& $adb install -r <apk_path>
+```
+
+If ADB connection fails, tell the user what port to enable on the phone.
+Never skip the install step.

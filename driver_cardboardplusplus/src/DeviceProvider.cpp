@@ -40,13 +40,16 @@ const char* const* DeviceProvider::GetInterfaceVersions()
 
 void DeviceProvider::RunFrame()
 {
+    static int count = 0;
+    count++;
+    if (count == 1) VRDriverLog()->Log("DeviceProvider::RunFrame FIRST CALL");
     m_controllerDriver->RunFrame();
     m_hmdDriver->RunFrame();
 }
 
 bool DeviceProvider::ShouldBlockStandbyMode()
 {
-    return false;
+    return true;
 }
 
 void DeviceProvider::EnterStandby() {}

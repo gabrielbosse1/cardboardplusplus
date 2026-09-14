@@ -138,8 +138,12 @@ constexpr const char* kTexFragmentShader =
     precision mediump float;
     varying vec2 v_TexCoord;
     uniform samplerExternalOES sTexture;
+    uniform float u_VMax;
     void main() {
-      gl_FragColor = texture2D(sTexture, vec2(v_TexCoord.x, 1.0 - v_TexCoord.y));
+      // u_VMax clamps V to skip macroblock padding rows at the bottom of
+      // H.264 frames (coded height > actual content height). Defaults to 1.0.
+      float v = 1.0 - v_TexCoord.y * u_VMax;
+      gl_FragColor = texture2D(sTexture, vec2(v_TexCoord.x, v));
     })glsl";
 
 // Regular 2D texture sampler for eye textures
@@ -230,6 +234,7 @@ void CardboardPlusPlusApp::OnSurfaceCreated(JNIEnv* env) {
   tex_tex_coord_param_ = glGetAttribLocation(tex_program_, "a_TexCoord");
   tex_mvp_param_ = glGetUniformLocation(tex_program_, "u_MVPMatrix");
   tex_texture_param_ = glGetUniformLocation(tex_program_, "sTexture");
+  tex_vmax_param_ = glGetUniformLocation(tex_program_, "u_VMax");
 
   CHECKGLERROR("Tex program params");
 
@@ -622,6 +627,7 @@ void CardboardPlusPlusApp::DrawCameraQuad(GLuint texture_id) {
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_EXTERNAL_OES, texture_id);
   glUniform1i(tex_texture_param_, 0);
+  glUniform1f(tex_vmax_param_, tex_vmax_value_);
 
   quad_.Draw();
 

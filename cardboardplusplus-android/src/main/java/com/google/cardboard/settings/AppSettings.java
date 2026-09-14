@@ -17,6 +17,7 @@ public class AppSettings {
   private static final String KEY_BITRATE_KBPS = "bitrate_kbps";
   private static final String KEY_CODEC = "codec";
   private static final String KEY_PC_IP = "pc_ip";
+  private static final String KEY_DEBUG_LOGGING = "debug_logging";
 
   private final SharedPreferences prefs;
 
@@ -26,6 +27,7 @@ public class AppSettings {
   private int bitrateKbps;
   private VideoCodec codec;
   private String pcIp;
+  private boolean debugLogging;
 
   public AppSettings(Context context) {
     this.prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
@@ -39,6 +41,7 @@ public class AppSettings {
     bitrateKbps = prefs.getInt(KEY_BITRATE_KBPS, 20000);
     codec = VideoCodec.fromName(prefs.getString(KEY_CODEC, VideoCodec.H264.name()));
     pcIp = prefs.getString(KEY_PC_IP, "");
+    debugLogging = prefs.getBoolean(KEY_DEBUG_LOGGING, false);
   }
 
   public int getVideoWidth() {
@@ -90,5 +93,15 @@ public class AppSettings {
   public void setCodec(VideoCodec c) {
     codec = c;
     prefs.edit().putString(KEY_CODEC, c.name()).apply();
+  }
+
+  /** Whether verbose debug logging is enabled. Off by default to avoid log spam. */
+  public boolean isDebugLogging() {
+    return debugLogging;
+  }
+
+  public void setDebugLogging(boolean enabled) {
+    debugLogging = enabled;
+    prefs.edit().putBoolean(KEY_DEBUG_LOGGING, enabled).apply();
   }
 }

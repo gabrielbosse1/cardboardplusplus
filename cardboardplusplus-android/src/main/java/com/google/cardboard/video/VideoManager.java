@@ -3,6 +3,7 @@ package com.google.cardboard.video;
 import android.util.Log;
 import com.google.cardboard.NativeBridge;
 import com.google.cardboard.core.AppConstants;
+import com.google.cardboard.core.DebugLog;
 import com.google.cardboard.settings.AppSettings;
 
 /**
@@ -12,6 +13,7 @@ import com.google.cardboard.settings.AppSettings;
  */
 public class VideoManager {
   private static final String TAG = VideoManager.class.getSimpleName();
+  private static final DebugLog DBG = new DebugLog(TAG);
 
   private final NativeBridge bridge;
   private final DecoderCapabilityReporter capabilityReporter;
@@ -26,6 +28,11 @@ public class VideoManager {
   public VideoManager(NativeBridge bridge, AppSettings appSettings) {
     this.bridge = bridge;
     this.capabilityReporter = new DecoderCapabilityReporter(TAG, appSettings);
+  }
+
+  /** Query the hardware decoder cap (max supported resolution). */
+  public int[] queryDecoderCap() {
+    return capabilityReporter.queryDecoderCapability();
   }
 
   /** Called by the activity when the user re-runs discovery (e.g. after a PC restart). */
@@ -51,11 +58,8 @@ public class VideoManager {
     }
     bridge.startVideoReceiver(AppConstants.VIDEO_PORT);
     Log.i(TAG, "Video receiver started on port " + AppConstants.VIDEO_PORT);
-    // Report this device's hardware decoder cap to the PC so the encoder can be
-    // clamped to what the decoder actually supports.
-    int[] cap = capabilityReporter.queryDecoderCapability();
-    Log.i(TAG, "Hardware decoder cap: " + cap[0] + "x" + cap[1]);
-    capabilityReporter.sendCapToPc(cap[0], cap[1]);
+    // Decoder cap is now announced by DiscoveryManager on its proven socket
+    // (the separate-socket send was silently dropped by Windows firewall).
     startWatchdog();
   }
 

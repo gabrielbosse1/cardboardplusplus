@@ -4,6 +4,7 @@ import android.media.MediaCodecInfo;
 import android.media.MediaCodecList;
 import android.util.Log;
 import com.google.cardboard.core.AppConstants;
+import com.google.cardboard.core.DebugLog;
 import com.google.cardboard.network.NetworkUtils;
 import com.google.cardboard.settings.AppSettings;
 import java.net.DatagramPacket;
@@ -22,6 +23,7 @@ import java.util.Arrays;
  * part of the runtime protocol shared with the PC driver and must not change.
  */
 final class DecoderCapabilityReporter {
+  private static final DebugLog DBG = new DebugLog("DecoderCap");
   // Wire protocol prefix (shared with the driver) - format: "CARDBOARD_CAP W H".
   private static final String CAP_MESSAGE_PREFIX = "CARDBOARD_CAP ";
   // The PC may not be listening yet; sending a few times avoids dropping the cap notice.
@@ -79,7 +81,7 @@ final class DecoderCapabilityReporter {
                       new DatagramPacket(data, data.length, addr, AppConstants.UDP_DISCOVERY_PORT));
                   Thread.sleep(CAP_SEND_GAP_MS);
                 }
-                Log.i(tag, "Sent decoder cap to PC (" + addr.getHostAddress() + "): " + msg);
+                DBG.i("Sent decoder cap to PC (%s): %s", addr.getHostAddress(), msg);
               } catch (Exception e) {
                 Log.w(tag, "Failed to send decoder cap to PC", e);
               }

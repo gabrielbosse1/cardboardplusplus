@@ -30,6 +30,8 @@ pub fn handle(mut request: Request, core: &AppCore) {
         (Method::Get, "/preview") => ok_json(&preview_payload(core)),
         (Method::Post, "/preview") => set_preview(&mut request, core),
         (Method::Post, "/settings") => apply_settings(&mut request, core),
+        (Method::Get, "/debug") => ok_json(&debug_payload()),
+        (Method::Post, "/debug") => set_debug(&mut request),
         _ => text(StatusCode(404), NOT_FOUND_BODY),
     };
 
@@ -182,3 +184,38 @@ fn ok_json<T: serde::Serialize>(body: &T) -> Response<std::io::Cursor<Vec<u8>>> 
 
 /// Fallback for unknown routes (kept as raw text, matching `/`).
 const NOT_FOUND_BODY: &str = "{\"error\":\"not found — GET / for the endpoint index\"}";
+
+/// GET /debug — current debug state.
+fn debug_payload() -> serde_json::Value {
+    serde_json::json!({
+        "debug": crate::app::debug_enabled(),
+        "hint": "POST /debug {\"enabled\":true} to toggle verbose logging",
+    })
+}
+
+/// POST /debug — toggle debug logging at runtime.
+fn set_debug(request: &mut Request) -> Response<std::io::Cursor<Vec<u8>>> {
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct DebugPayload {
+        enabled: bool,
+    }
+
+    let body = read_body_bytes(request);
+    let parsed: DebugPayload = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(_) => {
+            return json(
+                StatusCode(400),
+                &serde_json::json!({"error": "body must be JSON like {\"enabled\":true}"}),
+            );
+        }
+    };
+
+    crate::app::set_debug_enabled(parsed.enabled);
+    ok_json(&serde_json::json!({
+        "ok": true,
+        "debug": parsed.enabled,
+    }))
+}

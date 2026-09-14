@@ -1,5 +1,6 @@
 #include "HmdDriver.h"
 #include "DriverLog.h"
+#include "DebugLog.h"
 #include "CardboardWire.h"
 #include "H264Utils.h"
 #include <cstdlib>
@@ -37,6 +38,12 @@ static void SendFramedUdp(SOCKET socket, const sockaddr_in* addr,
                 if (*droppedCounter % 30 == 1) {
                     DriverLog("[UDP] Send buffer full, dropping frame (dropped=%d)", (int)*droppedCounter);
                 }
+            } else {
+                // Non-WOULDBLOCK errors are unusual — log every one
+                char targetIp[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &addr->sin_addr, targetIp, sizeof(targetIp));
+                DriverLog("[UDP] sendto error %d to %s:%d (size=%d)", err,
+                          targetIp, ntohs(addr->sin_port), chunkSize);
             }
             break; // drop the rest of this frame
         }
@@ -111,12 +118,12 @@ void HmdDriver::ShutdownUDP()
 void HmdDriver::OnEncodedPacket(uint8_t* data, int size, int64_t pts, bool keyframe)
 {
     if (keyframe && size >= 8) {
-        DriverLog("[Encoded] size=%d, pts=%lld, keyframe=YES, first16=%02X %02X %02X %02X %02X %02X %02X %02X",
+        DebugLog("[Encoded] size=%d, pts=%lld, keyframe=YES, first16=%02X %02X %02X %02X %02X %02X %02X %02X",
                   size, pts,
                   data[0], data[1], data[2], data[3],
                   data[4], data[5], data[6], data[7]);
     } else {
-        DriverLog("[Encoded] size=%d, pts=%lld, keyframe=%s, data[0]=0x%02X",
+        DebugLog("[Encoded] size=%d, pts=%lld, keyframe=%s, data[0]=0x%02X",
                   size, pts, keyframe ? "YES" : "NO", data[0]);
     }
 
@@ -145,7 +152,7 @@ void HmdDriver::OnEncodedPacket(uint8_t* data, int size, int64_t pts, bool keyfr
         SendFannedOut(fixed, fixedSize, framed, framedSize);
         free(framed);
         free(fixed);
-        DriverLog("[UDP] Fixed keyframe: inserted IDR start code at offset %d", ppsEnd);
+        DebugLog("[UDP] Fixed keyframe: inserted IDR start code at offset %d", ppsEnd);
         return;
     }
 
@@ -158,7 +165,7 @@ void HmdDriver::OnEncodedPacket(uint8_t* data, int size, int64_t pts, bool keyfr
     // Preview: raw Annex-B — ffplay demuxes start codes directly.
     SendFannedOut(data, size, framed, framedSize);
     free(framed);
-    DriverLog("[UDP] Sent framed packet: payload=%d bytes", size);
+    DebugLog("[UDP] Sent framed packet: payload=%d bytes", size);
 }
 
 void HmdDriver::SendFannedOut(const uint8_t* raw, int rawSize,
@@ -172,8 +179,24 @@ void HmdDriver::SendFannedOut(const uint8_t* raw, int rawSize,
 
     // Phone copy (only while a real phone target is set). Length-prefixed so
     // MediaCodec can reconstruct the exact AVPacket.
-    if (m_hasPhoneTarget.load(std::memory_order_relaxed)) {
+    bool hasTarget = m_hasPhoneTarget.load(std::memory_order_relaxed);
+    if (hasTarget) {
+        // Log phone send every 60 frames (~1 second at 60fps)
+        static uint64_t phoneLogCounter = 0;
+        if (++phoneLogCounter % 60 == 1) {
+            char phoneIp[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &m_serverAddr.sin_addr, phoneIp, sizeof(phoneIp));
+            DriverLog("[UDP] Sending to phone %s:%d (frames=%llu, raw=%d, framed=%d)",
+                      phoneIp, ntohs(m_serverAddr.sin_port),
+                      (unsigned long long)phoneLogCounter, rawSize, framedSize);
+        }
         SendFramedUdp(m_udpSocket, &m_serverAddr, framed, framedSize, &m_udpDroppedFrames);
         m_udpFramesSent.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        // Log when phone target is missing — every 5 seconds (300 frames)
+        static uint64_t noTargetCounter = 0;
+        if (++noTargetCounter % 300 == 1) {
+            DriverLog("[UDP] No phone target set (skipped phone send, frames=%llu)", (unsigned long long)noTargetCounter);
+        }
     }
 }

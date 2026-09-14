@@ -116,6 +116,11 @@ JNI_METHOD(void, nativeOnVideoActive)
   native(native_app)->OnVideoActive();
 }
 
+JNI_METHOD(void, nativeSetVideoVMax)
+(JNIEnv* /*env*/, jobject /*obj*/, jlong native_app, jfloat v_max) {
+  native(native_app)->SetVideoVMax(v_max);
+}
+
 JNI_METHOD(void, nativeResetCameraTexture)
 (JNIEnv* /*env*/, jobject /*obj*/, jlong native_app) {
   native(native_app)->ResetCameraTexture();

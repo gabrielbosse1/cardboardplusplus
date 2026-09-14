@@ -1,8 +1,11 @@
 ﻿#include "HmdDriver.h"
 #include "DriverLog.h"
+#include "DebugLog.h"
+#include "CardboardWire.h"
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 
 using namespace vr;
 
@@ -82,6 +85,10 @@ EVRInitError HmdDriver::Activate(uint32_t unObjectId)
         DriverLog("WARNING: Discovery initialization failed. Phone auto-detection will be disabled.");
     }
 
+    if (!InitializeSensorSocket()) {
+        DriverLog("WARNING: Sensor socket initialization failed. Head tracking will use synthetic data.");
+    }
+
     // Start background encoding thread. All slow work (GPU readback, pixel
     // conversion, encode, UDP send) happens here so Present() returns quickly
     // and the SteamVR compositor keeps its vsync pacing.
@@ -112,6 +119,12 @@ EVRInitError HmdDriver::Activate(uint32_t unObjectId)
     VRProperties()->SetFloatProperty(props, Prop_UserHeadToEyeDepthMeters_Float, 0.f);
     VRProperties()->SetBoolProperty(props, Prop_IsOnDesktop_Bool, false);
     VRProperties()->SetBoolProperty(props, Prop_DisplayDebugMode_Bool, false);
+    VRProperties()->SetBoolProperty(props, Prop_DeviceProvidesBatteryStatus_Bool, false);
+
+    // Fake proximity sensor: create boolean component "/proximity" and set it true.
+    // A device never goes to sleep while this is true, regardless of inactivity.
+    VRDriverInput()->CreateBooleanComponent(props, "/proximity", &m_proximityHandle);
+    VRDriverInput()->UpdateBooleanComponent(m_proximityHandle, true, 0);
 #ifdef DRIVER_NO_DIRECT_MODE
     VRProperties()->SetBoolProperty(props, Prop_HasDriverDirectModeComponent_Bool, false);
     DriverLog("HMD properties set: HasDriverDirectModeComponent=false (DIRECT MODE DISABLED), IsDisplayOnDesktop=false, DebugMode=false");
@@ -173,6 +186,7 @@ void HmdDriver::Deactivate()
     m_layerCopies.clear();
 
     ShutdownDiscovery();
+    ShutdownSensorSocket();
     ShutdownUDP();
     ShutdownVideoEncoder();
     DestroyAllSwapTextureSets(0);
@@ -222,25 +236,71 @@ DriverPose_t HmdDriver::GetPose()
     pose.result = TrackingResult_Running_OK;
     pose.deviceIsConnected = true;
 
-    static auto startTime = std::chrono::steady_clock::now();
-    auto now = std::chrono::steady_clock::now();
-    double elapsed = std::chrono::duration<double>(now - startTime).count();
+    // World-from-driver is always identity (driver origin = world origin).
+    pose.qWorldFromDriverRotation.w = 1.0;
+    pose.qWorldFromDriverRotation.x = 0.0;
+    pose.qWorldFromDriverRotation.y = 0.0;
+    pose.qWorldFromDriverRotation.z = 0.0;
 
-    float bobHeight = (float)(sin(elapsed * 2.0) * 0.02);
-    float swayX = (float)(sin(elapsed * 1.5) * 0.01);
+    // Staleness watchdog: if no sensor packet has arrived for kSensorStaleMs, the
+    // phone/bridge link is gone. Report the pose as invalid rather than freezing on
+    // the last sample (which previously made SteamVR show a "tracking" but dead headset).
+    // ponytail: accel (0x10) is a continuous sensor, so a 2s gap means the link truly died.
+    static constexpr int64_t kSensorStaleMs = 2000;
+    const int64_t lastRecv = m_lastSensorRecvMs.load(std::memory_order_relaxed);
+    const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const bool fresh = lastRecv != 0 && (nowMs - lastRecv) < kSensorStaleMs;
+    const int64_t lastRot = m_lastRotationRecvMs.load(std::memory_order_relaxed);
+    const bool rotFresh = lastRot != 0 && (nowMs - lastRot) < kSensorStaleMs;
 
+    bool hasQ = rotFresh && m_hasQuaternion.load(std::memory_order_relaxed);
+    bool hasS = fresh && m_hasSensorData.load(std::memory_order_relaxed);
+
+    if (!fresh) {
+        pose.poseIsValid = false;
+        pose.result = TrackingResult_Running_OutOfRange;
+        pose.qDriverFromHeadRotation.w = 1.0;
+        pose.qDriverFromHeadRotation.x = 0.0;
+        pose.qDriverFromHeadRotation.y = 0.0;
+        pose.qDriverFromHeadRotation.z = 0.0;
+        pose.qRotation = pose.qDriverFromHeadRotation;
+        return pose;
+    }
+
+    // Read the current quaternion (if available) for pose.
     HmdQuaternion_t quat;
     quat.w = 1.0;
     quat.x = 0.0;
     quat.y = 0.0;
     quat.z = 0.0;
 
-    pose.qWorldFromDriverRotation = quat;
-    pose.qDriverFromHeadRotation = quat;
+    if (hasQ) {
+        std::lock_guard<std::mutex> lock(m_sensorMutex);
+        quat.w = m_sensorQuat[0];
+        quat.x = m_sensorQuat[1];
+        quat.y = m_sensorQuat[2];
+        quat.z = m_sensorQuat[3];
+    } else {
+        static auto startTime = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        double elapsed = std::chrono::duration<double>(now - startTime).count();
+        pose.vecPosition[0] = (float)(sin(elapsed * 1.5) * 0.01);
+        pose.vecPosition[1] = (float)(sin(elapsed * 2.0) * 0.02);
+    }
 
-    pose.vecPosition[0] = swayX;
-    pose.vecPosition[1] = bobHeight;
-    pose.vecPosition[2] = 0.0;
+    pose.qDriverFromHeadRotation.w = 1.0;
+    pose.qDriverFromHeadRotation.x = 0.0;
+    pose.qDriverFromHeadRotation.y = 0.0;
+    pose.qDriverFromHeadRotation.z = 0.0;
+    pose.qRotation = quat;
+
+    {
+        static int counter = 0;
+        counter++;
+        DebugLog("GetPose #%d hasQ=%d hasS=%d q=(%.4f,%.4f,%.4f,%.4f) ts=%lld",
+                 counter, hasQ, hasS, quat.w, quat.x, quat.y, quat.z, (long long)m_sensorTimestampMs);
+    }
 
     return pose;
 }
@@ -250,6 +310,15 @@ void HmdDriver::RunFrame()
     // Update the server with our current pose each frame so compositor knows this HMD is present.
     DriverPose_t pose = GetPose();
     VRServerDriverHost()->TrackedDevicePoseUpdated(m_driverId, pose, sizeof(DriverPose_t));
+
+    {
+        static int rfCount = 0;
+        rfCount++;
+        if (rfCount % 300 == 1) {
+            DriverLog("RunFrame #%d driverId=%u hasQ=%d", rfCount, m_driverId,
+                      m_hasQuaternion.load(std::memory_order_relaxed) ? 1 : 0);
+        }
+    }
 
     if (m_bridgeInitialized.load(std::memory_order_relaxed)) {
         cbpp::PayloadSettingsChange s;
@@ -423,4 +492,177 @@ void HmdDriver::ShutdownBridge()
     m_bridgeServer.ShutdownCmdConsumer();
     m_bridgeServer.Stop();
     DriverLog("Bridge shared-memory regions released");
+}
+
+// ---------------------------------------------------------------------------
+// Sensor data forwarding: the bridge forwards phone telemetry (gyro/accel/mag)
+// to the driver on UDP port 42074. The packet format is identical to the
+// phone→bridge format (tag 0x10, 45 bytes LE) so the driver reuses the same
+// wire constants. GetPose() reads the latest sample under m_sensorMutex.
+// ---------------------------------------------------------------------------
+
+bool HmdDriver::InitializeSensorSocket()
+{
+    DriverLog("Initializing sensor socket...");
+
+    m_sensorSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (m_sensorSocket == INVALID_SOCKET) {
+        DriverLog("sensor socket() failed! WSAError: %d", WSAGetLastError());
+        return false;
+    }
+
+    BOOL reuseAddr = TRUE;
+    setsockopt(m_sensorSocket, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuseAddr, sizeof(reuseAddr));
+
+    sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(wire::kSensorPort);
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(m_sensorSocket, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+        DriverLog("sensor bind() failed on port %d! WSAError: %d", wire::kSensorPort, WSAGetLastError());
+        closesocket(m_sensorSocket);
+        m_sensorSocket = INVALID_SOCKET;
+        return false;
+    }
+
+    m_sensorInitialized = true;
+    m_sensorRunning = true;
+    m_sensorThread = std::thread(&HmdDriver::SensorThreadFunc, this);
+
+    DriverLog("Sensor socket initialized. Listening on port %d", wire::kSensorPort);
+    return true;
+}
+
+void HmdDriver::ShutdownSensorSocket()
+{
+    DriverLog("Shutting down sensor socket...");
+
+    if (m_sensorInitialized) {
+        m_sensorRunning = false;
+
+        // Send a dummy packet to unblock recvfrom.
+        SOCKET wakeSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (wakeSocket != INVALID_SOCKET) {
+            sockaddr_in localAddr;
+            localAddr.sin_family = AF_INET;
+            localAddr.sin_port = htons(wire::kSensorPort);
+            inet_pton(AF_INET, "127.0.0.1", &localAddr.sin_addr);
+            const char wake[] = { 0x00 };
+            sendto(wakeSocket, wake, 1, 0, (sockaddr*)&localAddr, sizeof(localAddr));
+            closesocket(wakeSocket);
+        }
+
+        if (m_sensorThread.joinable()) {
+            m_sensorThread.join();
+        }
+
+        if (m_sensorSocket != INVALID_SOCKET) {
+            closesocket(m_sensorSocket);
+            m_sensorSocket = INVALID_SOCKET;
+        }
+
+        m_sensorInitialized = false;
+    }
+
+    DriverLog("Sensor socket shutdown complete.");
+}
+
+void HmdDriver::SensorThreadFunc()
+{
+    DriverLog("Sensor thread started on port %d", wire::kSensorPort);
+
+    // Wire format: tag 0x10, u64 timestamp LE, 3x f32 gyro, 3x f32 accel, 3x f32 mag = 45 bytes.
+    static constexpr int kSensorPacketLen = 45;
+    uint8_t buffer[64];
+    sockaddr_in senderAddr;
+    int senderAddrLen = sizeof(senderAddr);
+
+    // Set a 2-second receive timeout so we can log periodic status.
+    DWORD recvTimeout = 2000;
+    setsockopt(m_sensorSocket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&recvTimeout, sizeof(recvTimeout));
+
+    int logCounter = 0;
+    int recvCount = 0;
+
+    while (m_sensorRunning) {
+        senderAddrLen = sizeof(senderAddr);
+        int bytesReceived = recvfrom(m_sensorSocket, (char*)buffer, sizeof(buffer), 0,
+                                     (sockaddr*)&senderAddr, &senderAddrLen);
+
+        if (!m_sensorRunning) break;
+        if (bytesReceived == SOCKET_ERROR) {
+            int err = WSAGetLastError();
+            if (err == WSAETIMEDOUT) {
+                logCounter++;
+                DebugLogThrottle(3, "Sensor: no data received after %d timeouts (hasData=%d)", logCounter, m_hasSensorData.load() ? 1 : 0);
+                continue;
+            }
+            if (m_sensorRunning) {
+                DriverLog("Sensor recvfrom error: %d", err);
+            }
+            continue;
+        }
+
+        DebugLogThrottle(50, "Sensor recv: %d bytes, tag=0x%02x", bytesReceived, buffer[0]);
+
+        if (bytesReceived >= kSensorPacketLen && buffer[0] == 0x10) {
+            // Parse the sensor packet (little-endian).
+            uint64_t timestamp = 0;
+            std::memcpy(&timestamp, &buffer[1], 8);
+
+            float gyro[3], accel[3], mag[3];
+            std::memcpy(gyro,  &buffer[9],  12);
+            std::memcpy(accel, &buffer[21], 12);
+            std::memcpy(mag,   &buffer[33], 12);
+
+            // Store the latest sample under the mutex so GetPose() can read it.
+            {
+                std::lock_guard<std::mutex> lock(m_sensorMutex);
+                std::memcpy(m_sensorGyro, gyro, 12);
+                std::memcpy(m_sensorAccel, accel, 12);
+                std::memcpy(m_sensorMag, mag, 12);
+                m_sensorTimestampMs = timestamp;
+            }
+            m_hasSensorData.store(true, std::memory_order_relaxed);
+            m_lastSensorRecvMs.store(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count(),
+                std::memory_order_relaxed);
+            recvCount++;
+
+            DebugLog("Sensor pkt #%d: gyro=(%.3f,%.3f,%.3f) accel=(%.1f,%.1f,%.1f) ts=%llu",
+                recvCount, gyro[0], gyro[1], gyro[2], accel[0], accel[1], accel[2], (unsigned long long)timestamp);
+        } else if (bytesReceived >= 25 && buffer[0] == 0x12) {
+            // Fused rotation quaternion from Android TYPE_ROTATION_VECTOR.
+            uint64_t timestamp = 0;
+            std::memcpy(&timestamp, &buffer[1], 8);
+            float quat[4];
+            std::memcpy(quat, &buffer[9], 16);
+
+            {
+                std::lock_guard<std::mutex> lock(m_sensorMutex);
+                std::memcpy(m_sensorQuat, quat, 16);
+                m_sensorTimestampMs = timestamp;
+            }
+            m_hasQuaternion.store(true, std::memory_order_relaxed);
+            m_hasSensorData.store(true, std::memory_order_relaxed);
+            m_lastSensorRecvMs.store(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count(),
+                std::memory_order_relaxed);
+            m_lastRotationRecvMs.store(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count(),
+                std::memory_order_relaxed);
+            recvCount++;
+
+            DebugLog("Rotation pkt #%d: quat=(%.3f,%.3f,%.3f,%.3f) ts=%llu",
+                recvCount, quat[0], quat[1], quat[2], quat[3], (unsigned long long)timestamp);
+        } else {
+            DriverLog("Sensor: got %d bytes, tag=0x%02x (not 0x10/0x12)", bytesReceived, buffer[0]);
+        }
+    }
+
+    DriverLog("Sensor thread exiting (received %d packets total)", recvCount);
 }

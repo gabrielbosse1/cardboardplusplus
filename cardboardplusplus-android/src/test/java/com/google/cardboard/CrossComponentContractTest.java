@@ -1,5 +1,6 @@
 package com.google.cardboard;
 
+import com.google.cardboard.core.AppConstants;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import org.junit.Test;
@@ -28,27 +29,35 @@ public class CrossComponentContractTest {
         //   buf[21..25] = f32 acceleration[0] (LE)
         //   buf[25..29] = f32 acceleration[1] (LE)
         //   buf[29..33] = f32 acceleration[2] (LE)
+        //   buf[33..37] = f32 magnetic_field[0] (LE)
+        //   buf[37..41] = f32 magnetic_field[1] (LE)
+        //   buf[41..45] = f32 magnetic_field[2] (LE)
         long timestamp = 1234L;
         float[] angVel = {0.5f, -0.2f, 0.1f};
         float[] accel = {1.0f, 9.8f, 0.0f};
+        float[] mag = {22.1f, -45.3f, 11.7f};
 
-        ByteBuffer buf = ByteBuffer.allocate(33).order(ByteOrder.LITTLE_ENDIAN);
+        ByteBuffer buf = ByteBuffer.allocate(45).order(ByteOrder.LITTLE_ENDIAN);
         buf.put((byte) 0x10);
         buf.putLong(timestamp);
         for (float v : angVel) buf.putFloat(v);
         for (float v : accel) buf.putFloat(v);
+        for (float v : mag) buf.putFloat(v);
         byte[] packet = buf.array();
 
         // Verify tag
         assertEquals(0x10, packet[0]);
-        // Verify length (1 + 8 + 6*4 = 33)
-        assertEquals(33, packet.length);
+        // Verify length (1 + 8 + 9*4 = 45)
+        assertEquals(45, packet.length);
         // Verify timestamp is LE u64
         long parsedTimestamp = ByteBuffer.wrap(packet, 1, 8).order(ByteOrder.LITTLE_ENDIAN).getLong();
         assertEquals(timestamp, parsedTimestamp);
         // Verify first angular velocity is LE f32
         float parsedAngVel0 = ByteBuffer.wrap(packet, 9, 4).order(ByteOrder.LITTLE_ENDIAN).getFloat();
         assertEquals(angVel[0], parsedAngVel0, 0.001f);
+        // Verify magnetic field is at correct offset
+        float parsedMag0 = ByteBuffer.wrap(packet, 33, 4).order(ByteOrder.LITTLE_ENDIAN).getFloat();
+        assertEquals(mag[0], parsedMag0, 0.001f);
     }
 
     @Test

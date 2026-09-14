@@ -9,8 +9,10 @@ import android.view.View;
 import android.view.inputmethod.EditorInfo;
 import android.widget.EditText;
 import android.widget.PopupMenu;
+import android.widget.Toast;
 import com.google.cardboard.NativeBridge;
 import com.google.cardboard.R;
+import com.google.cardboard.core.DebugLog;
 
 /**
  * Owns the settings popup menu (switch viewer / set PC IP).
@@ -47,7 +49,22 @@ public class SettingsMenuController implements PopupMenu.OnMenuItemClickListener
       showPcIpDialog();
       return true;
     }
+    if (item.getItemId() == R.id.toggle_debug) {
+      toggleDebugLogging();
+      return true;
+    }
     return false;
+  }
+
+  private void toggleDebugLogging() {
+    boolean newState = !appSettings.isDebugLogging();
+    appSettings.setDebugLogging(newState);
+    DebugLog.setGlobalEnabled(newState);
+    Toast.makeText(
+        anchor.getContext(),
+        newState ? R.string.debug_on : R.string.debug_off,
+        Toast.LENGTH_SHORT)
+        .show();
   }
 
   private void showPcIpDialog() {

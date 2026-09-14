@@ -19,6 +19,8 @@ pub const TELEMETRY_PORT: u16 = 42071;
 pub const CAMERA_PORT: u16 = 42072;
 /// TCP port for the Python MediaPipe hand-landmark server.
 pub const MEDIAPIPE_PORT: u16 = 42073;
+/// UDP port for bridge → driver sensor data forwarding (binary, same format as phone→bridge).
+pub const SENSOR_PORT: u16 = 42074;
 
 /// Which encoder the driver should use, in the same order the UI exposes them
 /// (index 0 = auto, then AMF, NVENC, QSV, libx264).

@@ -6,6 +6,8 @@ mod hand_overlay;
 mod net;
 mod server;
 
+pub(crate) use app::debug_log;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,6 +17,11 @@ use slint::{Timer, TimerMode};
 
 fn main() {
     let headless = std::env::args().any(|a| a == "--headless");
+
+    // Enable debug logging if CARDBOARD_DEBUG=1 or --debug flag.
+    let debug = std::env::args().any(|a| a == "--debug")
+        || std::env::var("CARDBOARD_DEBUG").map(|v| v == "1").unwrap_or(false);
+    app::set_debug_enabled(debug);
 
     // All logic lives in the UI-independent core; the server and the window
     // are two views over the same AppCore instance. The headless flag drops
@@ -108,6 +115,15 @@ fn start_state_poller(core: Arc<AppCore>, weak: slint::Weak<MainWindow>) {
         global.set_preview_frames(snap.preview_frames as i32);
         global.set_preview_drops(snap.preview_drops as i32);
         global.set_camera_connected(snap.camera_connected);
+        global.set_gyro_x(format!("{:.2}", snap.latest_gyro_x).into());
+        global.set_gyro_y(format!("{:.2}", snap.latest_gyro_y).into());
+        global.set_gyro_z(format!("{:.2}", snap.latest_gyro_z).into());
+        global.set_accel_x(format!("{:.2}", snap.latest_accel_x).into());
+        global.set_accel_y(format!("{:.2}", snap.latest_accel_y).into());
+        global.set_accel_z(format!("{:.2}", snap.latest_accel_z).into());
+        global.set_mag_x(format!("{:.2}", snap.latest_mag_x).into());
+        global.set_mag_y(format!("{:.2}", snap.latest_mag_y).into());
+        global.set_mag_z(format!("{:.2}", snap.latest_mag_z).into());
         if let Some(img) = core.take_preview_frame() {
             global.set_preview_frame(img);
         }

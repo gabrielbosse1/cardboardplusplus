@@ -1,5 +1,6 @@
 #include "HmdDriver.h"
 #include "DriverLog.h"
+#include "DebugLog.h"
 #include "CardboardWire.h"
 #include <cstdio>
 #include <cstring>
@@ -161,7 +162,7 @@ void HmdDriver::DiscoveryThreadFunc()
                 sendto(m_discoverySocket, wire::kBridgeAck, (int)wire::kBridgeAckLen, 0,
                        (sockaddr*)&responseAddr, sizeof(responseAddr));
                 SendBridgeStats(responseAddr);
-                DriverLog("BRIDGE_HELLO from %s:%d acked with BRIDGE_ACK + BRIDGE_STATS (data target untouched)", senderIpStr, ntohs(senderAddr.sin_port));
+                DebugLog("BRIDGE_HELLO from %s:%d acked with BRIDGE_ACK + BRIDGE_STATS (data target untouched)", senderIpStr, ntohs(senderAddr.sin_port));
                 continue;
             }
 
@@ -171,14 +172,14 @@ void HmdDriver::DiscoveryThreadFunc()
                 // cuts it. Only the preview target is affected, never the phone's.
                 bool enabled = (strstr(buffer, "1") != nullptr);
                 m_previewEnabled.store(enabled, std::memory_order_relaxed);
-                DriverLog("BRIDGE_PREVIEW from %s:%d -> local preview %s", senderIpStr, ntohs(senderAddr.sin_port), enabled ? "ON" : "OFF");
+                DebugLog("BRIDGE_PREVIEW from %s:%d -> local preview %s", senderIpStr, ntohs(senderAddr.sin_port), enabled ? "ON" : "OFF");
                 continue;
             }
 
             if (strncmp(buffer, wire::kBridgeCfg, wire::kBridgeCfgLen) == 0) {
                 // The bridge pushes stream settings (BRIDGE_CFG <fps> <bitrate> <codec>)
                 // on the same socket. It is control-plane traffic, not a phone — ignore.
-                DriverLog("BRIDGE_CFG from %s:%d ignored (control-plane)", senderIpStr, ntohs(senderAddr.sin_port));
+                DebugLog("BRIDGE_CFG from %s:%d ignored (control-plane)", senderIpStr, ntohs(senderAddr.sin_port));
                 continue;
             }
 
@@ -194,7 +195,7 @@ void HmdDriver::DiscoveryThreadFunc()
             sendto(m_discoverySocket, wire::kDiscoveryAck, (int)wire::kDiscoveryAckLen, 0,
                    (sockaddr*)&responseAddr, sizeof(responseAddr));
 
-            DriverLog("Discovery ACK sent to %s", senderIpStr);
+            DebugLog("Discovery ACK sent to %s", senderIpStr);
         }
 
         // Check if the phone has timed out (no packets for kPhoneTimeoutMs).
@@ -275,5 +276,5 @@ void HmdDriver::SwitchDataTarget(const char* phoneIp)
     inet_pton(AF_INET, phoneIp, &m_serverAddr.sin_addr);
     m_hasPhoneTarget.store(true, std::memory_order_relaxed);
 
-    DriverLog("Data target switched to %s:%d (phone copy enabled alongside local preview)", phoneIp, wire::kDataPort);
+    DebugLog("Data target switched to %s:%d (phone copy enabled alongside local preview)", phoneIp, wire::kDataPort);
 }

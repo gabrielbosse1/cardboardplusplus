@@ -3,6 +3,7 @@
 //! REST API show.
 
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 /// Cheaply-clonable handle to the bridge state. Every worker thread (REST
@@ -14,6 +15,19 @@ pub type SharedState = Arc<Mutex<AppState>>;
 
 /// The log view (UI + `/logs`) only keeps this many newest lines.
 const MAX_LOG_LINES: usize = 200;
+
+/// Global debug flag. Toggle via `CARDBOARD_DEBUG=1` env var or `POST /debug`.
+static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Check if debug logging is enabled.
+pub fn debug_enabled() -> bool {
+    DEBUG_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Toggle debug logging at runtime.
+pub fn set_debug_enabled(enabled: bool) {
+    DEBUG_ENABLED.store(enabled, Ordering::Relaxed);
+}
 
 /// Everything worth knowing about the current session. Plain data only — no
 /// Slint or network types leak in here, which keeps the REST/UI views trivial.
@@ -44,6 +58,11 @@ pub struct AppState {
     pub camera_frame_time: Instant,
     /// Hands detected by the bridge-side ONNX pipeline (separate from phone telemetry).
     pub camera_detected_hands: usize,
+    // -- latest sensor sample (for UI display and driver forwarding) --
+    pub latest_gyro: [f32; 3],
+    pub latest_accel: [f32; 3],
+    pub latest_mag: [f32; 3],
+    pub latest_timestamp_ms: u64,
     // -- private accounting used to derive the per-second fps figures above --
     gyro_pulse_count: u64,
     hand_pulse_count: u64,
@@ -75,6 +94,10 @@ impl Default for AppState {
             camera_frame: None,
             camera_frame_time: Instant::now(),
             camera_detected_hands: 0,
+            latest_gyro: [0.0; 3],
+            latest_accel: [0.0; 3],
+            latest_mag: [0.0; 3],
+            latest_timestamp_ms: 0,
             gyro_pulse_count: 0,
             hand_pulse_count: 0,
             fps_window_started: Instant::now(),
@@ -111,10 +134,14 @@ impl AppState {
     }
 
     /// A gyro sample arrived: counts toward both the gyro rate and the total
-    /// telemetry packet tally.
-    pub fn note_gyro(&mut self) {
+    /// telemetry packet tally; stores the latest values for UI/driver.
+    pub fn note_gyro(&mut self, sample: &crate::net::telemetry::GyroSample) {
         self.gyro_pulse_count += 1;
         self.packets_total += 1;
+        self.latest_gyro = sample.angular_velocity;
+        self.latest_accel = sample.acceleration;
+        self.latest_mag = sample.magnetic_field;
+        self.latest_timestamp_ms = sample.timestamp_ms;
     }
 
     /// A hand-tracking frame arrived: counts toward the hand rate and records
@@ -154,6 +181,18 @@ impl AppState {
         }
     }
 }
+
+/// Append a debug-only line to the ring log. Only fires when debug is enabled.
+macro_rules! debug_log {
+    ($state:expr, $($arg:tt)*) => {
+        if $crate::app::debug_enabled() {
+            if let Ok(mut s) = $state.lock() {
+                s.push_log(format!($($arg)*));
+            }
+        }
+    };
+}
+pub(crate) use debug_log;
 
 #[cfg(test)]
 mod tests {
@@ -200,7 +239,7 @@ mod tests {
     #[test]
     fn every_telemetry_packet_counts_toward_the_tally() {
         let mut s = AppState::default();
-        s.note_gyro();
+        s.note_gyro(&crate::net::telemetry::GyroSample::default());
         s.note_hand(2);
         assert_eq!(s.packets_total, 2);
         assert_eq!(s.hands_detected, 2);

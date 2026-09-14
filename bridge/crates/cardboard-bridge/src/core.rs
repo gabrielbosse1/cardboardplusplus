@@ -45,6 +45,15 @@ pub struct StatusSnapshot {
     pub preview_drops: u64,
     pub camera_connected: bool,
     pub camera_detected_hands: usize,
+    pub latest_gyro_x: f32,
+    pub latest_gyro_y: f32,
+    pub latest_gyro_z: f32,
+    pub latest_accel_x: f32,
+    pub latest_accel_y: f32,
+    pub latest_accel_z: f32,
+    pub latest_mag_x: f32,
+    pub latest_mag_y: f32,
+    pub latest_mag_z: f32,
 }
 
 impl From<&AppState> for StatusSnapshot {
@@ -69,6 +78,15 @@ impl From<&AppState> for StatusSnapshot {
             preview_drops: s.preview_drops,
             camera_connected: s.camera_connected,
             camera_detected_hands: s.camera_detected_hands,
+            latest_gyro_x: s.latest_gyro[0],
+            latest_gyro_y: s.latest_gyro[1],
+            latest_gyro_z: s.latest_gyro[2],
+            latest_accel_x: s.latest_accel[0],
+            latest_accel_y: s.latest_accel[1],
+            latest_accel_z: s.latest_accel[2],
+            latest_mag_x: s.latest_mag[0],
+            latest_mag_y: s.latest_mag[1],
+            latest_mag_z: s.latest_mag[2],
         }
     }
 }
@@ -89,7 +107,7 @@ pub struct AppliedSettings {
 /// started or the TCP connection fails after retries.
 fn spawn_mediapipe_server(state: &SharedState) -> Option<MediapipeClient> {
     // First try connecting to an already-running server (e.g. started manually).
-    if let Ok(client) = MediapipeClient::connect(MEDIAPIPE_PORT) {
+    if let Ok(client) = MediapipeClient::try_once(MEDIAPIPE_PORT) {
         if let Ok(mut s) = state.lock() {
             s.push_log("mediapipe: connected to existing server".into());
         }
@@ -106,8 +124,23 @@ fn spawn_mediapipe_server(state: &SharedState) -> Option<MediapipeClient> {
             if near.is_file() {
                 Some(near)
             } else {
-                // Go up from target/debug/ to bridge/
-                exe_dir.parent().and_then(|p| p.parent()).and_then(|p| p.parent()).map(|p| p.join("mediapipe_server.py")).filter(|p| p.is_file())
+                // Try bridge/crates/cardboard-bridge/ (dev layout)
+                let dev_candidate = exe_dir
+                    .parent() // target/debug -> target
+                    .and_then(|p| p.parent()) // target -> bridge
+                    .and_then(|p| p.parent()) // bridge -> repo root
+                    .map(|p| p.join("bridge").join("crates").join("cardboard-bridge").join("mediapipe_server.py"))
+                    .filter(|p| p.is_file());
+                if dev_candidate.is_some() {
+                    dev_candidate
+                } else {
+                    // Try going up to bridge/ and looking in crates/cardboard-bridge/
+                    exe_dir
+                        .parent() // target/debug -> target
+                        .and_then(|p| p.parent()) // target -> bridge
+                        .map(|p| p.join("crates").join("cardboard-bridge").join("mediapipe_server.py"))
+                        .filter(|p| p.is_file())
+                }
             }
         } else {
             None
