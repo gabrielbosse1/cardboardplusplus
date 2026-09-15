@@ -33,8 +33,8 @@ the whole project before touching any code.
 │  · creates HMD       │   │  · Cardboard SDK renderer    │
 │  · encodes H264      │   │  · decodes H264 (MediaCodec) │
 │  · sends UDP to phone│   │  · camera preview            │
-│  · hand-tracking axis│   │  · MediaPipe hand model      │
-│    relay → SteamVR   │   │    → sends hands to driver   │
+│  · hand-tracking axis│   │  · camera JPEG → Bridge      │
+│    relay → SteamVR   │   │    (MediaPipe runs there)    │
 └──────────────────────┘   └──────────────────────────────┘
 ```
 
@@ -47,8 +47,10 @@ the whole project before touching any code.
 - **Side bar** has sections:
   - **Stream**: edit resolution, bitrate, speed/FPS, encoder selection, start/stop.
     These settings are pushed down to the driver (and mirrored for the client).
-  - **Camera**: phone camera passthrough + hand tracking. Uses a MediaPipe model
-    running on the **phone** to detect hands; the hand data is sent back to the
+  - **Camera**: phone camera passthrough + hand tracking. The phone streams
+    camera JPEGs to the Bridge, which runs the MediaPipe hand model in a Python
+    sidecar (`bridge/crates/cardboard-bridge/mediapipe_server.py`, TCP 42073);
+    on-phone inference is a future option, not the current path. The hand data is sent back to the
     SteamVR driver, which feeds it to SteamVR as bone/controller input. This means
     hands are exposed to SteamVR apps like real tracked objects.
   - **General**: automatic installers. The Bridge ships with the compiled driver
@@ -80,14 +82,18 @@ the whole project before touching any code.
   control + telemetry plane over shared memory (`bridge-shm`):
   - driver → Bridge: status, frame counts, telemetry, encoder stats
   - Bridge → driver: settings (resolution, bitrate, speed, etc.)
-- The phone app decodes the UDP H264 with MediaCodec and renders. It is also the
-  hand-tracking compute node (MediaPipe), sending hand poses back to the driver.
+- The phone app decodes the UDP H264 with MediaCodec and renders. It streams
+  camera JPEGs to the Bridge, which is the hand-tracking compute node
+  (MediaPipe sidecar, TCP 42073).
 
 ## Hand tracking (the reason the whole thing must ship together)
 
-- Runs on the **Android client** using the device camera + a MediaPipe hand model.
-- The phone sends detected hand/joint data back to the SteamVR driver (over the
-  same UDP link or a dedicated channel).
+- Runs on the **Bridge** using the phone's camera stream: the phone sends JPEG
+  frames (UDP 42072), the Bridge forwards them to `mediapipe_server.py` (TCP
+  42073) and gets back 21-landmark hands, which go to the SteamVR driver.
+- Running the model **on the phone** is a future option (the phone already sends
+  `0x11` hand-presence hints over telemetry); today the phone does no inference —
+  its `tracking/` folder is empty.
 - The driver exposes the hands to SteamVR as tracked skeleton/controller input, so
   VR apps see your hands.
 - **Integration rule:** a stream that works but has no hand tracking is NOT a
