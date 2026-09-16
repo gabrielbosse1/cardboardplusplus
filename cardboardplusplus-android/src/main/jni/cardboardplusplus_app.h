@@ -94,7 +94,7 @@ class CardboardPlusPlusApp {
    */
   void SwitchViewer();
 
-  void DrawCameraQuad(GLuint texture_id);
+  void DrawCameraQuad(GLuint texture_id, float u_min, float u_max);
 
   void OnCameraTextureInitialized(int textureId, int width, int height);
 
@@ -211,6 +211,8 @@ class CardboardPlusPlusApp {
   GLuint tex_mvp_param_;
   GLuint tex_texture_param_;
   GLuint tex_vmax_param_;
+  GLuint tex_umin_param_;
+  GLuint tex_umax_param_;
   float tex_vmax_value_ = 1.0f;
 
   GLuint left_eye_texture_;

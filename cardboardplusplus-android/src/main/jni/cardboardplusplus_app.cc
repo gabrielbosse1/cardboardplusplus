@@ -131,7 +131,10 @@ constexpr const char* kTexVertexShader =
       v_TexCoord = a_TexCoord;
     })glsl";
 
-// OES external texture sampler for camera passthrough
+// OES external texture sampler for camera passthrough and SBS video.
+// u_UMin/u_UMax select the horizontal range of the SBS texture for each eye
+// (left eye: 0.0-0.5, right eye: 0.5-1.0). u_VMax clamps V to skip macroblock
+// padding rows at the bottom of H.264 frames.
 constexpr const char* kTexFragmentShader =
     R"glsl(
     #extension GL_OES_EGL_image_external : require
@@ -139,11 +142,12 @@ constexpr const char* kTexFragmentShader =
     varying vec2 v_TexCoord;
     uniform samplerExternalOES sTexture;
     uniform float u_VMax;
+    uniform float u_UMin;
+    uniform float u_UMax;
     void main() {
-      // u_VMax clamps V to skip macroblock padding rows at the bottom of
-      // H.264 frames (coded height > actual content height). Defaults to 1.0.
       float v = 1.0 - v_TexCoord.y * u_VMax;
-      gl_FragColor = texture2D(sTexture, vec2(v_TexCoord.x, v));
+      float u = u_UMin + v_TexCoord.x * (u_UMax - u_UMin);
+      gl_FragColor = texture2D(sTexture, vec2(u, v));
     })glsl";
 
 // Regular 2D texture sampler for eye textures
@@ -235,6 +239,8 @@ void CardboardPlusPlusApp::OnSurfaceCreated(JNIEnv* env) {
   tex_mvp_param_ = glGetUniformLocation(tex_program_, "u_MVPMatrix");
   tex_texture_param_ = glGetUniformLocation(tex_program_, "sTexture");
   tex_vmax_param_ = glGetUniformLocation(tex_program_, "u_VMax");
+  tex_umin_param_ = glGetUniformLocation(tex_program_, "u_UMin");
+  tex_umax_param_ = glGetUniformLocation(tex_program_, "u_UMax");
 
   CHECKGLERROR("Tex program params");
 
@@ -341,13 +347,10 @@ void CardboardPlusPlusApp::OnDrawFrame() {
   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
   if (camera_texture_initialized_ && show_camera_texture_) {
-    DrawCameraQuad(camera_texture_);
+    DrawCameraQuad(camera_texture_, 0.0f, 1.0f);
   } else if (video_active_ && video_texture_) {
-    // Video is decoded by MediaCodec into a SurfaceTexture (OES), updated by
-    // VideoDecoder.updateVideoTexture() just before this draw. Draw it through
-    // the OES program; the SBS split is handled by the distortion eye ranges
-    // (camera_pass == false below).
-    DrawCameraQuad(video_texture_);
+    // SBS video: left eye gets left half (0.0-0.5)
+    DrawCameraQuad(video_texture_, 0.0f, 0.5f);
   } else if (left_eye_texture_set_) {
     DrawEyeQuad(left_eye_custom_texture_);
   } else {
@@ -361,9 +364,10 @@ void CardboardPlusPlusApp::OnDrawFrame() {
   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
   if (camera_texture_initialized_ && show_camera_texture_) {
-    DrawCameraQuad(camera_texture_);
+    DrawCameraQuad(camera_texture_, 0.0f, 1.0f);
   } else if (video_active_ && video_texture_) {
-    DrawCameraQuad(video_texture_);
+    // SBS video: right eye gets right half (0.5-1.0)
+    DrawCameraQuad(video_texture_, 0.5f, 1.0f);
   } else if (right_eye_texture_set_) {
     DrawEyeQuad(right_eye_custom_texture_);
   } else {
@@ -371,24 +375,14 @@ void CardboardPlusPlusApp::OnDrawFrame() {
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
   }
 
-  // The eye texture descriptions default to a side-by-side split (left half for
-  // the left eye, right half for the right eye) which is correct for SBS video.
-  // The camera passthrough draws the full image into each eye's framebuffer, so
-  // for that case we must sample the whole texture in both eyes and let Cardboard
-  // handle the IPD via the distortion meshes.
-  const bool camera_pass =
-      camera_texture_initialized_ && show_camera_texture_;
-  if (camera_pass) {
-    left_eye_texture_description_.left_u = 0.0f;
-    left_eye_texture_description_.right_u = 1.0f;
-    right_eye_texture_description_.left_u = 0.0f;
-    right_eye_texture_description_.right_u = 1.0f;
-  } else {
-    left_eye_texture_description_.left_u = 0.0f;
-    left_eye_texture_description_.right_u = 0.5f;
-    right_eye_texture_description_.left_u = 0.5f;
-    right_eye_texture_description_.right_u = 1.0f;
-  }
+  // Both camera passthrough and SBS video now draw a full eye view into each
+  // eye's framebuffer (SBS split is done in the shader via u_UMin/u_UMax).
+  // So the distortion renderer should sample the full texture (0.0-1.0) for
+  // both eyes in all cases.
+  left_eye_texture_description_.left_u = 0.0f;
+  left_eye_texture_description_.right_u = 1.0f;
+  right_eye_texture_description_.left_u = 0.0f;
+  right_eye_texture_description_.right_u = 1.0f;
 
   // Render with distortion
   CardboardDistortionRenderer_renderEyeToDisplay(
@@ -617,7 +611,7 @@ void CardboardPlusPlusApp::DrawEyeQuad(GLuint texture_id) {
   CHECKGLERROR("DrawEyeQuad");
 }
 
-void CardboardPlusPlusApp::DrawCameraQuad(GLuint texture_id) {
+void CardboardPlusPlusApp::DrawCameraQuad(GLuint texture_id, float u_min, float u_max) {
   glUseProgram(tex_program_);
 
   Matrix4x4 identity = GetIdentityMatrix();
@@ -628,6 +622,8 @@ void CardboardPlusPlusApp::DrawCameraQuad(GLuint texture_id) {
   glBindTexture(GL_TEXTURE_EXTERNAL_OES, texture_id);
   glUniform1i(tex_texture_param_, 0);
   glUniform1f(tex_vmax_param_, tex_vmax_value_);
+  glUniform1f(tex_umin_param_, u_min);
+  glUniform1f(tex_umax_param_, u_max);
 
   quad_.Draw();
 
