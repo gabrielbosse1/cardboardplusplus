@@ -120,7 +120,11 @@ public class DiscoveryManager {
             // connectivity (avoids Windows firewall dropping packets from a
             // brand-new socket to the same port).
             if (!capSent && capWidth > 0 && capHeight > 0) {
-              sendCap(socket, sendPacket.getAddress());
+              // Send CAP to the driver's actual IP (from ACK response), NOT the
+              // broadcast address. Broadcast CAP packets are silently dropped by
+              // Windows Firewall as unsolicited inbound, so the driver never
+              // receives them and the encoder runs unclamped.
+              sendCap(socket, recvPacket.getAddress());
               capSent = true;
             }
           }

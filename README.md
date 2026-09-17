@@ -1,6 +1,10 @@
 # Cardboard++
 ## Bringing Google Cardboard closer to a Meta Quest
 
+### This project is not ready for use
+
+There is no end-user installer — you must build and install everything manually. Hand tracking is not functional yet. This is a development-only project at this stage; expect rough edges and incomplete features.
+
 ![License](https://img.shields.io/github/license/gabrielbosse1/cardboardplusplus)
 ![Stars](https://img.shields.io/github/stars/gabrielbosse1/cardboardplusplus)
 ![Last Commit](https://img.shields.io/github/last-commit/gabrielbosse1/cardboardplusplus)

@@ -3,13 +3,6 @@ package com.google.cardboard.video;
 import android.media.MediaCodecInfo;
 import android.media.MediaCodecList;
 import android.util.Log;
-import com.google.cardboard.core.AppConstants;
-import com.google.cardboard.core.DebugLog;
-import com.google.cardboard.network.NetworkUtils;
-import com.google.cardboard.settings.AppSettings;
-import java.net.DatagramPacket;
-import java.net.DatagramSocket;
-import java.net.InetAddress;
 import java.util.Arrays;
 
 /**
@@ -23,26 +16,18 @@ import java.util.Arrays;
  * part of the runtime protocol shared with the PC driver and must not change.
  */
 final class DecoderCapabilityReporter {
-  private static final DebugLog DBG = new DebugLog("DecoderCap");
-  // Wire protocol prefix (shared with the driver) - format: "CARDBOARD_CAP W H".
-  private static final String CAP_MESSAGE_PREFIX = "CARDBOARD_CAP ";
-  // The PC may not be listening yet; sending a few times avoids dropping the cap notice.
-  private static final int CAP_SEND_ATTEMPTS = 3;
-  private static final long CAP_SEND_GAP_MS = 500;
-
-  private final String tag;
-  private final AppSettings appSettings;
-
-  DecoderCapabilityReporter(String tag, AppSettings appSettings) {
-    this.tag = tag;
-    this.appSettings = appSettings;
-  }
+  private DecoderCapabilityReporter() {}
 
   /**
    * Query the AVC hardware decoder's supported width/height upper bounds. Returns the maximum
    * resolution the decoder can handle (used to clamp the encoder on the PC side).
+   *
+   * <p>Only hardware-accelerated decoders are considered. Software decoders may advertise higher
+   * resolution caps (e.g. 2048x2048) but the actual hardware decoder used at runtime has a lower
+   * ceiling (e.g. 1920x1920). Reporting the software cap causes the PC encoder to produce a
+   * stream the hardware decoder can't handle.
    */
-  int[] queryDecoderCapability() {
+  static int[] queryDecoderCapability() {
     int maxW = 1920;
     int maxH = 1920;
     MediaCodecList list = new MediaCodecList(MediaCodecList.ALL_CODECS);
@@ -50,42 +35,27 @@ final class DecoderCapabilityReporter {
       if (info.isEncoder() || !Arrays.asList(info.getSupportedTypes()).contains("video/avc")) {
         continue;
       }
+      // Skip software decoders — only the hardware decoder's limits matter because
+      // that's the one Android's MediaCodec selector will pick at runtime.
+      if (!info.isHardwareAccelerated()) {
+        continue;
+      }
       try {
         android.media.MediaCodecInfo.CodecCapabilities caps =
             info.getCapabilitiesForType("video/avc");
         MediaCodecInfo.VideoCapabilities vc = caps.getVideoCapabilities();
         if (vc != null) {
-          maxW = (int) vc.getSupportedWidths().getUpper();
-          maxH = (int) vc.getSupportedHeights().getUpper();
+          int w = (int) vc.getSupportedWidths().getUpper();
+          int h = (int) vc.getSupportedHeights().getUpper();
+          Log.i("DecoderCap", "HW decoder " + info.getName() + " caps: " + w + "x" + h);
+          if (w > maxW) maxW = w;
+          if (h > maxH) maxH = h;
         }
       } catch (Exception e) {
-        Log.w(tag, "Failed to query decoder cap for " + info.getName(), e);
+        Log.w("DecoderCap", "Failed to query decoder cap for " + info.getName(), e);
       }
-      break;
     }
+    Log.i("DecoderCap", "Final HW decoder cap: " + maxW + "x" + maxH);
     return new int[] {maxW, maxH};
-  }
-
-  /** Send the decoder cap to the PC over the discovery UDP channel (broadcast or direct IP). */
-  void sendCapToPc(int width, int height) {
-    new Thread(
-            () -> {
-              try (DatagramSocket socket = new DatagramSocket()) {
-                socket.setBroadcast(true);
-                InetAddress addr = NetworkUtils.getPcOrBroadcastAddress(appSettings.getPcIp());
-                String msg = CAP_MESSAGE_PREFIX + width + " " + height;
-                byte[] data = msg.getBytes();
-                // Send a few times in case the PC isn't listening yet.
-                for (int i = 0; i < CAP_SEND_ATTEMPTS; i++) {
-                  socket.send(
-                      new DatagramPacket(data, data.length, addr, AppConstants.UDP_DISCOVERY_PORT));
-                  Thread.sleep(CAP_SEND_GAP_MS);
-                }
-                DBG.i("Sent decoder cap to PC (%s): %s", addr.getHostAddress(), msg);
-              } catch (Exception e) {
-                Log.w(tag, "Failed to send decoder cap to PC", e);
-              }
-            })
-        .start();
   }
 }

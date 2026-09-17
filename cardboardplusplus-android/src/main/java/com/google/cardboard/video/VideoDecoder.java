@@ -208,6 +208,9 @@ public class VideoDecoder {
       int baseH = codedH > 0 ? codedH : height;
       int alignedW = (baseW + 15) & ~15;
       int alignedH = (baseH + 15) & ~15;
+
+      decoder = MediaCodec.createDecoderByType("video/avc");
+
       MediaFormat format = MediaFormat.createVideoFormat("video/avc", alignedW, alignedH);
       format.setByteBuffer("csd-0", ByteBuffer.wrap(sps));
       format.setByteBuffer("csd-1", ByteBuffer.wrap(pps));
@@ -217,20 +220,7 @@ public class VideoDecoder {
         format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1);
       }
       format.setInteger(MediaFormat.KEY_ALLOW_FRAME_DROP, 1);
-      // Allow the codec to adapt to larger resolutions without a hard failure.
-      format.setInteger(MediaFormat.KEY_MAX_WIDTH, 4096);
-      format.setInteger(MediaFormat.KEY_MAX_HEIGHT, 4096);
 
-      decoder = MediaCodec.createDecoderByType("video/avc");
-      try {
-        android.media.MediaCodecInfo.VideoCapabilities vc =
-            decoder.getCodecInfo().getCapabilitiesForType("video/avc").getVideoCapabilities();
-        DBG.i("Codec supported widths=%s heights=%s upper=%dx%d", vc.getSupportedWidths(),
-            vc.getSupportedHeights(), vc.getSupportedWidths().getUpper(),
-            vc.getSupportedHeights().getUpper());
-      } catch (Exception e) {
-        DBG.w("could not query video capabilities: " + e.getMessage());
-      }
       decoder.configure(format, surface, null, 0);
       if (surfaceTexture != null) {
         surfaceTexture.setDefaultBufferSize(baseW, baseH);

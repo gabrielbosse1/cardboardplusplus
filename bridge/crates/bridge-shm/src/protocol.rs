@@ -100,7 +100,7 @@ pub mod MsgType {
 
 /// Payloads. All `repr(C)`, little-endian, fixed size; extra bytes zero.
 pub mod payload {
-    /// Msg `TEXTURE_SET_CREATED`. 40 bytes.
+    /// Msg `TEXTURE_SET_CREATED`. 32 bytes.
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
     pub struct TextureSetCreated {
@@ -135,7 +135,7 @@ pub mod payload {
         pub pad2: u32,
     }
 
-    /// Msg `POSE`. 72 bytes (DriverPose_t essentials).
+    /// Msg `POSE`. 84 bytes (DriverPose_t essentials).
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
     pub struct Pose {
@@ -148,7 +148,7 @@ pub mod payload {
         pub timestamp_ns: i64,
     }
 
-    /// Msg `CONTROLLER_INPUT`. 32 bytes.
+    /// Msg `CONTROLLER_INPUT`. 40 bytes.
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
     pub struct ControllerInput {

@@ -4,7 +4,6 @@ import android.util.Log;
 import com.google.cardboard.NativeBridge;
 import com.google.cardboard.core.AppConstants;
 import com.google.cardboard.core.DebugLog;
-import com.google.cardboard.settings.AppSettings;
 
 /**
  * Owns the video decode pipeline: creates the OES texture + MediaCodec-backed {@link VideoDecoder}
@@ -16,7 +15,6 @@ public class VideoManager {
   private static final DebugLog DBG = new DebugLog(TAG);
 
   private final NativeBridge bridge;
-  private final DecoderCapabilityReporter capabilityReporter;
   private VideoDecoder decoder;
   private boolean surfaceCreated = false;
 
@@ -25,14 +23,13 @@ public class VideoManager {
   private Runnable reconnectAction;
   private VideoWatchdog watchdog;
 
-  public VideoManager(NativeBridge bridge, AppSettings appSettings) {
+  public VideoManager(NativeBridge bridge) {
     this.bridge = bridge;
-    this.capabilityReporter = new DecoderCapabilityReporter(TAG, appSettings);
   }
 
   /** Query the hardware decoder cap (max supported resolution). */
   public int[] queryDecoderCap() {
-    return capabilityReporter.queryDecoderCapability();
+    return DecoderCapabilityReporter.queryDecoderCapability();
   }
 
   /** Called by the activity when the user re-runs discovery (e.g. after a PC restart). */

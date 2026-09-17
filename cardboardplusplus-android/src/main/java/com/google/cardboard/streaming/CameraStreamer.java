@@ -7,6 +7,7 @@ import android.graphics.YuvImage;
 import android.media.Image;
 import android.util.Log;
 import com.google.cardboard.camera.CameraController;
+import com.google.cardboard.core.AppConstants;
 import com.google.cardboard.core.DebugLog;
 import com.google.cardboard.network.NetworkUtils;
 import com.google.cardboard.settings.AppSettings;
@@ -19,7 +20,6 @@ import java.net.InetAddress;
 public class CameraStreamer implements CameraController.FrameCallback {
   private static final String TAG = CameraStreamer.class.getSimpleName();
   private static final DebugLog DBG = new DebugLog(TAG);
-  private static final int PC_PORT = 42072;
   private static final int TARGET_WIDTH = 320;
   private static final int TARGET_HEIGHT = 240;
   private static final int JPEG_QUALITY = 50;
@@ -50,7 +50,7 @@ public class CameraStreamer implements CameraController.FrameCallback {
           socket = new DatagramSocket();
           pcAddress = NetworkUtils.getPcOrBroadcastAddress(appSettings.getPcIp());
           streaming = true;
-          Log.i(TAG, "Streamer connected to " + pcAddress.getHostAddress() + ":" + PC_PORT);
+          Log.i(TAG, "Streamer connected to " + pcAddress.getHostAddress() + ":" + AppConstants.CAMERA_PORT);
           while (shouldStream && socket != null && !socket.isClosed()) {
             Thread.sleep(500);
           }
@@ -112,7 +112,7 @@ public class CameraStreamer implements CameraController.FrameCallback {
 
       if (jpegData.length > 60000) return;
 
-      DatagramPacket packet = new DatagramPacket(jpegData, jpegData.length, pcAddress, PC_PORT);
+      DatagramPacket packet = new DatagramPacket(jpegData, jpegData.length, pcAddress, AppConstants.CAMERA_PORT);
       socket.send(packet);
       frameCount++;
       if (frameCount % 60 == 1) {
@@ -135,7 +135,8 @@ public class CameraStreamer implements CameraController.FrameCallback {
     ByteBuffer vBuf = vPlane.getBuffer();
 
     int yRowStride = yPlane.getRowStride();
-    int uvRowStride = uPlane.getRowStride();
+    int uRowStride = uPlane.getRowStride();
+    int vRowStride = vPlane.getRowStride();
     int uvPixelStride = uPlane.getPixelStride();
 
     int ySize = w * h;
@@ -154,9 +155,10 @@ public class CameraStreamer implements CameraController.FrameCallback {
     int uvWidth = w / 2;
     for (int row = 0; row < uvHeight; row++) {
       for (int col = 0; col < uvWidth; col++) {
-        int uvOffset = row * uvRowStride + col * uvPixelStride;
-        nv21[pos++] = vBuf.get(uvOffset);
-        nv21[pos++] = uBuf.get(uvOffset);
+        int vOffset = row * vRowStride + col * uvPixelStride;
+        int uOffset = row * uRowStride + col * uvPixelStride;
+        nv21[pos++] = vBuf.get(vOffset);
+        nv21[pos++] = uBuf.get(uOffset);
       }
     }
     return nv21;

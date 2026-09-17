@@ -7,11 +7,11 @@ $srcFfmpeg = "$root\driver_cardboardplusplus\lib\ffmpeg\bin"
 $dstDir = "$SteamVR\drivers\cardboardplusplus\bin\win64"
 
 if (-not (Test-Path $srcDll)) {
-    throw "Driver DLL not found at $srcDll — run scripts\compile-driver.ps1 first"
+    throw "Driver DLL not found at $srcDll - run scripts\compile-driver.ps1 first"
 }
 
 if (-not (Test-Path "$SteamVR\drivers")) {
-    throw "SteamVR drivers directory not found at $SteamVR\drivers — check -SteamVR path or install SteamVR"
+    throw "SteamVR drivers directory not found at $SteamVR\drivers - check -SteamVR path or install SteamVR"
 }
 
 Write-Host "Installing driver to $dstDir ..." -ForegroundColor Cyan

@@ -25,6 +25,7 @@ import android.hardware.SensorManager;
 import android.opengl.GLSurfaceView;
 import android.os.Build.VERSION;
 import android.os.Build.VERSION_CODES;
+import android.net.wifi.WifiManager;
 import android.os.Bundle;
 import android.os.PowerManager;
 import android.provider.Settings;
@@ -90,6 +91,7 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
   // overridden by the proximity sensor on many OEMs (the phone reads "covered" inside the
   // Cardboard viewer and the OS forces the screen off), so a wake lock is required.
   private PowerManager.WakeLock wakeLock;
+  private WifiManager.WifiLock wifiLock;
   private SensorManager sensorManager;
   private Sensor proximitySensor;
   private final SensorEventListener proximityListener =
@@ -123,7 +125,7 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
     telemetrySender = new TelemetrySender(this, appSettings);
     permissionManager = new PermissionManager(this);
     cameraController = new CameraController(this, this);
-    videoManager = new VideoManager(this, appSettings);
+    videoManager = new VideoManager(this);
     discoveryManager = new DiscoveryManager(appSettings);
     // Pre-query the hardware decoder cap so the DiscoveryManager can announce it
     // to the driver on the first ACK (using the same socket that proved connectivity).
@@ -194,6 +196,9 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
     if (wakeLock != null && wakeLock.isHeld()) {
       wakeLock.release();
     }
+    if (wifiLock != null && wifiLock.isHeld()) {
+      wifiLock.release();
+    }
 
     // 3. Stop camera hardware and release texture so it gets recreated fresh on resume
     cameraController.onPause();
@@ -233,6 +238,7 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
     // Keep the screen on for the whole VR session. The proximity listener refreshes this
     // whenever the phone is inside the viewer (and releases it when taken out).
     acquireWakeLock();
+    acquireWifiLock();
     if (sensorManager == null) {
       sensorManager = (SensorManager) getSystemService(SENSOR_SERVICE);
     }
@@ -279,6 +285,23 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
     }
     if (!wakeLock.isHeld()) {
       wakeLock.acquire();
+    }
+  }
+
+  /** Acquire a WiFi multicast lock to prevent power-save from throttling UDP telemetry. */
+  private void acquireWifiLock() {
+    try {
+      WifiManager wm = (WifiManager) getApplicationContext().getSystemService(WIFI_SERVICE);
+      if (wm == null) return;
+      if (wifiLock == null) {
+        wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, TAG);
+        wifiLock.setReferenceCounted(false);
+      }
+      if (!wifiLock.isHeld()) {
+        wifiLock.acquire();
+      }
+    } catch (Exception e) {
+      Log.w(TAG, "WiFi lock acquisition failed: " + e.getMessage());
     }
   }
 

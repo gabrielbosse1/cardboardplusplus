@@ -9,6 +9,7 @@ import android.util.Log;
 import android.view.Display;
 import android.view.Surface;
 import android.view.WindowManager;
+import com.google.cardboard.core.AppConstants;
 import com.google.cardboard.core.DebugLog;
 import com.google.cardboard.network.NetworkUtils;
 import com.google.cardboard.settings.AppSettings;
@@ -37,7 +38,6 @@ import java.util.concurrent.Executors;
 public class TelemetrySender implements SensorEventListener {
     private static final String TAG = TelemetrySender.class.getSimpleName();
     private static final DebugLog DBG = DebugLog.create(TelemetrySender.class, null);
-    private static final int TELEMETRY_PORT = 42071;
     private static final byte GYRO_TAG = 0x10;
     private static final byte ROTATION_TAG = 0x12;
 
@@ -144,12 +144,12 @@ public class TelemetrySender implements SensorEventListener {
                 socket = s;
                 bridgeAddress = addr;
                 connected = true;  // volatile write AFTER socket/address — memory fence
-                Log.i(TAG, "Telemetry connected to " + addr.getHostAddress() + ":" + TELEMETRY_PORT);
+                Log.i(TAG, "Telemetry connected to " + addr.getHostAddress() + ":" + AppConstants.TELEMETRY_PORT);
                 // Send hello so bridge learns phone IP (was 0.0.0.0 before).
                 try {
                     byte[] hello = "CARDBOARD_PHONE_HELLO v1".getBytes();
-                    s.send(new DatagramPacket(hello, hello.length, addr, TELEMETRY_PORT));
-                    DBG.d("Sent phone hello to %s:%d", addr.getHostAddress(), TELEMETRY_PORT);
+                    s.send(new DatagramPacket(hello, hello.length, addr, AppConstants.TELEMETRY_PORT));
+                    DBG.d("Sent phone hello to %s:%d", addr.getHostAddress(), AppConstants.TELEMETRY_PORT);
         } catch (Exception e) {
           Log.w(TAG, "phone hello send failed", e);
         }
@@ -286,7 +286,7 @@ public class TelemetrySender implements SensorEventListener {
         final InetAddress faddr = addr;
         executor.execute(() -> {
             try {
-                DatagramPacket packet = new DatagramPacket(data, data.length, faddr, TELEMETRY_PORT);
+                DatagramPacket packet = new DatagramPacket(data, data.length, faddr, AppConstants.TELEMETRY_PORT);
                 fs.send(packet);
             } catch (Exception e) {
                 Log.w(TAG, "Telemetry send failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
@@ -313,7 +313,7 @@ public class TelemetrySender implements SensorEventListener {
         final InetAddress faddr = addr;
         executor.execute(() -> {
             try {
-                DatagramPacket packet = new DatagramPacket(data, data.length, faddr, TELEMETRY_PORT);
+                DatagramPacket packet = new DatagramPacket(data, data.length, faddr, AppConstants.TELEMETRY_PORT);
                 fs.send(packet);
             } catch (Exception e) {
                 Log.w(TAG, "Rotation send failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());

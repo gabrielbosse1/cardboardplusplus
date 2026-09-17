@@ -9,8 +9,10 @@ public final class AppConstants {
   public static final int CAMERA_PERMISSIONS_REQUEST_CODE = 3;
 
   // Network ports
-  public static final int UDP_DISCOVERY_PORT = 42070;
   public static final int VIDEO_PORT = 42069;
+  public static final int UDP_DISCOVERY_PORT = 42070;
+  public static final int TELEMETRY_PORT = 42071;
+  public static final int CAMERA_PORT = 42072;
   public static final int DISCOVERY_INTERVAL_MS = 500;
 
   // Camera defaults

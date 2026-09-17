@@ -163,7 +163,7 @@ private:
     HANDLE m_cachedSyncHandle;
     ID3D11Texture2D* m_pSyncTexture;
     IDXGIKeyedMutex* m_pSyncMutex;
-    bool m_syncAcquired;
+    bool m_syncAcquired = false;
 
     // ---- background encoder thread handshake ----
     std::thread m_encodingThread;

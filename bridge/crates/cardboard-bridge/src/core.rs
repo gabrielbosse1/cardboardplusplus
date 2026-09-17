@@ -361,7 +361,7 @@ impl AppCore {
         let mut child = match Command::new("ffmpeg")
             .args([
                 "-f", "h264",
-                "-probesize", "32",
+                "-probesize", "32768",
                 "-analyzeduration", "0",
                 "-i", "pipe:0",
                 "-vf", "scale=480:270",
@@ -414,6 +414,7 @@ impl AppCore {
 
         // Thread 2: read complete RGBA frames from ffmpeg stdout (blocking is fine here).
         let stop_reader = stop.clone();
+        let preview_decode_cleanup = self.preview_decode.clone();
         thread::spawn(move || {
             let mut rgba = vec![0u8; frame_bytes];
             let mut off = 0usize;
@@ -437,6 +438,13 @@ impl AppCore {
                         }
                     }
                     Err(_) => break,
+                }
+            }
+            // ffmpeg exited (crash or stop). Clear the handle so the next
+            // start_preview_decode doesn't inherit a dead child.
+            if let Ok(mut decode) = preview_decode_cleanup.lock() {
+                if decode.take().is_some() {
+                    eprintln!("[preview] ffmpeg exited, handle cleared");
                 }
             }
         });

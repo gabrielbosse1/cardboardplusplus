@@ -105,15 +105,15 @@ fn start_state_poller(core: Arc<AppCore>, weak: slint::Weak<MainWindow>) {
         global.set_phone_ip(snap.phone_ip.clone().into());
         global.set_stream_fps(snap.stream_fps);
         global.set_latency_ms(snap.latency_ms);
-        global.set_packets_total(snap.packets_total as i32);
+        global.set_packets_total(snap.packets_total.min(i32::MAX as u64) as i32);
         global.set_gyro_fps(snap.gyro_fps);
         global.set_hand_fps(snap.hand_fps);
         global.set_hands_detected(snap.hands_detected);
         global.set_preview_enabled(snap.preview_enabled);
         global.set_preview_driver_fps(snap.preview_driver_fps);
         global.set_preview_bitrate_kbps(snap.preview_bitrate_kbps);
-        global.set_preview_frames(snap.preview_frames as i32);
-        global.set_preview_drops(snap.preview_drops as i32);
+        global.set_preview_frames(snap.preview_frames.min(i32::MAX as u64) as i32);
+        global.set_preview_drops(snap.preview_drops.min(i32::MAX as u64) as i32);
         global.set_camera_connected(snap.camera_connected);
         global.set_gyro_x(format!("{:.2}", snap.latest_gyro_x).into());
         global.set_gyro_y(format!("{:.2}", snap.latest_gyro_y).into());

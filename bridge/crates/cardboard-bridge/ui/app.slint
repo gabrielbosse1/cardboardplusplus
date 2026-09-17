@@ -685,7 +685,7 @@ component StreamPage inherits VerticalLayout {
         }
 
         Text {
-            text: "UDP 42069 · 4-byte big-endian length + H.264 Annex-B frame";
+            text: "UDP 42069 · raw H.264 Annex-B (no length prefix)";
             color: Theme.text-dim;
             font-size: 11px;
         }
@@ -765,7 +765,7 @@ component StreamPage inherits VerticalLayout {
                     }
 
                     Text {
-                        text: "UDP 127.0.0.1:42069 · 4-byte big-endian length + H.264 Annex-B";
+                        text: "UDP 127.0.0.1:42069 · raw H.264 Annex-B (no length prefix)";
                         color: Theme.text-dim;
                         font-size: 11px;
                     }

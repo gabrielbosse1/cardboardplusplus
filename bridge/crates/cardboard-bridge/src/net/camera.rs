@@ -12,7 +12,7 @@ use crate::app::SharedState;
 use crate::net::mediapipe::MediapipeClient;
 use crate::net::CAMERA_PORT;
 
-/// Poll cadence for the non-blocking recv loop.
+/// Poll cadence when no frames are available. Drained inline below.
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Bind the camera socket and start the receive loop.  Called by `AppCore::new`.
@@ -43,14 +43,21 @@ fn camera_loop(sock: UdpSocket, state: SharedState, client: Option<MediapipeClie
     let mut frame_count: u64 = 0;
 
     loop {
-        match sock.recv(&mut buf) {
-            Ok(n) if n > 0 => {
-                frame_count += 1;
-                process_frame(&buf[..n], &state, frame_count, client.as_ref());
+        let mut got_one = false;
+        // Drain every available datagram before sleeping (latest-wins for camera).
+        loop {
+            match sock.recv(&mut buf) {
+                Ok(n) if n > 0 => {
+                    frame_count += 1;
+                    got_one = true;
+                    process_frame(&buf[..n], &state, frame_count, client.as_ref());
+                }
+                _ => break,
             }
-            _ => {}
         }
-        std::thread::sleep(POLL_INTERVAL);
+        if !got_one {
+            std::thread::sleep(POLL_INTERVAL);
+        }
     }
 }
 
