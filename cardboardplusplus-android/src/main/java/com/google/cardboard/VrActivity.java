@@ -255,6 +255,18 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
     // Start telemetry (gyro/accel/mag → bridge)
     telemetrySender.start();
 
+    // Recreate the video decoder + restart the receiver on the GL thread.
+    // onSurfaceCreated() only fires when the GL context is recreated; after a
+    // plain pause/resume (context preserved) it never runs, so restart here,
+    // guarded to avoid duplicates.
+    glView.queueEvent(
+        () -> {
+          if (!videoManager.isStarted()) {
+            videoManager.onSurfaceCreated();
+            videoManager.start();
+          }
+        });
+
     // Queue camera setup on GL thread (guards prevent duplicates)
     glView.queueEvent(
         () -> {
