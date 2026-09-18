@@ -272,6 +272,12 @@ void CardboardPlusPlusApp::OnSurfaceCreated(JNIEnv* env) {
 }
 
 int CardboardPlusPlusApp::CreateVideoTexture() {
+  // Runs on the GL thread: retire the texture id stashed by StopVideoReceiver
+  // before allocating a new one (deleting after regen could kill the live id).
+  if (video_texture_pending_delete_) {
+    glDeleteTextures(1, &video_texture_pending_delete_);
+    video_texture_pending_delete_ = 0;
+  }
   GLuint textureId = 0;
   // Only allocate the OES texture name. It must NOT be bound to a GL context
   // here: SurfaceTexture(int) requires an unbound texture, and a pre-bound
@@ -328,6 +334,12 @@ void CardboardPlusPlusApp::SetScreenParams(int width, int height) {
 }
 
 void CardboardPlusPlusApp::OnDrawFrame() {
+  // Runs on the GL thread: drain a retired video texture when there is no
+  // restart (no CreateVideoTexture) to delete it.
+  if (video_texture_pending_delete_) {
+    glDeleteTextures(1, &video_texture_pending_delete_);
+    video_texture_pending_delete_ = 0;
+  }
   if (!UpdateDeviceParams()) {
     return;
   }
@@ -704,8 +716,10 @@ void CardboardPlusPlusApp::StopVideoReceiver() {
 
   video_active_ = false;
 
+  // Runs on the UI thread with no GL context: only stash the id. It is
+  // deleted on the GL thread in CreateVideoTexture()/OnDrawFrame().
   if (video_texture_) {
-    glDeleteTextures(1, &video_texture_);
+    video_texture_pending_delete_ = video_texture_;
     video_texture_ = 0;
   }
 

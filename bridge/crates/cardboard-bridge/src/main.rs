@@ -55,10 +55,11 @@ fn run_window(core: Arc<AppCore>) {
         .set_app_version(format!("v{}", core::APP_VERSION).into());
 
     wire_callbacks(&core, &ui);
-    start_state_poller(core, ui.as_weak());
+    start_state_poller(core.clone(), ui.as_weak());
 
     println!("[bridge] running — press Ctrl+C to quit");
     ui.run().expect("bridge event loop failed");
+    core.shutdown();
 }
 
 /// Delegate the UI's callbacks to the core, converting the Slint encoder index
@@ -75,17 +76,32 @@ fn wire_callbacks(core: &std::sync::Arc<AppCore>, ui: &MainWindow) {
 
     {
         let core = std::sync::Arc::clone(core);
+        ui.global::<BridgeState>().on_test_link(move || {
+            core.start_link_test();
+        });
+    }
+
+    {
+        let core = std::sync::Arc::clone(core);
+        ui.global::<BridgeState>().on_hand_toggled(move |enabled| {
+            core.set_hand_enabled(enabled);
+        });
+    }
+
+    {
+        let core = std::sync::Arc::clone(core);
         ui.global::<BridgeState>()
-            .on_toggle_preview(move |enabled| {
-                core.set_preview(enabled);
+            .on_overlay_toggled(move |enabled| {
+                core.set_hand_overlay(enabled);
             });
     }
 
     {
         let core = std::sync::Arc::clone(core);
-        ui.global::<BridgeState>().on_open_preview(move || {
-            core.open_ffplay_preview();
-        });
+        ui.global::<BridgeState>()
+            .on_apply_hand_model(move |det, pres, track| {
+                core.apply_hand_model(det, pres, track);
+            });
     }
 }
 
@@ -94,6 +110,9 @@ fn wire_callbacks(core: &std::sync::Arc<AppCore>, ui: &MainWindow) {
 /// keeps stats flowing even after `run_window` would otherwise unwind).
 fn start_state_poller(core: Arc<AppCore>, weak: slint::Weak<MainWindow>) {
     let timer = Timer::default();
+    // Last delivered link-test result: a fresh one parks the bitrate slider
+    // so the user fine-tunes from the recommendation instead of stale state.
+    let mut last_test_result = 0i32;
     timer.start(TimerMode::Repeated, Duration::from_millis(50), move || {
         let Some(ui) = weak.upgrade() else { return };
         let snap = core.status();
@@ -107,15 +126,24 @@ fn start_state_poller(core: Arc<AppCore>, weak: slint::Weak<MainWindow>) {
         global.set_latency_ms(snap.latency_ms);
         global.set_packets_total(snap.packets_total.min(i32::MAX as u64) as i32);
         global.set_gyro_fps(snap.gyro_fps);
-        global.set_hand_fps(snap.hand_fps);
-        global.set_hands_detected(snap.hands_detected);
-        global.set_preview_enabled(snap.preview_enabled);
+        // Hand page shows the bridge-side MediaPipe pipeline (camera 42072
+        // -> TCP 42073), not phone telemetry hands: `hands_detected`/`hand_fps`
+        // count phone 0x11 packets, `camera_detected_hands` is the sidecar.
+        global.set_hand_fps(snap.camera_fps);
+        global.set_hands_detected(snap.camera_detected_hands as i32);
         global.set_preview_driver_fps(snap.preview_driver_fps);
         global.set_preview_bitrate_kbps(snap.preview_bitrate_kbps);
         global.set_preview_frames(snap.preview_frames.min(i32::MAX as u64) as i32);
         global.set_preview_drops(snap.preview_drops.min(i32::MAX as u64) as i32);
         global.set_camera_connected(snap.camera_connected);
         global.set_camera_fps(snap.camera_fps);
+        global.set_hand_enabled(snap.hand_enabled);
+        global.set_hand_overlay(snap.hand_overlay);
+        global.set_hand_det(snap.hand_min_detection);
+        global.set_hand_pres(snap.hand_min_presence);
+        global.set_hand_track(snap.hand_min_tracking);
+        global.set_net_decoded_fps(snap.net_decoded_fps);
+        global.set_net_stalls(snap.net_stalls as i32);
         global.set_gyro_x(format!("{:.2}", snap.latest_gyro_x).into());
         global.set_gyro_y(format!("{:.2}", snap.latest_gyro_y).into());
         global.set_gyro_z(format!("{:.2}", snap.latest_gyro_z).into());
@@ -125,6 +153,15 @@ fn start_state_poller(core: Arc<AppCore>, weak: slint::Weak<MainWindow>) {
         global.set_mag_x(format!("{:.2}", snap.latest_mag_x).into());
         global.set_mag_y(format!("{:.2}", snap.latest_mag_y).into());
         global.set_mag_z(format!("{:.2}", snap.latest_mag_z).into());
+        global.set_link_test_active(snap.link_test_active);
+        global.set_link_test_note(snap.link_test_note.clone().into());
+        if snap.link_test_result_mbps != 0 && snap.link_test_result_mbps != last_test_result {
+            last_test_result = snap.link_test_result_mbps;
+            global.set_bitrate(snap.link_test_result_mbps);
+        }
+        if snap.link_test_result_mbps == 0 {
+            last_test_result = 0;
+        }
         if let Some(img) = core.take_preview_frame() {
             global.set_preview_frame(img);
         }

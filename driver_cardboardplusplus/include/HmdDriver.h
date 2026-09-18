@@ -117,6 +117,7 @@ private:
     void ShutdownVideoEncoder();
     bool ApplyHardwareCap(int capW, int capH);
     void ClampEncoderToCap();
+    bool ApplyBridgeCfg(int fps, int bitrateKbps, const char* codec);
     void ApplyStreamSettings(const cbpp::PayloadSettingsChange& settings);
     void RunBridgeHeartbeat();
 

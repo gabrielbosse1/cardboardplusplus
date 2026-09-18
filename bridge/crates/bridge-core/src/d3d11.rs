@@ -97,14 +97,19 @@ impl D3D11Acquirer {
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         unsafe { texture.GetDesc(&mut desc) };
 
-        // Create a CPU staging texture matching the source.
+        // Staging textures cannot be multisampled: force single-sample and
+        // resolve (not copy) when the source uses MSAA.
+        let multisampled = desc.SampleDesc.Count > 1;
         let staging_desc = D3D11_TEXTURE2D_DESC {
             Width: desc.Width,
             Height: desc.Height,
             MipLevels: 1,
             ArraySize: 1,
             Format: desc.Format,
-            SampleDesc: desc.SampleDesc,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Usage: D3D11_USAGE_STAGING,
             BindFlags: 0,
             CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
@@ -125,7 +130,12 @@ impl D3D11Acquirer {
 
         unsafe {
             self.context.Flush();
-            self.context.CopyResource(&staging_res, &tex_res);
+            if multisampled {
+                self.context
+                    .ResolveSubresource(&staging_res, 0, &tex_res, 0, desc.Format);
+            } else {
+                self.context.CopyResource(&staging_res, &tex_res);
+            }
         }
 
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();

@@ -245,6 +245,11 @@ class CardboardPlusPlusApp {
   std::unique_ptr<VideoReceiver> video_receiver_;
   std::unique_ptr<H264Decoder> h264_decoder_;
   GLuint video_texture_;
+  // Texture id retired by StopVideoReceiver (UI thread, no GL context).
+  // Deleted on the GL thread before the next glGenTextures/frame. Must only
+  // be touched from StopVideoReceiver (stash), CreateVideoTexture/OnDrawFrame
+  // (delete).
+  GLuint video_texture_pending_delete_ = 0;
   bool video_receiver_started_;
   int video_width_;
   int video_height_;

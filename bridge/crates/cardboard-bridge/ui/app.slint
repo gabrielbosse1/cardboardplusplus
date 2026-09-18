@@ -1,25 +1,19 @@
-import { ScrollView } from "std-widgets.slint";
+import { ScrollView, Slider } from "std-widgets.slint";
 
 export global Theme {
-    in-out property <color> bg: #0B0E14;
-    in-out property <color> surface: #121723;
-    in-out property <color> surface2: #1A2130;
-    in-out property <color> surface3: #222B3D;
-    in-out property <color> border: #2A3345;
-    in-out property <color> text-hi: #E9EEF7;
-    in-out property <color> text-mid: #9AA7BD;
-    in-out property <color> text-dim: #5E6B81;
-    in-out property <color> accent: #8B5CF6;
-    in-out property <color> accent2: #22D3EE;
-    in-out property <color> ok: #34D399;
-    in-out property <color> warn: #FBBF24;
-    in-out property <color> err: #F87171;
-}
-
-export struct Tab {
-    index: int,
-    label: string,
-    icon: image,
+    in-out property <color> bg: #000000;
+    in-out property <color> surface: #1C1C1E;
+    in-out property <color> surface2: #2C2C2E;
+    in-out property <color> surface3: #3A3A3C;
+    in-out property <color> border: #2C2C2E;
+    in-out property <color> text-hi: #F5F5F7;
+    in-out property <color> text-mid: #A1A1A6;
+    in-out property <color> text-dim: #6E6E73;
+    in-out property <color> accent: #0A84FF;
+    in-out property <color> accent-dim: #0A84FF2E;
+    in-out property <color> ok: #30D158;
+    in-out property <color> warn: #FFD60A;
+    in-out property <color> err: #FF453A;
 }
 
 export global BridgeState {
@@ -28,7 +22,7 @@ export global BridgeState {
     in-out property <bool> driver-connected: false;
     in-out property <bool> phone-connected: false;
     in-out property <bool> encoder-active: false;
-    in-out property <string> encoder-name: "auto";
+    in-out property <string> encoder-name: "gpu";
 
     in-out property <int> stream-fps: 0;
     in-out property <int> latency-ms: 0;
@@ -39,7 +33,10 @@ export global BridgeState {
     in-out property <int> landmark-count: 21;
 
     in-out property <bool> hand-enabled: false;
-    in-out property <int> hand-confidence: 82;
+    in-out property <bool> hand-overlay: true;
+    in-out property <int> hand-det: 50;
+    in-out property <int> hand-pres: 50;
+    in-out property <int> hand-track: 50;
 
     in-out property <int> video-width: 2880;
     in-out property <int> video-height: 1620;
@@ -47,11 +44,15 @@ export global BridgeState {
     in-out property <int> bitrate: 20;
     in-out property <int> encoder-index: 0;
 
+    in-out property <float> net-decoded-fps: 0.0;
+    in-out property <int> net-stalls: 0;
+    in-out property <bool> link-test-active: false;
+    in-out property <string> link-test-note: "";
+
     in-out property <string> phone-ip: "0.0.0.0";
     in-out property <string> log-text: "";
     in-out property <string> app-version: "0.1.0";
 
-    in-out property <bool> preview-enabled: false;
     in-out property <int> preview-driver-fps: 0;
     in-out property <int> preview-bitrate-kbps: 0;
     in-out property <int> preview-frames: 0;
@@ -72,18 +73,20 @@ export global BridgeState {
     in-out property <string> mag-z: "0.00";
 
     callback apply-settings(int, int, int, int, int);
-    callback toggle-preview(bool);
-    callback open-preview();
+    callback test-link();
+    callback hand-toggled(bool);
+    callback overlay-toggled(bool);
+    callback apply-hand-model(int, int, int);
 }
 
-component GradientButton inherits Rectangle {
+component PrimaryButton inherits Rectangle {
     in property <string> text;
     in property <bool> enabled: true;
     callback clicked;
 
-    height: 40px;
-    border-radius: 10px;
-    background: root.enabled ? @linear-gradient(90deg, Theme.accent, Theme.accent2) : #2A3345;
+    height: 38px;
+    border-radius: 9px;
+    background: root.enabled ? Theme.accent : Theme.surface3;
     opacity: root.enabled ? 1 : 0.6;
 
     TouchArea {
@@ -103,9 +106,43 @@ component GradientButton inherits Rectangle {
         horizontal-alignment: center;
         vertical-alignment: center;
         text: root.text;
-        color: #FFFFFF;
+        color: root.enabled ? #FFFFFF : Theme.text-dim;
         font-size: 13px;
         font-weight: 600;
+    }
+}
+
+component SecondaryButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    callback clicked;
+
+    height: 38px;
+    border-radius: 9px;
+    border-width: 1px;
+    border-color: Theme.border;
+    background: Theme.surface2;
+
+    TouchArea {
+        width: 100%;
+        height: 100%;
+        mouse-cursor: pointer;
+        clicked => {
+            if root.enabled {
+                root.clicked();
+            }
+        }
+    }
+
+    Text {
+        width: 100%;
+        height: 100%;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        text: root.text;
+        color: root.enabled ? Theme.text-hi : Theme.text-dim;
+        font-size: 13px;
+        font-weight: 500;
     }
 }
 
@@ -128,6 +165,7 @@ component Stepper inherits HorizontalLayout {
         font-size: 13px;
         vertical-alignment: center;
         horizontal-stretch: 1;
+        wrap: word-wrap;
     }
 
     Rectangle {
@@ -143,7 +181,7 @@ component Stepper inherits HorizontalLayout {
             height: 100%;
             horizontal-alignment: center;
             vertical-alignment: center;
-            text: "{root.value}{root.unit}";
+            text: root.value + root.unit;
             color: Theme.text-hi;
             font-size: 14px;
             font-weight: 600;
@@ -239,7 +277,7 @@ component Toggle inherits Rectangle {
             border-radius: 13px;
             border-width: 1px;
             border-color: Theme.border;
-            background: root.checked ? @linear-gradient(90deg, Theme.accent, Theme.accent2) : Theme.surface2;
+            background: root.checked ? Theme.accent : Theme.surface2;
 
             Rectangle {
                 width: 19px;
@@ -276,7 +314,7 @@ component Pill inherits Rectangle {
     border-radius: 9px;
     border-width: 1px;
     border-color: root.active ? Theme.accent : Theme.border;
-    background: root.active ? @linear-gradient(90deg, Theme.accent, Theme.accent2) : Theme.surface2;
+    background: root.active ? Theme.accent-dim : Theme.surface2;
 
     TouchArea {
         width: 100%;
@@ -295,7 +333,7 @@ component Pill inherits Rectangle {
         horizontal-alignment: center;
         vertical-alignment: center;
         text: root.text;
-        color: root.active ? #FFFFFF : Theme.text-mid;
+        color: root.active ? Theme.text-hi : Theme.text-mid;
         font-size: 12px;
         font-weight: root.active ? 600 : 400;
     }
@@ -303,12 +341,13 @@ component Pill inherits Rectangle {
 
 component StatusPill inherits Rectangle {
     in property <string> label;
+    in property <string> detail: "";
     in property <bool> ok;
 
     height: 26px;
     border-radius: 13px;
     border-width: 1px;
-    border-color: root.ok ? Theme.ok : Theme.err;
+    border-color: Theme.border;
     background: Theme.surface2;
 
     HorizontalLayout {
@@ -321,11 +360,11 @@ component StatusPill inherits Rectangle {
             width: 8px;
             height: 8px;
             border-radius: 4px;
-            background: root.ok ? Theme.ok : Theme.err;
+            background: root.ok ? Theme.ok : Theme.text-dim;
         }
 
         Text {
-            text: root.label;
+            text: root.detail == "" ? root.label : root.label + " · " + root.detail;
             color: root.ok ? Theme.text-hi : Theme.text-dim;
             font-size: 12px;
             vertical-alignment: center;
@@ -357,6 +396,7 @@ component Card inherits Rectangle {
             text: root.hint;
             color: Theme.text-dim;
             font-size: 11px;
+            wrap: word-wrap;
         }
 
         @children
@@ -396,6 +436,39 @@ component Metric inherits Rectangle {
     }
 }
 
+component MiniMetric inherits Rectangle {
+    in property <string> label;
+    in property <string> value: "";
+    in property <color> value-color: Theme.text-hi;
+
+    height: 52px;
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: Theme.border;
+    background: Theme.surface2;
+
+    VerticalLayout {
+        padding: 6px;
+        spacing: 0px;
+        alignment: center;
+
+        Text {
+            text: root.value;
+            color: root.value-color;
+            font-size: 15px;
+            font-weight: 700;
+            horizontal-alignment: center;
+        }
+
+        Text {
+            text: root.label;
+            color: Theme.text-dim;
+            font-size: 10px;
+            horizontal-alignment: center;
+        }
+    }
+}
+
 component TabButton inherits Rectangle {
     in property <string> label;
     in property <image> icon;
@@ -404,7 +477,7 @@ component TabButton inherits Rectangle {
 
     height: 44px;
     border-radius: 10px;
-    background: root.active ? @linear-gradient(90deg, Theme.accent, Theme.accent2) : transparent;
+    background: root.active ? Theme.surface3 : transparent;
 
     Rectangle {
         x: 0;
@@ -412,7 +485,7 @@ component TabButton inherits Rectangle {
         height: 20px;
         y: (parent.height - 20px) / 2;
         border-radius: 2px;
-        background: root.active ? #FFFFFF : transparent;
+        background: root.active ? Theme.accent : transparent;
     }
 
     HorizontalLayout {
@@ -425,14 +498,15 @@ component TabButton inherits Rectangle {
             width: 21px;
             height: 21px;
             source: root.icon;
-            colorize: root.active ? #FFFFFF : Theme.text-dim;
+            colorize: root.active ? Theme.text-hi : Theme.text-dim;
             vertical-alignment: center;
         }
 
         Text {
             text: root.label;
-            color: root.active ? #FFFFFF : Theme.text-dim;
+            color: root.active ? Theme.text-hi : Theme.text-dim;
             font-size: 13px;
+            font-weight: root.active ? 600 : 400;
             vertical-alignment: center;
         }
     }
@@ -492,22 +566,26 @@ component TopBar inherits Rectangle {
         }
 
         StatusPill {
-            label: "Driver";
+            label: "Stream";
+            detail: BridgeState.stream-fps + " fps";
             ok: BridgeState.driver-connected;
         }
 
         StatusPill {
             label: "Phone";
+            detail: BridgeState.gyro-fps + "/s";
             ok: BridgeState.phone-connected;
         }
 
         StatusPill {
-            label: "Encoder";
-            ok: BridgeState.encoder-active;
+            label: "Hands";
+            detail: BridgeState.hand-fps + " fps";
+            ok: BridgeState.hand-enabled;
         }
 
         StatusPill {
             label: "Camera";
+            detail: BridgeState.camera-fps + " fps";
             ok: BridgeState.camera-connected;
         }
     }
@@ -565,7 +643,7 @@ component Sidebar inherits Rectangle {
 
 component BottomBar inherits Rectangle {
     height: 28px;
-    background: #07090D;
+    background: #000000;
 
     Rectangle {
         width: 100%;
@@ -579,7 +657,7 @@ component BottomBar inherits Rectangle {
         spacing: 8px;
 
         Text {
-            text: "Cardboard++ Bridge  ·  v{BridgeState.app-version}";
+            text: "Cardboard++ Bridge  ·  v" + BridgeState.app-version;
             color: Theme.text-dim;
             font-size: 11px;
             vertical-alignment: center;
@@ -598,259 +676,155 @@ component BottomBar inherits Rectangle {
     }
 }
 
-component StreamPage inherits VerticalLayout {
+component StreamPage inherits HorizontalLayout {
     spacing: 14px;
     padding: 20px;
 
-    Text {
-        text: "Stream";
-        color: Theme.text-hi;
-        font-size: 22px;
-        font-weight: 700;
-    }
+    VerticalLayout {
+        horizontal-stretch: 1;
+        spacing: 14px;
 
-    Card {
-        title: "Data path";
-        hint: "The bridge never touches the encoded video. Decoding stays on the phone via MediaCodec.";
+        Rectangle {
+            background: Theme.surface;
+            border-width: 1px;
+            border-color: Theme.border;
+            border-radius: 14px;
 
-        HorizontalLayout {
-            spacing: 14px;
+            VerticalLayout {
+                padding: 12px;
+                spacing: 10px;
 
-            Rectangle {
-                horizontal-stretch: 1;
-                height: 64px;
-                border-radius: 12px;
-                border-width: 1px;
-                border-color: Theme.border;
-                background: Theme.surface2;
+                HorizontalLayout {
+                    spacing: 10px;
 
-                VerticalLayout {
-                    padding: 10px;
-                    spacing: 2px;
-                    alignment: center;
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        height: 46px;
+                        border-radius: 10px;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        background: Theme.surface2;
 
-                    Text {
-                        text: "PC · SteamVR driver";
-                        color: BridgeState.driver-connected ? Theme.text-hi : Theme.text-dim;
-                        font-size: 12px;
-                        font-weight: 600;
-                        horizontal-alignment: center;
+                        VerticalLayout {
+                            padding: 6px;
+                            spacing: 0px;
+                            alignment: center;
+
+                            Text {
+                                text: "PC · SteamVR driver";
+                                color: BridgeState.driver-connected ? Theme.text-hi : Theme.text-dim;
+                                font-size: 11px;
+                                font-weight: 600;
+                                horizontal-alignment: center;
+                            }
+
+                            Text {
+                                text: BridgeState.driver-connected ? "encoding & streaming" : "not connected";
+                                color: BridgeState.driver-connected ? Theme.ok : Theme.err;
+                                font-size: 10px;
+                                horizontal-alignment: center;
+                            }
+                        }
                     }
 
                     Text {
-                        text: BridgeState.driver-connected ? "encoding & streaming" : "not connected";
-                        color: BridgeState.driver-connected ? Theme.ok : Theme.err;
-                        font-size: 11px;
-                        horizontal-alignment: center;
-                    }
-                }
-            }
-
-            Text {
-                text: "→";
-                color: Theme.text-mid;
-                font-size: 22px;
-                vertical-alignment: center;
-            }
-
-            Rectangle {
-                horizontal-stretch: 1;
-                height: 64px;
-                border-radius: 12px;
-                border-width: 1px;
-                border-color: Theme.border;
-                background: Theme.surface2;
-
-                VerticalLayout {
-                    padding: 10px;
-                    spacing: 2px;
-                    alignment: center;
-
-                    Text {
-                        text: "Phone · MediaCodec";
-                        color: BridgeState.phone-connected ? Theme.text-hi : Theme.text-dim;
-                        font-size: 12px;
-                        font-weight: 600;
-                        horizontal-alignment: center;
-                    }
-
-                    Text {
-                        text: "{BridgeState.video-width}×{BridgeState.video-height} @ {BridgeState.fps} fps";
+                        text: "→";
                         color: Theme.text-mid;
-                        font-size: 11px;
-                        horizontal-alignment: center;
+                        font-size: 18px;
+                        vertical-alignment: center;
+                    }
+
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        height: 46px;
+                        border-radius: 10px;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        background: Theme.surface2;
+
+                        VerticalLayout {
+                            padding: 6px;
+                            spacing: 0px;
+                            alignment: center;
+
+                            Text {
+                                text: "Phone · MediaCodec";
+                                color: BridgeState.phone-connected ? Theme.text-hi : Theme.text-dim;
+                                font-size: 11px;
+                                font-weight: 600;
+                                horizontal-alignment: center;
+                            }
+
+                            Text {
+                                text: BridgeState.video-width + "×" + BridgeState.video-height + " @ " + BridgeState.fps + " fps";
+                                color: Theme.text-mid;
+                                font-size: 10px;
+                                horizontal-alignment: center;
+                            }
+                        }
+                    }
+                }
+
+                Text {
+                    text: "UDP 42069 · raw H.264 Annex-B (no length prefix)";
+                    color: Theme.text-dim;
+                    font-size: 10px;
+                    wrap: word-wrap;
+                }
+
+                GridLayout {
+                    spacing: 8px;
+
+                    Row {
+                        MiniMetric {
+                            label: "Resolution (SBS)";
+                            value: BridgeState.video-width + "×" + BridgeState.video-height;
+                            horizontal-stretch: 1;
+                        }
+
+                        MiniMetric {
+                            label: "Target FPS";
+                            value: BridgeState.fps + " fps";
+                            horizontal-stretch: 1;
+                        }
+                    }
+
+                    Row {
+                        MiniMetric {
+                            label: "Bitrate";
+                            value: BridgeState.bitrate + " Mbps";
+                            horizontal-stretch: 1;
+                        }
+
+                        MiniMetric {
+                            label: "Latency";
+                            value: BridgeState.latency-ms + " ms";
+                            value-color: BridgeState.latency-ms < 60 ? Theme.ok : (BridgeState.latency-ms < 120 ? Theme.warn : Theme.err);
+                            horizontal-stretch: 1;
+                        }
+                    }
+
+                    Row {
+                        MiniMetric {
+                            label: "Phone Decode";
+                            value: Math.round(BridgeState.net-decoded-fps) + " fps";
+                            horizontal-stretch: 1;
+                        }
+
+                        MiniMetric {
+                            label: "Link Stalls";
+                            value: BridgeState.net-stalls + "";
+                            value-color: BridgeState.net-stalls > 0 ? Theme.warn : Theme.text-hi;
+                            horizontal-stretch: 1;
+                        }
                     }
                 }
             }
         }
 
-        Text {
-            text: "UDP 42069 · raw H.264 Annex-B (no length prefix)";
-            color: Theme.text-dim;
-            font-size: 11px;
-        }
-    }
-
-    Card {
-        title: "Live session";
-
-        HorizontalLayout {
-            spacing: 12px;
-
-            Metric {
-                label: "Resolution (SBS)";
-                value: "{BridgeState.video-width}×{BridgeState.video-height}";
-                horizontal-stretch: 1;
-            }
-
-            Metric {
-                label: "Target FPS";
-                value: "{BridgeState.fps}";
-                horizontal-stretch: 1;
-            }
-
-            Metric {
-                label: "Bitrate";
-                value: "{BridgeState.bitrate} Mbps";
-                horizontal-stretch: 1;
-            }
-
-            Metric {
-                label: "Latency";
-                value: "{BridgeState.latency-ms} ms";
-                value-color: BridgeState.latency-ms < 60 ? Theme.ok : (BridgeState.latency-ms < 120 ? Theme.warn : Theme.err);
-                horizontal-stretch: 1;
-            }
-        }
-    }
-
-    Card {
-        title: "Preview tap";
-        hint: "The driver keeps a localhost copy (UDP 127.0.0.1:42069) alongside the phone stream. The bridge decodes and displays it here in real time.";
-
-        Toggle {
-            label: "Live local preview stream";
-            checked: BridgeState.preview-enabled;
-            changed(b) => {
-                BridgeState.toggle-preview(b);
-            }
-        }
-
         Rectangle {
-            height: 74px;
-            border-radius: 12px;
-            border-width: 1px;
-            border-color: Theme.border;
-            background: Theme.surface2;
-
-            HorizontalLayout {
-                padding: 10px;
-                spacing: 12px;
-
-                Image {
-                    source: @image-url("icons/stream.svg");
-                    width: 30px;
-                    height: 30px;
-                    colorize: Theme.ok;
-                }
-
-                VerticalLayout {
-                    spacing: 2px;
-
-                    Text {
-                        text: BridgeState.preview-enabled ? "Local preview: streaming" : "Local preview: off";
-                        color: BridgeState.preview-enabled ? Theme.ok : Theme.text-dim;
-                        font-size: 13px;
-                        font-weight: 600;
-                    }
-
-                    Text {
-                        text: "UDP 127.0.0.1:42069 · raw H.264 Annex-B (no length prefix)";
-                        color: Theme.text-dim;
-                        font-size: 11px;
-                    }
-                }
-
-                Rectangle {
-                    horizontal-stretch: 1;
-                }
-            }
-        }
-
-        HorizontalLayout {
-            spacing: 12px;
-
-            Metric {
-                label: "Driver FPS";
-                value: "{BridgeState.preview-driver-fps}";
-                horizontal-stretch: 1;
-            }
-
-            Metric {
-                label: "Bitrate";
-                value: "{BridgeState.preview-bitrate-kbps / 1000.0} Mbps";
-                horizontal-stretch: 1;
-            }
-
-            Metric {
-                label: "Frames sent";
-                value: "{BridgeState.preview-frames}";
-                horizontal-stretch: 1;
-            }
-
-            Metric {
-                label: "Dropped";
-                value: "{BridgeState.preview-drops}";
-                value-color: BridgeState.preview-drops > 0 ? Theme.warn : Theme.text-hi;
-                horizontal-stretch: 1;
-            }
-        }
-
-        Rectangle {
-            height: 270px;
-            border-radius: 12px;
-            clip: true;
-            background: #000;
-            border-width: 1px;
-            border-color: Theme.border;
-
-            if BridgeState.preview-enabled : Image {
-                source: BridgeState.preview-frame;
-                width: 100%;
-                height: 100%;
-                image-fit: cover;
-            }
-
-            if !BridgeState.preview-enabled : Text {
-                text: "Toggle preview on to see the live stream";
-                color: Theme.text-dim;
-                font-size: 13px;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-                width: 100%;
-                height: 100%;
-            }
-        }
-    }
-}
-
-component HandPage inherits VerticalLayout {
-    spacing: 14px;
-    padding: 20px;
-
-    Text {
-        text: "Hand Tracking";
-        color: Theme.text-hi;
-        font-size: 22px;
-        font-weight: 700;
-    }
-
-    Card {
-        title: "Camera feed";
-        hint: "Live JPEG frames from the phone camera (UDP 42072). Hand skeleton overlay drawn in real time.";
-
-        Rectangle {
-            height: 420px;
+            vertical-stretch: 1;
+            min-height: 140px;
             border-radius: 12px;
             clip: true;
             background: #000;
@@ -858,242 +832,98 @@ component HandPage inherits VerticalLayout {
             border-color: Theme.border;
 
             Image {
-                source: BridgeState.camera-frame;
+                source: BridgeState.preview-frame;
                 width: 100%;
                 height: 100%;
-                image-fit: contain;
+                image-fit: cover;
             }
         }
     }
 
-    Card {
-        title: "Model";
-        hint: "MediaPipe runs on the phone (ML Kit / MediaPipe pipeline); the bridge receives landmark frames over the telemetry link and applies filters here, out of the SteamVR callback path.";
-
-        Toggle {
-            label: "Enable hand tracking on the phone";
-            checked: BridgeState.hand-enabled;
-            changed(b) => {
-                BridgeState.hand-enabled = b;
-            }
-        }
-
-        Stepper {
-            label: "Confidence threshold";
-            value: BridgeState.hand-confidence;
-            min: 10;
-            max: 99;
-            step: 1;
-            unit: "%";
-            changed(v) => {
-                BridgeState.hand-confidence = v;
-            }
-        }
-    }
+    ScrollView {
+        width: 380px;
+        horizontal-scrollbar-policy: always-off;
+        viewport-height: right-col.preferred-height;
+        right-col := VerticalLayout {
+            spacing: 14px;
+            width: parent.width;
 
     Card {
-        title: "Status";
+        title: "Preview";
+        hint: "The driver's localhost copy (UDP 127.0.0.1:42069), decoded live inside the bridge. The phone stream is unaffected.";
 
-        if !BridgeState.hand-enabled : Text {
-            text: "Hand tracking is disabled. Frames are not being requested from the phone.";
-            color: Theme.text-dim;
-            font-size: 12px;
+        Text {
+            text: BridgeState.preview-frames > 0 ? "Local preview: streaming" : "Local preview: waiting for the driver…";
+            color: BridgeState.preview-frames > 0 ? Theme.ok : Theme.text-dim;
+            font-size: 13px;
+            font-weight: 600;
             wrap: word-wrap;
         }
 
-        if BridgeState.hand-enabled && BridgeState.hands-detected == 0 : Text {
-            text: "No hands detected yet. Keep your hands in the phone camera frustum.";
-            color: Theme.warn;
-            font-size: 12px;
-            wrap: word-wrap;
-        }
-
-        if BridgeState.hand-enabled && BridgeState.hands-detected > 0 : Text {
-            text: "Tracking active.";
-            color: Theme.ok;
-            font-size: 12px;
-            wrap: word-wrap;
-        }
-
-        HorizontalLayout {
+        GridLayout {
             spacing: 12px;
 
-            Metric {
-                label: "Hands detected";
-                value: "{BridgeState.hands-detected}";
-                horizontal-stretch: 1;
+            Row {
+                Metric {
+                    label: "Driver FPS";
+                    value: BridgeState.preview-driver-fps + "";
+                    horizontal-stretch: 1;
+                }
+
+                Metric {
+                    label: "Bitrate";
+                    value: BridgeState.preview-bitrate-kbps + " kbps";
+                    horizontal-stretch: 1;
+                }
             }
 
-            Metric {
-                label: "Landmarks / hand";
-                value: "{BridgeState.landmark-count}";
-                horizontal-stretch: 1;
-            }
-        }
-    }
-}
+            Row {
+                Metric {
+                    label: "Frames sent";
+                    value: BridgeState.preview-frames + "";
+                    horizontal-stretch: 1;
+                }
 
-component DiagnosticsPage inherits VerticalLayout {
-    spacing: 14px;
-    padding: 20px;
-
-    Text {
-        text: "Diagnostics";
-        color: Theme.text-hi;
-        font-size: 22px;
-        font-weight: 700;
-    }
-
-    HorizontalLayout {
-        spacing: 12px;
-
-        Metric {
-            label: "Stream FPS";
-            value: "{BridgeState.stream-fps}";
-            horizontal-stretch: 1;
-        }
-
-        Metric {
-            label: "Encoder";
-            value: BridgeState.encoder-name;
-            horizontal-stretch: 1;
-        }
-
-        Metric {
-            label: "Latency";
-            value: "{BridgeState.latency-ms} ms";
-            horizontal-stretch: 1;
-        }
-
-        Metric {
-            label: "Gyro rate";
-            value: "{BridgeState.gyro-fps}/s";
-            horizontal-stretch: 1;
-        }
-    }
-
-    HorizontalLayout {
-        spacing: 12px;
-
-        Metric {
-            label: "Hand FPS";
-            value: "{BridgeState.hand-fps}";
-            horizontal-stretch: 1;
-        }
-
-        Metric {
-            label: "Telemetry packets";
-            value: "{BridgeState.packets-total}";
-            horizontal-stretch: 1;
-        }
-
-        Metric {
-            label: "Phone address";
-            value: BridgeState.phone-ip;
-            horizontal-stretch: 1;
-        }
-    }
-
-    Card {
-        title: "Bridge log";
-        hint: "Newest entries on top.";
-
-        Rectangle {
-            width: 100%;
-            height: 240px;
-            border-radius: 12px;
-            border-width: 1px;
-            border-color: Theme.border;
-            background: #0A0D13;
-
-            Flickable {
-                width: 100%;
-                height: 100%;
-
-                Text {
-                    x: 12px;
-                    y: 8px;
-                    width: parent.width - 24px;
-                    wrap: word-wrap;
-                    text: BridgeState.log-text;
-                    color: Theme.text-mid;
-                    font-size: 12px;
-                    font-family: "Consolas";
+                Metric {
+                    label: "Dropped";
+                    value: BridgeState.preview-drops + "";
+                    value-color: BridgeState.preview-drops > 0 ? Theme.warn : Theme.text-hi;
+                    horizontal-stretch: 1;
                 }
             }
         }
     }
-}
-
-component GeneralPage inherits VerticalLayout {
-    spacing: 14px;
-    padding: 20px;
-
-    Text {
-        text: "General";
-        color: Theme.text-hi;
-        font-size: 22px;
-        font-weight: 700;
-    }
 
     Card {
         title: "Encoder";
+        hint: "GPU lets the driver pick the hardware backend for your card (AMF → NVENC → QSV, libx264 fallback). CPU forces software encoding.";
 
         HorizontalLayout {
             spacing: 10px;
 
             Pill {
-                text: "Auto";
+                text: "GPU";
                 active: BridgeState.encoder-index == 0;
+                horizontal-stretch: 1;
                 clicked => {
                     BridgeState.encoder-index = 0;
                 }
             }
 
             Pill {
-                text: "AMF";
+                text: "CPU";
                 active: BridgeState.encoder-index == 1;
+                horizontal-stretch: 1;
                 clicked => {
                     BridgeState.encoder-index = 1;
                 }
             }
-
-            Pill {
-                text: "NVENC";
-                active: BridgeState.encoder-index == 2;
-                clicked => {
-                    BridgeState.encoder-index = 2;
-                }
-            }
-
-            Pill {
-                text: "QSV";
-                active: BridgeState.encoder-index == 3;
-                clicked => {
-                    BridgeState.encoder-index = 3;
-                }
-            }
-
-            Pill {
-                text: "libx264";
-                active: BridgeState.encoder-index == 4;
-                clicked => {
-                    BridgeState.encoder-index = 4;
-                }
-            }
-        }
-
-        Text {
-            text: "Driver auto-detects AMF → NVENC → QSV → libx264. Picking a specific one pins the encoder selection.";
-            color: Theme.text-dim;
-            font-size: 11px;
-            wrap: word-wrap;
         }
     }
 
     Card {
-        title: "Streaming settings";
-        hint: "Resolution is clamped by the phone's hardware decoder cap. Settings are pushed to the driver over UDP 42070.";
+        title: "Picture";
+        hint: "Resolution is clamped by the phone's hardware decoder cap. Settings push to the driver over UDP 42070 when you apply.";
 
         VerticalLayout {
             spacing: 12px;
@@ -1131,22 +961,361 @@ component GeneralPage inherits VerticalLayout {
                 }
             }
 
-            Stepper {
-                label: "Bitrate";
-                value: BridgeState.bitrate;
-                min: 2;
-                max: 100;
-                step: 2;
-                unit: " Mbps";
-                changed(v) => {
-                    BridgeState.bitrate = v;
+            HorizontalLayout {
+                spacing: 10px;
+                height: 36px;
+                cross-axis-alignment: center;
+
+                Text {
+                    text: "Bitrate (Mbps)";
+                    color: Theme.text-mid;
+                    font-size: 13px;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    wrap: word-wrap;
+                }
+
+                Slider {
+                    minimum: 2;
+                    maximum: 40;
+                    value: BridgeState.bitrate;
+                    horizontal-stretch: 2;
+                    changed(v) => {
+                        BridgeState.bitrate = Math.round(v);
+                    }
+                }
+
+                Text {
+                    text: BridgeState.bitrate + " Mbps";
+                    color: Theme.text-hi;
+                    font-size: 14px;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                    width: 76px;
+                    horizontal-alignment: right;
                 }
             }
         }
     }
 
+    HorizontalLayout {
+        spacing: 10px;
+
+        SecondaryButton {
+            text: BridgeState.link-test-active ? "Testing Link… (≈10s)" : "Test Link";
+            enabled: BridgeState.driver-connected && BridgeState.phone-connected && !BridgeState.link-test-active;
+            horizontal-stretch: 1;
+            clicked => {
+                BridgeState.test-link();
+            }
+        }
+
+        PrimaryButton {
+            text: "Apply to Driver";
+            enabled: BridgeState.driver-connected;
+            horizontal-stretch: 1;
+            clicked => {
+                BridgeState.apply-settings(BridgeState.video-width, BridgeState.video-height, BridgeState.fps, BridgeState.bitrate, BridgeState.encoder-index);
+            }
+        }
+    }
+
+    Text {
+        text: BridgeState.link-test-note;
+        color: Theme.text-mid;
+        font-size: 12px;
+        wrap: word-wrap;
+        visible: BridgeState.link-test-note != "";
+    }
+        } // right-col
+    } // right ScrollView
+}
+
+component HandPage inherits VerticalLayout {
+    spacing: 14px;
+    padding: 20px;
+
+    Text {
+        text: "Hand Tracking";
+        color: Theme.text-hi;
+        font-size: 22px;
+        font-weight: 700;
+    }
+
     Card {
-        title: "Phone";
+        title: "Camera feed";
+        hint: "Live JPEG frames from the phone camera (UDP 42072). Hand skeleton overlay drawn in real time.";
+
+        Rectangle {
+            height: 420px;
+            border-radius: 12px;
+            clip: true;
+            background: #000;
+            border-width: 1px;
+            border-color: Theme.border;
+
+            Image {
+                source: BridgeState.camera-frame;
+                width: 100%;
+                height: 100%;
+                image-fit: contain;
+            }
+        }
+    }
+
+    Card {
+        title: "Detection Model";
+        hint: "MediaPipe Hand Landmarker runs in a Python sidecar (TCP 42073). Applying pushes the new thresholds live — no restart, no dropped frames.";
+
+        Toggle {
+            label: "Enable hand tracking";
+            checked: BridgeState.hand-enabled;
+            changed(b) => {
+                BridgeState.hand-toggled(b);
+            }
+        }
+
+        Toggle {
+            label: "Draw skeleton overlay on the camera feed";
+            checked: BridgeState.hand-overlay;
+            changed(b) => {
+                BridgeState.overlay-toggled(b);
+            }
+        }
+
+        Stepper {
+            label: "Detection confidence";
+            value: BridgeState.hand-det;
+            min: 1;
+            max: 100;
+            step: 5;
+            unit: "%";
+            changed(v) => {
+                BridgeState.hand-det = v;
+            }
+        }
+
+        Stepper {
+            label: "Presence confidence";
+            value: BridgeState.hand-pres;
+            min: 1;
+            max: 100;
+            step: 5;
+            unit: "%";
+            changed(v) => {
+                BridgeState.hand-pres = v;
+            }
+        }
+
+        Stepper {
+            label: "Tracking confidence";
+            value: BridgeState.hand-track;
+            min: 1;
+            max: 100;
+            step: 5;
+            unit: "%";
+            changed(v) => {
+                BridgeState.hand-track = v;
+            }
+        }
+
+        PrimaryButton {
+            text: "Apply Model Settings";
+            clicked => {
+                BridgeState.apply-hand-model(BridgeState.hand-det, BridgeState.hand-pres, BridgeState.hand-track);
+            }
+        }
+    }
+
+    Card {
+        title: "Status";
+
+        if !BridgeState.hand-enabled : Text {
+            text: "Hand tracking is disabled. Frames are not being requested from the phone.";
+            color: Theme.text-dim;
+            font-size: 12px;
+            wrap: word-wrap;
+        }
+
+        if BridgeState.hand-enabled && BridgeState.hands-detected == 0 : Text {
+            text: "No hands detected yet. Keep your hands in the phone camera frustum.";
+            color: Theme.warn;
+            font-size: 12px;
+            wrap: word-wrap;
+        }
+
+        if BridgeState.hand-enabled && BridgeState.hands-detected > 0 : Text {
+            text: "Tracking active.";
+            color: Theme.ok;
+            font-size: 12px;
+            wrap: word-wrap;
+        }
+
+        HorizontalLayout {
+            spacing: 12px;
+
+            Metric {
+                label: "Hands Detected";
+                value: BridgeState.hands-detected + "";
+                horizontal-stretch: 1;
+            }
+
+            Metric {
+                label: "Landmarks / Hand";
+                value: BridgeState.landmark-count + "";
+                horizontal-stretch: 1;
+            }
+
+            Metric {
+                label: "Hand FPS";
+                value: BridgeState.hand-fps + " fps";
+                horizontal-stretch: 1;
+            }
+        }
+    }
+}
+
+component DiagnosticsPage inherits VerticalLayout {
+    spacing: 14px;
+    padding: 20px;
+
+    Text {
+        text: "Diagnostics";
+        color: Theme.text-hi;
+        font-size: 22px;
+        font-weight: 700;
+    }
+
+    HorizontalLayout {
+        spacing: 12px;
+
+        Metric {
+            label: "Stream FPS";
+            value: BridgeState.stream-fps + "";
+            horizontal-stretch: 1;
+        }
+
+        Metric {
+            label: "Encoder";
+            value: BridgeState.encoder-name;
+            horizontal-stretch: 1;
+        }
+
+        Metric {
+            label: "Latency";
+            value: BridgeState.latency-ms + " ms";
+            horizontal-stretch: 1;
+        }
+
+        Metric {
+            label: "Gyro Rate";
+            value: BridgeState.gyro-fps + "/s";
+            horizontal-stretch: 1;
+        }
+    }
+
+    HorizontalLayout {
+        spacing: 12px;
+
+        Metric {
+            label: "Hand FPS";
+            value: BridgeState.hand-fps + " fps";
+            horizontal-stretch: 1;
+        }
+
+        Metric {
+            label: "Camera FPS";
+            value: BridgeState.camera-fps + " fps";
+            horizontal-stretch: 1;
+        }
+
+        Metric {
+            label: "Telemetry Packets";
+            value: BridgeState.packets-total + "";
+            horizontal-stretch: 1;
+        }
+
+        Metric {
+            label: "Phone Address";
+            value: BridgeState.phone-ip;
+            horizontal-stretch: 1;
+        }
+    }
+
+    Card {
+        title: "Sensors";
+        hint: "Latest phone IMU sample from the telemetry uplink (UDP 42071).";
+
+        VerticalLayout {
+            spacing: 8px;
+
+            Text {
+                text: "Gyro  " + BridgeState.gyro-x + "  " + BridgeState.gyro-y + "  " + BridgeState.gyro-z + " rad/s";
+                color: Theme.text-mid;
+                font-size: 12px;
+                font-family: "Consolas";
+            }
+
+            Text {
+                text: "Accel " + BridgeState.accel-x + "  " + BridgeState.accel-y + "  " + BridgeState.accel-z + " m/s²";
+                color: Theme.text-mid;
+                font-size: 12px;
+                font-family: "Consolas";
+            }
+
+            Text {
+                text: "Mag   " + BridgeState.mag-x + "  " + BridgeState.mag-y + "  " + BridgeState.mag-z + " µT";
+                color: Theme.text-mid;
+                font-size: 12px;
+                font-family: "Consolas";
+            }
+        }
+    }
+
+    Card {
+        title: "Bridge log";
+        hint: "Newest entries on top.";
+
+        Rectangle {
+            width: 100%;
+            height: 240px;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: Theme.border;
+            background: #000000;
+
+            Flickable {
+                width: 100%;
+                height: 100%;
+
+                Text {
+                    x: 12px;
+                    y: 8px;
+                    width: parent.width - 24px;
+                    wrap: word-wrap;
+                    text: BridgeState.log-text;
+                    color: Theme.text-mid;
+                    font-size: 12px;
+                    font-family: "Consolas";
+                }
+            }
+        }
+    }
+}
+
+component GeneralPage inherits VerticalLayout {
+    spacing: 14px;
+    padding: 20px;
+
+    Text {
+        text: "General";
+        color: Theme.text-hi;
+        font-size: 22px;
+        font-weight: 700;
+    }
+
+    Card {
+        title: "Phone Link";
 
         HorizontalLayout {
             spacing: 10px;
@@ -1185,11 +1354,14 @@ component GeneralPage inherits VerticalLayout {
         }
     }
 
-    GradientButton {
-        text: "Apply to driver";
-        enabled: BridgeState.driver-connected;
-        clicked => {
-            BridgeState.apply-settings(BridgeState.video-width, BridgeState.video-height, BridgeState.fps, BridgeState.bitrate, BridgeState.encoder-index);
+    Card {
+        title: "About";
+
+        Text {
+            text: "Bridge v" + BridgeState.app-version + " · control plane for the SteamVR driver · GPL-3.0";
+            color: Theme.text-mid;
+            font-size: 12px;
+            wrap: word-wrap;
         }
     }
 }
@@ -1213,18 +1385,14 @@ export component MainWindow inherits Window {
             Sidebar {}
 
             Rectangle {
-                width: 720px;
                 horizontal-stretch: 1;
                 vertical-stretch: 1;
-                background: @linear-gradient(160deg, #0E1119, #0B0E14);
+                background: Theme.bg;
 
-                if BridgeState.current-tab == 0 : ScrollView {
+                if BridgeState.current-tab == 0 : StreamPage {
                     x: 0; y: 0;
                     width: parent.width;
                     height: parent.height;
-                    horizontal-scrollbar-policy: always-off;
-                    s0 := StreamPage {}
-                    viewport-height: s0.preferred-height;
                 }
                 if BridgeState.current-tab == 1 : ScrollView {
                     x: 0; y: 0;

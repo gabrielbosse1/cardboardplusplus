@@ -5,6 +5,10 @@
 //!     3x f32 acceleration, 3x f32 magnetic field (45 bytes total)
 //!   * `0x11` hand frame — u64 timestamp_ms, u8 hands, u8 landmarks/hand,
 //!     f32 confidence (15 bytes total)
+//!   * `0x13` net stats — u64 timestamp_ms, u32 frames decoded since last
+//!     report, u32 stall count (monotonic), f32 decoded fps (21 bytes total).
+//!     Sent every ~2 s by the phone's NetStatsReporter; drives the bridge's
+//!     adaptive bitrate.
 //!   * `0x20` ping — a bare tag byte, used only to keep the link alive
 //!
 //! Plus one text frame: `CARDBOARD_PHONE_HELLO vN` when the phone first joins.
@@ -34,11 +38,21 @@ pub struct RotationSample {
     pub quat: [f32; 4], // [w, x, y, z]
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+#[allow(dead_code)]
+pub struct NetStats {
+    pub timestamp_ms: u64,
+    pub frames_decoded: u32,
+    pub stalls: u32,
+    pub decoded_fps: f32,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum TelemetryPacket {
     Gyro(GyroSample),
     Hand(HandFrame),
     Rotation(RotationSample),
+    NetStats(NetStats),
     Hello,
     Ping,
     Unknown,
@@ -50,6 +64,8 @@ const GYRO_PACKET_LEN: usize = 45;
 const HAND_PACKET_LEN: usize = 15;
 /// Minimum length of a rotation quaternion packet (tag + 8 + 4*4 bytes = 25).
 const ROTATION_PACKET_LEN: usize = 25;
+/// Minimum length of a net-stats packet (tag + 8 + 4 + 4 + 4 bytes = 21).
+const NET_STATS_PACKET_LEN: usize = 21;
 
 /// Parse one datagram into the coarsest packet type the bridge cares about.
 /// Malformed or unrecognised data yields `Unknown` rather than an error, so
@@ -63,6 +79,7 @@ pub fn parse_packet(buf: &[u8]) -> TelemetryPacket {
         0x10 if buf.len() >= GYRO_PACKET_LEN => TelemetryPacket::Gyro(parse_gyro(buf)),
         0x11 if buf.len() >= HAND_PACKET_LEN => TelemetryPacket::Hand(parse_hand(buf)),
         0x12 if buf.len() >= ROTATION_PACKET_LEN => TelemetryPacket::Rotation(parse_rotation(buf)),
+        0x13 if buf.len() >= NET_STATS_PACKET_LEN => TelemetryPacket::NetStats(parse_net_stats(buf)),
         0x20 => TelemetryPacket::Ping,
         _ => {
             if is_phone_hello(buf) {
@@ -99,6 +116,15 @@ fn parse_rotation(buf: &[u8]) -> RotationSample {
     }
 }
 
+fn parse_net_stats(buf: &[u8]) -> NetStats {
+    NetStats {
+        timestamp_ms: read_u64(&buf[1..9]),
+        frames_decoded: read_u32(buf, 9),
+        stalls: read_u32(buf, 13),
+        decoded_fps: read_f32(buf, 17),
+    }
+}
+
 /// The greeting a phone sends on first contact over the telemetry link.
 fn is_phone_hello(buf: &[u8]) -> bool {
     String::from_utf8_lossy(buf)
@@ -114,6 +140,11 @@ fn read_u64(buf: &[u8]) -> u64 {
 /// Read a little-endian f32 at `offset` (bounds guaranteed by `parse_packet`).
 fn read_f32(buf: &[u8], offset: usize) -> f32 {
     f32::from_le_bytes(buf[offset..offset + 4].try_into().expect("fixed-size f32 slice"))
+}
+
+/// Read a little-endian u32 at `offset` (bounds guaranteed by `parse_packet`).
+fn read_u32(buf: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(buf[offset..offset + 4].try_into().expect("fixed-size u32 slice"))
 }
 
 /// Encode the phone-side greeting (kept for tests/reference — the real phone
@@ -206,5 +237,37 @@ mod tests {
         assert!(matches!(parse_packet(b"random noise"), TelemetryPacket::Unknown));
         // 0x10 with too few payload bytes must not be misread as a gyro frame.
         assert!(matches!(parse_packet(&[0x10, 0, 0, 0]), TelemetryPacket::Unknown));
+    }
+
+    fn net_stats_packet() -> Vec<u8> {
+        let mut buf = vec![0x13];
+        buf.extend_from_slice(&5678u64.to_le_bytes());
+        buf.extend_from_slice(&120u32.to_le_bytes()); // frames decoded
+        buf.extend_from_slice(&3u32.to_le_bytes()); // stalls
+        buf.extend_from_slice(&58.5f32.to_le_bytes()); // decoded fps
+        buf
+    }
+
+    #[test]
+    fn net_stats_packet_length_matches_the_wire_contract() {
+        assert_eq!(net_stats_packet().len(), NET_STATS_PACKET_LEN);
+    }
+
+    #[test]
+    fn parses_a_net_stats_packet() {
+        match parse_packet(&net_stats_packet()) {
+            TelemetryPacket::NetStats(stats) => {
+                assert_eq!(stats.timestamp_ms, 5678);
+                assert_eq!(stats.frames_decoded, 120);
+                assert_eq!(stats.stalls, 3);
+                assert_eq!(stats.decoded_fps, 58.5);
+            }
+            other => panic!("expected NetStats, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_truncated_net_stats() {
+        assert!(matches!(parse_packet(&[0x13, 0, 0, 0]), TelemetryPacket::Unknown));
     }
 }

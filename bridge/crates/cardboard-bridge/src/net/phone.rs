@@ -132,6 +132,11 @@ fn apply_packet(state: &SharedState, packet: TelemetryPacket, src: SocketAddr) {
                 }
                 forward_rot = Some(sample);
             }
+            TelemetryPacket::NetStats(stats) => {
+                s.phone_connected = true;
+                // Counters only — bitrate moves via manual Apply (see Test Link).
+                s.note_net_stats(&stats);
+            }
             TelemetryPacket::Unknown => {}
         }
         s.recompute_fps();
@@ -313,11 +318,56 @@ mod tests {
     // --- apply_packet: Unknown ---
 
     #[test]
-    fn unknown_packet_does_not_set_phone_connected() {
-        let state = fresh_state();
+    fn unknown_packet_does_not_set_phone_connected() {        let state = fresh_state();
         apply_packet(&state, TelemetryPacket::Unknown, fake_src());
         let s = state.lock().unwrap();
         assert!(!s.phone_connected);
+    }
+
+    // --- apply_packet: NetStats ---
+
+    #[test]
+    fn net_stats_sets_phone_connected_and_records_counters() {
+        use crate::net::telemetry::NetStats;
+        let state = fresh_state();
+        {
+            let mut s = state.lock().unwrap();
+            s.driver_connected = true;
+        }
+        let stats = NetStats {
+            timestamp_ms: 1,
+            frames_decoded: 120,
+            stalls: 0,
+            decoded_fps: 60.0,
+        };
+        apply_packet(&state, TelemetryPacket::NetStats(stats), fake_src());
+        let s = state.lock().unwrap();
+        assert!(s.phone_connected);
+        assert_eq!(s.net_frames_decoded, 120);
+        assert_eq!(s.net_decoded_fps, 60.0);
+    }
+
+    #[test]
+    fn net_stats_stall_never_pushes_by_itself() {
+        use crate::net::telemetry::NetStats;
+        let state = fresh_state();
+        {
+            let mut s = state.lock().unwrap();
+            s.driver_connected = true;
+            assert_eq!(s.applied_bitrate_mbps, 20);
+        }
+        let stats = NetStats {
+            timestamp_ms: 1,
+            frames_decoded: 10,
+            stalls: 2,
+            decoded_fps: 5.0,
+        };
+        // Counters update for the UI, but nothing is pushed: the applied
+        // settings only change via manual Apply (see Test Link).
+        apply_packet(&state, TelemetryPacket::NetStats(stats), fake_src());
+        let s = state.lock().unwrap();
+        assert_eq!(s.net_stalls, 2);
+        assert_eq!(s.applied_bitrate_mbps, 20);
     }
 
     // --- mark_phone_gone_if_stale ---

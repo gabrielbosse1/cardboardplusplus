@@ -124,6 +124,8 @@ struct ShmHandle {
     shm_fd: libc::c_int,
     /// 1 if we created the region (and should unlink on drop).
     owner: bool,
+    /// Name of the region this handle owns, so Drop unlinks the right one.
+    name: String,
 }
 
 #[cfg(not(windows))]
@@ -148,7 +150,7 @@ impl SharedMemory {
             unsafe { libc::close(fd) };
             return Err(e);
         }
-        Self::map(ShmHandle { shm_fd: fd, owner: true }, size)
+        Self::map(ShmHandle { shm_fd: fd, owner: true, name: name.to_string() }, size)
     }
 
     pub fn open(name: &str, size: usize) -> MemResult<Self> {
@@ -160,7 +162,7 @@ impl SharedMemory {
                 std::io::Error::last_os_error()
             )));
         }
-        Self::map(ShmHandle { shm_fd: fd, owner: false }, size)
+        Self::map(ShmHandle { shm_fd: fd, owner: false, name: name.to_string() }, size)
     }
 
     fn map(h: ShmHandle, size: usize) -> MemResult<Self> {
@@ -210,10 +212,9 @@ impl Drop for SharedMemory {
                     libc::munmap(self.base as *mut libc::c_void, self.size);
                     libc::close(self.handle.shm_fd);
                     if self.handle.owner {
-                        // Best-effort unlink; ignore when another consumer still has it open.
-                        let name =
-                            region_name();
-                        if let Ok(s) = std::ffi::CString::new(name) {
+                        // Best-effort unlink of the region WE own; ignore when
+                        // another consumer still has it open.
+                        if let Ok(s) = std::ffi::CString::new(self.handle.name.as_str()) {
                             libc::shm_unlink(s.as_ptr());
                         }
                     }

@@ -177,9 +177,18 @@ void HmdDriver::DiscoveryThreadFunc()
             }
 
             if (strncmp(buffer, wire::kBridgeCfg, wire::kBridgeCfgLen) == 0) {
-                // The bridge pushes stream settings (BRIDGE_CFG <fps> <bitrate> <codec>)
-                // on the same socket. It is control-plane traffic, not a phone — ignore.
-                DebugLog("BRIDGE_CFG from %s:%d ignored (control-plane)", senderIpStr, ntohs(senderAddr.sin_port));
+                // Bridge stream-settings push: "BRIDGE_CFG <fps> <bitrate_kbps> <codec>".
+                // Applied live (same re-init path as the hardware-cap clamp);
+                // malformed values keep the current encoder settings.
+                int cfgFps = 0, cfgKbps = 0;
+                char cfgCodec[32] = "";
+                if (sscanf_s(buffer, "BRIDGE_CFG %d %d %31s", &cfgFps, &cfgKbps, cfgCodec, (unsigned)sizeof(cfgCodec)) >= 2) {
+                    DriverLog("BRIDGE_CFG from %s:%d -> fps=%d bitrate=%d kbps codec=%s",
+                              senderIpStr, ntohs(senderAddr.sin_port), cfgFps, cfgKbps, cfgCodec);
+                    ApplyBridgeCfg(cfgFps, cfgKbps, cfgCodec);
+                } else {
+                    DebugLog("BRIDGE_CFG from %s:%d malformed, ignored", senderIpStr, ntohs(senderAddr.sin_port));
+                }
                 continue;
             }
 

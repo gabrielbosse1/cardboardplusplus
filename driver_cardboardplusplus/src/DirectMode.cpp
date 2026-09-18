@@ -34,7 +34,12 @@ static std::atomic<int> g_submitLayerCount{ 0 };
 
 void HmdDriver::CreateSwapTextureSet(uint32_t unPid, const SwapTextureSetDesc_t* pSwapTextureSetDesc, SwapTextureSet_t* pOutSwapTextureSet)
 {
-	// Create three distinct shared textures (true triple buffering) so the app,
+	// Zero the out-param on entry so a mid-function failure never leaves
+    // garbage handles for SteamVR to use.
+    if (pOutSwapTextureSet) {
+        std::memset(pOutSwapTextureSet, 0, sizeof(*pOutSwapTextureSet));
+    }
+    // Create three distinct shared textures (true triple buffering) so the app,
     // compositor, and encoder can each own a buffer simultaneously.
     DriverLog("CreateSwapTextureSet called: width=%d, height=%d, format=%d, samples=%d",
         pSwapTextureSetDesc->nWidth, pSwapTextureSetDesc->nHeight, pSwapTextureSetDesc->nFormat, pSwapTextureSetDesc->nSampleCount);

@@ -11,7 +11,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
-#include <cstdlib>
+#include <windows.h>
 #include "openvr_driver.h"
 
 namespace cbpp_debug {
@@ -19,8 +19,12 @@ namespace cbpp_debug {
 // Check once at load time; env var can't change mid-session (SteamVR restarts
 // the driver DLL anyway).
 inline bool debug_enabled() {
-    // Always-on for now — sensor diagnostics needed.
-    return true;
+    static const bool enabled = [] {
+        char val[2] = {};
+        return GetEnvironmentVariableA("CARDBOARD_DEBUG", val, sizeof(val)) == 1 &&
+               val[0] == '1';
+    }();
+    return enabled;
 }
 
 inline void log_msg(const char* tag, const char* pFormat, ...) {

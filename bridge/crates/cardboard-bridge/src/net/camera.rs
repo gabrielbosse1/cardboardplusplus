@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use crate::app::SharedState;
 use crate::net::mediapipe::MediapipeClient;
-use crate::net::CAMERA_PORT;
+use crate::net::{CAMERA_PORT, MEDIAPIPE_PORT};
 
 /// u16 seq header in front of every JPEG datagram (big-endian).
 pub const SEQ_HEADER_LEN: usize = 2;
@@ -59,10 +59,13 @@ pub fn spawn(state: SharedState, client: Option<MediapipeClient>) {
     let (tx, rx) = mpsc::sync_channel::<DetectJob>(DETECT_QUEUE);
     let detect_running = Arc::new(AtomicBool::new(true));
 
-    if let Some(cli) = client {
+    // Always run the detect worker, even when the sidecar wasn't reachable
+    // at startup: it lazy-connects (and retries) so a slow Python import
+    // or a manually-started server still heals without a bridge restart.
+    {
         let detect_state = state.clone();
         let running = detect_running.clone();
-        std::thread::spawn(move || detect_loop(rx, detect_state, cli, running));
+        std::thread::spawn(move || detect_loop(rx, detect_state, client, running));
     }
 
     std::thread::spawn(move || camera_loop(sock, state, tx));
@@ -118,12 +121,22 @@ fn process_frame(
         None => return,
     };
 
-    // Display path: never waits for MediaPipe.
-    if let Ok(mut s) = state.lock() {
-        s.note_camera_frame(w, h, rgba.clone());
-        if frame_count % 60 == 1 {
-            s.push_log(format!("camera frame #{frame_count} seq={seq}, {w}x{h}"));
+    // When the overlay is on, only the detect thread should store display
+    // frames — it annotates them with the skeleton. Storing raw frames here
+    // would cause a visible raw↔overlay flicker as the two threads race to
+    // overwrite the same slot.
+    let overlay_on = state.lock().map(|s| s.hand_overlay).unwrap_or(true);
+    if !overlay_on {
+        // Display path: never waits for MediaPipe.
+        if let Ok(mut s) = state.lock() {
+            s.note_camera_frame(w, h, rgba.clone());
+            if frame_count % 60 == 1 {
+                s.push_log(format!("camera frame #{frame_count} seq={seq}, {w}x{h}"));
+            }
         }
+    } else if frame_count % 60 == 1 {
+        // Still log even when skipping the display write, for diagnostics.
+        crate::debug_log!(state, "[camera] frame #{frame_count} seq={seq}, {w}x{h} (overlay on, skipping raw store)");
     }
 
     // Detect path: latest-wins. Channel full = worker busy → drop this one
@@ -131,11 +144,13 @@ fn process_frame(
     let _ = tx.try_send((seq, w, h, rgba, jpeg_data.to_vec()));
 }
 
-/// Detect thread: blocking TCP detect on the latest job only.
+/// Detect thread: blocking TCP detect on the latest job only. Holds an
+/// optional client: `None` (sidecar unreachable at startup) lazy-connects
+/// on the first enabled frame and retries, so the pipeline self-heals.
 fn detect_loop(
     rx: mpsc::Receiver<DetectJob>,
     state: SharedState,
-    client: MediapipeClient,
+    mut client: Option<MediapipeClient>,
     running: Arc<AtomicBool>,
 ) {
     while running.load(Ordering::Relaxed) {
@@ -148,15 +163,51 @@ fn detect_loop(
             job = newer;
         }
         let (seq, w, h, mut rgba, jpeg) = job;
-        let hands = client.detect(&jpeg);
+        // Master switch lives in shared state so the UI toggle takes effect
+        // on the very next frame without touching the thread layout.
+        let (enabled, overlay) = match state.lock() {
+            Ok(s) => (s.hand_enabled, s.hand_overlay),
+            Err(_) => (false, true),
+        };
+        // Lazy (re)connect: first enabled frame after a failed startup, or
+        // a manually-started sidecar, picks up the server without a restart.
+        // Healthy probe (not a bare accept): a wedged squatter must not be
+        // adopted — startup reclaims those; here we just retry next frame.
+        // Thresholds come from state so the probe never clobbers tuning.
+        if enabled && client.is_none() {
+            let (d, p, t) = match state.lock() {
+                Ok(s) => (
+                    s.hand_min_detection as f32 / 100.0,
+                    s.hand_min_presence as f32 / 100.0,
+                    s.hand_min_tracking as f32 / 100.0,
+                ),
+                Err(_) => (0.5, 0.5, 0.5),
+            };
+            if let Some(cli) = MediapipeClient::connect_healthy(MEDIAPIPE_PORT, d, p, t) {
+                client = Some(cli);
+                if let Ok(mut s) = state.lock() {
+                    s.push_log("mediapipe: lazy-connected to sidecar".into());
+                }
+            }
+        }
+        let hands = match (&client, enabled) {
+            (Some(cli), true) => cli.detect(&jpeg),
+            _ => vec![],
+        };
         let count = hands.len();
-        if count > 0 && !rgba.is_empty() {
+        if overlay && count > 0 && !rgba.is_empty() {
             crate::hand_overlay::draw_hands(&mut rgba, w, h, &hands);
         }
         if let Ok(mut s) = state.lock() {
             s.camera_detected_hands = count;
             if !rgba.is_empty() {
-                s.store_camera_frame(w, h, rgba);
+                if overlay {
+                    // When overlay is on, this is the sole display writer.
+                    // Count the frame for fps so the pill doesn't read zero.
+                    s.note_camera_frame(w, h, rgba);
+                } else {
+                    s.store_camera_frame(w, h, rgba);
+                }
             }
             if count > 0 {
                 crate::debug_log!(&state, "[camera] seq={seq} {count} hand(s)");

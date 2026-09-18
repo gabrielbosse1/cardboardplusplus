@@ -115,16 +115,23 @@ static void test_bridge_preview_toggle_parsing() {
 // ---- BRIDGE_CFG parsing simulation ----
 
 static void test_bridge_cfg_parsing() {
-    // Simulate parsing "BRIDGE_CFG 60 20000 h264_nvenc"
+    // Mirror of Discovery.cpp: "BRIDGE_CFG <fps> <bitrate_kbps> <codec>".
     const char* cfg = "BRIDGE_CFG 60 20000 h264_nvenc";
     int fps = 0, bitrate = 0;
     char codec[32] = {0};
-    int parsed = sscanf(cfg, "BRIDGE_STATS fps=%d bitrate=%d %31s", &fps, &bitrate, codec);
-    // This simulates what the driver would parse from BRIDGE_CFG.
-    // The actual driver logs BRIDGE_CFG as ignored (control-plane), but the
-    // format is: BRIDGE_CFG <fps> <bitrate_kbps> <codec>
+    int parsed = sscanf(cfg, "BRIDGE_CFG %d %d %31s", &fps, &bitrate, codec);
+    assert(parsed == 3);
+    assert(fps == 60);
+    assert(bitrate == 20000);
+    assert(strcmp(codec, "h264_nvenc") == 0);
+    // A bitrate-only push without codec still applies fps+bitrate.
+    const char* cfg2 = "BRIDGE_CFG 30 8000";
+    int fps2 = 0, bitrate2 = 0;
+    char codec2[32] = {0};
+    assert(sscanf(cfg2, "BRIDGE_CFG %d %d %31s", &fps2, &bitrate2, codec2) >= 2);
+    assert(fps2 == 30 && bitrate2 == 8000);
     assert(strncmp(cfg, wire::kBridgeCfg, wire::kBridgeCfgLen) == 0);
-    printf("PASS: BRIDGE_CFG prefix recognized\n");
+    printf("PASS: BRIDGE_CFG parses fps/bitrate/codec\n");
 }
 
 // ---- Phone discovery simulation (pretend to be phone) ----
@@ -533,7 +540,7 @@ static void test_dispatch_bridge_preview_off() {
 
 static void test_dispatch_bridge_cfg() {
     assert(simulate_dispatch("BRIDGE_CFG 60 20000 h264_nvenc") == DispatchResult::BridgeCfg);
-    printf("PASS: BRIDGE_CFG dispatched to ignored handler\n");
+    printf("PASS: BRIDGE_CFG dispatched to encoder re-init handler\n");
 }
 
 static void test_dispatch_keyframe_req() {

@@ -125,7 +125,7 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
     telemetrySender = new TelemetrySender(this, appSettings);
     permissionManager = new PermissionManager(this);
     cameraController = new CameraController(this, this);
-    videoManager = new VideoManager(this);
+    videoManager = new VideoManager(this, appSettings);
     discoveryManager = new DiscoveryManager(appSettings);
     // Pre-query the hardware decoder cap so the DiscoveryManager can announce it
     // to the driver on the first ACK (using the same socket that proved connectivity).
@@ -254,6 +254,18 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
 
     // Start telemetry (gyro/accel/mag → bridge)
     telemetrySender.start();
+
+    // Recreate the video decoder + restart the receiver on the GL thread.
+    // onSurfaceCreated() only fires when the GL context is recreated; after a
+    // plain pause/resume (context preserved) it never runs, so restart here,
+    // guarded to avoid duplicates.
+    glView.queueEvent(
+        () -> {
+          if (!videoManager.isStarted()) {
+            videoManager.onSurfaceCreated();
+            videoManager.start();
+          }
+        });
 
     // Queue camera setup on GL thread (guards prevent duplicates)
     glView.queueEvent(
