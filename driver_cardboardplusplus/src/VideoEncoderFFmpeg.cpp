@@ -18,12 +18,18 @@ bool VideoEncoder::InitializeFFmpeg()
 {
     ENCODER_LOG("Initializing FFmpeg H264 encoder...");
 
-    // Prefer hardware (GPU) encoders for throughput; fall back to libx264.
+    // Honor the requested encoder type (m_useGpuEncoding was set from the
+    // bridge's selection before this runs). SW forces libx264; GPU prefers
+    // hardware with libx264 as fallback so init still succeeds without HW.
     // h264_amf = AMD, h264_nvenc = NVIDIA, h264_qsv = Intel.
-    const char* codecCandidates[] = { "h264_amf", "h264_nvenc", "h264_qsv", "libx264" };
+    const char* hwCandidates[] = { "h264_amf", "h264_nvenc", "h264_qsv", "libx264" };
+    const char* swCandidates[] = { "libx264" };
+    const char** codecNames = m_useGpuEncoding ? hwCandidates : swCandidates;
+    const int codecNameCount = m_useGpuEncoding ? 4 : 1;
     const AVCodec* codec = nullptr;
 
-    for (const char* name : codecCandidates) {
+    for (int n = 0; n < codecNameCount; n++) {
+        const char* name = codecNames[n];
         const AVCodec* c = avcodec_find_encoder_by_name(name);
         if (!c) {
             ENCODER_LOG("Encoder %s not available, skipping", name);
