@@ -72,7 +72,7 @@ public class VideoDecoder {
   // ---------------------------------------------------------------------------
 
   /** Called from the GL thread before drawing, to present the latest decoded frame. */
-  public void updateVideoTexture() {
+  public synchronized void updateVideoTexture() {
     if (surfaceTexture == null) return;
     try {
       // The OES texture (textureId) is created by native and already lives in the

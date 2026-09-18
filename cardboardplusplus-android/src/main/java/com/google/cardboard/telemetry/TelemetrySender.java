@@ -62,7 +62,7 @@ public class TelemetrySender implements SensorEventListener {
     private long lastRawNs = 0;
     private static final long MIN_RAW_INTERVAL_NS = 5_000_000L; // 5 ms
 
-    private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    private ExecutorService executor = Executors.newSingleThreadExecutor();
 
     private volatile boolean running;
 
@@ -75,6 +75,10 @@ public class TelemetrySender implements SensorEventListener {
 
     public void start() {
         if (running) return;
+        // stop() shuts the executor down; recreate it so pause/resume works.
+        if (executor == null || executor.isShutdown() || executor.isTerminated()) {
+            executor = Executors.newSingleThreadExecutor();
+        }
         running = true;
         connected = false;
 

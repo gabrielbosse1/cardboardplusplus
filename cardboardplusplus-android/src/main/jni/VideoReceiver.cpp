@@ -203,7 +203,7 @@ void VideoReceiver::ReceiveLoop() {
       bool is_key = false;
       for (size_t i = 0; i + 4 < frame.size(); ++i) {
         if (frame[i] == 0x00 && frame[i+1] == 0x00 &&
-            frame[i+2] == 0x01 && frame[i+3] == 0x01) {
+            frame[i+2] == 0x00 && frame[i+3] == 0x01) {
           // 4-byte start code: NAL header at i+4
           int nal_type = frame[i+4] & 0x1F;
           if (nal_type == 5 || nal_type == 7) { is_key = true; break; }
