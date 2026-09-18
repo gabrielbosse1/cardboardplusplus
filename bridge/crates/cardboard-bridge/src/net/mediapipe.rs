@@ -30,6 +30,7 @@ pub struct DetectedHand {
 #[derive(Clone)]
 pub struct MediapipeClient {
     stream: Arc<Mutex<TcpStream>>,
+    port: u16,
 }
 
 impl MediapipeClient {
@@ -52,6 +53,7 @@ impl MediapipeClient {
         eprintln!("[mediapipe] connected to {addr}");
         Ok(Self {
             stream: Arc::new(Mutex::new(stream)),
+            port,
         })
     }
 
@@ -63,6 +65,7 @@ impl MediapipeClient {
         eprintln!("[mediapipe] connected to {addr}");
         Ok(Self {
             stream: Arc::new(Mutex::new(stream)),
+            port,
         })
     }
 
@@ -99,28 +102,50 @@ impl MediapipeClient {
         unreachable!()
     }
 
-    /// Send a JPEG frame and receive hand landmarks.
+    /// Send a JPEG frame and receive hand landmarks. On an IO error the
+    /// connection is re-established with backoff and the request retried
+    /// once, so a restarted Python server recovers without a bridge restart.
     pub fn detect(&self, jpeg: &[u8]) -> Vec<DetectedHand> {
         let mut stream = match self.stream.lock() {
             Ok(s) => s,
             Err(_) => return vec![],
         };
 
+        if let Some(hands) = Self::detect_once(&mut stream, jpeg) {
+            return hands;
+        }
+
+        // IO error: reconnect with backoff, then retry once.
+        let addr = format!("127.0.0.1:{}", self.port);
+        for attempt in 0..4 {
+            match Self::try_connect(&addr, 1, Duration::from_millis(100)) {
+                Ok(fresh) => {
+                    *stream = fresh;
+                    return Self::detect_once(&mut stream, jpeg).unwrap_or_default();
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(100 << attempt.min(4))),
+            }
+        }
+        vec![]
+    }
+
+    /// One request/response round-trip. Returns `None` on any IO error.
+    fn detect_once(stream: &mut TcpStream, jpeg: &[u8]) -> Option<Vec<DetectedHand>> {
         // Send: [4 bytes LE length] [JPEG data]
         let len_bytes = (jpeg.len() as u32).to_le_bytes();
         if stream.write_all(&len_bytes).is_err() || stream.write_all(jpeg).is_err() {
-            return vec![];
+            return None;
         }
         let _ = stream.flush();
 
         // Read: [1 byte num_hands] then per hand: [1 byte handedness] [4 bytes score] [252 bytes landmarks]
         let mut hdr = [0u8; 1];
         if stream.read_exact(&mut hdr).is_err() {
-            return vec![];
+            return None;
         }
         let n = hdr[0] as usize;
         if n == 0 {
-            return vec![];
+            return Some(vec![]);
         }
 
         let mut hands = Vec::with_capacity(n);
@@ -150,7 +175,7 @@ impl MediapipeClient {
             });
         }
 
-        hands
+        Some(hands)
     }
 }
 
@@ -278,6 +303,64 @@ mod tests {
 
         let stream = std::net::TcpStream::connect(format!("127.0.0.1:{port}"));
         assert!(stream.is_err());
+    }
+
+    #[test]
+    fn detect_reconnects_after_server_restart() {
+        use std::sync::mpsc::channel;
+
+        // Server A: accepts one connection, then on signal closes it and
+        // drops the listener so the port can be rebound (server "death").
+        let listener_a = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener_a.local_addr().unwrap().port();
+        let (accepted_tx, accepted_rx) = channel();
+        let (kill_tx, kill_rx) = channel();
+        std::thread::spawn(move || {
+            if let Ok((conn, _)) = listener_a.accept() {
+                let _ = accepted_tx.send(());
+                let _ = kill_rx.recv();
+                drop(conn);
+            }
+            drop(listener_a);
+        });
+
+        let client = MediapipeClient::connect(port).unwrap();
+        accepted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        kill_tx.send(()).unwrap();
+
+        // Server B: rebind the same port; the client's next detect must
+        // reconnect here and retry the request.
+        let mut listener_b = None;
+        for _ in 0..50 {
+            match TcpListener::bind(format!("127.0.0.1:{port}")) {
+                Ok(l) => { listener_b = Some(l); break; }
+                Err(_) => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+        let listener_b = listener_b.unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener_b.accept() {
+                let mut hdr = [0u8; 4];
+                let _ = stream.read_exact(&mut hdr);
+                let len = u32::from_le_bytes(hdr) as usize;
+                let mut body = vec![0u8; len];
+                let _ = stream.read_exact(&mut body);
+                let mut resp = vec![0x01, 0x00]; // 1 left hand
+                resp.extend_from_slice(&1.0f32.to_le_bytes());
+                for _ in 0..21 {
+                    resp.extend_from_slice(&0.0f32.to_le_bytes());
+                    resp.extend_from_slice(&0.0f32.to_le_bytes());
+                    resp.extend_from_slice(&0.0f32.to_le_bytes());
+                }
+                let _ = stream.write_all(&resp);
+                let _ = stream.flush();
+            }
+        });
+
+        // Only the post-reconnect retry can produce a hand: the first attempt
+        // runs on the dead connection.
+        let hands = client.detect(b"\xFF\xD8");
+        assert_eq!(hands.len(), 1);
     }
 
     #[test]

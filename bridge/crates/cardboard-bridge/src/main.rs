@@ -59,6 +59,7 @@ fn run_window(core: Arc<AppCore>) {
 
     println!("[bridge] running — press Ctrl+C to quit");
     ui.run().expect("bridge event loop failed");
+    core.shutdown();
 }
 
 /// Delegate the UI's callbacks to the core, converting the Slint encoder index
