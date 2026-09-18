@@ -55,7 +55,7 @@ fn run_window(core: Arc<AppCore>) {
         .set_app_version(format!("v{}", core::APP_VERSION).into());
 
     wire_callbacks(&core, &ui);
-    start_state_poller(core, ui.as_weak());
+    start_state_poller(core.clone(), ui.as_weak());
 
     println!("[bridge] running — press Ctrl+C to quit");
     ui.run().expect("bridge event loop failed");
