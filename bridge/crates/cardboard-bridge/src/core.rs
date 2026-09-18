@@ -105,15 +105,16 @@ pub struct AppliedSettings {
 }
 
 /// Spawn the Python MediaPipe hand-landmark server as a child process and
-/// connect to it via TCP.  Returns `None` if the Python process can't be
-/// started or the TCP connection fails after retries.
-fn spawn_mediapipe_server(state: &SharedState) -> Option<MediapipeClient> {
+/// connect to it via TCP. Returns the client plus the child handle (if we
+/// spawned one, so the caller can kill it on shutdown). Returns `(None, None)`
+/// if the Python process can't be started or the TCP connection fails.
+fn spawn_mediapipe_server(state: &SharedState) -> (Option<MediapipeClient>, Option<Child>) {
     // First try connecting to an already-running server (e.g. started manually).
     if let Ok(client) = MediapipeClient::try_once(MEDIAPIPE_PORT) {
         if let Ok(mut s) = state.lock() {
             s.push_log("mediapipe: connected to existing server".into());
         }
-        return Some(client);
+        return (Some(client), None);
     }
 
     // Locate the Python script relative to the binary or cwd.
@@ -148,7 +149,9 @@ fn spawn_mediapipe_server(state: &SharedState) -> Option<MediapipeClient> {
             None
         }
     };
-    let script_path = script_path?;
+    let Some(script_path) = script_path else {
+        return (None, None);
+    };
 
     let python = std::env::var("PYTHON").unwrap_or_else(|_| "python".into());
     let mut child = match Command::new(&python)
@@ -166,7 +169,7 @@ fn spawn_mediapipe_server(state: &SharedState) -> Option<MediapipeClient> {
             if let Ok(mut s) = state.lock() {
                 s.push_log(format!("mediapipe server failed to start: {e}"));
             }
-            return None;
+            return (None, None);
         }
     };
 
@@ -189,13 +192,13 @@ fn spawn_mediapipe_server(state: &SharedState) -> Option<MediapipeClient> {
 
     // Give the server a moment to bind, then connect.
     match MediapipeClient::connect(MEDIAPIPE_PORT) {
-        Ok(client) => Some(client),
+        Ok(client) => (Some(client), Some(child)),
         Err(e) => {
             if let Ok(mut s) = state.lock() {
                 s.push_log(format!("mediapipe TCP connect failed: {e}"));
             }
             let _ = child.kill();
-            None
+            (None, None)
         }
     }
 }
@@ -213,6 +216,9 @@ pub struct AppCore {
     preview_frame: Arc<Mutex<Option<(u32, u32, Vec<u8>)>>>,
     /// Handle to the running preview decode thread (so we can stop it).
     preview_decode: Arc<Mutex<Option<PreviewDecodeHandle>>>,
+    /// The spawned Python MediaPipe server (if we started one). Killed by
+    /// `shutdown()` so it doesn't outlive the bridge.
+    mediapipe_proc: Arc<Mutex<Option<Child>>>,
 }
 
 struct PreviewDecodeHandle {
@@ -240,7 +246,7 @@ impl AppCore {
         net::phone::spawn(state.clone());
 
         // Spawn the Python MediaPipe server and connect via TCP.
-        let mediapipe_client = spawn_mediapipe_server(&state);
+        let (mediapipe_client, mediapipe_proc) = spawn_mediapipe_server(&state);
         net::camera::spawn(state.clone(), mediapipe_client);
 
         Arc::new(Self {
@@ -248,6 +254,7 @@ impl AppCore {
             ffplay: Arc::new(Mutex::new(None)),
             preview_frame: Arc::new(Mutex::new(None)),
             preview_decode: Arc::new(Mutex::new(None)),
+            mediapipe_proc: Arc::new(Mutex::new(mediapipe_proc)),
         })
     }
 
@@ -304,6 +311,18 @@ impl AppCore {
             self.stop_preview_decode();
         }
         net::driver::set_preview(&self.state, enabled);
+    }
+
+    /// Kill the spawned MediaPipe server (if we started one) so the Python
+    /// process doesn't outlive the bridge. Called on shutdown.
+    pub fn shutdown(&self) {
+        if let Ok(mut proc) = self.mediapipe_proc.lock() {
+            if let Some(mut child) = proc.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+        self.push_log("bridge shutting down".into());
     }
 
     /// Take the most recent decoded preview frame (consumed by the UI poller).
@@ -653,6 +672,7 @@ mod tests {
             ffplay: Arc::new(Mutex::new(None)),
             preview_frame: Arc::new(Mutex::new(None)),
             preview_decode: Arc::new(Mutex::new(None)),
+            mediapipe_proc: Arc::new(Mutex::new(None)),
         };
         let logs = core.logs(10);
         assert_eq!(logs[0], "third");
