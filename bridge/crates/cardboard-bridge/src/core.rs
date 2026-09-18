@@ -155,7 +155,9 @@ fn spawn_mediapipe_server(state: &SharedState) -> Option<MediapipeClient> {
         .arg(&script_path)
         .arg("--port")
         .arg(MEDIAPIPE_PORT.to_string())
-        .stdout(Stdio::piped())
+        // Stdout is discarded (not piped): an undrained pipe would fill its
+        // 64KB buffer and wedge the child. Stderr is drained below.
+        .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
     {
