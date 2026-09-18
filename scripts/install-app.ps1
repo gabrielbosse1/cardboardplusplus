@@ -21,7 +21,7 @@ if (-not (Test-Path $apk)) {
 
 Write-Host "Checking for connected devices..." -ForegroundColor Cyan
 $devices = & $adb devices 2>&1
-if ($devices -notmatch "device$") { throw "No Android device connected - plug in a phone and enable USB debugging" }
+if (-not ($devices -match "\tdevice$")) { throw "No Android device connected - plug in a phone and enable USB debugging" }
 
 Write-Host "Installing APK to phone..." -ForegroundColor Cyan
 & $adb install -r $apk
