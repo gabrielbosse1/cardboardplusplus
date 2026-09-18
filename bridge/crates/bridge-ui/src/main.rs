@@ -567,7 +567,7 @@ fn install_driver(cfg: BridgeConfig) -> Result<String, String> {
     std::fs::create_dir_all(&target).map_err(|e| format!("mkdir {}: {e}", target))?;
     let target_dll = format!("{}\\driver_cardboardplusplus.dll", target);
 
-    // Backup existing DLL first.
+    // Backup existing DLL first (kept: rename below replaces atomically).
     if Path::new(&target_dll).exists() {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -575,12 +575,20 @@ fn install_driver(cfg: BridgeConfig) -> Result<String, String> {
             .unwrap_or(0);
         let backup = format!("{}.bak-{}", target_dll, stamp);
         std::fs::copy(&target_dll, &backup).map_err(|e| format!("backup {}: {e}", backup))?;
-        std::fs::remove_file(&target_dll).ok();
         info!("backed up existing driver to {}", backup);
     }
 
-    std::fs::copy(&cfg.driver_dll_src, &target_dll)
-        .map_err(|e| format!("copy to {}: {e}", target_dll))?;
+    // Atomic install: copy to a temp file in the same directory, then rename
+    // over the target. A failed copy never leaves a missing/half-written DLL.
+    let tmp_dll = format!("{}.tmp-{}", target_dll, std::process::id());
+    if let Err(e) = std::fs::copy(&cfg.driver_dll_src, &tmp_dll) {
+        let _ = std::fs::remove_file(&tmp_dll);
+        return Err(format!("copy to {}: {e}", tmp_dll));
+    }
+    if let Err(e) = std::fs::rename(&tmp_dll, &target_dll) {
+        let _ = std::fs::remove_file(&tmp_dll);
+        return Err(format!("rename {} -> {}: {e}", tmp_dll, target_dll));
+    }
 
     // Ship the manifest + bindings for a from-scratch install.
     let src_root = Path::new(&cfg.driver_dll_src)
