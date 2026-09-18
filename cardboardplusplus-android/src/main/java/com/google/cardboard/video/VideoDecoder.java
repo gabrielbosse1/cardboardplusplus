@@ -37,6 +37,7 @@ public class VideoDecoder {
   private boolean frameRendered = false;
   private int updateCount = 0;
   private int decodedFrames = 0;
+  private int totalDecodedFrames = 0;
   private long lastDecodeLogNs = 0;
   private final MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
 
@@ -86,6 +87,7 @@ public class VideoDecoder {
           frameRendered = true;
           drained++;
           decodedFrames++;
+          totalDecodedFrames++;
         }
         updateCount++;
         if (updateCount % 60 == 0) {
@@ -115,6 +117,11 @@ public class VideoDecoder {
   /** Time (elapsedRealtime ms) of the last received frame; 0 if none yet. */
   public long getLastFrameAtMs() {
     return lastFrameAtMs;
+  }
+
+  /** Monotonic count of decoded output frames (for the net-stats reporter). */
+  public int getTotalDecodedFrames() {
+    return totalDecodedFrames;
   }
 
   // ---------------------------------------------------------------------------

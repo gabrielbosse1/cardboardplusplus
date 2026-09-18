@@ -28,7 +28,6 @@ pub fn handle(mut request: Request, core: &AppCore) {
         (Method::Get, "/status") => ok_json(&core.status()),
         (Method::Get, "/logs") => ok_json(&logs_payload(core, query.as_deref())),
         (Method::Get, "/preview") => ok_json(&preview_payload(core)),
-        (Method::Post, "/preview") => set_preview(&mut request, core),
         (Method::Post, "/settings") => apply_settings(&mut request, core),
         (Method::Get, "/debug") => ok_json(&debug_payload()),
         (Method::Post, "/debug") => set_debug(&mut request),
@@ -38,11 +37,11 @@ pub fn handle(mut request: Request, core: &AppCore) {
     let _ = request.respond(response);
 }
 
-/// Current preview state: whether it is enabled and the driver's latest stats.
+/// Current preview state: the driver's latest streaming stats. The preview
+/// itself is always on — there is no toggle.
 fn preview_payload(core: &AppCore) -> serde_json::Value {
     let s = core.status();
     serde_json::json!({
-        "enabled": s.preview_enabled,
         "driver": {
             "fps": s.preview_driver_fps,
             "bitrate_kbps": s.preview_bitrate_kbps,
@@ -50,43 +49,6 @@ fn preview_payload(core: &AppCore) -> serde_json::Value {
             "drops": s.preview_drops,
         },
     })
-}
-
-/// POST /preview — toggle the local preview. Accepts `{"enabled": bool}` to
-/// switch the driver's localhost stream and/or `{"ffplay": true}` to open the
-/// ffplay viewer window.
-fn set_preview(request: &mut Request, core: &AppCore) -> Response<std::io::Cursor<Vec<u8>>> {
-    use serde::Deserialize;
-
-    #[derive(Deserialize)]
-    struct PreviewPayload {
-        enabled: Option<bool>,
-        #[serde(rename = "ffplay")]
-        open_ffplay: Option<bool>,
-    }
-
-    let body = read_body_bytes(request);
-    let parsed: PreviewPayload = match serde_json::from_slice(&body) {
-        Ok(p) => p,
-        Err(_) => {
-            return json(
-                StatusCode(400),
-                &serde_json::json!({"error": "body must be JSON like {\"enabled\":true} or {\"ffplay\":true}"}),
-            );
-        }
-    };
-
-    if let Some(enabled) = parsed.enabled {
-        core.set_preview(enabled);
-    }
-    if parsed.open_ffplay.unwrap_or(false) {
-        core.open_ffplay_preview();
-    }
-
-    ok_json(&serde_json::json!({
-        "ok": true,
-        "preview": preview_payload(core),
-    }))
 }
 
 /// The endpoint index behaves like the page literal: served as raw text.
@@ -113,6 +75,7 @@ fn apply_settings(request: &mut Request, core: &AppCore) -> Response<std::io::Cu
 
     /// Optional settings fields; absent ones fall back to `APPLIED_DEFAULTS`.
     /// `bitrate` (mbps) has a dedicated wire alias matching the public API.
+    /// `encoder` is "gpu" (driver picks the hardware backend) or "cpu".
     #[derive(Deserialize, Default)]
     struct SettingsPayload {
         width: Option<i32>,
@@ -129,7 +92,7 @@ fn apply_settings(request: &mut Request, core: &AppCore) -> Response<std::io::Cu
         Err(_) => {
             return json(
                 StatusCode(400),
-                &serde_json::json!({"error": "body must be JSON like {\"width\":2880,\"height\":1620,\"fps\":60,\"bitrate\":20,\"encoder\":\"auto\"}"}),
+                &serde_json::json!({"error": "body must be JSON like {\"width\":2880,\"height\":1620,\"fps\":60,\"bitrate\":20,\"encoder\":\"gpu\"}"}),
             );
         }
     };
@@ -139,7 +102,7 @@ fn apply_settings(request: &mut Request, core: &AppCore) -> Response<std::io::Cu
         parsed.height.unwrap_or(APPLIED_DEFAULTS.1),
         parsed.fps.unwrap_or(APPLIED_DEFAULTS.2),
         parsed.bitrate_mbps.unwrap_or(APPLIED_DEFAULTS.3),
-        parsed.encoder.as_deref().unwrap_or("auto"),
+        parsed.encoder.as_deref().unwrap_or("gpu"),
     );
 
     ok_json(&serde_json::json!({

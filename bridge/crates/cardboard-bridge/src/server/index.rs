@@ -15,22 +15,14 @@ Endpoints
 GET  /health   {\"ok\":true,\"app_version\":\"...\"}
   GET  /status   live status snapshot (driver/phone/encoder, fps, hands, ...)
   GET  /logs?n=50  newest-first log lines
-  GET  /preview   local-preview state + driver streaming stats
-  POST /preview   toggle local preview / open the ffplay viewer:
-
-         curl -X POST 127.0.0.1:8567/preview \\
-              -H \"Content-Type: application/json\" \\
-              -d '{\"enabled\":true}'        # driver keeps the 127.0.0.1:42069 copy
-         curl -X POST 127.0.0.1:8567/preview \\
-              -H \"Content-Type: application/json\" \\
-              -d '{\"ffplay\":true}'         # open the local viewer window
-  POST /settings push stream settings to the driver:
+   GET  /preview   local-preview driver streaming stats (always on, no toggle)
+   POST /settings push stream settings to the driver:
 
          curl -X POST 127.0.0.1:8567/settings \
               -H \"Content-Type: application/json\" \
-              -d '{\"width\":2880,\"height\":1620,\"fps\":60,\"bitrate\":20,\"encoder\":\"auto\"}'
+              -d '{\"width\":2880,\"height\":1620,\"fps\":60,\"bitrate\":20,\"encoder\":\"gpu\"}'
 
-       encoder: \"auto\" | \"amf\" | \"nvenc\" | \"qsv\" | \"libx264\" (h264_ prefix ok)
+       encoder: \"gpu\" (driver picks AMF/NVENC/QSV) | \"cpu\" (libx264)
        fields are optional; missing ones keep the current defaults.
 
 Port: set CARDBOARD_BRIDGE_PORT to override (default 8567).

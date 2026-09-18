@@ -22,8 +22,9 @@ pub const MEDIAPIPE_PORT: u16 = 42073;
 /// UDP port for bridge → driver sensor data forwarding (binary, same format as phone→bridge).
 pub const SENSOR_PORT: u16 = 42074;
 
-/// Which encoder the driver should use, in the same order the UI exposes them
-/// (index 0 = auto, then AMF, NVENC, QSV, libx264).
+/// Which encoder the driver should use. The UI only exposes two: GPU (the
+/// driver probes AMF → NVENC → QSV with a libx264 fallback) and CPU (forced
+/// libx264). Named backends stay for the REST API and old configs.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum EncoderChoice {
     Auto,
@@ -31,17 +32,20 @@ pub enum EncoderChoice {
     Nvenc,
     Qsv,
     Libx264,
+    Gpu,
+    Cpu,
 }
 
 impl From<i32> for EncoderChoice {
-    /// Maps the UI's encoder picker index (0..=4) to an encoder variant.
+    /// Maps the UI's encoder picker index (0 = GPU, 1 = CPU) to a variant.
     fn from(index: i32) -> Self {
         match index {
-            1 => EncoderChoice::Amf,
+            1 => EncoderChoice::Cpu,
             2 => EncoderChoice::Nvenc,
             3 => EncoderChoice::Qsv,
             4 => EncoderChoice::Libx264,
-            _ => EncoderChoice::Auto,
+            0 => EncoderChoice::Gpu,
+            _ => EncoderChoice::Gpu,
         }
     }
 }
@@ -56,6 +60,8 @@ impl EncoderChoice {
             "nvenc" | "h264_nvenc" => EncoderChoice::Nvenc,
             "qsv" | "h264_qsv" => EncoderChoice::Qsv,
             "libx264" => EncoderChoice::Libx264,
+            "gpu" => EncoderChoice::Gpu,
+            "cpu" => EncoderChoice::Cpu,
             _ => EncoderChoice::Auto,
         }
     }
@@ -68,6 +74,8 @@ impl EncoderChoice {
             EncoderChoice::Nvenc => "h264_nvenc",
             EncoderChoice::Qsv => "h264_qsv",
             EncoderChoice::Libx264 => "libx264",
+            EncoderChoice::Gpu => "gpu",
+            EncoderChoice::Cpu => "cpu",
         }
     }
 }
@@ -78,12 +86,9 @@ mod tests {
 
     #[test]
     fn encoder_picker_index_maps_to_variants() {
-        assert_eq!(EncoderChoice::from(0), EncoderChoice::Auto);
-        assert_eq!(EncoderChoice::from(1), EncoderChoice::Amf);
-        assert_eq!(EncoderChoice::from(2), EncoderChoice::Nvenc);
-        assert_eq!(EncoderChoice::from(3), EncoderChoice::Qsv);
-        assert_eq!(EncoderChoice::from(4), EncoderChoice::Libx264);
-        assert_eq!(EncoderChoice::from(99), EncoderChoice::Auto);
+        assert_eq!(EncoderChoice::from(0), EncoderChoice::Gpu);
+        assert_eq!(EncoderChoice::from(1), EncoderChoice::Cpu);
+        assert_eq!(EncoderChoice::from(99), EncoderChoice::Gpu);
     }
 
     #[test]
@@ -92,6 +97,8 @@ mod tests {
         assert_eq!(EncoderChoice::from_name("h264_AMF"), EncoderChoice::Amf);
         assert_eq!(EncoderChoice::from_name(" h264_qsv "), EncoderChoice::Qsv);
         assert_eq!(EncoderChoice::from_name("libx264"), EncoderChoice::Libx264);
+        assert_eq!(EncoderChoice::from_name("GPU"), EncoderChoice::Gpu);
+        assert_eq!(EncoderChoice::from_name("cpu"), EncoderChoice::Cpu);
         assert_eq!(EncoderChoice::from_name("totally-unknown"), EncoderChoice::Auto);
     }
 
@@ -99,5 +106,7 @@ mod tests {
     fn encoder_as_str_produces_the_driver_wire_names() {
         assert_eq!(EncoderChoice::Nvenc.as_str(), "h264_nvenc");
         assert_eq!(EncoderChoice::Auto.as_str(), "auto");
+        assert_eq!(EncoderChoice::Gpu.as_str(), "gpu");
+        assert_eq!(EncoderChoice::Cpu.as_str(), "cpu");
     }
 }

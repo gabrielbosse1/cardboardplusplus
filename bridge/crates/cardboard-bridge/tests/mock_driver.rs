@@ -143,15 +143,14 @@ fn encoder_choice_roundtrip() {
     // Verify the bridge's encoder choice logic matches expectations.
     use cardboard_bridge::net::EncoderChoice;
 
-    assert_eq!(EncoderChoice::from(0), EncoderChoice::Auto);
-    assert_eq!(EncoderChoice::from(1), EncoderChoice::Amf);
-    assert_eq!(EncoderChoice::from(2), EncoderChoice::Nvenc);
-    assert_eq!(EncoderChoice::from(3), EncoderChoice::Qsv);
-    assert_eq!(EncoderChoice::from(4), EncoderChoice::Libx264);
+    assert_eq!(EncoderChoice::from(0), EncoderChoice::Gpu);
+    assert_eq!(EncoderChoice::from(1), EncoderChoice::Cpu);
 
+    assert_eq!(EncoderChoice::Gpu.as_str(), "gpu");
+    assert_eq!(EncoderChoice::Cpu.as_str(), "cpu");
     assert_eq!(EncoderChoice::Nvenc.as_str(), "h264_nvenc");
     assert_eq!(EncoderChoice::Auto.as_str(), "auto");
-    assert_eq!(EncoderChoice::from_name("amf"), EncoderChoice::Amf);
+    assert_eq!(EncoderChoice::from_name("gpu"), EncoderChoice::Gpu);
     assert_eq!(EncoderChoice::from_name("h264_nvenc"), EncoderChoice::Nvenc);
 }
 

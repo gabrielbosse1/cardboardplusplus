@@ -29,10 +29,6 @@ struct DriverConn {
     addr: SocketAddr,
 }
 
-/// Bridge -> driver wire commands for the local preview toggle.
-const PREVIEW_WIRE_ON: &[u8] = b"BRIDGE_PREVIEW 1";
-const PREVIEW_WIRE_OFF: &[u8] = b"BRIDGE_PREVIEW 0";
-
 /// Fixed prefix of the driver's periodic stats packet.
 const STATS_PREFIX: &str = "BRIDGE_STATS";
 
@@ -166,25 +162,6 @@ fn parse_stats(msg: &str) -> Option<(i32, i32, u64, u64)> {
     Some((fps, kbps, frames, drops))
 }
 
-/// Tell the driver whether to keep sending the localhost preview stream, then
-/// record the choice so the UI/REST reflect what was actually asked.
-pub fn set_preview(state: &SharedState, enabled: bool) {
-    let Some(conn) = DRIVER_CONN.get() else {
-        if let Ok(mut s) = state.lock() {
-            s.preview_enabled = enabled;
-            s.push_log(format!("preview set to {} (driver link down; retried on next connect)", if enabled { "on" } else { "off" }));
-        }
-        return;
-    };
-    let wire = if enabled { PREVIEW_WIRE_ON } else { PREVIEW_WIRE_OFF };
-    let conn = conn.lock().expect("driver conn lock");
-    let _ = conn.sock.send_to(wire, conn.addr);
-    if let Ok(mut s) = state.lock() {
-        s.preview_enabled = enabled;
-        s.push_log(format!("local preview {} (BRIDGE_PREVIEW sent to driver)", if enabled { "enabled" } else { "disabled" }));
-    }
-}
-
 /// Drop the connected flags once the ACK has been missing too long — this is
 /// what backs the UI/REST "driver" indicator going red. The single log line is
 /// emitted on the transition only (the flag read guards it).
@@ -260,12 +237,6 @@ mod tests {
     fn capacity_messages_keep_field_padding_stable() {
         let (cap, _) = config_wire_packets(1, 2, 3, 4, EncoderChoice::Amf);
         assert_eq!(cap, b"CARDBOARD_CAP 1 2");
-    }
-
-    #[test]
-    fn preview_wire_bytes_match_the_driver_protocol() {
-        assert_eq!(PREVIEW_WIRE_ON, b"BRIDGE_PREVIEW 1");
-        assert_eq!(PREVIEW_WIRE_OFF, b"BRIDGE_PREVIEW 0");
     }
 
     #[test]

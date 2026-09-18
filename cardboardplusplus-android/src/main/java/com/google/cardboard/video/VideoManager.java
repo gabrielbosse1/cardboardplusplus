@@ -4,6 +4,7 @@ import android.util.Log;
 import com.google.cardboard.NativeBridge;
 import com.google.cardboard.core.AppConstants;
 import com.google.cardboard.core.DebugLog;
+import com.google.cardboard.settings.AppSettings;
 
 /**
  * Owns the video decode pipeline: creates the OES texture + MediaCodec-backed {@link VideoDecoder}
@@ -15,6 +16,7 @@ public class VideoManager {
   private static final DebugLog DBG = new DebugLog(TAG);
 
   private final NativeBridge bridge;
+  private final AppSettings appSettings;
   private VideoDecoder decoder;
   private boolean surfaceCreated = false;
 
@@ -22,9 +24,11 @@ public class VideoManager {
   // re-broadcast discovery so the PC driver re-routes video to this phone.
   private Runnable reconnectAction;
   private VideoWatchdog watchdog;
+  private NetStatsReporter netStats;
 
-  public VideoManager(NativeBridge bridge) {
+  public VideoManager(NativeBridge bridge, AppSettings appSettings) {
     this.bridge = bridge;
+    this.appSettings = appSettings;
   }
 
   /** Query the hardware decoder cap (max supported resolution). */
@@ -58,6 +62,7 @@ public class VideoManager {
     // Decoder cap is now announced by DiscoveryManager on its proven socket
     // (the separate-socket send was silently dropped by Windows firewall).
     startWatchdog();
+    startNetStats();
   }
 
   /**
@@ -78,6 +83,23 @@ public class VideoManager {
     }
   }
 
+  /**
+   * Starts the net-stats reporter that feeds the bridge's adaptive bitrate.
+   * Shares the decoder supplier with the watchdog so both observe the same pipeline.
+   */
+  private void startNetStats() {
+    if (netStats == null) {
+      netStats = new NetStatsReporter(appSettings, () -> decoder);
+    }
+    netStats.start();
+  }
+
+  private void stopNetStats() {
+    if (netStats != null) {
+      netStats.stop();
+    }
+  }
+
 
   /** Present the latest decoded frame into the GL OES texture. Call from the GL thread. */
   public void updateTexture() {
@@ -89,6 +111,7 @@ public class VideoManager {
   /** Tear down the decoder and stop the receiver. Call on pause. */
   public void onPause() {
     stopWatchdog();
+    stopNetStats();
     if (decoder != null) {
       decoder.release();
       decoder = null;

@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::app::{AppState, SharedState};
-use crate::net::mediapipe::MediapipeClient;
+use crate::net::mediapipe::{MediapipeClient, Reclaim};
 use crate::net::{self, EncoderChoice, DRIVER_DISCOVERY_PORT, MEDIAPIPE_PORT, VIDEO_PORT};
 
 /// Version read from Cargo.toml at compile time.
@@ -38,7 +38,6 @@ pub struct StatusSnapshot {
     pub gyro_fps: i32,
     pub hand_fps: i32,
     pub hands_detected: i32,
-    pub preview_enabled: bool,
     pub preview_driver_fps: i32,
     pub preview_bitrate_kbps: i32,
     pub preview_frames: u64,
@@ -55,6 +54,20 @@ pub struct StatusSnapshot {
     pub latest_mag_x: f32,
     pub latest_mag_y: f32,
     pub latest_mag_z: f32,
+    // -- appended (never reordered): phone video-path health + link test --
+    pub net_frames_decoded: u32,
+    pub net_stalls: u32,
+    pub net_decoded_fps: f32,
+    pub applied_bitrate_mbps: i32,
+    pub link_test_active: bool,
+    pub link_test_result_mbps: i32,
+    pub link_test_note: String,
+    // -- appended (never reordered): hand-tracking model state --
+    pub hand_enabled: bool,
+    pub hand_overlay: bool,
+    pub hand_min_detection: i32,
+    pub hand_min_presence: i32,
+    pub hand_min_tracking: i32,
 }
 
 impl From<&AppState> for StatusSnapshot {
@@ -72,7 +85,6 @@ impl From<&AppState> for StatusSnapshot {
             gyro_fps: s.gyro_fps,
             hand_fps: s.hand_fps,
             hands_detected: s.hands_detected,
-            preview_enabled: s.preview_enabled,
             preview_driver_fps: s.preview_driver_fps,
             preview_bitrate_kbps: s.preview_bitrate_kbps,
             preview_frames: s.preview_frames,
@@ -89,6 +101,18 @@ impl From<&AppState> for StatusSnapshot {
             latest_mag_x: s.latest_mag[0],
             latest_mag_y: s.latest_mag[1],
             latest_mag_z: s.latest_mag[2],
+            net_frames_decoded: s.net_frames_decoded,
+            net_stalls: s.net_stalls,
+            net_decoded_fps: s.net_decoded_fps,
+            applied_bitrate_mbps: s.applied_bitrate_mbps,
+            link_test_active: s.link_test_active,
+            link_test_result_mbps: s.link_test_result_mbps,
+            link_test_note: s.link_test_note.clone(),
+            hand_enabled: s.hand_enabled,
+            hand_overlay: s.hand_overlay,
+            hand_min_detection: s.hand_min_detection,
+            hand_min_presence: s.hand_min_presence,
+            hand_min_tracking: s.hand_min_tracking,
         }
     }
 }
@@ -108,13 +132,50 @@ pub struct AppliedSettings {
 /// connect to it via TCP. Returns the client plus the child handle (if we
 /// spawned one, so the caller can kill it on shutdown). Returns `(None, None)`
 /// if the Python process can't be started or the TCP connection fails.
+/// The sidecar takes no arguments: port and model defaults are static, and
+/// tuning happens live over the TCP link (`MediapipeClient::set_config`).
 fn spawn_mediapipe_server(state: &SharedState) -> (Option<MediapipeClient>, Option<Child>) {
+    let (d, p, t) = match state.lock() {
+        Ok(s) => (
+            s.hand_min_detection as f32 / 100.0,
+            s.hand_min_presence as f32 / 100.0,
+            s.hand_min_tracking as f32 / 100.0,
+        ),
+        Err(_) => (0.5, 0.5, 0.5),
+    };
     // First try connecting to an already-running server (e.g. started manually).
-    if let Ok(client) = MediapipeClient::try_once(MEDIAPIPE_PORT) {
+    // The healthy probe also pushes the current thresholds, so an adopted
+    // server keeps the UI's tuning.
+    if let Some(client) = MediapipeClient::connect_healthy(MEDIAPIPE_PORT, d, p, t) {
         if let Ok(mut s) = state.lock() {
             s.push_log("mediapipe: connected to existing server".into());
         }
         return (Some(client), None);
+    }
+    // No healthy server, but something still answers TCP: a stale squatter
+    // (e.g. an older bridge's wedged sidecar). Kill it if it's ours, fail
+    // loudly otherwise — never silently adopt it.
+    if MediapipeClient::try_once(MEDIAPIPE_PORT).is_ok() {
+        match MediapipeClient::reclaim_port(MEDIAPIPE_PORT) {
+            Reclaim::Freed(pid) => {
+                if let Ok(mut s) = state.lock() {
+                    s.push_log(format!("mediapipe: killed stale sidecar (PID {pid}), starting fresh"));
+                }
+            }
+            Reclaim::AlreadyFree => {
+                if let Ok(mut s) = state.lock() {
+                    s.push_log("mediapipe: stale server vanished, starting fresh".into());
+                }
+            }
+            Reclaim::Refused(reason) => {
+                if let Ok(mut s) = state.lock() {
+                    s.push_log(format!(
+                        "mediapipe: port {MEDIAPIPE_PORT} held by {reason}; not touching it — free the port and restart"
+                    ));
+                }
+                return (None, None);
+            }
+        }
     }
 
     // Locate the Python script relative to the binary or cwd.
@@ -150,14 +211,15 @@ fn spawn_mediapipe_server(state: &SharedState) -> (Option<MediapipeClient>, Opti
         }
     };
     let Some(script_path) = script_path else {
+        if let Ok(mut s) = state.lock() {
+            s.push_log("mediapipe server script not found (expected next to the binary or in crates/cardboard-bridge/)".into());
+        }
         return (None, None);
     };
 
     let python = std::env::var("PYTHON").unwrap_or_else(|_| "python".into());
     let mut child = match Command::new(&python)
         .arg(&script_path)
-        .arg("--port")
-        .arg(MEDIAPIPE_PORT.to_string())
         // Stdout is discarded (not piped): an undrained pipe would fill its
         // 64KB buffer and wedge the child. Stderr is drained below.
         .stdout(Stdio::null())
@@ -174,12 +236,18 @@ fn spawn_mediapipe_server(state: &SharedState) -> (Option<MediapipeClient>, Opti
     };
 
     // Drain stderr in a background thread so the Python process doesn't block.
+    // Lines are mirrored into the ring log too: the bridge often runs as a GUI
+    // app where its own stderr is invisible, and a silent sidecar is undebuggable.
     if let Some(stderr) = child.stderr.take() {
+        let log_state = state.clone();
         thread::spawn(move || {
             use std::io::BufRead;
             let reader = std::io::BufReader::new(stderr);
             for line in reader.lines().map_while(Result::ok) {
                 eprintln!("[mediapipe-py] {line}");
+                if let Ok(mut s) = log_state.lock() {
+                    s.push_log(format!("[mediapipe-py] {line}"));
+                }
             }
         });
     }
@@ -209,9 +277,6 @@ fn spawn_mediapipe_server(state: &SharedState) -> (Option<MediapipeClient>, Opti
 #[derive(Clone)]
 pub struct AppCore {
     state: SharedState,
-    /// The one spawned ffplay preview process (if any), so the UI can't stack
-    /// multiple windows. Replaced when the old one exits.
-    ffplay: Arc<Mutex<Option<Child>>>,
     /// The most recent decoded preview frame as raw RGBA pixels (width, height, data).
     preview_frame: Arc<Mutex<Option<(u32, u32, Vec<u8>)>>>,
     /// Handle to the running preview decode thread (so we can stop it).
@@ -219,11 +284,13 @@ pub struct AppCore {
     /// The spawned Python MediaPipe server (if we started one). Killed by
     /// `shutdown()` so it doesn't outlive the bridge.
     mediapipe_proc: Arc<Mutex<Option<Child>>>,
+    /// Live handle to the sidecar's TCP link. Cloned into the camera detect
+    /// thread; this copy serves `apply_hand_model` without a restart.
+    mediapipe_client: Arc<Mutex<Option<MediapipeClient>>>,
 }
 
 struct PreviewDecodeHandle {
     child: Child,
-    stop: Arc<Mutex<bool>>,
 }
 
 impl AppCore {
@@ -247,15 +314,19 @@ impl AppCore {
 
         // Spawn the Python MediaPipe server and connect via TCP.
         let (mediapipe_client, mediapipe_proc) = spawn_mediapipe_server(&state);
-        net::camera::spawn(state.clone(), mediapipe_client);
+        net::camera::spawn(state.clone(), mediapipe_client.clone());
 
-        Arc::new(Self {
+        let core = Arc::new(Self {
             state,
-            ffplay: Arc::new(Mutex::new(None)),
             preview_frame: Arc::new(Mutex::new(None)),
             preview_decode: Arc::new(Mutex::new(None)),
             mediapipe_proc: Arc::new(Mutex::new(mediapipe_proc)),
-        })
+            mediapipe_client: Arc::new(Mutex::new(mediapipe_client)),
+        });
+        // The preview is always on: start decoding the driver's localhost
+        // copy right away (the driver sends it by default, no toggle needed).
+        core.start_preview_decode();
+        core
     }
 
     /// Append a line to the shared ring log. Best-effort: a poisoned lock just
@@ -281,6 +352,7 @@ impl AppCore {
 
         if let Ok(mut s) = self.state.lock() {
             s.encoder_name = choice.as_str().to_string();
+            s.record_applied_settings(width, height, fps, bitrate_mbps);
             // Encoding only makes sense while the driver is present; if it is,
             // mark the encoder live again so a re-apply re-activates it.
             if s.driver_connected {
@@ -301,16 +373,105 @@ impl AppCore {
         }
     }
 
-    /// Toggle the local preview: tells the driver to keep (or stop) sending the
-    /// localhost copy of the stream. When enabled, also starts the embedded
-    /// decoder that renders the stream inside the bridge UI.
-    pub fn set_preview(&self, enabled: bool) {
-        if enabled {
-            self.start_preview_decode();
+    /// How long the manual link test samples the phone's net stats.
+    pub const LINK_TEST_SECS: u64 = 10;
+
+    /// Start one manual link test (UI "Test link" button). Samples the
+    /// phone's stall counter for `LINK_TEST_SECS`, then stores a recommended
+    /// bitrate + note for the user to fine-tune and Apply. Never pushes to
+    /// the driver by itself. No-op unless phone and driver are both live.
+    pub fn start_link_test(&self) {
+        let baseline = if let Ok(mut s) = self.state.lock() {
+            if s.link_test_active {
+                return;
+            }
+            if !s.driver_connected || !s.phone_connected {
+                s.push_log("link test needs driver + phone connected".into());
+                return;
+            }
+            s.link_test_active = true;
+            s.link_test_result_mbps = 0;
+            s.link_test_note = "testing…".into();
+            let at = s.applied_bitrate_mbps;
+            s.push_log(format!(
+                "link test started ({} s at {} Mbps)…",
+                Self::LINK_TEST_SECS, at
+            ));
+            (s.net_stalls, s.applied_fps, s.applied_bitrate_mbps)
         } else {
-            self.stop_preview_decode();
+            return;
+        };
+
+        let state = self.state.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(Self::LINK_TEST_SECS));
+            if let Ok(mut s) = state.lock() {
+                let (rec, note) = AppState::link_test_verdict(
+                    baseline.0,
+                    s.net_stalls,
+                    s.net_decoded_fps,
+                    baseline.1,
+                    baseline.2,
+                );
+                s.link_test_active = false;
+                s.link_test_result_mbps = rec;
+                s.link_test_note = note.to_string();
+                s.push_log(format!("link test done: {note} → {rec} Mbps (slider updated, Apply to save)"));
+            }
+        });
+    }
+
+    /// Master switch for bridge-side hand tracking. While off, the camera
+    /// detect worker skips the MediaPipe round-trip (the viewer still shows
+    /// the raw camera feed).
+    pub fn set_hand_enabled(&self, enabled: bool) {
+        if let Ok(mut s) = self.state.lock() {
+            s.hand_enabled = enabled;
+            s.push_log(format!(
+                "hand tracking {}",
+                if enabled { "enabled" } else { "disabled" }
+            ));
         }
-        net::driver::set_preview(&self.state, enabled);
+    }
+
+    /// Toggle the skeleton overlay drawn onto the camera viewer frame.
+    pub fn set_hand_overlay(&self, enabled: bool) {
+        if let Ok(mut s) = self.state.lock() {
+            s.hand_overlay = enabled;
+        }
+    }
+
+    /// Store new model confidences (0-100) and push them to the running
+    /// sidecar over TCP — the landmarker is recreated in place, so the camera
+    /// feed never drops a frame.
+    pub fn apply_hand_model(&self, det: i32, pres: i32, track: i32) {
+        let (d, p, t) = {
+            let mut s = self.state.lock().expect("state lock");
+            s.hand_min_detection = det.clamp(1, 100);
+            s.hand_min_presence = pres.clamp(1, 100);
+            s.hand_min_tracking = track.clamp(1, 100);
+            let (di, pi, ti) = (s.hand_min_detection, s.hand_min_presence, s.hand_min_tracking);
+            s.push_log(format!(
+                "hand model: detection {di}%, presence {pi}%, tracking {ti}%"
+            ));
+            (
+                di as f32 / 100.0,
+                pi as f32 / 100.0,
+                ti as f32 / 100.0,
+            )
+        };
+        let live = self
+            .mediapipe_client
+            .lock()
+            .ok()
+            .and_then(|c| c.clone())
+            .map(|cli| cli.set_config(d, p, t))
+            .unwrap_or(false);
+        self.push_log(if live {
+            "hand model updated live".into()
+        } else {
+            "sidecar not running — model applies on next bridge start".into()
+        });
     }
 
     /// Kill the spawned MediaPipe server (if we started one) so the Python
@@ -367,7 +528,6 @@ impl AppCore {
             }
         }
 
-        let stop = Arc::new(Mutex::new(false));
         let frame_slot = self.preview_frame.clone();
 
         // Bind the UDP socket that the driver sends the preview stream to.
@@ -413,13 +573,9 @@ impl AppCore {
         let frame_bytes = (frame_w * frame_h * 4) as usize;
 
         // Thread 1: drain all available UDP datagrams into ffmpeg stdin (non-blocking).
-        let stop_feeder = stop.clone();
         thread::spawn(move || {
             let mut buf = vec![0u8; 65536];
             loop {
-                if *stop_feeder.lock().unwrap_or_else(|e| e.into_inner()) {
-                    break;
-                }
                 // Drain every available datagram before sleeping.
                 loop {
                     match socket.recv(&mut buf) {
@@ -436,15 +592,11 @@ impl AppCore {
         });
 
         // Thread 2: read complete RGBA frames from ffmpeg stdout (blocking is fine here).
-        let stop_reader = stop.clone();
         let preview_decode_cleanup = self.preview_decode.clone();
         thread::spawn(move || {
             let mut rgba = vec![0u8; frame_bytes];
             let mut off = 0usize;
             loop {
-                if *stop_reader.lock().unwrap_or_else(|e| e.into_inner()) {
-                    break;
-                }
                 // Blocking read is safe here — ffmpeg produces output whenever it
                 // has decoded a frame, and the feeder thread keeps stdin full.
                 match stdout.read(&mut rgba[off..]) {
@@ -472,15 +624,10 @@ impl AppCore {
             }
         });
 
-        // Register the running decode session so stop_preview_decode can tear it down.
+        // Register the running decode session for the watcher below.
         {
             let mut decode = self.preview_decode.lock().expect("preview decode lock");
-            *decode = Some(PreviewDecodeHandle { child, stop });
-        }
-
-        // Record in AppState so the UI knows preview is active.
-        if let Ok(mut s) = self.state.lock() {
-            s.preview_enabled = true;
+            *decode = Some(PreviewDecodeHandle { child });
         }
 
         self.push_log("embedded preview started (UDP 42069 → ffmpeg → UI)".into());
@@ -493,7 +640,6 @@ impl AppCore {
             Arc::new(this)
         });
         let preview_decode = self.preview_decode.clone();
-        let state = self.state.clone();
         thread::spawn(move || {
             // Wait for the child to finish.
             let child_exited = {
@@ -502,21 +648,13 @@ impl AppCore {
             };
             let Some(_pid) = child_exited else { return };
 
-            // Busy-wait until the decode handle is gone (stopped) or preview is off.
+            // Busy-wait until the decode handle is gone, then restart it:
+            // the preview is always on, so a dead ffmpeg is always revived.
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(500));
-                let should_restart = {
-                    let decode = preview_decode.lock().expect("preview decode lock");
-                    let s = state.lock().expect("state lock");
-                    decode.is_none() && s.preview_enabled
-                };
-                if should_restart {
+                let decode = preview_decode.lock().expect("preview decode lock");
+                if decode.is_none() {
                     break;
-                }
-                // If preview was explicitly disabled, don't restart.
-                let s = state.lock().expect("state lock");
-                if !s.preview_enabled {
-                    return;
                 }
             }
             // Backoff before restart.
@@ -526,59 +664,6 @@ impl AppCore {
                 core.start_preview_decode();
             }
         });
-    }
-
-    /// Stop the embedded preview decoder and release the UDP port.
-    fn stop_preview_decode(&self) {
-        let handle = {
-            let mut decode = self.preview_decode.lock().expect("preview decode lock");
-            decode.take()
-        };
-        if let Some(mut h) = handle {
-            // Signal the decode thread to stop.
-            if let Ok(mut stop) = h.stop.lock() {
-                *stop = true;
-            }
-            let _ = h.child.kill();
-            let _ = h.child.wait();
-            self.push_log("embedded preview stopped".into());
-        }
-        // Clear the last frame.
-        if let Ok(mut frame) = self.preview_frame.lock() {
-            *frame = None;
-        }
-        if let Ok(mut s) = self.state.lock() {
-            s.preview_enabled = false;
-        }
-    }
-
-    /// Spawn the local preview viewer (ffplay) pointed at the driver's
-    /// localhost stream. At most one window: a second request while the first
-    /// is still running just logs a reminder. Spawned detached so the bridge
-    /// keeps running whether or not the viewer closes.
-    pub fn open_ffplay_preview(&self) {
-        let mut ffplay = self.ffplay.lock().expect("ffplay lock");
-        if let Some(child) = ffplay.as_mut() {
-            match child.try_wait() {
-                // Still running — don't stack a second window.
-                Ok(None) => {
-                    self.push_log("local preview already open (ffplay running)".into());
-                    return;
-                }
-                // Exited; drop the reference and spawn a fresh one below.
-                _ => *ffplay = None,
-            }
-        }
-        match std::process::Command::new("ffplay")
-            .args(["-f", "h264", "-an", "udp://127.0.0.1:42069"])
-            .spawn()
-        {
-            Ok(child) => {
-                *ffplay = Some(child);
-                self.push_log("local preview opened (ffplay udp://127.0.0.1:42069)".into());
-            }
-            Err(err) => self.push_log(format!("ffplay not available: {err}")),
-        }
     }
 
     /// Live status snapshot: a single read of the shared state.
@@ -608,7 +693,6 @@ mod tests {
             s.encoder_active = true;
             s.phone_connected = true;
             s.phone_ip = "10.0.0.1".into();
-            s.preview_enabled = true;
             s.gyro_fps = 1000;
             s.hands_detected = 2;
         }
@@ -617,7 +701,6 @@ mod tests {
         assert!(snapshot.encoder_active);
         assert!(snapshot.phone_connected);
         assert_eq!(snapshot.phone_ip, "10.0.0.1");
-        assert!(snapshot.preview_enabled);
         assert_eq!(snapshot.gyro_fps, 1000);
         assert_eq!(snapshot.hands_detected, 2);
     }
@@ -635,13 +718,18 @@ mod tests {
         let driver_pos = json.find("driver_connected").unwrap();
         let encoder_pos = json.find("encoder_active").unwrap();
         let phone_pos = json.find("phone_connected").unwrap();
-        let preview_pos = json.find("preview_enabled").unwrap();
+        let preview_pos = json.find("preview_driver_fps").unwrap();
         let camera_pos = json.find("camera_connected").unwrap();
         assert!(app_ver_pos < driver_pos);
         assert!(driver_pos < encoder_pos);
         assert!(encoder_pos < phone_pos);
         assert!(phone_pos < preview_pos);
         assert!(preview_pos < camera_pos);
+        // Phone health + link-test fields are appended (never reordered).
+        let net_pos = json.find("net_frames_decoded").unwrap();
+        let test_pos = json.find("link_test_active").unwrap();
+        assert!(camera_pos < net_pos);
+        assert!(net_pos < test_pos);
     }
 
     #[test]
@@ -669,10 +757,10 @@ mod tests {
         // Build an AppCore manually (without spawning threads).
         let core = AppCore {
             state,
-            ffplay: Arc::new(Mutex::new(None)),
             preview_frame: Arc::new(Mutex::new(None)),
             preview_decode: Arc::new(Mutex::new(None)),
             mediapipe_proc: Arc::new(Mutex::new(None)),
+            mediapipe_client: Arc::new(Mutex::new(None)),
         };
         let logs = core.logs(10);
         assert_eq!(logs[0], "third");
@@ -685,14 +773,12 @@ mod tests {
         let state: SharedState = Arc::new(Mutex::new(AppState::default()));
         {
             let mut s = state.lock().unwrap();
-            s.preview_enabled = true;
             s.preview_driver_fps = 60;
             s.preview_bitrate_kbps = 20000;
             s.preview_frames = 5000;
             s.preview_drops = 10;
         }
         let snapshot = StatusSnapshot::from(state.lock().unwrap().deref());
-        assert!(snapshot.preview_enabled);
         assert_eq!(snapshot.preview_driver_fps, 60);
         assert_eq!(snapshot.preview_bitrate_kbps, 20000);
         assert_eq!(snapshot.preview_frames, 5000);

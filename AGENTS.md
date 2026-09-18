@@ -379,6 +379,7 @@ Binary packets:
 - Bridge sends: `[u32 length LE][JPEG data]`
 - Server replies: `[u8 num_hands]` then per hand: `[u8 handedness][f32 score LE][21 × Landmark]`
 - Each `Landmark` = 3×f32 LE (x, y, z) = 12 bytes
+- Live tuning (no restart): bridge sends `[u32 0xFFFFFFFF][u8 kind=0x01][3×f32 LE detection/presence/tracking]`, server recreates the landmarker and acks `0x00`. Sidecar takes no CLI args; port and defaults are static.
 
 ### Port 8567 — REST API (TCP/HTTP, External → Bridge)
 - `GET /health` → `{"ok":true,"app_version":"..."}`

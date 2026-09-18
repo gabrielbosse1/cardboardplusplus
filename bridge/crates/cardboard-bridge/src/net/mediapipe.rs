@@ -26,6 +26,12 @@ pub struct DetectedHand {
     pub score: f32,
 }
 
+/// Length prefix that selects a config frame instead of a JPEG. A JPEG can
+/// never be 4 GiB, so this can't collide with a real frame.
+const CONFIG_SENTINEL_U32: u32 = 0xFFFFFFFF;
+/// Config payload kind: recreate the landmarker with 3× f32 LE confidences.
+const CONFIG_KIND_MODEL: u8 = 0x01;
+
 /// Shared handle to the TCP connection to the Python MediaPipe server.
 #[derive(Clone)]
 pub struct MediapipeClient {
@@ -57,11 +63,44 @@ impl MediapipeClient {
         })
     }
 
-    /// Connect to the Python server.  Retries a few times in case the
-    /// child process is still starting up.
+    /// TCP accept + protocol health probe. An accept alone proves nothing:
+    /// a stale sidecar (e.g. from a crashed older bridge) accepts and never
+    /// answers. The probe doubles as a no-op config push of the current
+    /// thresholds, so a healthy server keeps its tuning.
+    pub fn connect_healthy(port: u16, det: f32, pres: f32, track: f32) -> Option<Self> {
+        let client = Self::try_once(port).ok()?;
+        client.set_config(det, pres, track).then_some(client)
+    }
+
+    /// Take back `port` from a stale sidecar that failed the health probe.
+    /// Only the PID currently LISTENING on `port` is a candidate, only when
+    /// its image is a Python interpreter — anything else (self, system,
+    /// non-Python binaries) is refused with a reason, never killed.
+    pub fn reclaim_port(port: u16) -> Reclaim {
+        let Some(pid) = listen_pid(port) else {
+            return Reclaim::AlreadyFree;
+        };
+        if pid == std::process::id() || pid < 10 {
+            return Reclaim::Refused(format!("PID {pid} looks like self/system"));
+        }
+        match process_image_name(pid) {
+            Some(name) if is_python_image(&name) => {
+                if kill_pid(pid) && wait_port_free(port) {
+                    Reclaim::Freed(pid)
+                } else {
+                    Reclaim::Refused(format!("PID {pid} ({name}) would not die"))
+                }
+            }
+            Some(name) => Reclaim::Refused(format!("PID {pid} ({name}) is not the sidecar")),
+            None => Reclaim::Refused(format!("PID {pid} (unreadable image)")),
+        }
+    }
+    /// Connect to the Python server. Retries, in case the
+    /// child process is still starting up (MediaPipe/TF import takes
+    /// several seconds on first run, so allow up to ~15 s).
     pub fn connect(port: u16) -> anyhow::Result<Self> {
         let addr = format!("127.0.0.1:{port}");
-        let stream = Self::try_connect(&addr, 10, std::time::Duration::from_millis(200))?;
+        let stream = Self::try_connect(&addr, 30, std::time::Duration::from_millis(500))?;
         eprintln!("[mediapipe] connected to {addr}");
         Ok(Self {
             stream: Arc::new(Mutex::new(stream)),
@@ -128,6 +167,29 @@ impl MediapipeClient {
         vec![]
     }
 
+    /// Push new model confidences (0.0-1.0) to the running server: the
+    /// sidecar recreates its landmarker in place, no restart involved.
+    /// Returns false on any IO error (the caller logs; the next `detect()`
+    /// reconnects on its own, so a dead server heals without a bridge restart).
+    pub fn set_config(&self, det: f32, pres: f32, track: f32) -> bool {
+        let mut stream = match self.stream.lock() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let mut buf = [0u8; 4 + 1 + 3 * 4];
+        buf[0..4].copy_from_slice(&CONFIG_SENTINEL_U32.to_le_bytes());
+        buf[4] = CONFIG_KIND_MODEL;
+        buf[5..9].copy_from_slice(&det.to_le_bytes());
+        buf[9..13].copy_from_slice(&pres.to_le_bytes());
+        buf[13..17].copy_from_slice(&track.to_le_bytes());
+        if stream.write_all(&buf).is_err() {
+            return false;
+        }
+        let _ = stream.flush();
+        let mut ack = [0u8; 1];
+        stream.read_exact(&mut ack).is_ok()
+    }
+
     /// One request/response round-trip. Returns `None` on any IO error.
     fn detect_once(stream: &mut TcpStream, jpeg: &[u8]) -> Option<Vec<DetectedHand>> {
         // Send: [4 bytes LE length] [JPEG data]
@@ -176,6 +238,146 @@ impl MediapipeClient {
 
         Some(hands)
     }
+}
+
+/// Outcome of trying to take back the sidecar port from a stale occupant.
+#[derive(Debug, PartialEq)]
+pub enum Reclaim {
+    /// Killed the stale sidecar (PID) and the port is free; spawn fresh.
+    Freed(u32),
+    /// Nobody is listening anymore; spawn fresh.
+    AlreadyFree,
+    /// Someone holds the port and we won't touch it; human-readable reason.
+    Refused(String),
+}
+
+/// PID currently LISTENING on `port`, via `netstat`. The listener row is
+/// identified by its `0.0.0.0:0` foreign endpoint, not the state word (which
+/// is localized on some Windows installs) — see `parse_listen_pid`.
+#[cfg(windows)]
+fn listen_pid(port: u16) -> Option<u32> {
+    let out = std::process::Command::new("netstat")
+        .args(["-ano", "-p", "TCP"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_listen_pid(&String::from_utf8_lossy(&out.stdout), port)
+}
+
+#[cfg(not(windows))]
+fn listen_pid(_port: u16) -> Option<u32> {
+    None
+}
+
+/// Port part of a netstat endpoint (`127.0.0.1:42073`, `[::]:42073`).
+fn endpoint_port(ep: &str) -> Option<&str> {
+    ep.rsplit(':').next().map(|p| p.trim_end_matches(']'))
+}
+
+/// Parse `netstat -ano -p TCP` output: PID of the listener on `port`.
+/// Pure (no process touched) so unit tests pin it with canned output.
+fn parse_listen_pid(netstat: &str, port: u16) -> Option<u32> {
+    let want = port.to_string();
+    for line in netstat.lines() {
+        // `TCP  <local>  <foreign>  <state>  <pid>` — 5 columns.
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() != 5 || !cols[0].eq_ignore_ascii_case("TCP") {
+            continue;
+        }
+        if endpoint_port(cols[1]) != Some(want.as_str()) {
+            continue;
+        }
+        // Listener rows point at 0.0.0.0:0 / [::]:0; ESTABLISHED rows point
+        // at a real peer (possibly our own bridge) and must not match.
+        if cols[2] != "0.0.0.0:0" && cols[2] != "[::]:0" {
+            continue;
+        }
+        if let Ok(pid) = cols[4].parse::<u32>() {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+/// Only a Python interpreter may be killed as a stale sidecar.
+fn is_python_image(image_path: &str) -> bool {
+    let name = image_path
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(image_path);
+    name.eq_ignore_ascii_case("python.exe") || name.eq_ignore_ascii_case("pythonw.exe")
+}
+
+/// Full image path of `pid` via kernel32 (no new crates for one call).
+#[cfg(windows)]
+fn process_image_name(pid: u32) -> Option<String> {
+    use std::os::windows::ffi::OsStringExt;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(
+            dwDesiredAccess: u32,
+            bInheritHandle: i32,
+            dwProcessId: u32,
+        ) -> *mut std::ffi::c_void;
+        fn QueryFullProcessImageNameW(
+            hProcess: *mut std::ffi::c_void,
+            dwFlags: u32,
+            lpExeName: *mut u16,
+            lpdwSize: *mut u32,
+        ) -> i32;
+        fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+    }
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+        let mut buf = [0u16; 512];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut len);
+        CloseHandle(handle);
+        if ok == 0 {
+            return None;
+        }
+        Some(
+            std::ffi::OsString::from_wide(&buf[..len as usize])
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+}
+
+#[cfg(not(windows))]
+fn process_image_name(_pid: u32) -> Option<String> {
+    None
+}
+
+#[cfg(windows)]
+fn kill_pid(pid: u32) -> bool {
+    std::process::Command::new("taskkill")
+        .args(["/F", "/PID", &pid.to_string()])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn kill_pid(_pid: u32) -> bool {
+    false
+}
+
+/// Poll until `port` refuses connections (listener gone), ~5 s max.
+fn wait_port_free(port: u16) -> bool {
+    for _ in 0..10 {
+        match TcpStream::connect(format!("127.0.0.1:{port}")) {
+            Err(_) => return true,
+            Ok(_) => std::thread::sleep(Duration::from_millis(500)),
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -363,7 +565,91 @@ mod tests {
     }
 
     #[test]
+    fn set_config_sends_sentinel_frame_and_reads_ack() {
+        use std::sync::mpsc::channel;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 17];
+                let _ = stream.read_exact(&mut buf);
+                let _ = tx.send(buf);
+                let _ = stream.write_all(&[0x00]);
+                let _ = stream.flush();
+            }
+        });
+
+        let client = MediapipeClient::connect(port).unwrap();
+        assert!(client.set_config(0.8, 0.7, 0.6));
+        let got = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(&got[0..4], &0xFFFFFFFFu32.to_le_bytes());
+        assert_eq!(got[4], 0x01);
+        assert_eq!(f32::from_le_bytes(got[5..9].try_into().unwrap()), 0.8);
+        assert_eq!(f32::from_le_bytes(got[9..13].try_into().unwrap()), 0.7);
+        assert_eq!(f32::from_le_bytes(got[13..17].try_into().unwrap()), 0.6);
+    }
+
+    #[test]
     fn mediapipe_port_matches_contract() {
         assert_eq!(crate::net::MEDIAPIPE_PORT, 42073);
+    }
+
+    const SAMPLE_NETSTAT: &str = "Active Connections\r\n\r\n  Proto  Local Address          Foreign Address        State           PID\r\n  TCP    127.0.0.1:42073        0.0.0.0:0              LISTENING       1804\r\n  TCP    127.0.0.1:42073        127.0.0.1:51234        ESTABLISHED     1804\r\n  TCP    127.0.0.1:8567         0.0.0.0:0              LISTENING       9999\r\n";
+
+    #[test]
+    fn netstat_output_maps_listener_to_pid() {
+        // The LISTENING row wins; the ESTABLISHED row (a live client, maybe
+        // our own bridge) must not shadow it.
+        assert_eq!(parse_listen_pid(SAMPLE_NETSTAT, 42073), Some(1804));
+        assert_eq!(parse_listen_pid(SAMPLE_NETSTAT, 8567), Some(9999));
+    }
+
+    #[test]
+    fn netstat_parser_ignores_localized_state_words() {
+        // German Windows reports ABHÖREN instead of LISTENING — the foreign
+        // endpoint (0.0.0.0:0), not the state word, identifies listeners.
+        let german = "  Proto  Lokale Adresse         Remoteadresse          Status            PID\r\n  TCP    127.0.0.1:42073        0.0.0.0:0              ABH\u{d6}REN         4321\r\n";
+        assert_eq!(parse_listen_pid(german, 42073), Some(4321));
+    }
+
+    #[test]
+    fn netstat_parser_returns_none_when_port_absent() {
+        assert_eq!(parse_listen_pid(SAMPLE_NETSTAT, 12345), None);
+        assert_eq!(parse_listen_pid("", 42073), None);
+        // Port as a suffix of a longer port must not match.
+        let tricky = "  TCP    127.0.0.1:142073       0.0.0.0:0              LISTENING       7\r\n";
+        assert_eq!(parse_listen_pid(tricky, 42073), None);
+    }
+
+    #[test]
+    fn python_image_check_matches_interpreters_only() {
+        assert!(is_python_image(r"C:\Python312\python.exe"));
+        assert!(is_python_image(r"C:\a\b\pythonw.EXE"));
+        assert!(is_python_image("/usr/bin/python.exe"));
+        assert!(!is_python_image(r"C:\bridge\cardboard-bridge.exe"));
+        assert!(!is_python_image("python")); // bare name, no .exe
+        assert!(!is_python_image(r"C:\tools\python_helper.exe"));
+    }
+
+    /// A non-Python process squatting the sidecar port must survive reclaim:
+    /// the bridge reports it instead of killing it. Binds the real contract
+    /// port briefly; skips if a sidecar is already running.
+    #[test]
+    #[cfg(windows)]
+    fn reclaim_refuses_non_python_port_holder() {
+        let listener = match std::net::TcpListener::bind("127.0.0.1:42073") {
+            Ok(l) => l,
+            Err(_) => return, // sidecar running — nothing to prove here
+        };
+        match MediapipeClient::reclaim_port(42073) {
+            // Our own listener trips either the self-guard or the
+            // non-python guard — both must refuse, never kill.
+            Reclaim::Refused(_) => {}
+            other => panic!("must refuse a non-python squatter, got {other:?}"),
+        }
+        // And the squatter is still alive to take a connection.
+        assert!(std::net::TcpStream::connect("127.0.0.1:42073").is_ok());
+        drop(listener);
     }
 }

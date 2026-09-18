@@ -1,5 +1,6 @@
 #include "HmdDriver.h"
 #include "DriverLog.h"
+#include <cstring>
 
 using namespace vr;
 
@@ -108,6 +109,78 @@ void HmdDriver::ClampEncoderToCap()
         m_encoderW = newW;
         m_encoderH = newH;
     }
+}
+
+bool HmdDriver::ApplyBridgeCfg(int fps, int bitrateKbps, const char* codec)
+{
+    // Same re-init discipline as ApplyHardwareCap: never tear down while the
+    // background thread may still be reading encoder resources.
+    WaitEncoderIdle();
+
+    std::lock_guard<std::mutex> lock(m_encoderMutex);
+
+    int newFps = (fps > 0 && fps <= 120) ? fps : m_encoderFps;
+    int newBitrate = (bitrateKbps > 0 && bitrateKbps <= 100000) ? bitrateKbps * 1000 : m_encoderBitrate;
+    // Named codecs pin the backend; "auto" (or unknown) keeps the current one
+    // so a bitrate-only push never flips HW<->SW underneath the stream.
+    // "gpu"/"cpu" are the bridge's coarse switch: GPU lets VideoEncoder probe
+    // the hardware backends for the installed card, CPU forces libx264.
+    bool newGpu = m_encoderUseGpu;
+    if (codec) {
+        if (strcmp(codec, "libx264") == 0 || strcmp(codec, "cpu") == 0) newGpu = false;
+        else if (strcmp(codec, "h264_amf") == 0 || strcmp(codec, "h264_nvenc") == 0
+                 || strcmp(codec, "h264_qsv") == 0 || strcmp(codec, "gpu") == 0) newGpu = true;
+    }
+
+    if (!m_encoderInitialized || !m_pVideoEncoder) {
+        // Encoder not up yet; values apply at initialization time.
+        m_encoderFps = newFps;
+        m_encoderBitrate = newBitrate;
+        m_encoderUseGpu = newGpu;
+        DriverLog("BRIDGE_CFG stored (encoder not ready, applied on init)");
+        return true;
+    }
+
+    bool meaningful = (newFps != m_encoderFps || newBitrate != m_encoderBitrate || newGpu != m_encoderUseGpu);
+    if (!meaningful) {
+        return false;
+    }
+
+    DriverLog("Re-initializing encoder from BRIDGE_CFG: @%d fps, %d kbps, gpu=%d",
+              newFps, newBitrate / 1000, newGpu ? 1 : 0);
+
+    m_encoderFps = newFps;
+    m_encoderBitrate = newBitrate;
+    m_encoderUseGpu = newGpu;
+    ClampEncoderToCap();
+
+    m_pVideoEncoder->Shutdown();
+    delete m_pVideoEncoder;
+    m_pVideoEncoder = nullptr;
+    m_encoderInitialized = false;
+
+    m_pVideoEncoder = new VideoEncoder();
+    if (!m_pVideoEncoder) {
+        DriverLog("Failed to allocate VideoEncoder during BRIDGE_CFG re-init!");
+        return false;
+    }
+
+    m_pVideoEncoder->SetEncodedPacketCallback([this](uint8_t* data, int size, int64_t pts, bool keyframe) {
+        OnEncodedPacket(data, size, pts, keyframe);
+    });
+
+    if (!m_pVideoEncoder->Initialize(m_pD3D11Device, m_pD3D11DeviceContext,
+                                     m_encoderW, m_encoderH, m_encoderFps, m_encoderBitrate, m_encoderUseGpu)) {
+        DriverLog("VideoEncoder re-init failed under BRIDGE_CFG!");
+        delete m_pVideoEncoder;
+        m_pVideoEncoder = nullptr;
+        return false;
+    }
+
+    m_encoderInitialized = true;
+    m_encoderPts = 0;
+    DriverLog("Encoder re-initialized at %dx%d @%d fps from BRIDGE_CFG", m_encoderW, m_encoderH, m_encoderFps);
+    return true;
 }
 
 bool HmdDriver::ApplyHardwareCap(int capW, int capH)

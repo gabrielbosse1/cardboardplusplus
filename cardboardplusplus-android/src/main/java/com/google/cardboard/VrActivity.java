@@ -125,7 +125,7 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
     telemetrySender = new TelemetrySender(this, appSettings);
     permissionManager = new PermissionManager(this);
     cameraController = new CameraController(this, this);
-    videoManager = new VideoManager(this);
+    videoManager = new VideoManager(this, appSettings);
     discoveryManager = new DiscoveryManager(appSettings);
     // Pre-query the hardware decoder cap so the DiscoveryManager can announce it
     // to the driver on the first ACK (using the same socket that proved connectivity).
