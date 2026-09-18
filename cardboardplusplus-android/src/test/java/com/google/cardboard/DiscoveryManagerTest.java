@@ -77,6 +77,21 @@ public class DiscoveryManagerTest {
         assertEquals(42070, AppConstants.UDP_DISCOVERY_PORT);
     }
 
+    @Test
+    public void decoderCapIsResentPeriodically() {
+        // Mirrors DiscoveryManager: CAP goes out on the 1st, 61st, 121st... ACK
+        // (~every 30s), never just once — a restarted driver must learn the cap.
+        assertTrue(shouldSendCap(1));
+        assertFalse(shouldSendCap(2));
+        assertFalse(shouldSendCap(60));
+        assertTrue(shouldSendCap(61));
+        assertTrue(shouldSendCap(121));
+    }
+
+    private static boolean shouldSendCap(int ackCount) {
+        return ackCount % 60 == 1;
+    }
+
     /** Minimal state machine mirroring DiscoveryManager's lifecycle. */
     private static class FakeDiscovery {
         private volatile boolean broadcasting = false;

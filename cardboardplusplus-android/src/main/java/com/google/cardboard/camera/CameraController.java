@@ -14,6 +14,7 @@ import android.media.ImageReader;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.util.Log;
+import android.util.Range;
 import android.util.Size;
 import android.view.Surface;
 import com.google.cardboard.NativeBridge;
@@ -30,9 +31,13 @@ public class CameraController {
   private static final String TAG = CameraController.class.getSimpleName();
   private static final DebugLog DBG = new DebugLog(TAG);
 
-  /** Callback interface for raw camera frames. */
+  /**
+   * Callback interface for raw camera frames. Return true when taking
+   * ownership of {@code image} (the callback closes it); false means the
+   * controller closes it after the call returns.
+   */
   public interface FrameCallback {
-    void onFrame(Image image);
+    boolean onFrame(Image image);
   }
 
   private final Context context;
@@ -152,12 +157,15 @@ public class CameraController {
           reader -> {
             Image image = reader.acquireLatestImage();
             if (image == null) return;
+            boolean taken = false;
             try {
               if (frameCallback != null) {
-                frameCallback.onFrame(image);
+                taken = frameCallback.onFrame(image);
               }
             } finally {
-              image.close();
+              if (!taken) {
+                image.close();
+              }
             }
           },
           cameraHandler);
@@ -166,6 +174,38 @@ public class CameraController {
           cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
       captureRequestBuilder.addTarget(cameraSurface);
       captureRequestBuilder.addTarget(imageReader.getSurface());
+      // Pin the AE fps range so the sensor doesn't drop to ~8fps indoors.
+      // Prefer a range reaching 30fps; fall back to the fastest available.
+      try {
+        String camId = cameraDevice.getId();
+        CameraCharacteristics chars = cameraManager.getCameraCharacteristics(camId);
+        Range<Integer>[] ranges =
+            chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES);
+        if (ranges != null && ranges.length > 0) {
+          // Among ranges reaching 30fps, prefer the highest lower bound
+          // ([30,30] over [15,30]) so AE can't trade fps for exposure.
+          Range<Integer> best = null;
+          for (Range<Integer> r : ranges) {
+            if (r.getUpper() >= 30
+                && (best == null || r.getLower() > best.getLower())) {
+              best = r;
+            }
+          }
+          if (best == null) {
+            for (Range<Integer> r : ranges) {
+              if (best == null || r.getUpper() > best.getUpper()) {
+                best = r;
+              }
+            }
+          }
+          if (best != null) {
+            captureRequestBuilder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, best);
+            Log.i(TAG, "Camera fps range: " + best);
+          }
+        }
+      } catch (Exception e) {
+        Log.w(TAG, "FPS range not pinned: " + e.getMessage());
+      }
 
       cameraDevice.createCaptureSession(
           new ArrayList<Surface>() {

@@ -435,8 +435,21 @@ bool VideoEncoder::FinishEncode(int64_t pts)
     return true;
 }
 
+void VideoEncoder::RequestKeyframe()
+{
+    m_forceKeyframe.store(true, std::memory_order_relaxed);
+}
+
 bool VideoEncoder::SendFrameToEncoder()
 {
+    // Phone loss recovery: a KEYFRAME_REQ from the phone forces this frame
+    // to IDR so the decoder gets a fresh reference within ~1 RTT instead of
+    // waiting for the next periodic keyframe. exchange() consumes the flag,
+    // so repeated requests collapse into a single forced keyframe.
+    if (m_forceKeyframe.exchange(false, std::memory_order_relaxed) && m_pFrame) {
+        m_pFrame->pict_type = AV_PICTURE_TYPE_I;
+    }
+
     int ret = avcodec_send_frame(m_pCodecContext, m_pFrame);
     if (ret < 0) {
         ENCODER_ERROR("avcodec_send_frame failed! Error code: %d", ret);

@@ -112,18 +112,35 @@ public class CrossComponentContractTest {
 
     @Test
     public void discoveryBroadcastMatchesDriverExpectation() {
-        // Driver Discovery.cpp fallthrough: any packet not matching the four
+        // Driver Discovery.cpp fallthrough: any packet not matching the five
         // known prefixes triggers SwitchDataTarget + ACK.
         // Phone sends "CARDBOARD_DISCOVERY" which must NOT match:
         //   - kCardboardCap ("CARDBOARD_CAP")
         //   - kBridgeHeartbeat ("BRIDGE_HELLO")
         //   - kBridgePreview ("BRIDGE_PREVIEW")
         //   - kBridgeCfg ("BRIDGE_CFG")
+        //   - kKeyframeReq ("KEYFRAME_REQ")
         String discovery = "CARDBOARD_DISCOVERY";
         assertFalse(discovery.startsWith("CARDBOARD_CAP"));
         assertFalse(discovery.startsWith("BRIDGE_HELLO"));
         assertFalse(discovery.startsWith("BRIDGE_PREVIEW"));
         assertFalse(discovery.startsWith("BRIDGE_CFG"));
+        assertFalse(discovery.startsWith("KEYFRAME_REQ"));
+    }
+
+    @Test
+    public void keyframeReqMatchesDriverExpectation() {
+        // Phone sends KEYFRAME_REQ on loss; driver matches prefix kKeyframeReq,
+        // forces the next frame to IDR, and replies with nothing (no ACK, no
+        // target switch). Must not collide with any other known prefix.
+        assertEquals("KEYFRAME_REQ", AppConstants.KEYFRAME_REQ);
+        assertEquals(12, AppConstants.KEYFRAME_REQ.length());
+        String req = AppConstants.KEYFRAME_REQ;
+        assertFalse(req.startsWith("CARDBOARD_CAP"));
+        assertFalse(req.startsWith("BRIDGE_HELLO"));
+        assertFalse(req.startsWith("BRIDGE_PREVIEW"));
+        assertFalse(req.startsWith("BRIDGE_CFG"));
+        assertFalse("CARDBOARD_DISCOVERY".startsWith(req));
     }
 
     @Test
@@ -167,12 +184,21 @@ public class CrossComponentContractTest {
 
     @Test
     public void cameraJpegSizeGuardMatchesBridgeExpectation() {
-        // CameraStreamer drops frames > 60000 bytes
-        // Bridge camera.rs accepts any size (no guard)
+        // CameraStreamer drops frames whose JPEG + 2-byte seq header > 60000 bytes
+        // Bridge accepts any size (no guard)
         // This is a one-way contract: phone must stay under 60KB
         int maxJpegSize = 60000;
         assertTrue(maxJpegSize > 0);
         assertTrue(maxJpegSize < 65535); // must fit in a single UDP datagram
+    }
+
+    @Test
+    public void cameraWireFormatMatchesBridgeParser() {
+        // Phone sends [u16 seq BE][JPEG 256x192] on 42072.
+        assertEquals(2, AppConstants.CAMERA_SEQ_HEADER_LEN);
+        assertEquals(256, AppConstants.CAMERA_STREAM_WIDTH);
+        assertEquals(192, AppConstants.CAMERA_STREAM_HEIGHT);
+        assertEquals(60000, AppConstants.CAMERA_MAX_DATAGRAM);
     }
 
     // --- Timeout constants ---

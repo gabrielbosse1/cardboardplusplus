@@ -45,6 +45,10 @@ impl MediapipeClient {
         let stream = rx.recv_timeout(Duration::from_secs(2))
             .map_err(|_| anyhow::anyhow!("connect timed out"))?
             .map_err(|e| anyhow::anyhow!(e))?;
+        // Bound every detect() round-trip: a wedged Python server must not
+        // stall the camera thread forever.
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
         eprintln!("[mediapipe] connected to {addr}");
         Ok(Self {
             stream: Arc::new(Mutex::new(stream)),
@@ -75,7 +79,11 @@ impl MediapipeClient {
                 let _ = tx.send(TcpStream::connect(&addr_str));
             });
             match rx.recv_timeout(connect_timeout) {
-                Ok(Ok(s)) => return Ok(s),
+                Ok(Ok(s)) => {
+                    let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+                    let _ = s.set_write_timeout(Some(Duration::from_secs(2)));
+                    return Ok(s);
+                }
                 Ok(Err(e)) if attempt + 1 < retries => {
                     eprintln!("[mediapipe] connect attempt {} failed: {e}, retrying...", attempt + 1);
                     std::thread::sleep(delay);

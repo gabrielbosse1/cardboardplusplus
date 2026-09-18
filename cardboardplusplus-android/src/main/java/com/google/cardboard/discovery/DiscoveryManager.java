@@ -16,8 +16,9 @@ import java.net.InetAddress;
  * the configured PC IP or the subnet broadcast address until the driver answers {@code ACK}. The
  * driver uses a discovery packet as the signal that this phone is alive and should receive video.
  *
- * <p>After receiving the first ACK, the manager also sends {@code CARDBOARD_CAP <W> <H>} using the
- * same socket that proved connectivity (avoids Windows firewall dropping packets from a new socket).
+  * <p>After ACKs arrive, the manager re-sends {@code CARDBOARD_CAP <W> <H>} about every 30s using
+  * the same socket that proved connectivity (avoids Windows firewall dropping packets from a new
+  * socket), so a restarted driver always learns this phone's decode ceiling.
  *
  * <p>The wire values below are part of the runtime protocol shared with the PC driver and must not
  * change.
@@ -93,7 +94,7 @@ public class DiscoveryManager {
    * blocking indefinitely.
    */
   private void broadcastUntilAck(DatagramSocket socket, byte[] sendData, byte[] recvBuffer) {
-    boolean capSent = false;
+    int ackCount = 0;
     int consecutiveFailures = 0;
     try {
       while (broadcasting) {
@@ -116,16 +117,18 @@ public class DiscoveryManager {
           if (ACK_RESPONSE.equals(response)) {
             Log.i(TAG, "Discovery successful, driver connected");
             consecutiveFailures = 0;
-            // Send the hardware decoder cap on the same socket that proved
-            // connectivity (avoids Windows firewall dropping packets from a
-            // brand-new socket to the same port).
-            if (!capSent && capWidth > 0 && capHeight > 0) {
+            ackCount++;
+            // Re-announce the hardware decoder cap ~every 30s (every 60th ACK)
+            // on the same socket that proved connectivity (avoids Windows
+            // firewall dropping packets from a brand-new socket). A one-shot
+            // CAP is lost forever if the driver restarts afterwards and keeps
+            // encoding above this phone's decode ceiling (black screen).
+            if (capWidth > 0 && capHeight > 0 && ackCount % 60 == 1) {
               // Send CAP to the driver's actual IP (from ACK response), NOT the
               // broadcast address. Broadcast CAP packets are silently dropped by
               // Windows Firewall as unsolicited inbound, so the driver never
               // receives them and the encoder runs unclamped.
               sendCap(socket, recvPacket.getAddress());
-              capSent = true;
             }
           }
         } catch (Exception e) {

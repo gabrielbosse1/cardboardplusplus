@@ -94,7 +94,7 @@ fn wire_callbacks(core: &std::sync::Arc<AppCore>, ui: &MainWindow) {
 /// keeps stats flowing even after `run_window` would otherwise unwind).
 fn start_state_poller(core: Arc<AppCore>, weak: slint::Weak<MainWindow>) {
     let timer = Timer::default();
-    timer.start(TimerMode::Repeated, Duration::from_millis(250), move || {
+    timer.start(TimerMode::Repeated, Duration::from_millis(50), move || {
         let Some(ui) = weak.upgrade() else { return };
         let snap = core.status();
         let global = ui.global::<BridgeState>();
@@ -115,6 +115,7 @@ fn start_state_poller(core: Arc<AppCore>, weak: slint::Weak<MainWindow>) {
         global.set_preview_frames(snap.preview_frames.min(i32::MAX as u64) as i32);
         global.set_preview_drops(snap.preview_drops.min(i32::MAX as u64) as i32);
         global.set_camera_connected(snap.camera_connected);
+        global.set_camera_fps(snap.camera_fps);
         global.set_gyro_x(format!("{:.2}", snap.latest_gyro_x).into());
         global.set_gyro_y(format!("{:.2}", snap.latest_gyro_y).into());
         global.set_gyro_z(format!("{:.2}", snap.latest_gyro_z).into());

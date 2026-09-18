@@ -108,6 +108,28 @@ bool VideoReceiver::GetFrame(uint8_t** data, int* size) {
   return true;
 }
 
+void VideoReceiver::MaybeSendKeyframeNack() {
+  if (!has_sender_) return;
+  auto now = std::chrono::steady_clock::now();
+  auto elapsed_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(now - last_nack_).count();
+  if (elapsed_ms < kNackIntervalMs) return;
+  last_nack_ = now;
+
+  // Wire string shared with the PC driver (see CardboardWire.h) — the driver
+  // forces the next frame to IDR and replies with nothing.
+  static const char kKeyframeReq[] = "KEYFRAME_REQ";
+  sockaddr_in target = last_sender_;
+  target.sin_port = htons(kDiscoveryPort);
+  ssize_t sent = sendto(socket_fd_, kKeyframeReq, sizeof(kKeyframeReq) - 1, 0,
+                        (sockaddr*)&target, sizeof(target));
+  if (sent < 0) {
+    LOGW("KEYFRAME_REQ send failed");
+  } else {
+    LOGW("Video desync: sent KEYFRAME_REQ, awaiting forced IDR");
+  }
+}
+
 void VideoReceiver::ReceiveLoop() {
   LOGD("Receive loop started, waiting for data...");
 
@@ -129,10 +151,18 @@ void VideoReceiver::ReceiveLoop() {
       continue;
     }
 
-    ssize_t bytes = recv(socket_fd_, packet_buffer.data(), kMaxPacketSize, 0);
+    sockaddr_in sender;
+    socklen_t sender_len = sizeof(sender);
+    ssize_t bytes = recvfrom(socket_fd_, packet_buffer.data(), kMaxPacketSize, 0,
+                             (sockaddr*)&sender, &sender_len);
     if (bytes <= 0) {
       continue;
     }
+
+    // The only sender on the video port is the driver; remember it so loss
+    // recovery (KEYFRAME_REQ) knows where to send.
+    last_sender_ = sender;
+    has_sender_ = true;
 
     buffer.insert(buffer.end(), packet_buffer.begin(), packet_buffer.begin() + bytes);
 
@@ -155,6 +185,7 @@ void VideoReceiver::ReceiveLoop() {
         // Drop the buffer and resync from the next datagram.
         LOGE("Invalid frame length %zu, resetting reassembly buffer", frame_len);
         buffer.clear();
+        MaybeSendKeyframeNack();
         break;
       }
 

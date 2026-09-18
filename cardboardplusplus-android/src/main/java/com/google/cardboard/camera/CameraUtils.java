@@ -32,21 +32,29 @@ public final class CameraUtils {
   }
 
   /**
-   * Picks the first output size that is at least {@code minWidth}x{@code minHeight}, falling back
-   * to the requested minimum size when nothing qualifies.
+   * Picks the smallest output size that is at least {@code minWidth}x{@code minHeight},
+   * falling back to the requested minimum size when nothing qualifies.
+   * Smallest-qualifying keeps the sensor in a fast readout mode (high fps);
+   * the old first-match picked the largest (e.g. 2304x1728) and capped the
+   * streamer at ~8fps.
    */
   public static Size chooseOutputSize(
       StreamConfigurationMap map, int minWidth, int minHeight) {
+    Size best = null;
     if (map != null) {
       Size[] outputSizes = map.getOutputSizes(android.graphics.SurfaceTexture.class);
       if (outputSizes != null) {
         for (Size size : outputSizes) {
           if (size.getWidth() >= minWidth && size.getHeight() >= minHeight) {
-            return size;
+            if (best == null
+                || (long) size.getWidth() * size.getHeight()
+                    < (long) best.getWidth() * best.getHeight()) {
+              best = size;
+            }
           }
         }
       }
     }
-    return new Size(minWidth, minHeight);
+    return best != null ? best : new Size(minWidth, minHeight);
   }
 }

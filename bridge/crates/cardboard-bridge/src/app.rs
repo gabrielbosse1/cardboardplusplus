@@ -56,7 +56,8 @@ pub struct AppState {
     pub camera_connected: bool,
     pub camera_frame: Option<(u32, u32, Vec<u8>)>,
     pub camera_frame_time: Instant,
-    /// Hands detected by the bridge-side ONNX pipeline (separate from phone telemetry).
+    pub camera_fps: i32,
+    /// Hands detected by the bridge-side MediaPipe pipeline (separate from phone telemetry).
     pub camera_detected_hands: usize,
     // -- latest sensor sample (for UI display and driver forwarding) --
     pub latest_gyro: [f32; 3],
@@ -66,6 +67,7 @@ pub struct AppState {
     // -- private accounting used to derive the per-second fps figures above --
     gyro_pulse_count: u64,
     hand_pulse_count: u64,
+    camera_pulse_count: u64,
     fps_window_started: Instant,
 }
 
@@ -93,6 +95,7 @@ impl Default for AppState {
             camera_connected: false,
             camera_frame: None,
             camera_frame_time: Instant::now(),
+            camera_fps: 0,
             camera_detected_hands: 0,
             latest_gyro: [0.0; 3],
             latest_accel: [0.0; 3],
@@ -100,6 +103,7 @@ impl Default for AppState {
             latest_timestamp_ms: 0,
             gyro_pulse_count: 0,
             hand_pulse_count: 0,
+            camera_pulse_count: 0,
             fps_window_started: Instant::now(),
         }
     }
@@ -117,8 +121,9 @@ impl AppState {
     }
 
     /// Roll the per-second rate counters once at least one second has elapsed
-    /// since the last roll. Called after every inbound telemetry packet so the
-    /// fps figures stay fresh without a dedicated timing thread.
+    /// since the last roll. Called after every inbound telemetry packet and
+    /// every camera frame so the fps figures stay fresh without a dedicated
+    /// timing thread.
     pub fn recompute_fps(&mut self) {
         let now = Instant::now();
         let elapsed = now.duration_since(self.fps_window_started);
@@ -127,8 +132,10 @@ impl AppState {
             let dt = elapsed.as_secs_f32().max(0.001);
             self.gyro_fps = (self.gyro_pulse_count as f32 / dt) as i32;
             self.hand_fps = (self.hand_pulse_count as f32 / dt) as i32;
+            self.camera_fps = (self.camera_pulse_count as f32 / dt) as i32;
             self.gyro_pulse_count = 0;
             self.hand_pulse_count = 0;
+            self.camera_pulse_count = 0;
             self.fps_window_started = now;
         }
     }
@@ -164,7 +171,17 @@ impl AppState {
     }
 
     /// Store the latest decoded camera frame (RGBA) for the viewer.
+    /// Counts toward the camera fps rate.
     pub fn note_camera_frame(&mut self, w: u32, h: u32, rgba: Vec<u8>) {
+        self.camera_pulse_count += 1;
+        self.store_camera_frame(w, h, rgba);
+        self.recompute_fps();
+    }
+
+    /// Store the latest decoded camera frame without counting fps.
+    /// Used by the MediaPipe worker for annotated (overlay) frames so the
+    /// fps pill measures the display rate, not detect completions.
+    pub fn store_camera_frame(&mut self, w: u32, h: u32, rgba: Vec<u8>) {
         self.camera_frame = Some((w, h, rgba));
         self.camera_frame_time = Instant::now();
         if !self.camera_connected {

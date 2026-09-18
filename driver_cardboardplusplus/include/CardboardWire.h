@@ -57,6 +57,14 @@ namespace wire {
     static constexpr char kBridgeStats[] = "BRIDGE_STATS";
     static constexpr std::size_t kBridgeStatsLen = sizeof(kBridgeStats) - 1; // 12
 
+    // Phone -> driver keyframe request (loss recovery). The phone sends this
+    // when its video reassembly desyncs (a UDP datagram was lost), and the
+    // driver forces the next encoded frame to IDR. Handled with NO ack and NO
+    // data-target switch (see Discovery.cpp): a reply would land on the
+    // phone's video port and corrupt its reassembly buffer.
+    static constexpr char kKeyframeReq[] = "KEYFRAME_REQ";
+    static constexpr std::size_t kKeyframeReqLen = sizeof(kKeyframeReq) - 1; // 12
+
     // Bridge -> driver sensor data forwarding port (binary, same format as phone→bridge).
     static constexpr int kSensorPort = 42074;
 }

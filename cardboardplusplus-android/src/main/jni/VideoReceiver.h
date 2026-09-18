@@ -8,6 +8,8 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <chrono>
+#include <netinet/in.h>
 
 namespace ndk_cardboardplusplus {
 
@@ -55,7 +57,26 @@ class VideoReceiver {
   // (see VideoEncoder gop_size) or we would be forced to drop inside a GOP.
   static const size_t kMaxQueueDepth = 24;
 
+  // Loss recovery: the driver's discovery port. When reassembly desyncs (a
+  // UDP datagram was lost) we send KEYFRAME_REQ here so the driver forces
+  // the next frame to IDR. Mirrors wire::kDiscoveryPort / kKeyframeReq in
+  // the driver's CardboardWire.h — change together.
+  static const int kDiscoveryPort = 42070;
+  // Minimum gap between keyframe requests so a loss burst sends one NACK,
+  // not one per dropped datagram.
+  static const int kNackIntervalMs = 500;
+
   void ReceiveLoop();
+  // Sends KEYFRAME_REQ to the last-seen video sender (the driver) if the
+  // throttle allows. Called on desync; no-op until the first datagram
+  // arrives. Runs on the receive thread only.
+  void MaybeSendKeyframeNack();
+
+  // Last sender observed on the video port (i.e. the driver). ReceiveLoop is
+  // the only thread that touches these.
+  sockaddr_in last_sender_;
+  bool has_sender_ = false;
+  std::chrono::steady_clock::time_point last_nack_{};
 };
 
 }  // namespace ndk_cardboardplusplus

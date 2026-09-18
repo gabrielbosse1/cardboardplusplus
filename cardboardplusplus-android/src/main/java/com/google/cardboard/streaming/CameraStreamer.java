@@ -1,10 +1,11 @@
 package com.google.cardboard.streaming;
 
-import android.graphics.Bitmap;
 import android.graphics.ImageFormat;
 import android.graphics.Rect;
 import android.graphics.YuvImage;
 import android.media.Image;
+import android.os.Handler;
+import android.os.HandlerThread;
 import android.util.Log;
 import com.google.cardboard.camera.CameraController;
 import com.google.cardboard.core.AppConstants;
@@ -16,23 +17,33 @@ import java.nio.ByteBuffer;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class CameraStreamer implements CameraController.FrameCallback {
   private static final String TAG = CameraStreamer.class.getSimpleName();
   private static final DebugLog DBG = new DebugLog(TAG);
-  private static final int TARGET_WIDTH = 320;
-  private static final int TARGET_HEIGHT = 240;
-  private static final int JPEG_QUALITY = 50;
-  private static final long FRAME_INTERVAL_MS = 1000 / 15;
+  // Wire format: [u16 seq BE][JPEG 256x192 q38]. Downscale YUV first,
+  // single JPEG encode — no Bitmap round-trip (see docs/CAMERA_REBUILD_PLAN.md).
+  private static final int TARGET_WIDTH = AppConstants.CAMERA_STREAM_WIDTH;
+  private static final int TARGET_HEIGHT = AppConstants.CAMERA_STREAM_HEIGHT;
+  private static final int JPEG_QUALITY = AppConstants.CAMERA_JPEG_QUALITY;
+  private static final long FRAME_INTERVAL_MS = AppConstants.CAMERA_FRAME_INTERVAL_MS;
 
   private volatile boolean streaming = false;
   private volatile boolean shouldStream = false;
-  private DatagramSocket socket;
-  private InetAddress pcAddress;
+  private volatile DatagramSocket socket;
+  private volatile InetAddress pcAddress;
   private long lastFrameTimeMs;
   private int frameCount;
+  private int seq;
+  private int droppedFrames;
+  private int droppedBusy;
   private final AppSettings appSettings;
-  private Bitmap scaleBuffer;
+  // Dedicated sender thread: the Camera2 callback only hands off the Image
+  // and returns, so slow conversion can never stall the capture pipeline.
+  private HandlerThread senderThread;
+  private Handler senderHandler;
+  private final AtomicBoolean senderBusy = new AtomicBoolean(false);
 
   public CameraStreamer(AppSettings appSettings) {
     this.appSettings = appSettings;
@@ -44,6 +55,10 @@ public class CameraStreamer implements CameraController.FrameCallback {
     if (shouldStream) return;
     shouldStream = true;
     frameCount = 0;
+    droppedBusy = 0;
+    senderThread = new HandlerThread("CameraSender");
+    senderThread.start();
+    senderHandler = new Handler(senderThread.getLooper());
     Thread t = new Thread(() -> {
       while (shouldStream) {
         try {
@@ -70,57 +85,116 @@ public class CameraStreamer implements CameraController.FrameCallback {
     shouldStream = false;
     streaming = false;
     if (socket != null) { socket.close(); socket = null; }
-    if (scaleBuffer != null) { scaleBuffer.recycle(); scaleBuffer = null; }
-    Log.i(TAG, "Camera streamer stopped, sent " + frameCount + " frames");
+    if (senderThread != null) { senderThread.quitSafely(); senderThread = null; }
+    senderHandler = null;
+    Log.i(TAG, "Camera streamer stopped, sent " + frameCount + " frames, dropped "
+        + droppedFrames + " oversize, " + droppedBusy + " busy");
   }
 
   public boolean isStreaming() { return streaming; }
 
+  /**
+   * Hand the frame to the sender thread and return immediately so the capture
+   * pipeline never waits for conversion. Returns true when ownership of
+   * {@code image} is taken (the sender thread closes it); false means the
+   * caller keeps it and must close it.
+   */
   @Override
-  public void onFrame(Image image) {
-    if (!streaming || socket == null || pcAddress == null) return;
+  public boolean onFrame(Image image) {
+    if (!streaming || socket == null || pcAddress == null || senderHandler == null) return false;
 
     long now = System.currentTimeMillis();
-    if (now - lastFrameTimeMs < FRAME_INTERVAL_MS) return;
+    if (now - lastFrameTimeMs < FRAME_INTERVAL_MS) return false;
     lastFrameTimeMs = now;
 
+    if (!senderBusy.compareAndSet(false, true)) {
+      droppedBusy++;
+      return false;
+    }
+    senderHandler.post(() -> {
+      try {
+        sendFrame(image);
+      } finally {
+        try {
+          image.close();
+        } catch (Exception ignored) {
+        }
+        senderBusy.set(false);
+      }
+    });
+    return true;
+  }
+
+  /** Convert + send one frame. Runs on the sender thread. */
+  private void sendFrame(Image image) {
+    DatagramSocket sock = socket;
+    InetAddress addr = pcAddress;
+    if (sock == null || addr == null) return;
     try {
+      int w = image.getWidth();
+      int h = image.getHeight();
+      if (w <= 0 || h <= 0) return;
+
       byte[] nv21 = imageToNv21(image);
       if (nv21 == null) return;
 
-      int w = image.getWidth();
-      int h = image.getHeight();
-
-      YuvImage yuvImage = new YuvImage(nv21, ImageFormat.NV21, w, h, null);
+      // Downscale NV21 to stream size first, then a single JPEG encode.
+      byte[] small = downscaleNv21(nv21, w, h, TARGET_WIDTH, TARGET_HEIGHT);
+      YuvImage yuvImage = new YuvImage(small, ImageFormat.NV21, TARGET_WIDTH, TARGET_HEIGHT, null);
       ByteArrayOutputStream jpegStream = new ByteArrayOutputStream();
-      yuvImage.compressToJpeg(new Rect(0, 0, w, h), JPEG_QUALITY, jpegStream);
-      byte[] fullJpeg = jpegStream.toByteArray();
-      Bitmap fullBmp = android.graphics.BitmapFactory.decodeByteArray(fullJpeg, 0, fullJpeg.length);
-      if (fullBmp == null) return;
-
-      if (scaleBuffer == null || scaleBuffer.getWidth() != TARGET_WIDTH || scaleBuffer.getHeight() != TARGET_HEIGHT) {
-        if (scaleBuffer != null) scaleBuffer.recycle();
-        scaleBuffer = Bitmap.createBitmap(TARGET_WIDTH, TARGET_HEIGHT, Bitmap.Config.ARGB_8888);
-      }
-      android.graphics.Canvas canvas = new android.graphics.Canvas(scaleBuffer);
-      canvas.drawBitmap(fullBmp, null, new Rect(0, 0, TARGET_WIDTH, TARGET_HEIGHT), null);
-      fullBmp.recycle();
-
-      jpegStream.reset();
-      scaleBuffer.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, jpegStream);
+      yuvImage.compressToJpeg(new Rect(0, 0, TARGET_WIDTH, TARGET_HEIGHT), JPEG_QUALITY, jpegStream);
       byte[] jpegData = jpegStream.toByteArray();
 
-      if (jpegData.length > 60000) return;
+      if (jpegData.length + AppConstants.CAMERA_SEQ_HEADER_LEN > AppConstants.CAMERA_MAX_DATAGRAM) {
+        droppedFrames++;
+        return;
+      }
 
-      DatagramPacket packet = new DatagramPacket(jpegData, jpegData.length, pcAddress, AppConstants.CAMERA_PORT);
-      socket.send(packet);
+      byte[] payload = new byte[AppConstants.CAMERA_SEQ_HEADER_LEN + jpegData.length];
+      payload[0] = (byte) ((seq >> 8) & 0xFF);
+      payload[1] = (byte) (seq & 0xFF);
+      System.arraycopy(jpegData, 0, payload, AppConstants.CAMERA_SEQ_HEADER_LEN, jpegData.length);
+      seq++;
+
+      DatagramPacket packet = new DatagramPacket(payload, payload.length, addr, AppConstants.CAMERA_PORT);
+      sock.send(packet);
       frameCount++;
       if (frameCount % 60 == 1) {
-        DBG.i("Sent %d frames, last size: %d bytes", frameCount, jpegData.length);
+        DBG.i("Sent %d frames, dropped %d oversize %d busy, last size: %d bytes",
+            frameCount, droppedFrames, droppedBusy, payload.length);
       }
     } catch (Exception e) {
       Log.w(TAG, "Frame send failed: " + e.getMessage());
     }
+  }
+
+  /** Nearest-neighbor downscale of NV21 (Y + interleaved VU planes). */
+  static byte[] downscaleNv21(byte[] src, int srcW, int srcH, int dstW, int dstH) {
+    byte[] dst = new byte[dstW * dstH * 3 / 2];
+    // Y plane.
+    for (int y = 0; y < dstH; y++) {
+      int srcY = y * srcH / dstH;
+      for (int x = 0; x < dstW; x++) {
+        dst[y * dstW + x] = src[srcY * srcW + x * srcW / dstW];
+      }
+    }
+    // VU plane (half resolution).
+    int srcUvStart = srcW * srcH;
+    int dstUvStart = dstW * dstH;
+    int srcUvW = srcW / 2;
+    int dstUvW = dstW / 2;
+    int dstUvH = dstH / 2;
+    for (int y = 0; y < dstUvH; y++) {
+      int srcY = y * (srcH / 2) / dstUvH;
+      for (int x = 0; x < dstUvW; x++) {
+        int srcX = x * srcUvW / dstUvW;
+        int srcOff = srcUvStart + (srcY * srcUvW + srcX) * 2;
+        int dstOff = dstUvStart + (y * dstUvW + x) * 2;
+        dst[dstOff] = src[srcOff];
+        dst[dstOff + 1] = src[srcOff + 1];
+      }
+    }
+    return dst;
   }
 
   private static byte[] imageToNv21(Image image) {

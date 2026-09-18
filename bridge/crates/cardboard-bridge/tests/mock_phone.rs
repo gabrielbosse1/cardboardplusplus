@@ -192,20 +192,25 @@ fn mock_phone_can_send_hand_frame_over_udp() {
 
 #[test]
 fn mock_phone_can_send_camera_jpeg() {
-    // A minimal valid JPEG (SOI + EOI markers).
+    // Wire: [u16 seq BE][minimal JPEG (SOI + EOI markers)].
     let minimal_jpeg: Vec<u8> = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9];
+    let seq: u16 = 0x1234;
+    let mut datagram = vec![(seq >> 8) as u8, (seq & 0xFF) as u8];
+    datagram.extend_from_slice(&minimal_jpeg);
 
     let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
     let target = sock.local_addr().unwrap();
 
     let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
-    sender.send_to(&minimal_jpeg, target).unwrap();
+    sender.send_to(&datagram, target).unwrap();
 
     let mut buf = [0u8; 65535];
     sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     let (n, _) = sock.recv_from(&mut buf).unwrap();
-    assert_eq!(n, minimal_jpeg.len());
-    assert_eq!(&buf[..2], &[0xFF, 0xD8]); // JPEG SOI
+    assert_eq!(n, datagram.len());
+    let parsed_seq = u16::from_be_bytes([buf[0], buf[1]]);
+    assert_eq!(parsed_seq, seq);
+    assert_eq!(&buf[2..4], &[0xFF, 0xD8]); // JPEG SOI after seq header
 }
 
 #[test]

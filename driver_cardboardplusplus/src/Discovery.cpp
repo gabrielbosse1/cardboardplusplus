@@ -183,6 +183,21 @@ void HmdDriver::DiscoveryThreadFunc()
                 continue;
             }
 
+            if (strncmp(buffer, wire::kKeyframeReq, wire::kKeyframeReqLen) == 0) {
+                // The phone lost video data (its reassembly desynced) and needs
+                // a fresh reference frame. Force the next encoded frame to IDR.
+                // NO ack and NO target switch: a reply would land on the
+                // phone's video port and corrupt its reassembly buffer, and the
+                // sender is already the phone. The NACK still proves the phone
+                // is alive, so refresh its liveness timestamp.
+                m_lastPhonePacketMs.store(GetTickCount64(), std::memory_order_relaxed);
+                if (m_pVideoEncoder) {
+                    m_pVideoEncoder->RequestKeyframe();
+                }
+                DebugLog("KEYFRAME_REQ from %s:%d -> forced IDR requested", senderIpStr, ntohs(senderAddr.sin_port));
+                continue;
+            }
+
             // Switch data target to the phone's IP
             SwitchDataTarget(senderIpStr);
             m_lastPhonePacketMs.store(GetTickCount64(), std::memory_order_relaxed);
@@ -207,6 +222,11 @@ void HmdDriver::DiscoveryThreadFunc()
             if (last > 0 && (now - last) > kPhoneTimeoutMs) {
                 DriverLog("Phone timed out (%lld ms since last packet), clearing data target", now - last);
                 m_hasPhoneTarget.store(false, std::memory_order_relaxed);
+                // Clear the address too (under the same mutex SwitchDataTarget
+                // uses) so a reconnect can't hit the "already set" early
+                // return with a stale address and a cleared flag.
+                std::lock_guard<std::mutex> lock(m_targetIpMutex);
+                m_serverAddr.sin_addr.s_addr = INADDR_ANY;
             }
         }
     }
@@ -265,7 +285,11 @@ void HmdDriver::SwitchDataTarget(const char* phoneIp)
     inet_ntop(AF_INET, &m_serverAddr.sin_addr, currentIp, sizeof(currentIp));
 
     if (strcmp(currentIp, phoneIp) == 0) {
-        DriverLog("Data target already set to %s, skipping", phoneIp);
+        // Re-arm the flag: the phone-timeout path clears it without touching
+        // the address, so a reconnecting phone would otherwise hit this
+        // early return forever and never get video again.
+        m_hasPhoneTarget.store(true, std::memory_order_relaxed);
+        DebugLog("Data target still %s, re-armed phone send", phoneIp);
         return;
     }
 

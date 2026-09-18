@@ -78,6 +78,12 @@ static void test_discovery_wakeup_string() {
     printf("PASS: discovery wakeup string matches (len=%zu)\n", wire::kDiscoveryWakeupLen);
 }
 
+static void test_keyframe_req_string() {
+    assert(strcmp(wire::kKeyframeReq, "KEYFRAME_REQ") == 0);
+    assert(wire::kKeyframeReqLen == sizeof("KEYFRAME_REQ") - 1);
+    printf("PASS: KEYFRAME_REQ string matches (len=%zu)\n", wire::kKeyframeReqLen);
+}
+
 // ---- Discovery protocol simulation (pretend to be bridge) ----
 
 static void test_bridge_hello_triggers_ack() {
@@ -479,6 +485,7 @@ enum class DispatchResult {
     BridgeHello,
     BridgePreview,
     BridgeCfg,
+    KeyframeReq,
     PhoneDiscovery,
     Unknown,
 };
@@ -495,6 +502,9 @@ static DispatchResult simulate_dispatch(const char* buffer) {
     }
     if (strncmp(buffer, wire::kBridgeCfg, wire::kBridgeCfgLen) == 0) {
         return DispatchResult::BridgeCfg;
+    }
+    if (strncmp(buffer, wire::kKeyframeReq, wire::kKeyframeReqLen) == 0) {
+        return DispatchResult::KeyframeReq;
     }
     // Default: phone discovery (any other packet triggers SwitchDataTarget + ACK)
     return DispatchResult::PhoneDiscovery;
@@ -524,6 +534,20 @@ static void test_dispatch_bridge_preview_off() {
 static void test_dispatch_bridge_cfg() {
     assert(simulate_dispatch("BRIDGE_CFG 60 20000 h264_nvenc") == DispatchResult::BridgeCfg);
     printf("PASS: BRIDGE_CFG dispatched to ignored handler\n");
+}
+
+static void test_dispatch_keyframe_req() {
+    // KEYFRAME_REQ must hit its own branch: forced IDR, no ACK, no target
+    // switch. It must NOT fall through to PhoneDiscovery (whose ACK would
+    // land on the phone's video port and corrupt reassembly).
+    assert(simulate_dispatch("KEYFRAME_REQ") == DispatchResult::KeyframeReq);
+    // No prefix collisions with the other known messages.
+    const char* req = "KEYFRAME_REQ";
+    assert(strncmp(req, wire::kCardboardCap, wire::kCardboardCapLen) != 0);
+    assert(strncmp(req, wire::kBridgeHeartbeat, wire::kBridgeHeartbeatLen) != 0);
+    assert(strncmp(req, wire::kBridgePreview, wire::kBridgePreviewLen) != 0);
+    assert(strncmp(req, wire::kBridgeCfg, wire::kBridgeCfgLen) != 0);
+    printf("PASS: KEYFRAME_REQ dispatched to forced-IDR handler (no ACK, no target switch)\n");
 }
 
 static void test_dispatch_phone_discovery_triggers_ack() {
@@ -630,6 +654,7 @@ int main() {
     test_bridge_preview_string();
     test_bridge_stats_string();
     test_discovery_wakeup_string();
+    test_keyframe_req_string();
     test_bridge_hello_triggers_ack();
     test_cardboard_cap_is_not_acked();
     test_bridge_preview_toggle_parsing();
@@ -664,6 +689,7 @@ int main() {
     test_dispatch_bridge_preview_on();
     test_dispatch_bridge_preview_off();
     test_dispatch_bridge_cfg();
+    test_dispatch_keyframe_req();
     test_dispatch_phone_discovery_triggers_ack();
     test_dispatch_order_cap_before_hello();
     test_dispatch_order_hello_before_preview();

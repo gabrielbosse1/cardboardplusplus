@@ -2,6 +2,7 @@
 #define __STDC_CONSTANT_MACROS
 #include <windows.h>
 #include <d3d11.h>
+#include <atomic>
 #include <vector>
 #include <utility>
 #include <functional>
@@ -62,6 +63,12 @@ public:
     void SetEncodedPacketCallback(EncodedPacketCallback callback);
     // Periodic encode stats summary (called ~1/s from the encode thread).
     void SetTelemetryCallback(TelemetryCallback callback);
+
+    // Loss recovery: the discovery thread calls this when the phone sends
+    // KEYFRAME_REQ (it lost video data). Sets an atomic flag consumed by
+    // SendFrameToEncoder on the encode thread, which forces the next frame
+    // to IDR. Atomic so no encoder mutex is needed across threads.
+    void RequestKeyframe();
 
     bool IsInitialized() const { return m_initialized; }
     int GetWidth() const { return m_width; }
@@ -176,6 +183,10 @@ private:
     // Prepended to every keyframe that doesn't already start with SPS, so
     // decoders can configure even when the BSF skips the prepend.
     std::vector<uint8_t> m_spsPpsAnnexB;
+    // Forced-IDR flag for phone loss recovery (see RequestKeyframe). Set by
+    // the discovery thread, consumed once via exchange() in
+    // SendFrameToEncoder, so NACK bursts collapse into a single keyframe.
+    std::atomic<bool> m_forceKeyframe{false};
     int m_readbackBufferSize = 0;
     int m_readbackRowPitch = 0;
 

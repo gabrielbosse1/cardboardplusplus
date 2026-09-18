@@ -26,7 +26,6 @@ import argparse
 import socket
 import struct
 import sys
-import time
 
 import cv2
 import numpy as np
@@ -84,7 +83,9 @@ def handle_connection(conn, landmarker):
                 continue
 
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-            timestamp_ms = int(time.time() * 1000)
+            # Monotonic per-frame timestamp (VIDEO mode requires non-decreasing
+            # timestamps; wall-clock can jump on NTP/sleep adjustments).
+            timestamp_ms = frame_idx * 33
             mp_image = __import__("mediapipe").Image(image_format=__import__("mediapipe").ImageFormat.SRGB, data=rgb)
 
             result = landmarker.detect_for_video(mp_image, timestamp_ms)
