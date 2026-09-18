@@ -228,14 +228,29 @@ uint64_t BridgeServer::Publish(uint32_t msgType, const void* payload, uint32_t p
     return seq + 1;
 }
 
+uint64_t BridgeServer::PublishTelemetry(const PayloadTelemetry& t)
+{
+    {
+        std::lock_guard<std::mutex> lock(telemetryMutex_);
+        lastTelemetry_ = t;
+        hasTelemetry_ = true;
+    }
+    return Publish(MT_TELEMETRY, &t, sizeof(t));
+}
+
 void BridgeServer::PublishStatus()
 {
     PayloadTelemetry t;
-    std::memset(&t, 0, sizeof(t));
+    {
+        std::lock_guard<std::mutex> lock(telemetryMutex_);
+        if (!hasTelemetry_)
+            return; // no real encoder stats yet — never publish zeros
+        t = lastTelemetry_;
+    }
     // Reflect region health into telemetry so the UI can show liveness.
     t.summary_frames = LoadRelaxedU64(reinterpret_cast<volatile uint64_t&>(
         reinterpret_cast<RegionHeader*>(base_)->write_seq));
-    PublishTelemetry(t);
+    Publish(MT_TELEMETRY, &t, sizeof(t));
 }
 
 } // namespace cbpp

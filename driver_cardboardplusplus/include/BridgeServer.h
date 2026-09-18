@@ -14,6 +14,7 @@
 #include <windows.h>
 #include <cstdint>
 #include <atomic>
+#include <mutex>
 #include "BridgeProtocol.h"
 
 namespace cbpp {
@@ -43,7 +44,7 @@ public:
     uint64_t Publish(uint32_t msgType, const void* payload, uint32_t payloadLen);
 
     uint64_t PublishPose(const PayloadPose& p) { return Publish(MT_POSE, &p, sizeof(p)); }
-    uint64_t PublishTelemetry(const PayloadTelemetry& t) { return Publish(MT_TELEMETRY, &t, sizeof(t)); }
+    uint64_t PublishTelemetry(const PayloadTelemetry& t);
     uint64_t PublishFrameSubmitted(const PayloadFrameSubmitted& f) { return Publish(MT_FRAME_SUBMITTED, &f, sizeof(f)); }
     uint64_t PublishTextureSetCreated(const PayloadTextureSetCreated& t) { return Publish(MT_TEXTURE_SET_CREATED, &t, sizeof(t)); }
     uint64_t PublishControllerInput(const PayloadControllerInput& c) { return Publish(MT_CONTROLLER_INPUT, &c, sizeof(c)); }
@@ -88,6 +89,15 @@ private:
     uint32_t        cmd_slot_size_ = CMD_SLOT_SIZE;
     uint32_t        cmd_slot_count_ = CMD_SLOT_COUNT;
     uint64_t        cmd_cursor_ = 0;
+
+    // Last real encoder telemetry (PublishTelemetry caches it). PublishStatus
+    // re-sends these values with a fresh summary_frames instead of zeros, so
+    // the bridge's averages are never corrupted by a zeroed heartbeat.
+    // Mutex-guarded: PublishTelemetry runs on the encode thread, PublishStatus
+    // on RunFrame.
+    std::mutex        telemetryMutex_;
+    PayloadTelemetry  lastTelemetry_{};
+    bool              hasTelemetry_ = false;
 };
 
 } // namespace cbpp
