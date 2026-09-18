@@ -6,7 +6,7 @@
 //! containing up to 2 detected hands (21 landmarks each).
 
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -70,7 +70,6 @@ impl MediapipeClient {
     }
 
     fn try_connect(addr: &str, retries: u32, delay: Duration) -> anyhow::Result<TcpStream> {
-        let sock_addr = addr.to_socket_addrs()?.next().ok_or_else(|| anyhow::anyhow!("no addresses for {addr}"))?;
         let connect_timeout = Duration::from_secs(2);
         for attempt in 0..retries {
             // Use a channel-based timeout: spawn connect in a thread, recv
