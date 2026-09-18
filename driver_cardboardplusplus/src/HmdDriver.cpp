@@ -295,13 +295,6 @@ DriverPose_t HmdDriver::GetPose()
     pose.qDriverFromHeadRotation.z = 0.0;
     pose.qRotation = quat;
 
-    {
-        static int counter = 0;
-        counter++;
-        DebugLog("GetPose #%d hasQ=%d hasS=%d q=(%.4f,%.4f,%.4f,%.4f) ts=%lld",
-                 counter, hasQ, hasS, quat.w, quat.x, quat.y, quat.z, (long long)m_sensorTimestampMs);
-    }
-
     return pose;
 }
 
