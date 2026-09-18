@@ -171,11 +171,12 @@ void HmdDriver::OnEncodedPacket(uint8_t* data, int size, int64_t pts, bool keyfr
 void HmdDriver::SendFannedOut(const uint8_t* raw, int rawSize,
                                const uint8_t* framed, int framedSize)
 {
-    // Local preview copy — always on so the bridge / ffplay can watch the
-    // stream at any time without needing a phone connected. Raw Annex-B so
-    // ffplay demuxes start codes directly (no length prefix).
-    SendFramedUdp(m_udpSocket, &m_previewAddr, raw, rawSize, &m_udpDroppedFrames);
-    m_udpFramesSent.fetch_add(1, std::memory_order_relaxed);
+    // Local preview copy — only when the bridge enabled it via BRIDGE_PREVIEW.
+    // Raw Annex-B so ffplay demuxes start codes directly (no length prefix).
+    if (m_previewEnabled.load(std::memory_order_relaxed)) {
+        SendFramedUdp(m_udpSocket, &m_previewAddr, raw, rawSize, &m_udpDroppedFrames);
+        m_udpFramesSent.fetch_add(1, std::memory_order_relaxed);
+    }
 
     // Phone copy (only while a real phone target is set). Length-prefixed so
     // MediaCodec can reconstruct the exact AVPacket.

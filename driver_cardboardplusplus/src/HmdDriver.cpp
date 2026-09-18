@@ -189,7 +189,18 @@ void HmdDriver::Deactivate()
     ShutdownSensorSocket();
     ShutdownUDP();
     ShutdownVideoEncoder();
-    DestroyAllSwapTextureSets(0);
+    ShutdownBridge();
+    // DestroyAllSwapTextureSets is keyed by pid — pid 0 alone leaks every
+    // other process's sets, so free all known pids. Collect keys first: each
+    // call erases its entry from m_swapTextureSets.
+    std::vector<uint32_t> pids;
+    pids.reserve(m_swapTextureSets.size());
+    for (const auto& kv : m_swapTextureSets) {
+        pids.push_back(kv.first);
+    }
+    for (uint32_t pid : pids) {
+        DestroyAllSwapTextureSets(pid);
+    }
 
     if (m_pD3D11DeviceContext) {
         m_pD3D11DeviceContext->Release();
@@ -294,13 +305,6 @@ DriverPose_t HmdDriver::GetPose()
     pose.qDriverFromHeadRotation.y = 0.0;
     pose.qDriverFromHeadRotation.z = 0.0;
     pose.qRotation = quat;
-
-    {
-        static int counter = 0;
-        counter++;
-        DebugLog("GetPose #%d hasQ=%d hasS=%d q=(%.4f,%.4f,%.4f,%.4f) ts=%lld",
-                 counter, hasQ, hasS, quat.w, quat.x, quat.y, quat.z, (long long)m_sensorTimestampMs);
-    }
 
     return pose;
 }
