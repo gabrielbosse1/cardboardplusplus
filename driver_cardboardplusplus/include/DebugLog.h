@@ -19,8 +19,9 @@ namespace cbpp_debug {
 // Check once at load time; env var can't change mid-session (SteamVR restarts
 // the driver DLL anyway).
 inline bool debug_enabled() {
-    // Always-on for now — sensor diagnostics needed.
-    return true;
+    static const bool enabled = (std::getenv("CARDBOARD_DEBUG") != nullptr &&
+                                 std::strcmp(std::getenv("CARDBOARD_DEBUG"), "1") == 0);
+    return enabled;
 }
 
 inline void log_msg(const char* tag, const char* pFormat, ...) {
