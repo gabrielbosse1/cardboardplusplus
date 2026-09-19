@@ -48,7 +48,6 @@ The project is functional but needs cleanup. The SteamVR driver captures frames,
 
 ### What I'm working on now
 
-- **Fixing redundant work** — there are places where the same data gets converted multiple times (AVCC→Annex B→length-prefix→Annex B). Cleaning this up.
 - **Moving CPU work to GPU** — the BGRA→NV12 color conversion currently happens on the CPU via FFmpeg's sws_scale. Moving this to a compute shader.
 - **Understanding and cleaning the codebase** — removing dead code, fixing misleading flags, aligning resolution values.
 - **Linux support** — after the core fixes are done, making the driver work on Linux (replacing D3D11 with Vulkan on the linux version).
