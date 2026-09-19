@@ -552,9 +552,27 @@ fn build_driver(cfg: BridgeConfig) -> Result<String, String> {
 }
 
 fn install_driver(cfg: BridgeConfig) -> Result<String, String> {
-    if !Path::new(&cfg.driver_dll_src).exists() {
-        return Err(format!("dll not found at {}", cfg.driver_dll_src));
-    }
+    use bridge_core::driver_install::{
+        DriverDllSource, download_to, driver_dll_source, force_driver_enabled,
+        install_ffmpeg_standalone, install_resources,
+    };
+    // Configured DLL wins when present; otherwise the shared standalone
+    // resolver (local checkout build, then version-matched GitHub release).
+    let mut downloaded: Option<std::path::PathBuf> = None;
+    let src = if Path::new(&cfg.driver_dll_src).exists() {
+        std::path::PathBuf::from(&cfg.driver_dll_src)
+    } else {
+        match driver_dll_source()? {
+            DriverDllSource::Local(p) => p,
+            DriverDllSource::Download(url) => {
+                let tmp = std::env::temp_dir()
+                    .join(format!("cb-driver-{}.dll", std::process::id()));
+                download_to(&url, &tmp)?;
+                downloaded = Some(tmp.clone());
+                tmp
+            }
+        }
+    };
     let target = dll_install_dir(&cfg);
     std::fs::create_dir_all(&target).map_err(|e| format!("mkdir {}: {e}", target))?;
     let target_dll = format!("{}\\driver_cardboardplusplus.dll", target);
@@ -573,51 +591,39 @@ fn install_driver(cfg: BridgeConfig) -> Result<String, String> {
     // Atomic install: copy to a temp file in the same directory, then rename
     // over the target. A failed copy never leaves a missing/half-written DLL.
     let tmp_dll = format!("{}.tmp-{}", target_dll, std::process::id());
-    if let Err(e) = std::fs::copy(&cfg.driver_dll_src, &tmp_dll) {
+    if let Err(e) = std::fs::copy(&src, &tmp_dll) {
         let _ = std::fs::remove_file(&tmp_dll);
         return Err(format!("copy to {}: {e}", tmp_dll));
     }
     // Retry while SteamVR holds the loaded DLL open; the error names the
     // lock so "access denied" becomes actionable.
-    bridge_core::driver_deps::replace_locked(Path::new(&tmp_dll), Path::new(&target_dll))?;
+    let installed =
+        bridge_core::driver_deps::replace_locked(Path::new(&tmp_dll), Path::new(&target_dll));
+    if let Some(tmp) = downloaded {
+        let _ = std::fs::remove_file(tmp);
+    }
+    installed?;
 
-    // Runtime deps: the driver links the pinned FFmpeg majors — install the
-    // exact set from deps.json (fails with the expected names when the
-    // vendored shared build is absent, never a silent dead driver).
-    let ffmpeg_dlls = bridge_core::driver_deps::install_ffmpeg_dlls(Path::new(&target), false)?;
+    // Runtime deps: the pinned FFmpeg set — vendored, or fetched from the
+    // pinned zip when there is no checkout (fails with the expected names
+    // when the pin itself is stale, never a silent dead driver).
+    let ffmpeg_dlls = install_ffmpeg_standalone(Path::new(&target), false)?;
     info!("installed FFmpeg runtimes: {}", ffmpeg_dlls.join(", "));
 
-    // Ship the manifest + bindings for a from-scratch install.
-    let src_root = Path::new(&cfg.driver_dll_src)
-        .parent()
-        .and_then(|p| p.parent())
-        .unwrap_or(Path::new("."));
-    let res_src = src_root.join("resources");
-    if res_src.is_dir() {
-        let res_dst = Path::new(&cfg.steamvr_drivers_dir).join("resources");
-        let _ = std::fs::create_dir_all(&res_dst);
-        if !res_dst.join("driver.vrdrivermanifest").exists() {
-            let _ = std::fs::copy(res_src.join("driver.vrdrivermanifest"),
-                                  res_dst.join("driver.vrdrivermanifest"));
-        }
-        if !res_dst.join("controller_profile.json").exists() {
-            let _ = std::fs::copy(res_src.join("controller_profile.json"),
-                                  res_dst.join("controller_profile.json"));
-        }
-        if !res_dst.join("legacy_bindings_example.json").exists() {
-            let _ = std::fs::copy(res_src.join("legacy_bindings_example.json"),
-                                  res_dst.join("legacy_bindings_example.json"));
-        }
-        let _ = std::fs::copy(src_root.join("driver.vrdrivermanifest"),
-                              Path::new(&cfg.steamvr_drivers_dir)
-                                  .join("driver.vrdrivermanifest"));
-    }
+    // Ship the exe-baked manifest + bindings for a from-scratch install.
+    install_resources(Path::new(&cfg.steamvr_drivers_dir))?;
+
+    // Force the driver on in steamvr.vrsettings (repairs a user-disabled or
+    // safe-mode-blocked state from an earlier crash).
+    let root = paths::steamvr_root_from_drivers_dir(&cfg.steamvr_drivers_dir);
+    let forced = force_driver_enabled(&root)?;
 
     Ok(format!(
-        "installed driver into {} (+ {} FFmpeg {} DLLs)",
+        "installed driver into {} (+ {} FFmpeg {} DLLs{})",
         target,
         ffmpeg_dlls.len(),
-        bridge_core::driver_deps::ffmpeg_version()
+        bridge_core::driver_deps::ffmpeg_version(),
+        if forced { "; vrsettings forced on" } else { "" },
     ))
 }
 

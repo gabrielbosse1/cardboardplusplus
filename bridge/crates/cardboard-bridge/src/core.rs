@@ -634,9 +634,9 @@ impl AppCore {
         present
     }
 
-    /// One-click SteamVR driver install (wizard step 2): copy the compiled
-    /// DLL into the SteamVR driver dir with backup + manifest, on a thread.
-    /// No-op while an install is already running.
+    /// One-click SteamVR driver install (wizard step 2): standalone, no
+    /// checkout needed — release DLL, FFmpeg runtimes, baked resources,
+    /// plus vrsettings force-on. No-op while an install is already running.
     pub fn install_driver(&self) {
         {
             let Ok(mut s) = self.state.lock() else {
@@ -951,12 +951,6 @@ impl AppCore {
     }
 }
 
-/// Compiled driver DLL produced by the C++ build, resolved from the repo
-/// checkout (empty when the checkout can't be located — the caller must
-/// surface an error, never a personal path).
-fn driver_dll_src() -> String {
-    paths::default_driver_dll()
-}
 /// SteamVR addon home for this driver (standard Steam location by default).
 fn steamvr_drivers_dir() -> String {
     paths::default_steamvr_drivers_dir()
@@ -971,16 +965,17 @@ fn driver_target_dll() -> String {
     format!("{}\\bin\\win64\\driver_cardboardplusplus.dll", steamvr_drivers_dir())
 }
 
-/// Copy the compiled DLL into SteamVR with backup + manifest (same steps
-/// as the legacy bridge-ui installer). Runs on the install thread.
+/// Copy the driver DLL into SteamVR with backup + manifest (same steps
+/// as the legacy bridge-ui installer). Standalone: the DLL comes from a
+/// local checkout build when present, otherwise the version-matched GitHub
+/// release; FFmpeg + resources are fetched/baked, no checkout needed.
+/// Runs on the install thread.
 fn install_driver_files() -> Result<String, String> {
+    use bridge_core::driver_install::{
+        DriverDllSource, download_to, driver_dll_source, force_driver_enabled,
+        install_ffmpeg_standalone, install_resources,
+    };
     use std::path::Path;
-    let src = driver_dll_src();
-    if src.is_empty() || !Path::new(&src).exists() {
-        return Err(format!(
-            "compiled dll not found at {src} (build the driver first)"
-        ));
-    }
     let target_dir = format!("{}\\bin\\win64", steamvr_drivers_dir());
     std::fs::create_dir_all(&target_dir).map_err(|e| format!("mkdir {target_dir}: {e}"))?;
     let target_dll = driver_target_dll();
@@ -994,6 +989,20 @@ fn install_driver_files() -> Result<String, String> {
         std::fs::copy(&target_dll, &backup).map_err(|e| format!("backup {backup}: {e}"))?;
     }
 
+    // Local checkout build wins (dev); otherwise download the release DLL
+    // matching this exe's baked commit count into a temp file.
+    let mut downloaded: Option<std::path::PathBuf> = None;
+    let src = match driver_dll_source()? {
+        DriverDllSource::Local(p) => p,
+        DriverDllSource::Download(url) => {
+            let tmp = std::env::temp_dir()
+                .join(format!("cb-driver-{}.dll", std::process::id()));
+            download_to(&url, &tmp)?;
+            downloaded = Some(tmp.clone());
+            tmp
+        }
+    };
+
     let tmp_dll = format!("{target_dll}.tmp-{}", std::process::id());
     if let Err(e) = std::fs::copy(&src, &tmp_dll) {
         let _ = std::fs::remove_file(&tmp_dll);
@@ -1001,50 +1010,34 @@ fn install_driver_files() -> Result<String, String> {
     }
     // Retry while SteamVR holds the loaded DLL open; the error names the
     // lock so "access denied" becomes actionable.
-    bridge_core::driver_deps::replace_locked(
+    let installed = bridge_core::driver_deps::replace_locked(
         std::path::Path::new(&tmp_dll),
         std::path::Path::new(&target_dll),
-    )?;
-
-    // Runtime deps: the driver links the pinned FFmpeg majors — install the
-    // exact set from deps.json (fails with the expected names when the
-    // vendored shared build is absent, never a silent dead driver).
-    let ffmpeg_dlls = bridge_core::driver_deps::install_ffmpeg_dlls(
-        Path::new(&target_dir),
-        false,
-    )?;
-
-    // Ship the manifest + bindings for a from-scratch install.
-    let src_root = Path::new(&src)
-        .parent()
-        .and_then(|p| p.parent())
-        .unwrap_or(Path::new("."));
-    let res_src = src_root.join("resources");
-    if res_src.is_dir() {
-        let drivers_dir = steamvr_drivers_dir();
-        let res_dst = Path::new(&drivers_dir).join("resources");
-        let _ = std::fs::create_dir_all(&res_dst);
-        for name in [
-            "driver.vrdrivermanifest",
-            "controller_profile.json",
-            "legacy_bindings_example.json",
-        ] {
-            let dst = res_dst.join(name);
-            if !dst.exists() {
-                let _ = std::fs::copy(res_src.join(name), &dst);
-            }
-        }
-        let _ = std::fs::copy(
-            src_root.join("driver.vrdrivermanifest"),
-            Path::new(&drivers_dir).join("driver.vrdrivermanifest"),
-        );
+    );
+    if let Some(tmp) = downloaded {
+        let _ = std::fs::remove_file(tmp);
     }
+    installed?;
+
+    // Runtime deps: the pinned FFmpeg set — vendored, or fetched from the
+    // pinned zip when there is no checkout (fails with the expected names
+    // when the pin itself is stale, never a silent dead driver).
+    let ffmpeg_dlls = install_ffmpeg_standalone(Path::new(&target_dir), false)?;
+
+    // Ship the exe-baked manifest + bindings for a from-scratch install.
+    let drivers_dir = steamvr_drivers_dir();
+    install_resources(Path::new(&drivers_dir))?;
+
+    // Force the driver on in steamvr.vrsettings (repairs a user-disabled or
+    // safe-mode-blocked state from an earlier crash).
+    let forced = force_driver_enabled(&steamvr_root())?;
 
     Ok(format!(
-        "installed driver into {target_dir} (+ {} FFmpeg {} DLLs: {})",
+        "installed driver into {target_dir} (+ {} FFmpeg {} DLLs: {}{})",
         ffmpeg_dlls.len(),
         bridge_core::driver_deps::ffmpeg_version(),
-        ffmpeg_dlls.join(", ")
+        ffmpeg_dlls.join(", "),
+        if forced { "; vrsettings forced on" } else { "" },
     ))
 }
 

@@ -4,5 +4,6 @@
 //! module) and portable default paths (`paths` module).
 
 pub mod driver_deps;
+pub mod driver_install;
 pub mod paths;
 pub mod shm;

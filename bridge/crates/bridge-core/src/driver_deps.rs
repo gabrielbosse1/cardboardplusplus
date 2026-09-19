@@ -11,6 +11,13 @@ use std::path::{Path, PathBuf};
 
 use super::paths;
 
+/// The pin file baked into the exe: a standalone bridge has no repo
+/// checkout, so the manifest travels inside the binary. A repo checkout
+/// file still wins when present (lets devs trial a new pin), the hardcoded
+/// fallback below is the last resort.
+const EMBEDDED_DEPS_JSON: &str =
+    include_str!("../../../../driver_cardboardplusplus/lib/ffmpeg/deps.json");
+
 /// Pinned FFmpeg version (mirrors `deps.json`).
 pub const FALLBACK_FFMPEG_VERSION: &str = "8.1";
 
@@ -69,27 +76,34 @@ fn parse_manifest(text: &str) -> Option<(String, Vec<String>, Option<String>)> {
     Some((version, dlls, url))
 }
 
-/// Pinned FFmpeg version from the manifest, fallback when unreadable.
+/// Pinned FFmpeg version: repo manifest, then the exe-embedded copy,
+/// then the hardcoded fallback.
 pub fn ffmpeg_version() -> String {
-    manifest_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
+    manifest_text()
         .and_then(|t| parse_manifest(&t).map(|(v, _, _)| v))
         .unwrap_or_else(|| FALLBACK_FFMPEG_VERSION.into())
 }
 
-/// Expected runtime DLL names from the manifest, fallback when unreadable.
+/// Expected runtime DLL names: repo manifest, then exe-embedded, then fallback.
 pub fn expected_dlls() -> Vec<String> {
-    manifest_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
+    manifest_text()
         .and_then(|t| parse_manifest(&t).map(|(_, d, _)| d))
         .unwrap_or_else(|| FALLBACK_DLLS.iter().map(|s| s.to_string()).collect())
 }
 
-/// GitHub zip URL for the pinned runtime, if the manifest names one.
+/// GitHub zip URL for the pinned runtime: repo manifest, then exe-embedded.
 pub fn bin_zip_url() -> Option<String> {
-    manifest_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|t| parse_manifest(&t).and_then(|(_, _, u)| u))
+    manifest_text().and_then(|t| parse_manifest(&t).and_then(|(_, _, u)| u))
+}
+
+/// Manifest text: repo checkout file first, exe-embedded copy second.
+/// `None` only when both are missing/unreadable.
+fn manifest_text() -> Option<String> {
+    let from_repo = manifest_path().and_then(|p| std::fs::read_to_string(p).ok());
+    if from_repo.is_some() {
+        return from_repo;
+    }
+    Some(EMBEDDED_DEPS_JSON.to_string())
 }
 
 /// Stale FFmpeg runtimes in `dir`: `av*.dll` / `sw*.dll` not in the pinned
@@ -245,6 +259,17 @@ fn lock_hint(dst: &Path, e: &std::io::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_manifest_matches_fallback_pin() {
+        // The exe-embedded deps.json must parse and agree with the
+        // hardcoded fallback, or standalone installs pin the wrong set.
+        let (v, d, u) = parse_manifest(EMBEDDED_DEPS_JSON).expect("embedded parses");
+        assert_eq!(v, FALLBACK_FFMPEG_VERSION);
+        let fallback: Vec<String> = FALLBACK_DLLS.iter().map(|s| s.to_string()).collect();
+        assert_eq!(d, fallback);
+        assert!(u.is_some_and(|s| s.starts_with("https://")));
+    }
 
     #[test]
     fn manifest_parses_version_and_dlls() {
