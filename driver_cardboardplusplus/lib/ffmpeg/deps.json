@@ -1,0 +1,12 @@
+{
+  "comment": "Single source of truth for the driver's FFmpeg runtime deps. The driver links 4 libs (see driver_cardboardplusplus.vcxproj AdditionalDependencies) but BtbN's avcodec-62.dll additionally hard-imports swresample-6.dll, so 5 DLLs must ship next to it (verified via dumpbin /DEPENDENTS + LoadLibrary). bin/*.dll is git-ignored and auto-fetched from bin_zip_url on first use; link-time lib/*.lib + lib/*-<major>.def stay vendored. Bump dlls + bin_zip_url together — the 8.x line keeps majors 62/62/60/9/6, so any 8.x shared zip fits. Readers: scripts/ffmpeg-deps.ps1 (compile-driver + install-driver + fetch-ffmpeg-deps) and bridge/crates/bridge-core/src/driver_deps.rs.",
+  "ffmpeg_version": "8.1",
+  "dlls": [
+    "avcodec-62.dll",
+    "avformat-62.dll",
+    "avutil-60.dll",
+    "swscale-9.dll",
+    "swresample-6.dll"
+  ],
+  "bin_zip_url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip"
+}

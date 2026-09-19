@@ -44,6 +44,9 @@ public class CameraStreamer implements CameraController.FrameCallback {
   private HandlerThread senderThread;
   private Handler senderHandler;
   private final AtomicBoolean senderBusy = new AtomicBoolean(false);
+  // Reused conversion scratch (sender thread only): avoids ~5 allocs/frame.
+  private byte[] nv21Scratch;
+  private byte[] smallScratch;
 
   public CameraStreamer(AppSettings appSettings) {
     this.appSettings = appSettings;
@@ -66,8 +69,30 @@ public class CameraStreamer implements CameraController.FrameCallback {
           pcAddress = NetworkUtils.getPcOrBroadcastAddress(appSettings.getPcIp());
           streaming = true;
           Log.i(TAG, "Streamer connected to " + pcAddress.getHostAddress() + ":" + AppConstants.CAMERA_PORT);
+          // Re-resolve while alive (same reason as TelemetrySender: PC-IP or
+          // network can change mid-session; a pinned address needs a restart).
+          String lastPcIp = appSettings.getPcIp();
+          if (lastPcIp == null) lastPcIp = "";
+          long lastResolveMs = System.currentTimeMillis();
           while (shouldStream && socket != null && !socket.isClosed()) {
             Thread.sleep(500);
+            try {
+              String cur = appSettings.getPcIp();
+              if (cur == null) cur = "";
+              long now = System.currentTimeMillis();
+              if (!cur.equals(lastPcIp) || now - lastResolveMs > 5000) {
+                InetAddress fresh = NetworkUtils.getPcOrBroadcastAddress(cur);
+                lastPcIp = cur;
+                lastResolveMs = now;
+                if (!fresh.equals(pcAddress)) {
+                  pcAddress = fresh;
+                  Log.i(TAG, "Streamer retargeted to " + fresh.getHostAddress()
+                      + ":" + AppConstants.CAMERA_PORT);
+                }
+              }
+            } catch (Exception e) {
+              Log.w(TAG, "Streamer retarget failed: " + e.getClass().getSimpleName());
+            }
           }
         } catch (Exception e) {
           Log.w(TAG, "Connection failed: " + e.getMessage() + ", retrying in 2s...");
@@ -135,11 +160,17 @@ public class CameraStreamer implements CameraController.FrameCallback {
       int h = image.getHeight();
       if (w <= 0 || h <= 0) return;
 
-      byte[] nv21 = imageToNv21(image);
+      byte[] nv21 = imageToNv21(image, w, h);
       if (nv21 == null) return;
 
-      // Downscale NV21 to stream size first, then a single JPEG encode.
-      byte[] small = downscaleNv21(nv21, w, h, TARGET_WIDTH, TARGET_HEIGHT);
+      // The ImageReader is requested at stream size, so this is usually a
+      // no-op reference; downscale only when the sensor gave us bigger.
+      byte[] small;
+      if (w == TARGET_WIDTH && h == TARGET_HEIGHT) {
+        small = nv21;
+      } else {
+        small = downscaleNv21(nv21, w, h, TARGET_WIDTH, TARGET_HEIGHT);
+      }
       YuvImage yuvImage = new YuvImage(small, ImageFormat.NV21, TARGET_WIDTH, TARGET_HEIGHT, null);
       ByteArrayOutputStream jpegStream = new ByteArrayOutputStream();
       yuvImage.compressToJpeg(new Rect(0, 0, TARGET_WIDTH, TARGET_HEIGHT), JPEG_QUALITY, jpegStream);
@@ -168,9 +199,9 @@ public class CameraStreamer implements CameraController.FrameCallback {
     }
   }
 
-  /** Nearest-neighbor downscale of NV21 (Y + interleaved VU planes). */
-  static byte[] downscaleNv21(byte[] src, int srcW, int srcH, int dstW, int dstH) {
-    byte[] dst = new byte[dstW * dstH * 3 / 2];
+  /** Nearest-neighbor downscale of NV21 (Y + interleaved VU planes) into reused scratch. */
+  private byte[] downscaleNv21(byte[] src, int srcW, int srcH, int dstW, int dstH) {
+    byte[] dst = ensureSmall(dstW * dstH * 3 / 2);
     // Y plane.
     for (int y = 0; y < dstH; y++) {
       int srcY = y * srcH / dstH;
@@ -197,9 +228,7 @@ public class CameraStreamer implements CameraController.FrameCallback {
     return dst;
   }
 
-  private static byte[] imageToNv21(Image image) {
-    int w = image.getWidth();
-    int h = image.getHeight();
+  private byte[] imageToNv21(Image image, int w, int h) {
     Image.Plane yPlane = image.getPlanes()[0];
     Image.Plane uPlane = image.getPlanes()[1];
     Image.Plane vPlane = image.getPlanes()[2];
@@ -214,7 +243,7 @@ public class CameraStreamer implements CameraController.FrameCallback {
     int uvPixelStride = uPlane.getPixelStride();
 
     int ySize = w * h;
-    byte[] nv21 = new byte[ySize * 3 / 2];
+    byte[] nv21 = ensureNv21(ySize * 3 / 2);
 
     // Copy Y plane row-by-row.
     int pos = 0;
@@ -236,5 +265,21 @@ public class CameraStreamer implements CameraController.FrameCallback {
       }
     }
     return nv21;
+  }
+
+  /** Grow-only scratch for the NV21 conversion (sender thread only). */
+  private byte[] ensureNv21(int need) {
+    if (nv21Scratch == null || nv21Scratch.length < need) {
+      nv21Scratch = new byte[need];
+    }
+    return nv21Scratch;
+  }
+
+  /** Grow-only scratch for the downscaled frame (sender thread only). */
+  private byte[] ensureSmall(int need) {
+    if (smallScratch == null || smallScratch.length < need) {
+      smallScratch = new byte[need];
+    }
+    return smallScratch;
   }
 }

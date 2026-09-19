@@ -1,6 +1,8 @@
 //! Wire protocol shared with the C++ driver.
 //!
-//! # Layout (authoritative copy: `docs/TRANSPORT.md`)
+//! # Layout (authoritative copy: this file — `bridge/crates/bridge-shm/src/protocol.rs`,
+//! mirrored by `driver_cardboardplusplus/include/BridgeProtocol.h`;
+//! values here are the locked SHM contract, do not change them)
 //!
 //! Region layout:
 //!

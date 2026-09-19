@@ -57,4 +57,30 @@ public final class CameraUtils {
     }
     return best != null ? best : new Size(minWidth, minHeight);
   }
+
+  /**
+   * Same smallest-qualifying pick but for {@link android.media.ImageReader}
+   * (YUV_420_888) outputs, whose supported sizes differ from SurfaceTexture's.
+   * The streamer only needs 256x192, so request small directly instead of
+   * capturing full-res and downscaling every frame in Java.
+   */
+  public static Size chooseYuvOutputSize(
+      StreamConfigurationMap map, int minWidth, int minHeight) {
+    Size best = null;
+    if (map != null) {
+      Size[] outputSizes = map.getOutputSizes(android.graphics.ImageFormat.YUV_420_888);
+      if (outputSizes != null) {
+        for (Size size : outputSizes) {
+          if (size.getWidth() >= minWidth && size.getHeight() >= minHeight) {
+            if (best == null
+                || (long) size.getWidth() * size.getHeight()
+                    < (long) best.getWidth() * best.getHeight()) {
+              best = size;
+            }
+          }
+        }
+      }
+    }
+    return best != null ? best : new Size(minWidth, minHeight);
+  }
 }

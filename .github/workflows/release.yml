@@ -1,0 +1,120 @@
+name: Release
+
+# One GitHub Release per master commit: builds the bridge (release), the
+# driver (Release DLL) and the APK, then attaches all three to a release
+# tagged r<commit-count>. The commit count is also the version the driver
+# and the app report to the bridge at runtime.
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "master" ]
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      count: ${{ steps.ver.outputs.count }}
+      sha: ${{ steps.ver.outputs.sha }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0 # rev-list --count needs the full history
+    - id: ver
+      run: |
+        echo "count=$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
+        echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+  bridge:
+    needs: version
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@stable
+    - name: Build bridge (release)
+      run: cargo build --release --manifest-path bridge/Cargo.toml
+    - name: Upload bridge exe
+      uses: actions/upload-artifact@v4
+      with:
+        name: bridge-r${{ needs.version.outputs.count }}
+        path: bridge/target/release/cardboard-bridge.exe
+
+  driver:
+    needs: version
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - name: Bake commit count into DriverVersion.h
+      run: |
+        $count = (git rev-list --count HEAD).Trim()
+        Set-Content -LiteralPath driver_cardboardplusplus\include\DriverVersion.h -Value '#pragma once
+        #define DRIVER_BUILD_VERSION "' + $count + '"
+        '
+      shell: pwsh
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v2
+    - name: Build driver (Release)
+      run: msbuild driver_cardboardplusplus\driver_cardboardplusplus.sln /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143
+    - name: Upload driver DLL
+      uses: actions/upload-artifact@v4
+      with:
+        name: driver-r${{ needs.version.outputs.count }}
+        path: driver_cardboardplusplus\x64\Release\driver_cardboardplusplus.dll
+
+  apk:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+    - name: Setup Gradle
+      uses: gradle/actions/setup-gradle@v4
+    - name: Build APK
+      run: ./gradlew assembleDebug
+    - name: Upload APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: app-r${{ needs.version.outputs.count }}
+        path: cardboardplusplus-android/build/outputs/apk/debug/app-debug.apk
+
+  publish:
+    needs: [version, bridge, driver, apk]
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - uses: actions/download-artifact@v4
+      with:
+        path: dist
+    - name: Create GitHub Release
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        COUNT="${{ needs.version.outputs.count }}"
+        SHA="${{ needs.version.outputs.sha }}"
+        TAG="r$COUNT"
+        mv "dist/bridge-r$COUNT/cardboard-bridge.exe" "dist/cardboard-bridge-r$COUNT.exe"
+        mv "dist/driver-r$COUNT/driver_cardboardplusplus.dll" "dist/driver_cardboardplusplus-r$COUNT.dll"
+        mv "dist/app-r$COUNT/app-debug.apk" "dist/cardboardplusplus-r$COUNT.apk"
+        NOTES="$(git log -1 --format='%h %s')"
+        if gh release view "$TAG" >/dev/null 2>&1; then
+          # Re-run on the same commit: just refresh the files.
+          gh release upload "$TAG" dist/cardboard-bridge-r$COUNT.exe dist/driver_cardboardplusplus-r$COUNT.dll dist/cardboardplusplus-r$COUNT.apk --clobber
+        else
+          gh release create "$TAG" dist/cardboard-bridge-r$COUNT.exe dist/driver_cardboardplusplus-r$COUNT.dll dist/cardboardplusplus-r$COUNT.apk \
+            --title "r$COUNT ($SHA)" --notes "$NOTES"
+        fi

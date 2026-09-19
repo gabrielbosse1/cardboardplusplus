@@ -24,20 +24,7 @@ EVRInitError ControllerDriver::Activate(uint32_t unObjectId)
 	VRDriverInput()->CreateScalarComponent(props, "/input/joystick/x", &m_joystickXHandle, EVRScalarType::VRScalarType_Absolute,
 		EVRScalarUnits::VRScalarUnits_NormalizedTwoSided); //Why VRScalarType_Absolute? Take a look at the comments on EVRScalarType.
 	VRDriverInput()->CreateScalarComponent(props, "/input/trackpad/x", &m_trackpadXHandle, EVRScalarType::VRScalarType_Absolute,
-		EVRScalarUnits::VRScalarUnits_NormalizedTwoSided); //Why VRScalarUnits_NormalizedTwoSided? Take a look at the comments on EVRScalarUnits.
-	
-	//The following properites are ones I tried out because I saw them in other samples, but I found they were not needed to get the sample working.
-	//There are many samples, take a look at the openvr_header.h file. You can try them out.
-
-	//VRProperties()->SetUint64Property(props, Prop_CurrentUniverseId_Uint64, 2);
-	//VRProperties()->SetBoolProperty(props, Prop_HasControllerComponent_Bool, true);
-	//VRProperties()->SetBoolProperty(props, Prop_NeverTracked_Bool, true);
-	//VRProperties()->SetInt32Property(props, Prop_Axis0Type_Int32, k_eControllerAxis_TrackPad);
-	//VRProperties()->SetInt32Property(props, Prop_Axis2Type_Int32, k_eControllerAxis_Joystick);
-	//VRProperties()->SetStringProperty(props, Prop_SerialNumber_String, "example_controler_serial");
-	//uint64_t availableButtons = ButtonMaskFromId(k_EButton_SteamVR_Touchpad) |
-	//	ButtonMaskFromId(k_EButton_IndexController_JoyStick);
-	//VRProperties()->SetUint64Property(props, Prop_SupportedButtons_Uint64, availableButtons);
+		EVRScalarUnits::VRScalarUnits_NormalizedTwoSided); //Why VRScalarUnits_NormalizedTwoSided? Take a look at the comments on EVRScalarType.
 
 	return VRInitError_None;
 }

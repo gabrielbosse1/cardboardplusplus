@@ -29,12 +29,15 @@ final class H264NalParser {
   static byte[] extractNal(byte[] data, int nalType) {
     int n = data.length;
     int i = 0;
-    while (i + 4 < n) {
+    // Need at least 3 bytes left for the shortest start code; the header byte
+    // past the code is bounds-checked before reading.
+    while (i + 2 < n) {
       int sc = startCodeLen(data, i);
       if (sc == 0) {
         i++;
         continue;
       }
+      if (i + sc >= n) break; // start code at the very tail, no header byte
       int type = data[i + sc] & 0x1F;
       if (type == nalType) {
         int next = findNextStart(data, i + sc);
@@ -57,19 +60,22 @@ final class H264NalParser {
   }
 
   private static int findNextStart(byte[] d, int from) {
-    for (int i = from; i + 3 < d.length; i++) {
-      if (d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 0 && d[i + 3] == 1) return i;
-      if (i + 2 < d.length && d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1) return i;
+    // Same tail rule as extractNal: a start code can begin at the last 3 bytes.
+    for (int i = Math.max(0, from); i + 2 < d.length; i++) {
+      if (startCodeLen(d, i) != 0) return i;
     }
     return -1;
   }
 
   /**
-   * Parse the coded (SPS) width/height from an annexb SPS NAL (with start code).
+   * Parse the visible width/height from an annexb SPS NAL (with start code).
    *
    * <p>The SPS bitstream is decoded far enough to reach {@code pic_width_in_mbs_minus1} /
-   * {@code pic_height_in_map_units_minus1} and apply the frame_mbs_only_flag / chroma logic that
-   * determines the coded dimensions. Returns {@code null} if the NAL cannot be parsed.
+   * {@code pic_height_in_map_units_minus1}, applies the frame_mbs_only_flag / chroma logic that
+   * determines the coded dimensions, then subtracts the frame-crop rectangle
+   * when {@code frame_cropping_flag} is set — so the result is the visible
+   * size (e.g. 2880x1620), not the macroblock-coded size (e.g. 2880x1632).
+   * Returns {@code null} if the NAL cannot be parsed.
    */
   static int[] parseSpsDimensions(byte[] sps) {
     try {
@@ -94,12 +100,13 @@ final class H264NalParser {
       br.skip(8); // constraint flags + reserved
       br.skip(8); // level_idc
       br.readUe(); // seq_parameter_set_id
+      int chromaFormatIdc = 1; // default 4:2:0 when not present (baseline/main)
       if (profileIdc == 100 || profileIdc == 110 || profileIdc == 122
           || profileIdc == 244 || profileIdc == 44 || profileIdc == 83
           || profileIdc == 86 || profileIdc == 118 || profileIdc == 128
           || profileIdc == 138 || profileIdc == 139 || profileIdc == 134
           || profileIdc == 135) {
-        br.readUe(); // chroma_format_idc
+        chromaFormatIdc = br.readUe(); // chroma_format_idc
         br.readUe(); // bit_depth_luma_minus8
         br.readUe(); // bit_depth_chroma_minus8
         br.skip(1); // qpprime
@@ -136,6 +143,33 @@ final class H264NalParser {
       int codedW = wMbs * 16;
       int codedH = hMbs * 16;
       if (frameMbsOnly == 0) codedH *= 2;
+      // Visible size: subtract the frame-crop rectangle when present.
+      if (br.read(1) == 1) { // frame_cropping_flag
+        int cropLeft = br.readUe();
+        int cropRight = br.readUe();
+        int cropTop = br.readUe();
+        int cropBottom = br.readUe();
+        int cropUnitX;
+        int cropUnitY;
+        if (chromaFormatIdc == 0) {
+          cropUnitX = 1;
+          cropUnitY = 2 - frameMbsOnly;
+        } else if (chromaFormatIdc == 1) {
+          cropUnitX = 2;
+          cropUnitY = 2 * (2 - frameMbsOnly);
+        } else if (chromaFormatIdc == 2) {
+          cropUnitX = 2;
+          cropUnitY = (2 - frameMbsOnly);
+        } else {
+          cropUnitX = 1;
+          cropUnitY = (2 - frameMbsOnly);
+        }
+        int visibleW = codedW - (cropLeft + cropRight) * cropUnitX;
+        int visibleH = codedH - (cropTop + cropBottom) * cropUnitY;
+        if (visibleW > 0 && visibleH > 0) {
+          return new int[] { visibleW, visibleH };
+        }
+      }
       return new int[] { codedW, codedH };
     } catch (Exception e) {
       return null;

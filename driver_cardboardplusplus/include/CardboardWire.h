@@ -4,10 +4,18 @@
 //
 // LOCKED CONTRACT -- these values are part of the driver's external behavior
 // and must never change (the agentize harness + the bridge mock expect them):
-//   * "CARDBOARD_CAP" : phone -> driver hardware decoder-cap message
+//   * "CARDBOARD_CAP" : phone -> driver hardware decoder-cap message (no ACK)
 //   * "ACK"           : driver -> phone discovery acknowledgement
 //   * "wake"          : loopback packet that unblocks a blocked discovery recv
-//   * 42069 / 42070   : UDP data + discovery ports
+//   * "BRIDGE_HELLO"  : bridge -> driver liveness probe (driver replies BRIDGE_ACK)
+//   * "BRIDGE_ACK v1" : driver -> bridge acknowledgement
+//   * "BRIDGE_CFG"    : bridge -> driver stream-settings push (fps/kbps/codec)
+//   * "BRIDGE_PREVIEW": bridge -> driver localhost-preview switch (0/1)
+//   * "BRIDGE_STATS"  : driver -> bridge periodic streaming stats
+//   * "KEYFRAME_REQ"  : phone -> driver forced-IDR request (no ACK, no target switch)
+//   * 42069           : UDP data port (video: phone copy + localhost preview)
+//   * 42070           : UDP discovery/control port
+//   * 42074 (kSensorPort): UDP sensor-forward port, bridge -> driver (0x10/0x12)
 #include <cstddef>
 
 namespace wire {

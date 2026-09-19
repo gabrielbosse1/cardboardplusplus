@@ -29,17 +29,20 @@ public class VideoDecoder {
   private final int width;
   private final int height;
 
-  private SurfaceTexture surfaceTexture;
-  private Surface surface;
+  private volatile SurfaceTexture surfaceTexture;
+  private volatile Surface surface;
   private MediaCodec decoder;
 
   private volatile long lastFrameAtMs = 0;
-  private boolean frameRendered = false;
+  private volatile boolean frameRendered = false;
   private int updateCount = 0;
   private int decodedFrames = 0;
-  private int totalDecodedFrames = 0;
+  private volatile int totalDecodedFrames = 0;
   private long lastDecodeLogNs = 0;
   private final MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
+  // Guards decoder/config/SPS state shared by the decode-forwarding thread
+  // (feed) and the GL thread (drain). NAL scanning happens outside the lock.
+  private final Object codecLock = new Object();
 
   // Codec-specific data (SPS/PPS) collected from the first keyframe(s).
   private byte[] sps;
@@ -73,45 +76,56 @@ public class VideoDecoder {
   // ---------------------------------------------------------------------------
 
   /** Called from the GL thread before drawing, to present the latest decoded frame. */
-  public synchronized void updateVideoTexture() {
-    if (surfaceTexture == null) return;
+  public void updateVideoTexture() {
+    SurfaceTexture st = surfaceTexture;
+    if (st == null) return;
     try {
       // The OES texture (textureId) is created by native and already lives in the
       // GL context, so no attachToGLContext is needed. Just drain decoder output
       // into the Surface and sample the latest frame.
-      if (configured && decoder != null) {
-        int outIdx;
-        int drained = 0;
-        while ((outIdx = decoder.dequeueOutputBuffer(bufferInfo, 0)) >= 0) {
-          decoder.releaseOutputBuffer(outIdx, true);
-          frameRendered = true;
-          drained++;
-          decodedFrames++;
-          totalDecodedFrames++;
-        }
-        updateCount++;
-        if (updateCount % 60 == 0) {
-          DBG.i("updateVideoTexture #%d drained=%d configured=%b decoderNull=%b", updateCount, drained, configured, decoder == null);
-        }
-        long nowNs = System.nanoTime();
-        if (nowNs - lastDecodeLogNs >= 1_000_000_000L) {
-          double fps = decodedFrames * 1e9 / (nowNs - lastDecodeLogNs);
-          DBG.i("Decoded video FPS=%.1f (frames=%d)", Math.round(fps * 10) / 10.0, decodedFrames);
-          decodedFrames = 0;
-          lastDecodeLogNs = nowNs;
-        }
-      } else if (updateCount % 60 == 0) {
-        updateCount++;
-        DBG.i("updateVideoTexture #%d SKIP configured=%b", updateCount, configured);
+      boolean doUpdate;
+      synchronized (codecLock) {
+        doUpdate = drainOutputLocked();
       }
 
-      if (frameRendered) {
-        surfaceTexture.updateTexImage();
+      if (doUpdate && frameRendered) {
+        st.updateTexImage();
         frameRendered = false;
       }
     } catch (Exception e) {
       Log.e(TAG, "updateVideoTexture error: " + e.getMessage());
     }
+  }
+
+  /** Drain decoder output into the Surface. Caller must hold {@link #codecLock}. */
+  private boolean drainOutputLocked() {
+    if (configured && decoder != null) {
+      int outIdx;
+      int drained = 0;
+      while ((outIdx = decoder.dequeueOutputBuffer(bufferInfo, 0)) >= 0) {
+        decoder.releaseOutputBuffer(outIdx, true);
+        frameRendered = true;
+        drained++;
+        decodedFrames++;
+        totalDecodedFrames++;
+      }
+      updateCount++;
+      if (updateCount % 60 == 0) {
+        DBG.i("updateVideoTexture #%d drained=%d configured=%b decoderNull=%b", updateCount, drained, configured, decoder == null);
+      }
+      long nowNs = System.nanoTime();
+      if (nowNs - lastDecodeLogNs >= 1_000_000_000L) {
+        double fps = decodedFrames * 1e9 / (nowNs - lastDecodeLogNs);
+        DBG.i("Decoded video FPS=%.1f (frames=%d)", Math.round(fps * 10) / 10.0, decodedFrames);
+        decodedFrames = 0;
+        lastDecodeLogNs = nowNs;
+      }
+      return true;
+    } else if (updateCount % 60 == 0) {
+      updateCount++;
+      DBG.i("updateVideoTexture #%d SKIP configured=%b", updateCount, configured);
+    }
+    return false;
   }
 
   /** Time (elapsedRealtime ms) of the last received frame; 0 if none yet. */
@@ -129,61 +143,113 @@ public class VideoDecoder {
   // ---------------------------------------------------------------------------
 
   /**
-   * Feed one H.264 access unit (annexb, start-code prefixed). The decoder is configured lazily once
-   * SPS and PPS have been observed in the stream.
+   * Feed one frame from the native direct buffer. Copies out of the shared
+   * buffer immediately (the native side reuses it for the next frame) and
+   * delegates to {@link #feedFrame(byte[], boolean)}.
    */
-  public synchronized void feedFrame(byte[] data, boolean isKey) {
+  public void feedDirect(ByteBuffer src, int length, boolean isKey) {
+    if (src == null || length <= 0) return;
+    byte[] data = new byte[length];
+    int oldLimit = src.limit();
+    int oldPos = src.position();
+    try {
+      src.position(0);
+      src.limit(length);
+      src.get(data, 0, length);
+    } catch (Exception e) {
+      Log.e(TAG, "feedDirect copy failed: " + e.getMessage());
+      return;
+    } finally {
+      try {
+        src.limit(oldLimit);
+        src.position(oldPos);
+      } catch (Exception ignored) {
+      }
+    }
+    feedFrame(data, isKey);
+  }
+
+  /**
+   * Feed one H.264 access unit (annexb, start-code prefixed). The decoder is configured lazily once
+   * SPS and PPS have been observed in the stream. SPS/PPS only arrive in
+   * keyframes, so non-keyframes skip the rescan entirely (isKey comes from the
+   * receiver's single scan, passed through native).
+   */
+  public void feedFrame(byte[] data, boolean isKey) {
     if (data == null || data.length == 0) return;
     lastFrameAtMs = SystemClock.elapsedRealtime();
 
     // Refresh SPS/PPS whenever present so a resolution change from the PC
     // (e.g. the encoder re-inits after applying the phone's hardware cap) is
     // detected and the decoder reconfigured instead of silently breaking.
-    byte[] newSps = extractNal(data, 7);
-    byte[] newPps = extractNal(data, 8);
+    // Scanning happens outside the codec lock; only state updates take it.
+    byte[] newSps = isKey ? extractNal(data, 7) : null;
+    byte[] newPps = null;
+    int[] dims = null;
     if (newSps != null) {
-      int[] dims = parseSpsDimensions(newSps);
-      boolean changed = false;
-      if (!Arrays.equals(newSps, sps)) { sps = newSps; changed = true; }
-      if (newPps != null && !Arrays.equals(newPps, pps)) { pps = newPps; changed = true; }
-      if (dims != null && (codedW != dims[0] || codedH != dims[1])) {
-        codedW = dims[0];
-        codedH = dims[1];
-        changed = true;
-      }
-      if (changed && configured) {
-        Log.i(TAG, "SPS/PPS or resolution changed (->" + codedW + "x" + codedH
-            + "); reconfiguring decoder");
-        reconfigureDecoder();
+      dims = parseSpsDimensions(newSps);
+      // Fast path: identical SPS bytes mean nothing changed — skip the PPS
+      // scan too (SPS+PPS always travel together in x264 streams).
+      if (!Arrays.equals(newSps, sps)) {
+        newPps = extractNal(data, 8);
       }
     }
 
-    if (!configured) {
-      if (sps != null && pps != null) {
-        if (!configure()) {
-          Log.e(TAG, "MediaCodec configure failed; dropping until next keyframe");
+    synchronized (codecLock) {
+      boolean changed = false;
+      if (newSps != null) {
+        // Dims-first: a cheap int compare detects resolution changes before
+        // the byte compare decides whether the codec-specific data changed.
+        if (dims != null && (codedW != dims[0] || codedH != dims[1])) {
+          codedW = dims[0];
+          codedH = dims[1];
+          changed = true;
+        }
+        if (!Arrays.equals(newSps, sps)) {
+          sps = newSps;
+          changed = true;
+        }
+        if (newPps != null && !Arrays.equals(newPps, pps)) {
+          pps = newPps;
+          changed = true;
+        }
+        if (changed && configured) {
+          Log.i(TAG, "SPS/PPS or resolution changed (->" + codedW + "x" + codedH
+              + "); reconfiguring decoder");
+          reconfigureDecoderLocked();
+        }
+      }
+
+      if (!configured) {
+        if (sps != null && pps != null) {
+          if (!configureLocked()) {
+            Log.e(TAG, "MediaCodec configure failed; dropping until next keyframe");
+            return;
+          }
+        } else {
+          // Still waiting for codec-specific data; drop until we have SPS+PPS.
           return;
         }
-      } else {
-        // Still waiting for codec-specific data; drop until we have SPS+PPS.
-        return;
       }
-    }
 
-    try {
-      int index = decoder.dequeueInputBuffer(10_000);
-      if (index < 0) {
-        Log.w(TAG, "No input buffer available, dropping frame");
-        return;
+      try {
+        // Under pressure drop P-frames immediately (0-timeout) but never drop
+        // keyframes: without SPS/IDR the decoder can't configure and every
+        // following P-frame would corrupt, so keyframes keep a short wait.
+        int index = decoder.dequeueInputBuffer(isKey ? 10_000 : 0);
+        if (index < 0) {
+          if (isKey) Log.w(TAG, "No input buffer for keyframe, dropping frame");
+          return;
+        }
+        ByteBuffer input = decoder.getInputBuffer(index);
+        if (input == null) return;
+        input.clear();
+        input.put(data, 0, data.length);
+        int flags = isKey ? MediaCodec.BUFFER_FLAG_KEY_FRAME : 0;
+        decoder.queueInputBuffer(index, 0, data.length, 0, flags);
+      } catch (Exception e) {
+        Log.e(TAG, "feedFrame error: " + e.getMessage());
       }
-      ByteBuffer input = decoder.getInputBuffer(index);
-      if (input == null) return;
-      input.clear();
-      input.put(data, 0, data.length);
-      int flags = isKey ? MediaCodec.BUFFER_FLAG_KEY_FRAME : 0;
-      decoder.queueInputBuffer(index, 0, data.length, 0, flags);
-    } catch (Exception e) {
-      Log.e(TAG, "feedFrame error: " + e.getMessage());
     }
   }
 
@@ -191,8 +257,9 @@ public class VideoDecoder {
   // Codec configuration (initial + reconfiguration on SPS/PPS/resolution change)
   // ---------------------------------------------------------------------------
 
-  /** Stop and re-create the decoder with the current SPS/PPS (resolution change). */
-  private void reconfigureDecoder() {
+  /** Stop and re-create the decoder with the current SPS/PPS (resolution change).
+   *  Caller must hold {@link #codecLock}. */
+  private void reconfigureDecoderLocked() {
     try {
       if (decoder != null) {
         decoder.stop();
@@ -203,11 +270,11 @@ public class VideoDecoder {
       Log.w(TAG, "decoder stop/release during reconfigure failed: " + e.getMessage());
     }
     configured = false;
-    // configure() will use the updated sps/pps/codedW/codedH.
-    configure();
+    // configureLocked() will use the updated sps/pps/codedW/codedH.
+    configureLocked();
   }
 
-  private boolean configure() {
+  private boolean configureLocked() {
     try {
       // Use the actual coded resolution from SPS so the MediaFormat matches the
       // stream (and stays within the hardware decoder's width cap).
@@ -237,8 +304,8 @@ public class VideoDecoder {
       if (bridge != null) bridge.onVideoActive();
       // Tell the OES shader to skip macroblock padding rows at the bottom of
       // the decoded frame. The codec outputs at alignedH but only the top
-      // height rows contain valid content; the rest are green garbage.
-      float vMax = (float) height / (float) alignedH;
+      // baseH rows contain valid content; the rest are green garbage.
+      float vMax = (float) baseH / (float) alignedH;
       if (bridge != null) bridge.setVideoVMax(vMax);
       Log.i(TAG, "MediaCodec configured (SPS=" + sps.length + " PPS=" + pps.length
           + " vMax=" + vMax + ")");
@@ -250,7 +317,15 @@ public class VideoDecoder {
     }
   }
 
-  public synchronized void release() {
+  public void release() {
+    synchronized (codecLock) {
+      releaseLocked();
+    }
+    Log.i(TAG, "VideoDecoder released");
+  }
+
+  /** Caller must hold {@link #codecLock}. */
+  private void releaseLocked() {
     try {
       if (decoder != null) {
         decoder.stop();
@@ -279,7 +354,6 @@ public class VideoDecoder {
     configured = false;
     sps = null;
     pps = null;
-    Log.i(TAG, "VideoDecoder released");
   }
 
   // --- annexb NAL extraction ---------------------------------------------------

@@ -38,6 +38,9 @@
     <string name="pc_ip_cancel"
             description="Text of the cancel button in the PC IP dialog. [CHAR_LIMIT=20]">
             Cancel</string>
+    <string name="pc_ip_invalid"
+            description="Toast shown when the entered PC IP does not parse. [CHAR_LIMIT=60]">
+            Invalid IP address — not saved</string>
     <string name="toggle_debug"
             description="Short text shown on the settings menu to toggle debug logging. [CHAR_LIMIT=30]">
             Debug logging</string>

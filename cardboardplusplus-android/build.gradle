@@ -1,9 +1,31 @@
 apply plugin: 'com.android.application'
 
+// Version is the git commit count, so every build reports which commit it
+// came from (shown by the bridge on phone hello). Computed once at the top
+// level (project scope) — nested DSL closures resolve `exec` unreliably.
+// Falls back to 1 when git is unavailable (e.g. source export).
+def commitCount = 1
+try {
+    def out = new ByteArrayOutputStream()
+    project.exec {
+        commandLine 'git', 'rev-list', '--count', 'HEAD'
+        // project.rootDir is the repo root (settings.gradle maps :app here).
+        workingDir(project.rootDir)
+        standardOutput = out
+    }
+    commitCount = out.toString().trim().toInteger()
+} catch (Exception ignored) {}
+
 android {
     compileSdk = 35
     lintOptions {
         abortOnError = false
+    }
+    // Explicit: DebugLog/VrActivity/TelemetrySender read BuildConfig.DEBUG /
+    // VERSION_NAME (commit count), so generation must never silently vanish
+    // under a future AGP default flip.
+    buildFeatures {
+        buildConfig = true
     }
     defaultConfig {
         applicationId "com.cardboardplusplus"
@@ -17,8 +39,8 @@ android {
         // See the release notes for details.
         minSdkVersion = 26
         targetSdkVersion = 35
-        versionCode 1
-        versionName "1.33.0"
+        versionCode commitCount
+        versionName "$commitCount"
         testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
         ndk {
             abiFilters 'armeabi-v7a', 'arm64-v8a'
@@ -42,13 +64,11 @@ android {
 dependencies {
     implementation fileTree(dir: 'libs', include: ['*.jar'])
     implementation 'androidx.appcompat:appcompat:1.6.1'
-    // Android Mobile Vision
-    // TODO(b/213613345) Migrate to ML Kit.
-    implementation 'com.google.android.gms:play-services-vision:20.1.3'
-    implementation 'com.google.android.material:material:1.12.0'
-    implementation 'com.google.protobuf:protobuf-javalite:3.19.4'
+    // NOTE: no ffmpeg-kit (the native H264Decoder it served is deleted; the
+    // live path is receiver -> Java MediaCodec), no play-services-vision /
+    // protobuf / material (zero imports; vision TODO migrated away).
+    // Keep this list minimal: every dep costs APK size on a sideloaded app.
     implementation project(":sdk")
-    implementation 'io.github.jamaismagic.ffmpeg:ffmpeg-kit-lts-full-gpl-16kb:6.1.4'
     testImplementation 'junit:junit:4.13.2'
 }
 

@@ -168,14 +168,6 @@ inline uint64_t LoadRelaxedU64(const volatile uint64_t& p) {
 #endif
 }
 
-inline uint64_t LoadAcquireU64(const volatile uint64_t& p) {
-#ifdef _MSC_VER
-    return _ReadWriteBarrier(), p;
-#else
-    return std::atomic_ref<const uint64_t>(const_cast<uint64_t&>(p)).load(std::memory_order_acquire);
-#endif
-}
-
 inline void StoreReleaseU64(volatile uint64_t& p, uint64_t v) {
 #ifdef _MSC_VER
     _ReadWriteBarrier();

@@ -10,7 +10,7 @@
 //! by allowing write access to the shared state.
 
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::app::SharedState;
@@ -24,16 +24,21 @@ const ACK_POLL_TIMEOUT: Duration = Duration::from_millis(200);
 const DRIVER_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The bound discovery socket plus the driver address it talks to.
+/// The socket is shared lock-free (`UdpSocket: Send + Sync`): the heartbeat
+/// thread recvs while `send_config` sends, and neither ever blocks the other.
 struct DriverConn {
-    sock: UdpSocket,
+    sock: Arc<UdpSocket>,
     addr: SocketAddr,
 }
 
 /// Fixed prefix of the driver's periodic stats packet.
 const STATS_PREFIX: &str = "BRIDGE_STATS";
 
+/// Malformed STATS datagrams rejected so far (surfaced via debug log).
+static STATS_REJECTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Process-global, set once by `spawn`; `send_config` reads it on demand.
-static DRIVER_CONN: OnceLock<Mutex<DriverConn>> = OnceLock::new();
+static DRIVER_CONN: OnceLock<DriverConn> = OnceLock::new();
 
 /// Register the discovery socket and start the heartbeat loop. Called early by
 /// `AppCore::new`; if binding fails the failure is logged and everything else
@@ -56,7 +61,10 @@ pub fn spawn(state: SharedState) {
         .parse()
         .expect("driver discovery address is a literal");
 
-    let _ = DRIVER_CONN.set(Mutex::new(DriverConn { sock, addr }));
+    let _ = DRIVER_CONN.set(DriverConn {
+        sock: Arc::new(sock),
+        addr,
+    });
     let conn = DRIVER_CONN.get().expect("driver conn set just above");
 
     std::thread::spawn(move || heartbeat_loop(&state, conn));
@@ -64,7 +72,7 @@ pub fn spawn(state: SharedState) {
 
 /// Periodic handshake: say hello, watch for the ACK, and declare the driver
 /// gone once it has been silent for `DRIVER_ACK_TIMEOUT`.
-fn heartbeat_loop(state: &SharedState, conn: &Mutex<DriverConn>) {
+fn heartbeat_loop(state: &SharedState, conn: &DriverConn) {
     let mut last_ack = None::<Instant>;
     let mut buf = [0u8; 512];
 
@@ -78,8 +86,7 @@ fn heartbeat_loop(state: &SharedState, conn: &Mutex<DriverConn>) {
 
 /// Re-send the discovery greeting. The driver answers with BRIDGE_ACK when it
 /// speaks the protocol; silence keeps the loop pinging.
-fn send_heartbeat(conn: &Mutex<DriverConn>) {
-    let conn = conn.lock().expect("driver conn lock");
+fn send_heartbeat(conn: &DriverConn) {
     let _ = conn.sock.send_to(b"BRIDGE_HELLO v1", conn.addr);
 }
 
@@ -87,16 +94,16 @@ fn send_heartbeat(conn: &Mutex<DriverConn>) {
 /// driver has queued for us (in practice an ACK may be followed by a STATS
 /// packet in the same pass).
 fn poll_for_ack(
-    conn: &Mutex<DriverConn>,
+    conn: &DriverConn,
     buf: &mut [u8; 512],
     last_ack: &mut Option<Instant>,
     state: &SharedState,
 ) {
     loop {
-        let Ok((n, _src)) = conn.lock().expect("driver conn lock").sock.recv_from(buf) else {
+        let Ok((n, src)) = conn.sock.recv_from(buf) else {
             return; // poll timed out — no more packets from the driver
         };
-        match handle_bridge_datagram(&buf[..n], last_ack, state) {
+        match handle_bridge_datagram(&buf[..n], src, last_ack, state) {
             DatagramHandled::Continue => continue, // drain the next one if any
             DatagramHandled::Stop => return,
         }
@@ -108,13 +115,29 @@ fn poll_for_ack(
 /// ignored and we keep draining so a stray packet can't stall the heartbeat.
 enum DatagramHandled {
     Continue,
+    // Kept for the drain match: STATS used to end a pass before it learned
+    // to keep draining (an ACK queued behind STATS was delayed a heartbeat).
+    #[allow(dead_code)]
     Stop,
 }
 
-fn handle_bridge_datagram(data: &[u8], last_ack: &mut Option<Instant>, state: &SharedState) -> DatagramHandled {
+fn handle_bridge_datagram(
+    data: &[u8],
+    src: SocketAddr,
+    last_ack: &mut Option<Instant>,
+    state: &SharedState,
+) -> DatagramHandled {
     let msg = String::from_utf8_lossy(data);
     crate::debug_log!(state, "[driver] recv: {}", msg.trim());
+    // Liveness only from the real driver socket: any local process can spray
+    // `BRIDGE_STATS` at us, and that must never keep `driver_connected` true
+    // after the real driver died.
+    let trusted =
+        src.ip() == std::net::IpAddr::from([127, 0, 0, 1]) && src.port() == DRIVER_DISCOVERY_PORT;
     if msg.trim_start().starts_with("BRIDGE_ACK") {
+        if !trusted {
+            return DatagramHandled::Continue;
+        }
         *last_ack = Some(Instant::now());
         if let Ok(mut s) = state.lock() {
             if !s.driver_connected {
@@ -123,41 +146,100 @@ fn handle_bridge_datagram(data: &[u8], last_ack: &mut Option<Instant>, state: &S
             s.driver_connected = true;
             // A live driver implies an active encoder until told otherwise.
             s.encoder_active = true;
+            // Trailing commit-count suffix ("BRIDGE_ACK v1 <n>"); old
+            // drivers send none, so an empty suffix keeps the old value.
+            let version = ack_version(&msg);
+            if !version.is_empty() && s.driver_version != version {
+                s.driver_version = version.to_string();
+                s.push_log(format!("driver version {version}"));
+            }
         }
         return DatagramHandled::Continue;
     }
-    if msg.starts_with(STATS_PREFIX) {
-        if let Some((fps, kbps, frames, drops)) = parse_stats(&msg) {
-            if let Ok(mut s) = state.lock() {
-                s.note_preview_stats(fps, kbps, frames, drops);
+    if msg.trim_start().starts_with(STATS_PREFIX) {
+        if !trusted {
+            return DatagramHandled::Continue;
+        }
+        match parse_stats(&msg) {
+            Some((fps, kbps, frames, drops)) => {
+                if let Ok(mut s) = state.lock() {
+                    s.note_preview_stats(fps, kbps, frames, drops);
+                }
+            }
+            None => {
+                let n = STATS_REJECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                crate::debug_log!(
+                    state,
+                    "[driver] rejected malformed STATS ({} bytes, reject #{})",
+                    data.len(),
+                    n
+                );
             }
         }
-        return DatagramHandled::Stop; // stats is the last packet of a pass
+        // STATS is routine traffic, not the end of a pass: keep draining so
+        // an ACK queued behind it is still seen in the same heartbeat.
+        return DatagramHandled::Continue;
     }
     DatagramHandled::Continue
 }
 
+/// Extract the driver's commit-count version from `BRIDGE_ACK v1 <n>`.
+/// Returns "" when the driver sent no suffix (pre-version builds).
+fn ack_version(msg: &str) -> &str {
+    let rest = msg.trim_start().strip_prefix("BRIDGE_ACK").unwrap_or("").trim_start();
+    // tok0 = "v1" (protocol), tok1 = commit-count version (if present).
+    let mut toks = rest.split_whitespace();
+    toks.next();
+    toks.next().unwrap_or("")
+}
+
 /// Parse `BRIDGE_STATS fps=<n> bitrate=<kbps> frames=<n> drops=<n>` into
-/// (fps, bitrate_kbps, frames, drops). Missing or malformed fields default to 0
-/// so a partial packet never poisons the counters the UI shows. Control bytes
-/// (e.g. a stray NUL from an older driver build) are stripped first so a field
-/// like "frames=\0 10" still parses.
+/// (fps, bitrate_kbps, frames, drops). Returns `None` when zero of the four
+/// fields parse, so a malformed packet is distinguishable from an idle
+/// driver (all zeros). Control bytes (e.g. a stray NUL from an older driver
+/// build) are stripped first so a field like "frames=\0 10" still parses.
 fn parse_stats(msg: &str) -> Option<(i32, i32, u64, u64)> {
-    let rest = msg.strip_prefix(STATS_PREFIX)?;
+    let rest = msg.trim_start().strip_prefix(STATS_PREFIX)?;
     let clean: String = rest.chars().filter(|c| !c.is_control()).collect();
     let mut fps = 0i32;
     let mut kbps = 0i32;
     let mut frames = 0u64;
     let mut drops = 0u64;
+    let mut parsed = 0u32;
     for field in clean.split_whitespace() {
-        let (key, value) = field.split_once('=')?;
+        let Some((key, value)) = field.split_once('=') else {
+            continue;
+        };
         match key {
-            "fps" => fps = value.parse().unwrap_or(0),
-            "bitrate" => kbps = value.parse().unwrap_or(0),
-            "frames" => frames = value.parse().unwrap_or(0),
-            "drops" => drops = value.parse().unwrap_or(0),
+            "fps" => {
+                if let Ok(v) = value.parse() {
+                    fps = v;
+                    parsed += 1;
+                }
+            }
+            "bitrate" => {
+                if let Ok(v) = value.parse() {
+                    kbps = v;
+                    parsed += 1;
+                }
+            }
+            "frames" => {
+                if let Ok(v) = value.parse() {
+                    frames = v;
+                    parsed += 1;
+                }
+            }
+            "drops" => {
+                if let Ok(v) = value.parse() {
+                    drops = v;
+                    parsed += 1;
+                }
+            }
             _ => {}
         }
+    }
+    if parsed == 0 {
+        return None;
     }
     Some((fps, kbps, frames, drops))
 }
@@ -190,7 +272,6 @@ pub fn send_config(width: i32, height: i32, fps: i32, bitrate_mbps: i32, encoder
     let Some(conn) = DRIVER_CONN.get() else {
         return;
     };
-    let conn = conn.lock().expect("driver conn lock");
     let (cap, cfg) = config_wire_packets(width, height, fps, bitrate_mbps, encoder);
     let _ = conn.sock.send_to(&cap, conn.addr);
     let _ = conn.sock.send_to(&cfg, conn.addr);
@@ -249,12 +330,22 @@ mod tests {
 
     #[test]
     fn stats_parser_tolerates_partial_and_extra_fields() {
-        // Missing fields default to 0; unknown keys are skipped.
+        // Missing fields stay 0 as long as at least one field parses;
+        // unknown keys are skipped.
         assert_eq!(parse_stats("BRIDGE_STATS fps=30"), Some((30, 0, 0, 0)));
         assert_eq!(
             parse_stats("BRIDGE_STATS fps=1 bitrate=2 frames=3 drops=4 future=none"),
             Some((1, 2, 3, 4))
         );
+    }
+
+    #[test]
+    fn stats_parser_rejects_zero_valid_fields() {
+        // Malformed must be distinguishable from an idle driver (all zeros).
+        assert_eq!(parse_stats("BRIDGE_STATS"), None);
+        assert_eq!(parse_stats("BRIDGE_STATS future=none"), None);
+        assert_eq!(parse_stats("BRIDGE_STATS fps=abc"), None);
+        assert_eq!(parse_stats("BRIDGE_STATS fps"), None);
     }
 
     #[test]
@@ -272,11 +363,50 @@ mod tests {
         Arc::new(Mutex::new(AppState::default()))
     }
 
+    fn driver_src() -> SocketAddr {
+        "127.0.0.1:42070".parse().unwrap()
+    }
+
+    fn spoofed_src() -> SocketAddr {
+        "192.168.1.5:42070".parse().unwrap()
+    }
+
+    #[test]
+    fn ack_version_extracts_commit_count_suffix() {
+        assert_eq!(ack_version("BRIDGE_ACK v1 542"), "542");
+        assert_eq!(ack_version("BRIDGE_ACK v1"), "");
+        assert_eq!(ack_version("  BRIDGE_ACK v1 7"), "7");
+        assert_eq!(ack_version("garbage"), "");
+    }
+
+    #[test]
+    fn bridge_ack_with_version_suffix_stores_driver_version() {
+        let state = fresh_state();
+        let mut last_ack = None;
+        handle_bridge_datagram(b"BRIDGE_ACK v1 542", driver_src(), &mut last_ack, &state);
+        let s = state.lock().unwrap();
+        assert!(s.driver_connected);
+        assert_eq!(s.driver_version, "542");
+        assert!(s.log.iter().any(|l| l.contains("driver version 542")));
+    }
+
+    #[test]
+    fn bridge_ack_without_suffix_keeps_old_driver_version() {
+        let state = fresh_state();
+        {
+            let mut s = state.lock().unwrap();
+            s.driver_version = "100".into();
+        }
+        let mut last_ack = None;
+        handle_bridge_datagram(b"BRIDGE_ACK v1", driver_src(), &mut last_ack, &state);
+        assert_eq!(state.lock().unwrap().driver_version, "100");
+    }
+
     #[test]
     fn bridge_ack_sets_driver_connected_and_encoder_active() {
         let state = fresh_state();
         let mut last_ack = None;
-        let result = handle_bridge_datagram(b"BRIDGE_ACK v1", &mut last_ack, &state);
+        let result = handle_bridge_datagram(b"BRIDGE_ACK v1", driver_src(), &mut last_ack, &state);
         assert!(matches!(result, DatagramHandled::Continue));
         assert!(last_ack.is_some());
         let s = state.lock().unwrap();
@@ -288,9 +418,22 @@ mod tests {
     fn bridge_ack_with_leading_whitespace_still_connects() {
         let state = fresh_state();
         let mut last_ack = None;
-        handle_bridge_datagram(b"  BRIDGE_ACK v1", &mut last_ack, &state);
+        handle_bridge_datagram(b"  BRIDGE_ACK v1", driver_src(), &mut last_ack, &state);
         let s = state.lock().unwrap();
         assert!(s.driver_connected);
+    }
+
+    #[test]
+    fn spoofed_ack_does_not_touch_connection_flags() {
+        // Any local process can spray BRIDGE_ACK; only 127.0.0.1:42070 counts.
+        let state = fresh_state();
+        let mut last_ack = None;
+        let result = handle_bridge_datagram(b"BRIDGE_ACK v1", spoofed_src(), &mut last_ack, &state);
+        assert!(matches!(result, DatagramHandled::Continue));
+        assert!(last_ack.is_none());
+        let s = state.lock().unwrap();
+        assert!(!s.driver_connected);
+        assert!(!s.encoder_active);
     }
 
     #[test]
@@ -302,7 +445,7 @@ mod tests {
             s.encoder_active = false;
         }
         let mut last_ack = None;
-        handle_bridge_datagram(b"BRIDGE_ACK v1", &mut last_ack, &state);
+        handle_bridge_datagram(b"BRIDGE_ACK v1", driver_src(), &mut last_ack, &state);
         let s = state.lock().unwrap();
         assert!(s.driver_connected);
         assert!(s.encoder_active);
@@ -314,15 +457,55 @@ mod tests {
         let mut last_ack = None;
         let result = handle_bridge_datagram(
             b"BRIDGE_STATS fps=60 bitrate=20000 frames=1234 drops=2",
+            driver_src(),
             &mut last_ack,
             &state,
         );
-        assert!(matches!(result, DatagramHandled::Stop));
+        // STATS keeps draining: an ACK queued behind it is seen in the same pass.
+        assert!(matches!(result, DatagramHandled::Continue));
         let s = state.lock().unwrap();
         assert_eq!(s.preview_driver_fps, 60);
         assert_eq!(s.preview_bitrate_kbps, 20000);
         assert_eq!(s.preview_frames, 1234);
         assert_eq!(s.preview_drops, 2);
+    }
+
+    #[test]
+    fn bridge_stats_with_leading_whitespace_still_parses() {
+        let state = fresh_state();
+        let mut last_ack = None;
+        handle_bridge_datagram(
+            b"  BRIDGE_STATS fps=30 bitrate=8000 frames=100 drops=0",
+            driver_src(),
+            &mut last_ack,
+            &state,
+        );
+        assert_eq!(state.lock().unwrap().preview_driver_fps, 30);
+    }
+
+    #[test]
+    fn spoofed_stats_updates_nothing() {
+        let state = fresh_state();
+        let mut last_ack = None;
+        handle_bridge_datagram(
+            b"BRIDGE_STATS fps=30 bitrate=8000 frames=100 drops=0",
+            spoofed_src(),
+            &mut last_ack,
+            &state,
+        );
+        assert!(last_ack.is_none());
+        let s = state.lock().unwrap();
+        assert_eq!(s.preview_driver_fps, 0);
+        assert!(!s.driver_connected);
+    }
+
+    #[test]
+    fn malformed_stats_updates_nothing() {
+        let state = fresh_state();
+        let mut last_ack = None;
+        let result = handle_bridge_datagram(b"BRIDGE_STATS", driver_src(), &mut last_ack, &state);
+        assert!(matches!(result, DatagramHandled::Continue));
+        assert_eq!(state.lock().unwrap().preview_driver_fps, 0);
     }
 
     #[test]
@@ -336,6 +519,7 @@ mod tests {
         let mut last_ack = None;
         handle_bridge_datagram(
             b"BRIDGE_STATS fps=30 bitrate=8000 frames=100 drops=0",
+            driver_src(),
             &mut last_ack,
             &state,
         );
@@ -348,7 +532,7 @@ mod tests {
     fn unknown_datagram_does_not_change_state() {
         let state = fresh_state();
         let mut last_ack = None;
-        let result = handle_bridge_datagram(b"random garbage", &mut last_ack, &state);
+        let result = handle_bridge_datagram(b"random garbage", driver_src(), &mut last_ack, &state);
         assert!(matches!(result, DatagramHandled::Continue));
         assert!(last_ack.is_none());
         let s = state.lock().unwrap();
@@ -359,7 +543,7 @@ mod tests {
     fn empty_datagram_does_not_change_state() {
         let state = fresh_state();
         let mut last_ack = None;
-        let result = handle_bridge_datagram(b"", &mut last_ack, &state);
+        let result = handle_bridge_datagram(b"", driver_src(), &mut last_ack, &state);
         assert!(matches!(result, DatagramHandled::Continue));
         assert!(last_ack.is_none());
     }
@@ -369,7 +553,7 @@ mod tests {
         let state = fresh_state();
         let mut last_ack = None;
         for _ in 0..5 {
-            handle_bridge_datagram(b"BRIDGE_ACK v1", &mut last_ack, &state);
+            handle_bridge_datagram(b"BRIDGE_ACK v1", driver_src(), &mut last_ack, &state);
         }
         let s = state.lock().unwrap();
         assert!(s.driver_connected);
@@ -377,13 +561,18 @@ mod tests {
     }
 
     #[test]
-    fn ack_then_stats_drain_returns_stop() {
+    fn ack_then_stats_drain_keeps_draining() {
         let state = fresh_state();
         let mut last_ack = None;
-        let r1 = handle_bridge_datagram(b"BRIDGE_ACK v1", &mut last_ack, &state);
+        let r1 = handle_bridge_datagram(b"BRIDGE_ACK v1", driver_src(), &mut last_ack, &state);
         assert!(matches!(r1, DatagramHandled::Continue));
-        let r2 = handle_bridge_datagram(b"BRIDGE_STATS fps=0 bitrate=0 frames=0 drops=0", &mut last_ack, &state);
-        assert!(matches!(r2, DatagramHandled::Stop));
+        let r2 = handle_bridge_datagram(
+            b"BRIDGE_STATS fps=0 bitrate=0 frames=0 drops=0",
+            driver_src(),
+            &mut last_ack,
+            &state,
+        );
+        assert!(matches!(r2, DatagramHandled::Continue));
     }
 
     // --- mark_driver_gone_if_stale tests ---

@@ -676,6 +676,7 @@ name = "bridge-core"
 version = "0.1.0"
 dependencies = [
  "bridge-shm",
+ "serde_json",
 ]
 
 [[package]]
@@ -807,6 +808,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bridge-core",
+ "bridge-shm",
  "serde",
  "serde_json",
  "slint",

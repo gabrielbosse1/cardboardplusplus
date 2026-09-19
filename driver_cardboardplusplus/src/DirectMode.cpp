@@ -15,10 +15,12 @@ using namespace vr;
 
 // DIAG (Test A, FLICKER_ISSUE_MAP.md §8/§10): counts SubmitLayer calls between
 // Presents and logs black-frame / format info to confirm multi-layer clobber (H1).
-// Toggle: comment out the line below to compile without the diagnostics.
-// NOTE: keep this OFF in production — every DIAG log is a synchronous file write
+// Derived from the build type: on in debug builds (_DEBUG), off in release.
+// NOTE: kept off in release — every DIAG log is a synchronous file write
 // on the compositor thread and caused SteamVR frame-timing spikes.
-//#define DRIVER_DIAG
+#ifdef _DEBUG
+#define DRIVER_DIAG
+#endif
 #ifdef DRIVER_DIAG
 static std::atomic<int> g_submitLayerCount{ 0 };
 #endif
@@ -66,12 +68,26 @@ void HmdDriver::CreateSwapTextureSet(uint32_t unPid, const SwapTextureSetDesc_t*
         std::shared_ptr<SwapTextureSet> set = std::make_shared<SwapTextureSet>();
         set->nextIndex = 0;
 
+        // Roll back partial textures on failure (M12): a mid-loop return must
+        // never leak textures or hand half-registered handles to SteamVR.
+        auto rollback = [&](int created) {
+            for (int j = 0; j < created; j++) {
+                m_textureHandleMap.erase((vr::SharedTextureHandle_t)set->hSharedHandles[j]);
+                m_setByHandle.erase((vr::SharedTextureHandle_t)set->hSharedHandles[j]);
+                if (set->pTextures[j]) {
+                    set->pTextures[j]->Release();
+                    set->pTextures[j] = nullptr;
+                }
+            }
+        };
+
         for (int i = 0; i < 3; i++) {
             ID3D11Texture2D* pTexture = nullptr;
             HRESULT hr = m_pD3D11Device->CreateTexture2D(&desc, nullptr, &pTexture);
 
             if (FAILED(hr)) {
                 DriverLog("Failed to create texture %d! HRESULT: 0x%x", i, hr);
+                rollback(i);
                 return;
             }
 
@@ -80,6 +96,7 @@ void HmdDriver::CreateSwapTextureSet(uint32_t unPid, const SwapTextureSetDesc_t*
             if (FAILED(hr)) {
                 DriverLog("Failed to get DXGI resource for texture %d! HRESULT: 0x%x", i, hr);
                 pTexture->Release();
+                rollback(i);
                 return;
             }
 
@@ -90,6 +107,7 @@ void HmdDriver::CreateSwapTextureSet(uint32_t unPid, const SwapTextureSetDesc_t*
             if (FAILED(hr)) {
                 DriverLog("Failed to get shared handle for texture %d! HRESULT: 0x%x", i, hr);
                 pTexture->Release();
+                rollback(i);
                 return;
             }
 
@@ -182,6 +200,7 @@ void HmdDriver::GetNextSwapTextureSetIndex(vr::SharedTextureHandle_t sharedTextu
 	// Round-robin each eye's swap texture set so the app renders into a
     // different buffer every frame. This is what makes triple buffering real:
     // the buffer the driver is encoding from is never the one being written.
+    if (!pIndices) return; // L11: SteamVR must pass an out-param; never write through null
     for (int eye = 0; eye < 2; eye++) {
         auto it = m_setByHandle.find(sharedTextureHandles[eye]);
         if (it == m_setByHandle.end()) {
@@ -233,6 +252,13 @@ void HmdDriver::SubmitLayer(const SubmitLayerPerEye_t(&perEye)[2])
 
 void HmdDriver::Present(vr::SharedTextureHandle_t syncTexture)
 {
+    // Bridge stream switch (H2): single gated load. OFF skips everything —
+    // the sync texture is never touched, so no release is needed. Reset to ON
+    // in Activate so one OFF can't stick across reloads (R3).
+    if (!m_streamEnabled.load(std::memory_order_relaxed)) {
+        return;
+    }
+
     // Count every Present SteamVR issues (compositor rate), independent of whether
     // we actually encode, so we can see if the stream is Present-bound or encode-bound.
     m_presentCount++;

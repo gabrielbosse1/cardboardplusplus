@@ -19,7 +19,14 @@ use bridge_core::paths;
 /// Version read from Cargo.toml at compile time.
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Default stream settings used when a request omits a field.
+/// Local preview size (driver localhost copy → ffmpeg → UI). Single source of
+/// truth for the ffmpeg scale filter and the RGBA frame buffer below.
+pub const PREVIEW_W: u32 = 480;
+pub const PREVIEW_H: u32 = 270;
+
+/// Compiled boot defaults (mirror `AppState::default`); the link-test verdict
+/// starts relative to these. NOTE: not the POST /settings fallback — partial
+/// bodies keep the live session values via `AppCore::applied_settings`.
 /// Order: (width, height, fps, bitrate_mbps).
 pub const APPLIED_DEFAULTS: (i32, i32, i32, i32) = (2880, 1620, 60, 20);
 
@@ -75,6 +82,15 @@ pub struct StatusSnapshot {
     pub install_note: String,
     pub driver_present: bool,
     pub steamvr_note: String,
+    // -- appended (never reordered): full applied session (POST /settings
+    // partial bodies fall back to these, so they must be visible) --
+    pub applied_width: i32,
+    pub applied_height: i32,
+    pub applied_fps: i32,
+    // -- appended (never reordered): component versions (commit counts
+    // reported by the driver / phone hello handshake) --
+    pub driver_version: String,
+    pub phone_version: String,
 }
 
 impl From<&AppState> for StatusSnapshot {
@@ -124,6 +140,11 @@ impl From<&AppState> for StatusSnapshot {
             install_note: s.install_note.clone(),
             driver_present: s.driver_present,
             steamvr_note: s.steamvr_note.clone(),
+            applied_width: s.applied_width,
+            applied_height: s.applied_height,
+            applied_fps: s.applied_fps,
+            driver_version: s.driver_version.clone(),
+            phone_version: s.phone_version.clone(),
         }
     }
 }
@@ -228,8 +249,28 @@ fn spawn_mediapipe_server(state: &SharedState) -> (Option<MediapipeClient>, Opti
         return (None, None);
     };
 
-    let python = std::env::var("PYTHON").unwrap_or_else(|_| "python".into());
-    let mut child = match Command::new(&python)
+    let (python_prog, python_args) = python_command();
+    {
+        // Log the exact interpreter (sidecar needs mediapipe/opencv/numpy —
+        // see requirements.txt next to mediapipe_server.py).
+        let mut probe = Command::new(&python_prog);
+        probe.args(&python_args).arg("--version");
+        let ver = probe
+            .output()
+            .map(|o| {
+                let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
+                if s.trim().is_empty() {
+                    s = String::from_utf8_lossy(&o.stderr).into_owned();
+                }
+                s.lines().next().unwrap_or("unknown").trim().to_string()
+            })
+            .unwrap_or_else(|_| "not runnable".to_string());
+        if let Ok(mut s) = state.lock() {
+            s.push_log(format!("mediapipe python: {python_prog} {ver}"));
+        }
+    }
+    let mut child = match Command::new(&python_prog)
+        .args(&python_args)
         .arg(&script_path)
         // Stdout is discarded (not piped): an undrained pipe would fill its
         // 64KB buffer and wedge the child. Stderr is drained below.
@@ -282,6 +323,57 @@ fn spawn_mediapipe_server(state: &SharedState) -> (Option<MediapipeClient>, Opti
     }
 }
 
+/// Resolve the Python interpreter: `$PYTHON` first, then the Windows `py -3`
+/// launcher, then plain `python`. Returns (program, extra args).
+fn python_command() -> (String, Vec<String>) {
+    if let Ok(p) = std::env::var("PYTHON") {
+        if !p.trim().is_empty() {
+            return (p, vec![]);
+        }
+    }
+    for (prog, args) in [("py", vec!["-3"]), ("python", vec![])] {
+        let ok = Command::new(prog)
+            .args(&args)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            return (
+                prog.to_string(),
+                args.into_iter().map(str::to_string).collect(),
+            );
+        }
+    }
+    ("python".to_string(), vec![])
+}
+
+/// Startup ffmpeg check (F42): the preview decoder shells out to ffmpeg, so
+/// a missing binary means a permanently dark preview pill. Log-only, with
+/// the install hint — no vendoring.
+fn log_ffmpeg_version(state: &SharedState) {
+    match Command::new("ffmpeg").arg("-version").output() {
+        Ok(out) if out.status.success() => {
+            let first = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .next()
+                .unwrap_or("ffmpeg")
+                .trim()
+                .to_string();
+            if let Ok(mut s) = state.lock() {
+                s.push_log(format!("preview ffmpeg: {first}"));
+            }
+        }
+        _ => {
+            if let Ok(mut s) = state.lock() {
+                s.push_log(
+                    "ffmpeg not found on PATH — preview stays dark; install via `winget install ffmpeg`".into(),
+                );
+            }
+        }
+    }
+}
+
 /// The bridge's brain, independent of any UI. `AppCore` is cheap to clone —
 /// each clone shares the same `Arc<Mutex<AppState>>`, so the UI, the REST
 /// server and the network threads all observe one consistent state.
@@ -322,6 +414,52 @@ impl AppCore {
 
         net::driver::spawn(state.clone());
         net::phone::spawn(state.clone());
+
+        // The shipped binary also drains the driver's SHM status ring (50 ms
+        // thread, same cadence as the bridge-ui worker): without this, nobody
+        // reads SHM in the product config — the bridge would be UDP-only and
+        // driver telemetry/pose frames would pile up unread.
+        {
+            let shm_state = state.clone();
+            thread::spawn(move || {
+                let mut svc: Option<bridge_core::shm::ShmService> = None;
+                loop {
+                    if svc.is_none() {
+                        match bridge_core::shm::ShmService::open(
+                            bridge_shm::protocol::DEFAULT_REGION_SIZE,
+                        ) {
+                            Ok(s) => {
+                                svc = Some(s);
+                                if let Ok(mut st) = shm_state.lock() {
+                                    st.push_log("shm: attached to driver status region".into());
+                                }
+                            }
+                            Err(_) => {
+                                // Driver not up yet; retry at 1 Hz, not 20 Hz.
+                                std::thread::sleep(std::time::Duration::from_secs(1));
+                                continue;
+                            }
+                        }
+                    }
+                    if let Some(s) = svc.as_mut() {
+                        let msgs = s.drain();
+                        if !msgs.is_empty() {
+                            crate::debug_log!(
+                                &shm_state,
+                                "[shm] drained {} msgs (write_seq={})",
+                                msgs.len(),
+                                s.last_write_seq
+                            );
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            });
+        }
+
+        // Startup dependency checks (log-only, never fatal): preview needs
+        // ffmpeg on PATH, hand tracking needs the Python sidecar.
+        log_ffmpeg_version(&state);
 
         // Spawn the Python MediaPipe server and connect via TCP.
         let (mediapipe_client, mediapipe_proc) = spawn_mediapipe_server(&state);
@@ -604,24 +742,46 @@ impl AppCore {
 
         let frame_slot = self.preview_frame.clone();
 
-        // Bind the UDP socket that the driver sends the preview stream to.
-        let socket = match UdpSocket::bind("127.0.0.1:42069") {
-            Ok(s) => s,
-            Err(e) => {
-                self.push_log(format!("preview bind failed (port 42069): {e}"));
-                return;
+        // Bind the UDP socket that the driver sends the preview stream to,
+        // with backoff: a stale bridge/Python preview tap may still hold it.
+        let socket = {
+            let mut bound = None;
+            for attempt in 0..6 {
+                match UdpSocket::bind("127.0.0.1:42069") {
+                    Ok(s) => {
+                        bound = Some(s);
+                        break;
+                    }
+                    Err(e) => {
+                        if attempt == 5 {
+                            let holder = crate::net::mediapipe::listen_pid(VIDEO_PORT)
+                                .map(|pid| format!(" (held by PID {pid})"))
+                                .unwrap_or_default();
+                            self.push_log(format!(
+                                "preview bind failed (port 42069): {e}{holder} — free the port and restart"
+                            ));
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                }
             }
+            bound.expect("preview socket bound above")
         };
         socket.set_nonblocking(true).ok();
 
         // Spawn ffmpeg: raw Annex-B H.264 in → scaled RGBA rawvideo out.
+        let vf = format!("scale={PREVIEW_W}:{PREVIEW_H}");
         let mut child = match Command::new("ffmpeg")
             .args([
                 "-f", "h264",
                 "-probesize", "32768",
                 "-analyzeduration", "0",
                 "-i", "pipe:0",
-                "-vf", "scale=480:270",
+                "-vf",
+            ])
+            .arg(&vf)
+            .args([
                 "-f", "rawvideo",
                 "-pix_fmt", "rgba",
                 "-v", "0",
@@ -642,8 +802,8 @@ impl AppCore {
         let mut stdin = child.stdin.take().expect("ffmpeg stdin");
         let mut stdout = child.stdout.take().expect("ffmpeg stdout");
 
-        let frame_w: u32 = 480;
-        let frame_h: u32 = 270;
+        let frame_w: u32 = PREVIEW_W;
+        let frame_h: u32 = PREVIEW_H;
         let frame_bytes = (frame_w * frame_h * 4) as usize;
 
         // Thread 1: drain all available UDP datagrams into ffmpeg stdin (non-blocking).
@@ -661,16 +821,24 @@ impl AppCore {
                         _ => break, // Would-block or error — done for this tick.
                     }
                 }
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                // 2 ms backoff instead of a 1 ms busy spin: still ~500 drain
+                // chances/s, far less CPU while the driver is idle.
+                std::thread::sleep(std::time::Duration::from_millis(2));
             }
         });
 
         // Thread 2: read complete RGBA frames from ffmpeg stdout (blocking is fine here).
         let preview_decode_cleanup = self.preview_decode.clone();
         thread::spawn(move || {
+            // Double-buffered: the full frame swaps into the UI slot while
+            // the evicted buffer becomes the next read target — steady-state
+            // zero allocation instead of one ~518 KB Vec per frame.
             let mut rgba = vec![0u8; frame_bytes];
             let mut off = 0usize;
             loop {
+                if rgba.len() < frame_bytes {
+                    rgba.resize(frame_bytes, 0);
+                }
                 // Blocking read is safe here — ffmpeg produces output whenever it
                 // has decoded a frame, and the feeder thread keeps stdin full.
                 match stdout.read(&mut rgba[off..]) {
@@ -679,10 +847,17 @@ impl AppCore {
                         off += n;
                         if off >= frame_bytes {
                             off = 0;
-                            let mut new_buf = vec![0u8; frame_bytes];
-                            std::mem::swap(&mut rgba, &mut new_buf);
                             if let Ok(mut slot) = frame_slot.lock() {
-                                *slot = Some((frame_w, frame_h, new_buf));
+                                match slot.as_mut() {
+                                    Some((_, _, old)) => std::mem::swap(&mut rgba, old),
+                                    None => {
+                                        *slot = Some((
+                                            frame_w,
+                                            frame_h,
+                                            std::mem::replace(&mut rgba, Vec::new()),
+                                        ));
+                                    }
+                                }
                             }
                         }
                     }
@@ -746,6 +921,28 @@ impl AppCore {
         StatusSnapshot::from(s.deref())
     }
 
+    /// Live session values backing POST /settings partial bodies: missing
+    /// fields keep what the driver actually got, never the compiled
+    /// `APPLIED_DEFAULTS` (a `{}` body is a no-op, not a reset).
+    pub fn applied_settings(&self) -> (i32, i32, i32, i32, String) {
+        match self.state.lock() {
+            Ok(s) => (
+                s.applied_width,
+                s.applied_height,
+                s.applied_fps,
+                s.applied_bitrate_mbps,
+                s.encoder_name.clone(),
+            ),
+            Err(_) => (
+                APPLIED_DEFAULTS.0,
+                APPLIED_DEFAULTS.1,
+                APPLIED_DEFAULTS.2,
+                APPLIED_DEFAULTS.3,
+                "gpu".into(),
+            ),
+        }
+    }
+
     /// Newest-first log lines. The REST/UI consumers reverse the ring so the
     /// most recent entry is always first.
     pub fn logs(&self, n: usize) -> Vec<String> {
@@ -802,10 +999,20 @@ fn install_driver_files() -> Result<String, String> {
         let _ = std::fs::remove_file(&tmp_dll);
         return Err(format!("copy to {tmp_dll}: {e}"));
     }
-    if let Err(e) = std::fs::rename(&tmp_dll, &target_dll) {
-        let _ = std::fs::remove_file(&tmp_dll);
-        return Err(format!("rename {tmp_dll} -> {target_dll}: {e}"));
-    }
+    // Retry while SteamVR holds the loaded DLL open; the error names the
+    // lock so "access denied" becomes actionable.
+    bridge_core::driver_deps::replace_locked(
+        std::path::Path::new(&tmp_dll),
+        std::path::Path::new(&target_dll),
+    )?;
+
+    // Runtime deps: the driver links the pinned FFmpeg majors — install the
+    // exact set from deps.json (fails with the expected names when the
+    // vendored shared build is absent, never a silent dead driver).
+    let ffmpeg_dlls = bridge_core::driver_deps::install_ffmpeg_dlls(
+        Path::new(&target_dir),
+        false,
+    )?;
 
     // Ship the manifest + bindings for a from-scratch install.
     let src_root = Path::new(&src)
@@ -833,7 +1040,12 @@ fn install_driver_files() -> Result<String, String> {
         );
     }
 
-    Ok(format!("installed driver into {target_dir}"))
+    Ok(format!(
+        "installed driver into {target_dir} (+ {} FFmpeg {} DLLs: {})",
+        ffmpeg_dlls.len(),
+        bridge_core::driver_deps::ffmpeg_version(),
+        ffmpeg_dlls.join(", ")
+    ))
 }
 
 #[cfg(test)]
@@ -893,6 +1105,18 @@ mod tests {
         assert!(test_pos < hand_pos);
         assert!(hand_pos < install_pos);
         assert!(install_pos < present_pos);
+        // Full applied session is appended after the wizard state.
+        let applied_w = json.find("applied_width").unwrap();
+        let applied_h = json.find("applied_height").unwrap();
+        let applied_fps = json.find("applied_fps").unwrap();
+        assert!(present_pos < applied_w);
+        assert!(applied_w < applied_h);
+        assert!(applied_h < applied_fps);
+        // Component versions are appended last (never reordered).
+        let driver_ver = json.find("driver_version").unwrap();
+        let phone_ver = json.find("phone_version").unwrap();
+        assert!(applied_fps < driver_ver);
+        assert!(driver_ver < phone_ver);
     }
 
     #[test]

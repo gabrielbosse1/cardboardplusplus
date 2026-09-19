@@ -43,12 +43,7 @@ public:
     // number written, or 0 if the server is not running.
     uint64_t Publish(uint32_t msgType, const void* payload, uint32_t payloadLen);
 
-    uint64_t PublishPose(const PayloadPose& p) { return Publish(MT_POSE, &p, sizeof(p)); }
     uint64_t PublishTelemetry(const PayloadTelemetry& t);
-    uint64_t PublishFrameSubmitted(const PayloadFrameSubmitted& f) { return Publish(MT_FRAME_SUBMITTED, &f, sizeof(f)); }
-    uint64_t PublishTextureSetCreated(const PayloadTextureSetCreated& t) { return Publish(MT_TEXTURE_SET_CREATED, &t, sizeof(t)); }
-    uint64_t PublishControllerInput(const PayloadControllerInput& c) { return Publish(MT_CONTROLLER_INPUT, &c, sizeof(c)); }
-    uint64_t PublishCapReported(const PayloadCapReported& c) { return Publish(MT_CAP_REPORTED, &c, sizeof(c)); }
 
     // Convenience status telemetry: publishes a TELEMETRY message from a struct.
     void PublishStatus();

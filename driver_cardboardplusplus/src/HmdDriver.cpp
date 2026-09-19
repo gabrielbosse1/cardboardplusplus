@@ -3,7 +3,6 @@
 #include "DebugLog.h"
 #include "CardboardWire.h"
 #include <chrono>
-#include <cmath>
 #include <cstring>
 #include <fstream>
 
@@ -26,10 +25,6 @@ using namespace vr;
 
 EVRInitError HmdDriver::Activate(uint32_t unObjectId)
 {
-    // When I wrote this code, only God and I understood it.
-    // Now only God understands it.
-    // If you're an atheist, good luck.
-    // I even managed to somehow get the error "'cannot open file 'kernel32.lib'"
     m_driverId = unObjectId;
     m_encoderInitialized = false;
     m_encoderPts = 0;
@@ -37,7 +32,8 @@ EVRInitError HmdDriver::Activate(uint32_t unObjectId)
     m_hasSubmit = false;
     m_udpSocket = INVALID_SOCKET;
     m_udpInitialized = false;
-    m_udpDroppedFrames = 0;
+    m_udpDroppedPreview = 0;
+    m_udpDroppedPhone = 0;
     m_discoverySocket = INVALID_SOCKET;
     m_discoveryInitialized = false;
     m_discoveryRunning = false;
@@ -48,6 +44,14 @@ EVRInitError HmdDriver::Activate(uint32_t unObjectId)
     m_frameQueued = false;
     m_encodeDone = true;
     m_pendingFrame = { nullptr, nullptr, 0, false };
+    // Session-state reset (L14 + R3): a stream-OFF from the bridge must not
+    // stick across SteamVR reloads, and stale submit/present counters must not
+    // leak from a previous session. No settings received yet means ON.
+    m_streamEnabled.store(1, std::memory_order_relaxed);
+    m_presentCount = 0;
+    m_lastPresentLogNs = 0;
+    m_lastHeartbeatNs = 0;
+    m_submitLayers.clear();
 
     DriverLog("HmdDriver::Activate called");
 
@@ -253,10 +257,11 @@ DriverPose_t HmdDriver::GetPose()
     pose.qWorldFromDriverRotation.y = 0.0;
     pose.qWorldFromDriverRotation.z = 0.0;
 
-    // Staleness watchdog: if no sensor packet has arrived for kSensorStaleMs, the
-    // phone/bridge link is gone. Report the pose as invalid rather than freezing on
-    // the last sample (which previously made SteamVR show a "tracking" but dead headset).
-    // ponytail: accel (0x10) is a continuous sensor, so a 2s gap means the link truly died.
+    // Staleness watchdog: if no sensor packet (gyro 0x10 or rotation 0x12) has
+    // arrived for kSensorStaleMs, the phone/bridge link is gone. Report the
+    // pose as invalid rather than freezing on the last sample (which previously
+    // made SteamVR show a "tracking" but dead headset).
+    // ponytail: 0x10/0x12 are continuous sensors, so a 2s gap means the link truly died.
     static constexpr int64_t kSensorStaleMs = 2000;
     const int64_t lastRecv = m_lastSensorRecvMs.load(std::memory_order_relaxed);
     const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -266,7 +271,6 @@ DriverPose_t HmdDriver::GetPose()
     const bool rotFresh = lastRot != 0 && (nowMs - lastRot) < kSensorStaleMs;
 
     bool hasQ = rotFresh && m_hasQuaternion.load(std::memory_order_relaxed);
-    bool hasS = fresh && m_hasSensorData.load(std::memory_order_relaxed);
 
     if (!fresh) {
         pose.poseIsValid = false;
@@ -292,14 +296,15 @@ DriverPose_t HmdDriver::GetPose()
         quat.x = m_sensorQuat[1];
         quat.y = m_sensorQuat[2];
         quat.z = m_sensorQuat[3];
-    } else {
-        static auto startTime = std::chrono::steady_clock::now();
-        auto now = std::chrono::steady_clock::now();
-        double elapsed = std::chrono::duration<double>(now - startTime).count();
-        pose.vecPosition[0] = (float)(sin(elapsed * 1.5) * 0.01);
-        pose.vecPosition[1] = (float)(sin(elapsed * 2.0) * 0.02);
     }
+    // No quaternion yet: keep identity rotation (a valid gyro-gated pose).
+    // Never synthesize motion here — the old sine-wave bob made the HMD drift
+    // on top of real tracking (H8).
 
+    // qRotation carries the live head orientation. qDriverFromHeadRotation is
+    // the fixed body-to-head offset (identity here) — the runtime composes
+    // all three transforms, so putting quat in both would apply head rotation
+    // twice. (Valve's simplehmd sample likewise keeps it identity.)
     pose.qDriverFromHeadRotation.w = 1.0;
     pose.qDriverFromHeadRotation.x = 0.0;
     pose.qDriverFromHeadRotation.y = 0.0;
@@ -374,7 +379,10 @@ void HmdDriver::GetEyeOutputViewport( EVREye eEye, uint32_t *pnX, uint32_t *pnY,
 
 void HmdDriver::GetProjectionRaw( EVREye eEye, float *pfLeft, float *pfRight, float *pfTop, float *pfBottom )
 {
-	// Return a simple symmetric projection for now. These values can be adjusted to change the FOV and aspect ratio.
+	// Simple symmetric projection. NOTE (M2_audit): top/bottom sign convention
+	// is UNVERIFIED — openvr_driver.h documents no convention, and swapping
+	// blindly risks an upside-down image. Verify with a SteamVR test pattern
+	// (top marker must appear up) before touching these values.
     *pfLeft = -1.0;
     *pfRight = 1.0;
     *pfTop = -1.0;
@@ -411,71 +419,24 @@ void HmdDriver::RunBridgeHeartbeat()
 
 void HmdDriver::ApplyStreamSettings(const cbpp::PayloadSettingsChange& settings)
 {
-    std::lock_guard<std::mutex> lock(m_encoderMutex);
-
-    m_streamEnabled.store(settings.stream_enabled ? 1 : 0, std::memory_order_relaxed);
+    // Bridge is the single on/off switch: log every transition (H2).
+    int newStream = settings.stream_enabled ? 1 : 0;
+    int oldStream = m_streamEnabled.exchange(newStream, std::memory_order_relaxed);
+    if (newStream != oldStream) {
+        DriverLog("Bridge stream switch: %s -> %s",
+                  oldStream ? "ON" : "OFF", newStream ? "ON" : "OFF");
+    }
     DriverLog("Bridge settings (seq=%llu): %ux%u @%u fps, %u kbps, encoder=%u, stream=%s",
               (unsigned long long)settings.seq, settings.width, settings.height, settings.fps,
               settings.bitrate_kbps, settings.encoder,
               settings.stream_enabled ? "ON" : "OFF");
 
-    bool oldGpu = m_encoderUseGpu;
-    int oldW = m_encoderW;
-    int oldH = m_encoderH;
-    int oldFps = m_encoderFps;
-    int oldBitrate = m_encoderBitrate;
-
-    m_encoderW = (int)settings.width;
-    m_encoderH = (int)settings.height;
-    m_encoderFps = (int)settings.fps;
-    m_encoderBitrate = (int)settings.bitrate_kbps * 1000;
-    m_encoderUseGpu = (settings.encoder != 0);
-    ClampEncoderToCap();
-
-    if (!m_encoderInitialized || !m_pVideoEncoder) {
-        DriverLog("Bridge settings stored; encoder not up yet, applied on init.");
-        return;
-    }
-
-    bool meaningful = (m_encoderW != oldW || m_encoderH != oldH || m_encoderFps != oldFps ||
-                       m_encoderBitrate != oldBitrate || m_encoderUseGpu != oldGpu);
-    if (!meaningful)
-        return;
-
-    DriverLog("Re-initializing encoder at %dx%d @%d fps, %d kbps, gpu=%d (from bridge settings)",
-              m_encoderW, m_encoderH, m_encoderFps, m_encoderBitrate / 1000, m_encoderUseGpu ? 1 : 0);
-
-    m_pVideoEncoder->Shutdown();
-    delete m_pVideoEncoder;
-    m_pVideoEncoder = nullptr;
-    m_encoderInitialized = false;
-
-    m_pVideoEncoder = new VideoEncoder();
-    if (!m_pVideoEncoder) {
-        DriverLog("Failed to allocate VideoEncoder during bridge settings re-init!");
-        return;
-    }
-
-    m_pVideoEncoder->SetEncodedPacketCallback([this](uint8_t* data, int size, int64_t pts, bool keyframe) {
-        OnEncodedPacket(data, size, pts, keyframe);
-    });
-    m_pVideoEncoder->SetTelemetryCallback([this](const cbpp::PayloadTelemetry& t) {
-        if (m_bridgeInitialized.load(std::memory_order_relaxed) && m_bridgeServer.running()) {
-            m_bridgeServer.PublishTelemetry(t);
-        }
-    });
-
-    if (!m_pVideoEncoder->Initialize(m_pD3D11Device, m_pD3D11DeviceContext,
-                                     m_encoderW, m_encoderH, m_encoderFps, m_encoderBitrate, m_encoderUseGpu)) {
-        DriverLog("VideoEncoder re-init failed under bridge settings!");
-        delete m_pVideoEncoder;
-        m_pVideoEncoder = nullptr;
-        return;
-    }
-
-    m_encoderInitialized = true;
-    m_encoderPts = 0;
-    DriverLog("Encoder re-initialized at %dx%d from bridge settings", m_encoderW, m_encoderH);
+    // bitrate_kbps is u32: clamp before *1000 so the int multiply can't overflow
+    // (H5). Out-of-range fps/bitrate are rejected inside ApplyEncoderSettings.
+    int bps = (settings.bitrate_kbps >= 1 && settings.bitrate_kbps <= 100000)
+        ? (int)settings.bitrate_kbps * 1000 : -1;
+    ApplyEncoderSettings((int)settings.width, (int)settings.height, (int)settings.fps,
+                         bps, settings.encoder != 0, "bridge-settings");
 }
 
 bool HmdDriver::InitializeBridge()

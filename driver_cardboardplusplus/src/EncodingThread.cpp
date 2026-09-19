@@ -79,8 +79,9 @@ void HmdDriver::EncodePendingFrame(const PendingFrame& frame)
         return;
     }
 
-    // Release shared textures before CPU work.
-    m_pVideoEncoder->ReleaseEyeTextures();
+    // No ReleaseEyeTextures on the success path: the opened textures stay
+    // cached in the encoder while the handles are unchanged (M9). They are
+    // released on handle change, error paths below, or Shutdown.
 
     // Phase 2: CPU work — BGRA→NV12 conversion + H264 encode + UDP send.
     if (!m_pVideoEncoder->SwsConvert()) {

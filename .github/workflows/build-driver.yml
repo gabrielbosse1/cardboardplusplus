@@ -15,9 +15,19 @@ jobs:
         configuration: [Debug, Release]
     steps:
     - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0 # DriverVersion.h is baked from rev-list --count
 
     - name: Add MSBuild to PATH
       uses: microsoft/setup-msbuild@v2
+
+    - name: Bake commit count into DriverVersion.h
+      run: |
+        $count = (git rev-list --count HEAD).Trim()
+        Set-Content -LiteralPath driver_cardboardplusplus\include\DriverVersion.h -Value '#pragma once
+        #define DRIVER_BUILD_VERSION "' + $count + '"
+        '
+      shell: pwsh
 
     - name: Build Driver
       run: msbuild driver_cardboardplusplus\driver_cardboardplusplus.sln /p:Configuration=${{ matrix.configuration }} /p:Platform=x64 /p:PlatformToolset=v143

@@ -577,10 +577,15 @@ fn install_driver(cfg: BridgeConfig) -> Result<String, String> {
         let _ = std::fs::remove_file(&tmp_dll);
         return Err(format!("copy to {}: {e}", tmp_dll));
     }
-    if let Err(e) = std::fs::rename(&tmp_dll, &target_dll) {
-        let _ = std::fs::remove_file(&tmp_dll);
-        return Err(format!("rename {} -> {}: {e}", tmp_dll, target_dll));
-    }
+    // Retry while SteamVR holds the loaded DLL open; the error names the
+    // lock so "access denied" becomes actionable.
+    bridge_core::driver_deps::replace_locked(Path::new(&tmp_dll), Path::new(&target_dll))?;
+
+    // Runtime deps: the driver links the pinned FFmpeg majors — install the
+    // exact set from deps.json (fails with the expected names when the
+    // vendored shared build is absent, never a silent dead driver).
+    let ffmpeg_dlls = bridge_core::driver_deps::install_ffmpeg_dlls(Path::new(&target), false)?;
+    info!("installed FFmpeg runtimes: {}", ffmpeg_dlls.join(", "));
 
     // Ship the manifest + bindings for a from-scratch install.
     let src_root = Path::new(&cfg.driver_dll_src)
@@ -608,7 +613,12 @@ fn install_driver(cfg: BridgeConfig) -> Result<String, String> {
                                   .join("driver.vrdrivermanifest"));
     }
 
-    Ok(format!("installed driver into {}", target))
+    Ok(format!(
+        "installed driver into {} (+ {} FFmpeg {} DLLs)",
+        target,
+        ffmpeg_dlls.len(),
+        bridge_core::driver_deps::ffmpeg_version()
+    ))
 }
 
 fn install_apk(cfg: BridgeConfig) -> Result<String, String> {

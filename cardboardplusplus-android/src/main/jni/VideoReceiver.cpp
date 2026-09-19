@@ -8,7 +8,12 @@
 #include <vector>
 
 #define LOG_TAG "VideoReceiver"
+// Debug logs compile out in release (NDEBUG). Warnings and errors always fire.
+#ifdef NDEBUG
+#define LOGD(...) ((void)0)
+#else
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+#endif
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 
@@ -72,6 +77,9 @@ void VideoReceiver::Stop() {
     socket_fd_ = -1;
   }
 
+  // Wake the forwarding thread out of WaitAndGetFrame so join() can't hang.
+  frame_cv_.notify_all();
+
   if (receive_thread_.joinable()) {
     receive_thread_.join();
   }
@@ -84,7 +92,7 @@ bool VideoReceiver::HasFrame() {
   return !frame_queue_.empty();
 }
 
-bool VideoReceiver::GetFrame(uint8_t** data, int* size) {
+bool VideoReceiver::GetFrame(uint8_t** data, int* size, bool* is_key) {
   std::lock_guard<std::mutex> lock(buffer_mutex_);
 
   if (frame_queue_.empty()) {
@@ -92,10 +100,11 @@ bool VideoReceiver::GetFrame(uint8_t** data, int* size) {
   }
 
   // Move the oldest queued frame into current_frame_ so the returned pointer
-  // stays valid until the next GetFrame call (the caller decodes it
+  // stays valid until the next GetFrame call (the caller forwards it
   // synchronously within that window, same contract as before).
   current_frame_ = std::move(frame_queue_.front());
   frame_queue_.pop_front();
+  current_is_key_ = frame_is_key_.front();
   frame_is_key_.pop_front();
 
   if (current_frame_.empty()) {
@@ -104,6 +113,30 @@ bool VideoReceiver::GetFrame(uint8_t** data, int* size) {
 
   *data = current_frame_.data();
   *size = static_cast<int>(current_frame_.size());
+  if (is_key) *is_key = current_is_key_;
+
+  return true;
+}
+
+bool VideoReceiver::WaitAndGetFrame(uint8_t** data, int* size, bool* is_key) {
+  std::unique_lock<std::mutex> lock(buffer_mutex_);
+  frame_cv_.wait(lock, [this] { return !frame_queue_.empty() || !running_; });
+  if (frame_queue_.empty()) {
+    return false;  // Stopped with nothing queued.
+  }
+
+  current_frame_ = std::move(frame_queue_.front());
+  frame_queue_.pop_front();
+  current_is_key_ = frame_is_key_.front();
+  frame_is_key_.pop_front();
+
+  if (current_frame_.empty()) {
+    return false;
+  }
+
+  *data = current_frame_.data();
+  *size = static_cast<int>(current_frame_.size());
+  if (is_key) *is_key = current_is_key_;
 
   return true;
 }
@@ -133,8 +166,11 @@ void VideoReceiver::MaybeSendKeyframeNack() {
 void VideoReceiver::ReceiveLoop() {
   LOGD("Receive loop started, waiting for data...");
 
-  // Reassembly buffer for length-prefixed frames.
+  // Reassembly buffer for length-prefixed frames. buf_head_ marks consumed
+  // bytes so fully-arrived frames advance an offset instead of memmove-ing
+  // the whole remainder (compaction only when the head grows large).
   std::vector<uint8_t> buffer;
+  size_t buf_head_ = 0;
   std::vector<uint8_t> packet_buffer(kMaxPacketSize);
 
   while (running_) {
@@ -170,32 +206,53 @@ void VideoReceiver::ReceiveLoop() {
     // Wire format per frame: a 4-byte big-endian length N, followed by N
     // payload bytes. Each payload is exactly one libx264 AVPacket, i.e. one
     // full encoded frame (a keyframe packet carries SPS+PPS+all IDR slices; a
-    // P-frame packet carries all its slices). Feeding the whole packet to the
-    // decoder at once lets FFmpeg assemble multi-slice frames correctly,
-    // instead of the old behaviour that split every NAL into its own access
-    // unit (so only the last slice of an IDR keyframe survived).
-    while (buffer.size() >= 4) {
-      size_t frame_len = ((size_t)buffer[0] << 24) |
-                         ((size_t)buffer[1] << 16) |
-                         ((size_t)buffer[2] << 8) |
-                         ((size_t)buffer[3]);
+    // P-frame packet carries all its slices). The whole packet is queued for
+    // the Java MediaCodec instead of splitting NALs into access units (so
+    // only the last slice of an IDR keyframe would survive).
+    while (buffer.size() - buf_head_ >= 4) {
+      const uint8_t* base = buffer.data() + buf_head_;
+      size_t frame_len = ((size_t)base[0] << 24) |
+                         ((size_t)base[1] << 16) |
+                         ((size_t)base[2] << 8) |
+                         ((size_t)base[3]);
 
-      if (frame_len == 0 || frame_len > kMaxFrameSize) {
+      if (frame_len == 0 || frame_len > (size_t)kMaxFrameSize) {
         // Invalid length: stream desynced (e.g. a UDP datagram was lost).
         // Drop the buffer and resync from the next datagram.
         LOGE("Invalid frame length %zu, resetting reassembly buffer", frame_len);
         buffer.clear();
+        buf_head_ = 0;
         MaybeSendKeyframeNack();
         break;
       }
 
-      if (buffer.size() < 4 + frame_len) {
-        // Frame not fully arrived yet; wait for more datagrams.
+      if (buffer.size() - buf_head_ < 4 + frame_len) {
+        // Frame not fully arrived yet; if the backlog already exceeds the
+        // largest plausible frame, we missed its length prefix long ago —
+        // desync now instead of buffering megabytes. Otherwise wait for more
+        // datagrams.
+        if (buffer.size() - buf_head_ > (size_t)kMaxFrameSize) {
+          LOGE("Reassembly backlog %zu exceeds max frame, resyncing",
+               buffer.size() - buf_head_);
+          buffer.clear();
+          buf_head_ = 0;
+          MaybeSendKeyframeNack();
+          break;
+        }
         break;
       }
 
-      std::vector<uint8_t> frame(buffer.begin() + 4, buffer.begin() + 4 + frame_len);
-      buffer.erase(buffer.begin(), buffer.begin() + 4 + frame_len);
+      std::vector<uint8_t> frame(base + 4, base + 4 + frame_len);
+      buf_head_ += 4 + frame_len;
+      // Compact only when the consumed head is large, keeping the common
+      // case a pointer bump with no memmove.
+      if (buf_head_ == buffer.size()) {
+        buffer.clear();
+        buf_head_ = 0;
+      } else if (buf_head_ > 1024 * 1024) {
+        buffer.erase(buffer.begin(), buffer.begin() + buf_head_);
+        buf_head_ = 0;
+      }
 
       // Detect keyframes by scanning the whole payload for any SPS(7) or
       // IDR(5) NAL. libx264 emits AUD(9) before a keyframe, so checking only
@@ -251,6 +308,7 @@ void VideoReceiver::ReceiveLoop() {
         }
         frame_queue_.push_back(std::move(frame));
         frame_is_key_.push_back(is_key);
+        frame_cv_.notify_one();
         LOGD("Queued frame, payload=%zu, key=%d, queue_size=%zu", frame_len, is_key, frame_queue_.size());
       }
     }

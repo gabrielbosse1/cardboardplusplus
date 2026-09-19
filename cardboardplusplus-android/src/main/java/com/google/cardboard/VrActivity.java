@@ -39,10 +39,10 @@ import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
 
 import com.google.cardboard.camera.CameraController;
-import com.google.cardboard.codec.CodecSelector;
 import com.google.cardboard.core.AppConstants;
 import com.google.cardboard.core.DebugLog;
 import com.google.cardboard.discovery.DiscoveryManager;
+import com.google.cardboard.network.NetworkUtils;
 import com.google.cardboard.permissions.PermissionManager;
 import com.google.cardboard.render.VrRenderer;
 import com.google.cardboard.settings.AppSettings;
@@ -81,9 +81,6 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
   private VideoManager videoManager;
   private DiscoveryManager discoveryManager;
   private AppSettings appSettings;
-  // Wired now so the future PC-side streaming / codec-selection pipeline has its
-  // dependencies ready; neither is started in this version (see CameraStreamer).
-  private CodecSelector codecSelector;
   private CameraStreamer cameraStreamer;
   private TelemetrySender telemetrySender;
 
@@ -120,21 +117,30 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
     appSettings = new AppSettings(this);
     DebugLog.setGlobalEnabled(appSettings.isDebugLogging());
     DBG.i("VrActivity created, debug=%b", appSettings.isDebugLogging());
-    codecSelector = new CodecSelector(appSettings);
+    NetworkUtils.init(getApplicationContext());
     cameraStreamer = new CameraStreamer(appSettings);
     telemetrySender = new TelemetrySender(this, appSettings);
     permissionManager = new PermissionManager(this);
     cameraController = new CameraController(this, this);
     videoManager = new VideoManager(this, appSettings);
+    videoManager.setTelemetrySender(telemetrySender);
     discoveryManager = new DiscoveryManager(appSettings);
-    // Pre-query the hardware decoder cap so the DiscoveryManager can announce it
-    // to the driver on the first ACK (using the same socket that proved connectivity).
-    int[] decoderCap = videoManager.queryDecoderCap();
-    discoveryManager.setDecoderCap(decoderCap[0], decoderCap[1]);
-    DBG.i("Decoder cap: %dx%d", decoderCap[0], decoderCap[1]);
+    // Query the hardware decoder cap off the UI thread (MediaCodecList.ALL can
+    // block); DiscoveryManager announces it to the driver once known.
+    // If discovery ACKs arrive first, the CAP re-announce (every 60 ACKs)
+    // picks the cap up later — unset (0x0) is never announced.
+    new Thread(
+        () -> {
+          int[] decoderCap = videoManager.queryDecoderCap();
+          discoveryManager.setDecoderCap(decoderCap[0], decoderCap[1]);
+          DBG.i("Decoder cap: %dx%d", decoderCap[0], decoderCap[1]);
+        },
+        "decoder-cap-query")
+        .start();
     // If the video stream stalls (e.g. SteamVR restarted behind the running phone),
-    // re-broadcast discovery so the PC driver re-routes video to this phone.
-    videoManager.setReconnectAction(() -> discoveryManager.startDiscovery());
+    // poke a single discovery+CAP on the live socket so the PC driver re-routes
+    // video to this phone (falls back to full discovery if no socket is live).
+    videoManager.setReconnectAction(() -> discoveryManager.pokeNow());
 
     setContentView(R.layout.activity_vr);
     glView = findViewById(R.id.surface_view);
@@ -358,7 +364,7 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
 
   /** Callback for when close button is pressed. */
   public void closeSample(View view) {
-    Log.d(TAG, "Leaving VR sample");
+    if (BuildConfig.DEBUG) Log.d(TAG, "Leaving VR sample");
     finish();
   }
 
@@ -403,8 +409,13 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
         Log.i(TAG, "Camera permission granted, starting session");
         startSession();
       } else {
+        // Mirror the storage path: a permanent denial needs the Settings
+        // redirect, a plain denial just needs the explanation toast.
         Toast.makeText(this, "Camera permission is required for passthrough", Toast.LENGTH_LONG)
             .show();
+        if (!permissionManager.shouldShowCameraRationale()) {
+          launchPermissionsSettings();
+        }
       }
     }
   }
@@ -454,15 +465,9 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
 
   private native void nativeResetCameraTexture(long nativeApp);
 
-  private native void nativeSetEyeTexture(long nativeApp, int eye, int textureId);
-
   private native void nativeStartVideoReceiver(long nativeApp, int port);
 
   private native void nativeStopVideoReceiver(long nativeApp);
-
-  private native void nativeUpdateVideoTexture(long nativeApp);
-
-  private native boolean nativeHasVideoFrame(long nativeApp);
 
   // ---------------------------------------------------------------------------
   // NativeBridge implementation
@@ -539,11 +544,6 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
   }
 
   @Override
-  public void setEyeTexture(int eye, int textureId) {
-    nativeSetEyeTexture(nativeApp, eye, textureId);
-  }
-
-  @Override
   public void startVideoReceiver(int port) {
     nativeStartVideoReceiver(nativeApp, port);
   }
@@ -551,15 +551,5 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
   @Override
   public void stopVideoReceiver() {
     nativeStopVideoReceiver(nativeApp);
-  }
-
-  @Override
-  public void updateVideoTexture() {
-    nativeUpdateVideoTexture(nativeApp);
-  }
-
-  @Override
-  public boolean hasVideoFrame() {
-    return nativeHasVideoFrame(nativeApp);
   }
 }

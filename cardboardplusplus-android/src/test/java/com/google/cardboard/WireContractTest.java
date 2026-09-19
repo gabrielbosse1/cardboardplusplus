@@ -31,38 +31,34 @@ public class WireContractTest {
     @Test
     public void cameraStreamerPortMatchesBridge() {
         // CameraStreamer sends JPEG frames to bridge on this port.
-        assertEquals(42072, getCameraPort());
+        assertEquals(42072, AppConstants.CAMERA_PORT);
     }
 
     @Test
     public void telemetryPortMatchesBridge() {
         // Phone sends gyro/hand/ping telemetry to bridge on this port.
-        assertEquals(42071, getTelemetryPort());
+        assertEquals(42071, AppConstants.TELEMETRY_PORT);
     }
 
     @Test
     public void discoveryMessageIsExactlyCardboardDiscovery() {
-        // The phone broadcasts "CARDBOARD_DISCOVERY" — not "CARDBOARD_CAP".
-        String msg = "CARDBOARD_DISCOVERY";
-        assertEquals("CARDBOARD_DISCOVERY", msg);
-        assertNotEquals("CARDBOARD_CAP", msg);
+        // The phone broadcasts DISCOVERY_MESSAGE — not the CAP prefix.
+        assertEquals("CARDBOARD_DISCOVERY", AppConstants.DISCOVERY_MESSAGE);
+        assertNotEquals(AppConstants.CAP_PREFIX.trim(), AppConstants.DISCOVERY_MESSAGE);
     }
 
     @Test
     public void ackResponseIsExactlyAck() {
-        // The driver replies with just "ACK" (3 bytes, no newline).
-        String ack = "ACK";
-        assertEquals(3, ack.length());
-        assertEquals("ACK", ack);
+        // The driver replies with just DISCOVERY_ACK (3 bytes, no newline).
+        assertEquals(3, AppConstants.DISCOVERY_ACK.length());
+        assertEquals("ACK", AppConstants.DISCOVERY_ACK);
     }
 
     @Test
     public void phoneHelloFormatMatchesBridgeParser() {
-        // Phone sends "CARDBOARD_PHONE_HELLO v1" on first contact.
-        int version = 1;
-        String hello = String.format("CARDBOARD_PHONE_HELLO v%d", version);
-        assertTrue(hello.startsWith("CARDBOARD_PHONE_HELLO"));
-        assertTrue(hello.endsWith("v1"));
+        // Phone sends PHONE_HELLO on first contact.
+        assertTrue(AppConstants.PHONE_HELLO.startsWith("CARDBOARD_PHONE_HELLO"));
+        assertTrue(AppConstants.PHONE_HELLO.endsWith("v1"));
     }
 
     @Test
@@ -70,11 +66,4 @@ public class WireContractTest {
         assertTrue(AppConstants.DEFAULT_CAMERA_WIDTH >= 320);
         assertTrue(AppConstants.DEFAULT_CAMERA_HEIGHT >= 240);
     }
-
-    // Port constants not in AppConstants (camera + telemetry are phone-side only)
-    private static final int CAMERA_PORT = 42072;
-    private static final int TELEMETRY_PORT = 42071;
-
-    private int getCameraPort() { return CAMERA_PORT; }
-    private int getTelemetryPort() { return TELEMETRY_PORT; }
 }

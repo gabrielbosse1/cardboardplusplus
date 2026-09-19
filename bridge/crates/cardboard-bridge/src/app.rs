@@ -16,12 +16,17 @@ pub type SharedState = Arc<Mutex<AppState>>;
 /// The log view (UI + `/logs`) only keeps this many newest lines.
 const MAX_LOG_LINES: usize = 200;
 
-/// Global debug flag. Toggle via `CARDBOARD_DEBUG=1` env var or `POST /debug`.
+/// Global debug flag. Debug builds always report enabled (see
+/// `debug_enabled`); release builds default off and opt in at runtime via
+/// `CARDBOARD_DEBUG=1`, `--debug`, or `POST /debug`. Only this flag-gated
+/// `debug_log!` output is verbose — the UI diagnostics snapshot stays live
+/// regardless.
 static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// Check if debug logging is enabled.
+/// Check if debug logging is enabled. Always true in debug builds
+/// (`cfg!(debug_assertions)`), otherwise the runtime flag above.
 pub fn debug_enabled() -> bool {
-    DEBUG_ENABLED.load(Ordering::Relaxed)
+    cfg!(debug_assertions) || DEBUG_ENABLED.load(Ordering::Relaxed)
 }
 
 /// Toggle debug logging at runtime.
@@ -37,6 +42,10 @@ pub struct AppState {
     pub driver_connected: bool,
     pub encoder_active: bool,
     pub encoder_name: String,
+    /// Commit-count version reported by the driver (`BRIDGE_ACK v1 <n>`) and
+    /// the phone (`CARDBOARD_PHONE_HELLO v1 <n>`); "unknown" until heard.
+    pub driver_version: String,
+    pub phone_version: String,
     pub phone_connected: bool,
     pub phone_ip: String,
     pub stream_fps: i32,
@@ -100,6 +109,8 @@ impl Default for AppState {
             driver_connected: false,
             encoder_active: false,
             encoder_name: "gpu".into(),
+            driver_version: "unknown".into(),
+            phone_version: "unknown".into(),
             phone_connected: false,
             phone_ip: "0.0.0.0".into(),
             stream_fps: 0,
@@ -275,9 +286,11 @@ impl AppState {
     /// The driver's periodic BRIDGE_STATS landed: update the live preview
     /// numbers the UI shows. The frames counter coming from the driver is
     /// multi-target (it counts each phone copy too), which is fine for a
-    /// monitoring display.
+    /// monitoring display. `stream_fps` is driven from here too — it is the
+    /// only live fps source the bridge has.
     pub fn note_preview_stats(&mut self, fps: i32, bitrate_kbps: i32, frames: u64, drops: u64) {
         self.preview_driver_fps = fps;
+        self.stream_fps = fps;
         self.preview_bitrate_kbps = bitrate_kbps;
         self.preview_frames = frames;
         self.preview_drops = drops;

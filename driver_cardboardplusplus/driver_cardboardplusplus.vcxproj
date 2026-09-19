@@ -29,6 +29,7 @@
     <ClInclude Include="include\VideoEncoderLog.h" />
     <ClInclude Include="include\BridgeServer.h" />
     <ClInclude Include="include\BridgeProtocol.h" />
+    <ClInclude Include="include\DriverVersion.h" />
     <ClInclude Include="include\openvr.h" />
     <ClInclude Include="include\openvr_capi.h" />
     <ClInclude Include="include\openvr_driver.h" />

@@ -8,6 +8,7 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
 #include <chrono>
 #include <netinet/in.h>
 
@@ -22,7 +23,13 @@ class VideoReceiver {
   void Stop();
 
   bool HasFrame();
-  bool GetFrame(uint8_t** data, int* size);
+  // Pops the oldest queued frame. The returned pointer stays valid until the
+  // next GetFrame/WaitAndGetFrame call; *is_key reports the keyframe flag
+  // computed once at receive time (no caller rescan needed).
+  bool GetFrame(uint8_t** data, int* size, bool* is_key);
+  // Same as GetFrame but blocks (condition variable, no polling) until a
+  // frame arrives or Stop() is called. Returns false on stop-with-empty-queue.
+  bool WaitAndGetFrame(uint8_t** data, int* size, bool* is_key);
 
  private:
   int socket_fd_;
@@ -37,11 +44,17 @@ class VideoReceiver {
   // reference (because an earlier frame was dropped) corrupts the picture
   // until the next keyframe, so we must never break a keyframe->P-frame
   // chain. frame_is_key_ parallels frame_queue_ and records whether each
-  // queued frame is a keyframe (detected from its first NAL type: SPS/IDR).
+  // queued frame is a keyframe (detected by scanning the whole payload for
+  // SPS/IDR NALs — libx264 emits AUD first, so checking only the first NAL
+  // would miss real keyframes).
   std::deque<std::vector<uint8_t>> frame_queue_;
   std::deque<bool> frame_is_key_;
   std::vector<uint8_t> current_frame_;
+  bool current_is_key_ = false;
   std::mutex buffer_mutex_;
+  // Signalled on every queue push and on Stop() so the forwarding thread
+  // blocks instead of 1ms-polling.
+  std::condition_variable frame_cv_;
 
   static const int kMaxPacketSize = 65536;
   // Upper bound for a single encoded frame. Should comfortably exceed the
@@ -55,7 +68,7 @@ class VideoReceiver {
   // oldest *complete GOPs* (keeping the newest intact GOP) so latency stays
   // bounded without corrupting the picture. Must be >= the encoder GOP size
   // (see VideoEncoder gop_size) or we would be forced to drop inside a GOP.
-  static const size_t kMaxQueueDepth = 24;
+  static const size_t kMaxQueueDepth = 8;
 
   // Loss recovery: the driver's discovery port. When reassembly desyncs (a
   // UDP datagram was lost) we send KEYFRAME_REQ here so the driver forces

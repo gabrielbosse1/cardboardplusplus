@@ -1,0 +1,5 @@
+# Bridge hand-tracking sidecar (mediapipe_server.py).
+# Install:  py -3 -m pip install -r requirements.txt
+mediapipe>=0.10.0
+opencv-python>=4.8.0
+numpy>=1.26.0

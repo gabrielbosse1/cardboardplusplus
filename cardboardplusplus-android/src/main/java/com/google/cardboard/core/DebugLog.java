@@ -1,7 +1,7 @@
 package com.google.cardboard.core;
 
 import android.util.Log;
-import com.google.cardboard.settings.AppSettings;
+import com.google.cardboard.BuildConfig;
 
 /**
  * Conditional debug logging. Every verbose log call in the app goes through
@@ -26,8 +26,10 @@ public final class DebugLog {
 
     /** Call once per session or when the user toggles the setting. */
     public void setEnabled(boolean enabled) {
+        // Instance flag only — never touch the global here, or one module's
+        // setting would clobber every other module's logging. The global flag
+        // is owned by VrActivity via setGlobalEnabled().
         this.enabled = enabled;
-        globalEnabled = enabled;
     }
 
     public boolean isEnabled() {
@@ -44,7 +46,9 @@ public final class DebugLog {
 
     /** Check the global debug flag (used by instances without explicit AppSettings). */
     private boolean isEnabledGlobal() {
-        return enabled || globalEnabled;
+        // Debug builds always debug; release builds honor the runtime toggle
+        // (SharedPreferences via VrActivity), defaulting off.
+        return BuildConfig.DEBUG || enabled || globalEnabled;
     }
 
     /** Debug-level log. Only fires when debug is enabled. */
@@ -97,15 +101,5 @@ public final class DebugLog {
     /** Error log with throwable — always fires. */
     public void e(String msg, Throwable t) {
         Log.e(tag, msg, t);
-    }
-
-    /**
-     * Create a DebugLog for the given class, reading the initial enabled
-     * state from AppSettings.
-     */
-    public static DebugLog create(Class<?> clazz, AppSettings settings) {
-        DebugLog log = new DebugLog(clazz.getSimpleName());
-        if (settings != null) log.setEnabled(settings.isDebugLogging());
-        return log;
     }
 }

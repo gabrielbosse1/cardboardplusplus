@@ -1,5 +1,6 @@
 package com.google.cardboard;
 
+import com.google.cardboard.core.AppConstants;
 import org.junit.Test;
 import static org.junit.Assert.*;
 
@@ -15,8 +16,10 @@ public class CameraStreamerTest {
     private static final int JPEG_QUALITY = 38;
     private static final int TARGET_WIDTH = 256;
     private static final int TARGET_HEIGHT = 192;
-    private static final int MAX_JPEG_SIZE = 60000;
-    private static final int SEQ_HEADER_LEN = 2;
+    // Mirrors CameraStreamer.sendFrame: drop when jpeg + 2-byte seq header exceeds the datagram.
+    private static boolean isAccepted(int jpegLen) {
+        return jpegLen + AppConstants.CAMERA_SEQ_HEADER_LEN <= AppConstants.CAMERA_MAX_DATAGRAM;
+    }
 
     @Test
     public void frameRateLimitingRejectsFastFrames() {
@@ -36,23 +39,22 @@ public class CameraStreamerTest {
 
     @Test
     public void jpegSizeGuardRejectsOversizedFrames() {
-        byte[] oversized = new byte[60001];
-        assertTrue("60001 bytes should be rejected", oversized.length > MAX_JPEG_SIZE);
-
-        byte[] exact = new byte[60000];
-        assertFalse("60000 bytes should be accepted", exact.length > MAX_JPEG_SIZE);
+        // Prod drops when jpegLen + 2 > 60000, so a 60000-byte JPEG is dropped too.
+        assertFalse("59999-byte JPEG + header exceeds the datagram", isAccepted(59999));
+        assertFalse("60000-byte JPEG + header exceeds the datagram", isAccepted(60000));
+        assertTrue("59998-byte JPEG + header exactly fits", isAccepted(59998));
     }
 
     @Test
     public void targetDimensionsAreCorrect() {
-        assertEquals(256, TARGET_WIDTH);
-        assertEquals(192, TARGET_HEIGHT);
+        assertEquals(AppConstants.CAMERA_STREAM_WIDTH, TARGET_WIDTH);
+        assertEquals(AppConstants.CAMERA_STREAM_HEIGHT, TARGET_HEIGHT);
     }
 
     @Test
     public void jpegQualityIsReasonable() {
         assertTrue("Quality should be 1-100", JPEG_QUALITY >= 1 && JPEG_QUALITY <= 100);
-        assertEquals(38, JPEG_QUALITY);
+        assertEquals(AppConstants.CAMERA_JPEG_QUALITY, JPEG_QUALITY);
     }
 
     @Test
@@ -62,7 +64,7 @@ public class CameraStreamerTest {
         byte[] payload = new byte[]{(byte) ((seq >> 8) & 0xFF), (byte) (seq & 0xFF), 0x01};
         int parsed = ((payload[0] & 0xFF) << 8) | (payload[1] & 0xFF);
         assertEquals(seq, parsed);
-        assertEquals(SEQ_HEADER_LEN, 2);
+        assertEquals(AppConstants.CAMERA_SEQ_HEADER_LEN, 2);
     }
 
     @Test

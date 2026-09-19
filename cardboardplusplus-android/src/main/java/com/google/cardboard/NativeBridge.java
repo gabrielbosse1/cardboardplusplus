@@ -38,13 +38,7 @@ public interface NativeBridge {
 
   void resetCameraTexture();
 
-  void setEyeTexture(int eye, int textureId);
-
   void startVideoReceiver(int port);
 
   void stopVideoReceiver();
-
-  void updateVideoTexture();
-
-  boolean hasVideoFrame();
 }

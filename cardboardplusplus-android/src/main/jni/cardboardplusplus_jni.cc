@@ -126,11 +126,6 @@ JNI_METHOD(void, nativeResetCameraTexture)
   native(native_app)->ResetCameraTexture();
 }
 
-JNI_METHOD(void, nativeSetEyeTexture)
-(JNIEnv* /*env*/, jobject /*obj*/, jlong native_app, jint eye, jint textureId) {
-  native(native_app)->SetEyeTexture(eye, textureId);
-}
-
 JNI_METHOD(void, nativeStartVideoReceiver)
 (JNIEnv* /*env*/, jobject /*obj*/, jlong native_app, jint port) {
   native(native_app)->StartVideoReceiver(port);
@@ -139,16 +134,6 @@ JNI_METHOD(void, nativeStartVideoReceiver)
 JNI_METHOD(void, nativeStopVideoReceiver)
 (JNIEnv* /*env*/, jobject /*obj*/, jlong native_app) {
   native(native_app)->StopVideoReceiver();
-}
-
-JNI_METHOD(jboolean, nativeHasVideoFrame)
-(JNIEnv* /*env*/, jobject /*obj*/, jlong native_app) {
-  return native(native_app)->HasVideoFrame() ? JNI_TRUE : JNI_FALSE;
-}
-
-JNI_METHOD(void, nativeUpdateVideoTexture)
-(JNIEnv* /*env*/, jobject /*obj*/, jlong native_app) {
-  native(native_app)->UpdateVideoTexture();
 }
 
 }  // extern "C"

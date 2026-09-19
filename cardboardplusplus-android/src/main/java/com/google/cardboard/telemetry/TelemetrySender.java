@@ -5,10 +5,13 @@ import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
+import android.os.Handler;
+import android.os.HandlerThread;
 import android.util.Log;
 import android.view.Display;
 import android.view.Surface;
 import android.view.WindowManager;
+import com.google.cardboard.BuildConfig;
 import com.google.cardboard.core.AppConstants;
 import com.google.cardboard.core.DebugLog;
 import com.google.cardboard.network.NetworkUtils;
@@ -18,39 +21,43 @@ import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 
 /**
  * Reads sensors and sends telemetry packets to the bridge over UDP 42071.
  *
  * <p>Sends two packet types:
  * <ul>
- *   <li>Tag 0x10 (45 bytes): raw accel/gyro/mag for bridge display diagnostics</li>
+ *   <li>Tag 0x10 (45 bytes): raw accel/gyro/mag for bridge display diagnostics,
+ *       throttled to ~10Hz (the driver tracks via 0x12, not this)</li>
  *   <li>Tag 0x12 (25 bytes): fused rotation quaternion from
- *       TYPE_GAME_ROTATION_VECTOR for driver head tracking</li>
+ *       TYPE_GAME_ROTATION_VECTOR for driver head tracking, full rate</li>
  * </ul>
  *
  * <p>The game rotation vector is Android's sensor fusion of accel+gyro (no
  * magnetometer) into an absolute orientation quaternion, converted to OpenVR
  * space. The driver uses this directly for SteamVR head tracking.
+ *
+ * <p>All sensor callbacks run on a dedicated HandlerThread (never the UI
+ * thread); packets are sent inline on that thread with reused buffers, so the
+ * hot path allocates nothing.
  */
 public class TelemetrySender implements SensorEventListener {
     private static final String TAG = TelemetrySender.class.getSimpleName();
-    private static final DebugLog DBG = DebugLog.create(TelemetrySender.class, null);
-    private static final byte GYRO_TAG = 0x10;
-    private static final byte ROTATION_TAG = 0x12;
+    private static final DebugLog DBG = new DebugLog(TAG);
+    // Locked wire tags (centralized in AppConstants; values must not change).
+    private static final byte GYRO_TAG = AppConstants.TELEMETRY_TAG_GYRO;
+    private static final byte ROTATION_TAG = AppConstants.TELEMETRY_TAG_ROTATION;
 
     private final Context context;
     private final SensorManager sensorManager;
     private final AppSettings appSettings;
 
-    // Written by connect thread, read by sensor callback — volatile for visibility.
+    // Written by connect thread, read by sensor thread — volatile for visibility.
     private volatile DatagramSocket socket;
     private volatile InetAddress bridgeAddress;
     private volatile boolean connected;
 
-    // Sensor values — written by sensor callback, read by sender thread.
+    // Sensor values — sensor thread only (registered with its handler).
     private final float[] accel = new float[3];
     private final float[] gyro = new float[3];
     private final float[] mag = new float[3];
@@ -58,11 +65,31 @@ public class TelemetrySender implements SensorEventListener {
     // Fused rotation quaternion from TYPE_ROTATION_VECTOR.
     private final float[] rotationQuat = new float[4]; // [w, x, y, z]
 
-    // Throttle raw packets to ~200 Hz max (sensor delivers at ~200 Hz GAME).
+    // Throttle diagnostics-only raw packets to ~10Hz (rotation stays full rate).
     private long lastRawNs = 0;
-    private static final long MIN_RAW_INTERVAL_NS = 5_000_000L; // 5 ms
+    private static final long MIN_RAW_INTERVAL_NS = 100_000_000L; // 100 ms
 
-    private ExecutorService executor = Executors.newSingleThreadExecutor();
+    // Reused packet buffers + datagram (sensor thread only, no per-event alloc).
+    private final ByteBuffer rawBuf = ByteBuffer.allocate(45).order(ByteOrder.LITTLE_ENDIAN);
+    private final ByteBuffer rotBuf = ByteBuffer.allocate(25).order(ByteOrder.LITTLE_ENDIAN);
+    private final DatagramPacket sendPacket = new DatagramPacket(new byte[0], 0);
+
+    // Sensor thread: callbacks + UDP sends all happen here, off the UI thread.
+    private HandlerThread sensorThread;
+    private Handler sensorHandler;
+
+    // Scratch for quaternion math (sensor thread only).
+    private final float[] tmpA = new float[4];
+    private final float[] tmpB = new float[4];
+
+    // Cached display rotation (getSystemService+getRotation per packet is too
+    // hot); refreshed at most once per second. No onConfigurationChanged hook
+    // exists here, so a time-based refresh bounds the staleness instead.
+    // getDefaultDisplay is deprecated since 30 but still works through target
+    // 35; tablets pinned to ROTATION_0 just take the identity branch below.
+    private int cachedRotation = Surface.ROTATION_0;
+    private long lastRotCheckMs = 0;
+    private static final long ROTATION_CACHE_MS = 1000;
 
     private volatile boolean running;
 
@@ -70,17 +97,16 @@ public class TelemetrySender implements SensorEventListener {
         this.context = context;
         this.sensorManager = (SensorManager) context.getSystemService(Context.SENSOR_SERVICE);
         this.appSettings = appSettings;
-        DBG.setEnabled(appSettings.isDebugLogging());
     }
 
     public void start() {
         if (running) return;
-        // stop() shuts the executor down; recreate it so pause/resume works.
-        if (executor == null || executor.isShutdown() || executor.isTerminated()) {
-            executor = Executors.newSingleThreadExecutor();
-        }
         running = true;
         connected = false;
+
+        sensorThread = new HandlerThread("TelemetrySensors");
+        sensorThread.start();
+        sensorHandler = new Handler(sensorThread.getLooper());
 
         Sensor accelSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
         Sensor gyroSensor = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE);
@@ -104,13 +130,13 @@ public class TelemetrySender implements SensorEventListener {
         if (rotVecSensor == null) DBG.w("No rotation vector sensor found");
 
         int delay = SensorManager.SENSOR_DELAY_GAME;
-        if (accelSensor != null) sensorManager.registerListener(this, accelSensor, delay);
-        if (gyroSensor != null) sensorManager.registerListener(this, gyroSensor, delay);
-        if (magSensor != null) sensorManager.registerListener(this, magSensor, delay);
+        if (accelSensor != null) sensorManager.registerListener(this, accelSensor, delay, sensorHandler);
+        if (gyroSensor != null) sensorManager.registerListener(this, gyroSensor, delay, sensorHandler);
+        if (magSensor != null) sensorManager.registerListener(this, magSensor, delay, sensorHandler);
         // Register rotation vector sensor for fused orientation.
-        if (rotVecSensor != null) sensorManager.registerListener(this, rotVecSensor, delay);
+        if (rotVecSensor != null) sensorManager.registerListener(this, rotVecSensor, delay, sensorHandler);
 
-        // Connect thread: creates socket, then sender thread uses it.
+        // Connect thread: creates socket, then the sensor thread uses it.
         Thread connectThread = new Thread(this::connectLoop, "telemetry-connect");
         connectThread.setDaemon(true);
         connectThread.start();
@@ -133,7 +159,11 @@ public class TelemetrySender implements SensorEventListener {
         }
         socket = null;
         bridgeAddress = null;
-        executor.shutdownNow();
+        if (sensorThread != null) {
+            sensorThread.quitSafely();
+            sensorThread = null;
+        }
+        sensorHandler = null;
         Log.i(TAG, "TelemetrySender stopped");
     }
 
@@ -151,16 +181,50 @@ public class TelemetrySender implements SensorEventListener {
                 Log.i(TAG, "Telemetry connected to " + addr.getHostAddress() + ":" + AppConstants.TELEMETRY_PORT);
                 // Send hello so bridge learns phone IP (was 0.0.0.0 before).
                 try {
-                    byte[] hello = "CARDBOARD_PHONE_HELLO v1".getBytes();
+                    byte[] hello = phoneHelloBytes();
                     s.send(new DatagramPacket(hello, hello.length, addr, AppConstants.TELEMETRY_PORT));
                     DBG.d("Sent phone hello to %s:%d", addr.getHostAddress(), AppConstants.TELEMETRY_PORT);
         } catch (Exception e) {
           Log.w(TAG, "phone hello send failed", e);
         }
 
-                // Keep socket alive; the sender thread uses it.
+                // Keep socket alive; the sender thread uses it. Re-resolve the
+                // destination while alive: the PC-IP setting or the network
+                // (WiFi/Tailscale/DHCP) can change mid-session, and a pinned
+                // address survives forever because UDP-to-blackhole never
+                // throws (previously required an app restart to recover).
+                String lastPcIp = appSettings.getPcIp();
+                if (lastPcIp == null) lastPcIp = "";
+                long lastResolveMs = System.currentTimeMillis();
                 while (running && connected) {
                     Thread.sleep(500);
+                    try {
+                        String cur = appSettings.getPcIp();
+                        if (cur == null) cur = "";
+                        long now = System.currentTimeMillis();
+                        if (!cur.equals(lastPcIp) || now - lastResolveMs > 5000) {
+                            InetAddress fresh =
+                                    NetworkUtils.getPcOrBroadcastAddress(cur);
+                            lastPcIp = cur;
+                            lastResolveMs = now;
+                            if (!fresh.equals(bridgeAddress)) {
+                                bridgeAddress = fresh;
+                                Log.i(TAG, "Telemetry retargeted to "
+                                        + fresh.getHostAddress() + ":"
+                                        + AppConstants.TELEMETRY_PORT);
+                                try {
+                                    byte[] hello = phoneHelloBytes();
+                                    s.send(new DatagramPacket(hello, hello.length,
+                                            fresh, AppConstants.TELEMETRY_PORT));
+                                } catch (Exception e) {
+                                    Log.w(TAG, "retarget hello send failed", e);
+                                }
+                            }
+                        }
+                    } catch (Exception e) {
+                        Log.w(TAG, "Telemetry retarget failed: "
+                                + e.getClass().getSimpleName());
+                    }
                 }
             } catch (Exception e) {
                 connected = false;
@@ -169,6 +233,36 @@ public class TelemetrySender implements SensorEventListener {
             }
             if (!running) break;
             try { Thread.sleep(2000); } catch (InterruptedException ie) { break; }
+        }
+    }
+
+    /**
+     * Hello bytes with our build version appended ({@code CARDBOARD_PHONE_HELLO v1 <n>}).
+     * Static so tests can verify the wire format without a Context.
+     */
+    static byte[] phoneHelloBytes() {
+        return AppConstants.phoneHello(BuildConfig.VERSION_NAME).getBytes();
+    }
+
+    /**
+     * Send an already-framed datagram (e.g. NetStats 0x13) on the telemetry
+     * socket, reusing the cached bridge address. Returns false when no socket
+     * is live so the caller can fall back to its own socket.
+     */
+    public boolean sendDatagram(byte[] data) {
+        DatagramSocket s = socket;
+        InetAddress addr = bridgeAddress;
+        if (s == null || s.isClosed() || addr == null || !connected) return false;
+        try {
+            // Fresh packet: called from the NetStats thread, not the sensor
+            // thread that owns the reused sendPacket (every 2s, so the alloc
+            // is negligible).
+            s.send(new DatagramPacket(data, data.length, addr, AppConstants.TELEMETRY_PORT));
+            return true;
+        } catch (Exception e) {
+            Log.w(TAG, "Shared telemetry send failed: " + e.getClass().getSimpleName());
+            connected = false;
+            return false;
         }
     }
 
@@ -203,15 +297,21 @@ public class TelemetrySender implements SensorEventListener {
     // Fixed mount correction: the viewer holds the phone 180° about the screen
     // normal from the pinned landscape frame, so roll the result 180° about Z.
     private static final float[] Q_ROLL180 = {0f, 0f, 0f, 1f};
+    // Precomputed device-frame inverses per display rotation (no per-event alloc).
+    // Indexed 0..3 for ROTATION_0/90/180/270 (Surface constants match indices).
+    private static final float[][] Q_DEV_INV = {
+        {1f, 0f, 0f, 0f},   // ROTATION_0
+        {S, 0f, 0f, S},     // ROTATION_90
+        {0f, 0f, 0f, -1f},  // ROTATION_180
+        {S, 0f, 0f, -S},    // ROTATION_270
+    };
 
-    /** Quaternion multiply: out = a * b (all [w, x, y, z]). */
-    private static float[] qmul(float[] a, float[] b) {
-        return new float[]{
-            a[0]*b[0] - a[1]*b[1] - a[2]*b[2] - a[3]*b[3],
-            a[0]*b[1] + a[1]*b[0] + a[2]*b[3] - a[3]*b[2],
-            a[0]*b[2] - a[1]*b[3] + a[2]*b[0] + a[3]*b[1],
-            a[0]*b[3] + a[1]*b[2] - a[2]*b[1] + a[3]*b[0],
-        };
+    /** Quaternion multiply: out = a * b (all [w, x, y, z]). Writes into out, no alloc. */
+    private static void qmulInto(float[] a, float[] b, float[] out) {
+        out[0] = a[0]*b[0] - a[1]*b[1] - a[2]*b[2] - a[3]*b[3];
+        out[1] = a[0]*b[1] + a[1]*b[0] + a[2]*b[3] - a[3]*b[2];
+        out[2] = a[0]*b[2] - a[1]*b[3] + a[2]*b[0] + a[3]*b[1];
+        out[3] = a[0]*b[3] + a[1]*b[2] - a[2]*b[1] + a[3]*b[0];
     }
 
     private void handleRotationVector(SensorEvent event) {
@@ -225,23 +325,15 @@ public class TelemetrySender implements SensorEventListener {
         //   q_openvr = Q_WORLD * q_raw * q_device⁻¹ * Q_ROLL180
         // The result is absolute (gravity-level pitch/roll), so the bridge and
         // driver use it directly — no reference capture, no recenter needed.
-        float[] q1 = qmul(Q_WORLD, new float[]{w, x, y, z});
-        float[] qDevInv;
+        tmpB[0] = w; tmpB[1] = x; tmpB[2] = y; tmpB[3] = z;
+        qmulInto(Q_WORLD, tmpB, tmpA);
         int rot = getDisplayRotation();
-        if (rot == Surface.ROTATION_90) {
-            qDevInv = new float[]{S, 0f, 0f, S};
-        } else if (rot == Surface.ROTATION_270) {
-            qDevInv = new float[]{S, 0f, 0f, -S};
-        } else if (rot == Surface.ROTATION_180) {
-            qDevInv = new float[]{0f, 0f, 0f, -1f};
-        } else {
-            qDevInv = new float[]{1f, 0f, 0f, 0f};
-        }
-        float[] out = qmul(qmul(q1, qDevInv), Q_ROLL180);
-        rotationQuat[0] = out[0];
-        rotationQuat[1] = out[1];
-        rotationQuat[2] = out[2];
-        rotationQuat[3] = out[3];
+        qmulInto(tmpA, Q_DEV_INV[rot & 3], tmpB);
+        qmulInto(tmpB, Q_ROLL180, tmpA);
+        rotationQuat[0] = tmpA[0];
+        rotationQuat[1] = tmpA[1];
+        rotationQuat[2] = tmpA[2];
+        rotationQuat[3] = tmpA[3];
         sendRotationPacket(event.timestamp);
     }
 
@@ -262,41 +354,41 @@ public class TelemetrySender implements SensorEventListener {
 
         long timestampMs = timestampNs / 1_000_000;
 
-        // Remap accel/gyro/mag from portrait to VR frame based on display rotation.
-        // Portrait: X-right, Y-up, Z-toward-user.
-        // VR (ROTATION_90): VR_X=Portrait_Y, VR_Y=-Portrait_X, VR_Z=Portrait_Z.
-        // VR (ROTATION_270): VR_X=-Portrait_Y, VR_Y=Portrait_X, VR_Z=Portrait_Z.
-        float[] ga = gyro, aa = accel, ma = mag;
+        rawBuf.clear();
+        rawBuf.put(GYRO_TAG);
+        rawBuf.putLong(timestampMs);
+        // Remap portrait→VR inline (no temp arrays):
+        // ROTATION_90: VR_X=P_Y, VR_Y=-P_X; ROTATION_270: VR_X=-P_Y, VR_Y=P_X.
         int rot = getDisplayRotation();
         if (rot == Surface.ROTATION_90) {
-            ga = new float[]{ gyro[1], -gyro[0], gyro[2] };
-            aa = new float[]{ accel[1], -accel[0], accel[2] };
-            ma = new float[]{ mag[1], -mag[0], mag[2] };
+            putVec3(rawBuf, gyro[1], -gyro[0], gyro[2]);
+            putVec3(rawBuf, accel[1], -accel[0], accel[2]);
+            putVec3(rawBuf, mag[1], -mag[0], mag[2]);
         } else if (rot == Surface.ROTATION_270) {
-            ga = new float[]{ -gyro[1], gyro[0], gyro[2] };
-            aa = new float[]{ -accel[1], accel[0], accel[2] };
-            ma = new float[]{ -mag[1], mag[0], mag[2] };
+            putVec3(rawBuf, -gyro[1], gyro[0], gyro[2]);
+            putVec3(rawBuf, -accel[1], accel[0], accel[2]);
+            putVec3(rawBuf, -mag[1], mag[0], mag[2]);
+        } else {
+            putVec3(rawBuf, gyro[0], gyro[1], gyro[2]);
+            putVec3(rawBuf, accel[0], accel[1], accel[2]);
+            putVec3(rawBuf, mag[0], mag[1], mag[2]);
         }
 
-        ByteBuffer buf = ByteBuffer.allocate(45).order(ByteOrder.LITTLE_ENDIAN);
-        buf.put(GYRO_TAG);
-        buf.putLong(timestampMs);
-        for (float v : ga) buf.putFloat(v);
-        for (float v : aa) buf.putFloat(v);
-        for (float v : ma) buf.putFloat(v);
+        try {
+            sendPacket.setData(rawBuf.array(), 0, rawBuf.position());
+            sendPacket.setAddress(addr);
+            sendPacket.setPort(AppConstants.TELEMETRY_PORT);
+            s.send(sendPacket);
+        } catch (Exception e) {
+            Log.w(TAG, "Telemetry send failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+            connected = false;
+        }
+    }
 
-        final byte[] data = buf.array();
-        final DatagramSocket fs = s;
-        final InetAddress faddr = addr;
-        executor.execute(() -> {
-            try {
-                DatagramPacket packet = new DatagramPacket(data, data.length, faddr, AppConstants.TELEMETRY_PORT);
-                fs.send(packet);
-            } catch (Exception e) {
-                Log.w(TAG, "Telemetry send failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
-                connected = false;
-            }
-        });
+    private static void putVec3(ByteBuffer buf, float x, float y, float z) {
+        buf.putFloat(x);
+        buf.putFloat(y);
+        buf.putFloat(z);
     }
 
     /** Send fused rotation quaternion (tag 0x12) for driver head tracking. */
@@ -307,36 +399,36 @@ public class TelemetrySender implements SensorEventListener {
 
         long timestampMs = timestampNs / 1_000_000;
 
-        ByteBuffer buf = ByteBuffer.allocate(25).order(ByteOrder.LITTLE_ENDIAN);
-        buf.put(ROTATION_TAG);
-        buf.putLong(timestampMs);
-        for (float v : rotationQuat) buf.putFloat(v); // w, x, y, z
+        rotBuf.clear();
+        rotBuf.put(ROTATION_TAG);
+        rotBuf.putLong(timestampMs);
+        for (float v : rotationQuat) rotBuf.putFloat(v); // w, x, y, z
 
-        final byte[] data = buf.array();
-        final DatagramSocket fs = s;
-        final InetAddress faddr = addr;
-        executor.execute(() -> {
-            try {
-                DatagramPacket packet = new DatagramPacket(data, data.length, faddr, AppConstants.TELEMETRY_PORT);
-                fs.send(packet);
-            } catch (Exception e) {
-                Log.w(TAG, "Rotation send failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
-                connected = false;
-            }
-        });
+        try {
+            sendPacket.setData(rotBuf.array(), 0, rotBuf.position());
+            sendPacket.setAddress(addr);
+            sendPacket.setPort(AppConstants.TELEMETRY_PORT);
+            s.send(sendPacket);
+        } catch (Exception e) {
+            Log.w(TAG, "Rotation send failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+            connected = false;
+        }
     }
 
     @Override
     public void onAccuracyChanged(Sensor sensor, int accuracy) {}
 
     private int getDisplayRotation() {
+        long now = System.currentTimeMillis();
+        if (now - lastRotCheckMs < ROTATION_CACHE_MS) return cachedRotation;
+        lastRotCheckMs = now;
         try {
             WindowManager wm = (WindowManager) context.getSystemService(Context.WINDOW_SERVICE);
             if (wm != null) {
                 Display display = wm.getDefaultDisplay();
-                return display.getRotation();
+                cachedRotation = display.getRotation();
             }
         } catch (Exception ignored) {}
-        return Surface.ROTATION_0;
+        return cachedRotation;
     }
 }

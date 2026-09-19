@@ -45,14 +45,6 @@ add_library(cardboard_jni SHARED ${native_srcs})
 target_include_directories(cardboard_jni PRIVATE ${CARDBOARD_INCLUDE_DIR})
 
 # Build
-# Note: FFmpeg libraries are loaded at runtime via dlopen() from the ffmpeg-kit AAR
-# The AAR dependency ensures FFmpeg .so files are included in the APK automatically.
-# We compile against the real FFmpeg headers (from the driver's bundled copy) so the
-# AVFrame/AVPacket struct layouts and AVPixelFormat/AVERROR enums are correct; symbols
-# are still resolved at runtime via dlsym in H264Decoder.cpp.
-set(FFMPEG_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/../driver_cardboardplusplus/lib/ffmpeg/include)
-target_include_directories(cardboard_jni PRIVATE ${FFMPEG_INCLUDE_DIR})
-
 target_link_libraries(cardboard_jni
     ${ANDROID_LIB}
     ${GLESv2_LIB}

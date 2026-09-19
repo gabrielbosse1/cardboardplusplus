@@ -9,15 +9,22 @@
 using namespace vr;
 
 // ---------------------------------------------------------------------------
-// UDP transport: H264 packet framing + streaming to the bridge.
+// UDP transport: H264 packet framing + streaming to the phone + preview.
 //
 // Encoded packets arrive on OnEncodedPacket() (from the encoder thread via the
 // callback) and are sent as 4-byte-big-endian-length-prefixed datagrams in
-// <=60 KB chunks so the phone can reconstruct the exact AVPacket. The socket is
-// non-blocking so a stalled receiver drops frames instead of blocking SteamVR.
+// <=1400B chunks (no IP fragmentation on a 1500B MTU) so the phone can
+// reconstruct the exact AVPacket. The socket is non-blocking so a stalled
+// receiver drops frames instead of blocking SteamVR.
+// IPv4-only by design (L15): phone discovery, video, and preview are all
+// AF_INET loopback/LAN paths; no firewall rules are installed.
 // ---------------------------------------------------------------------------
 
 namespace {
+
+// Fits a UDP payload in one unfragmented datagram on a 1500B-MTU path
+// (20B IP + 8B UDP + payload). 1200B if relaying over Tailscale/VPN (H6/R9).
+static constexpr int kUdpChunkBytes = 1400;
 
 // Chunked non-blocking send. On a full send buffer the frame is dropped and the
 // running drop counter incremented (logged every 30th drop). Returns after
@@ -28,7 +35,7 @@ static void SendFramedUdp(SOCKET socket, const sockaddr_in* addr,
 {
     int offset = 0;
     while (offset < framedSize) {
-        int chunkSize = (framedSize - offset > 60000) ? 60000 : (framedSize - offset);
+        int chunkSize = (framedSize - offset > kUdpChunkBytes) ? kUdpChunkBytes : (framedSize - offset);
         int res = sendto(socket, (const char*)(framed + offset), chunkSize, 0,
                          (sockaddr*)addr, sizeof(*addr));
         if (res == SOCKET_ERROR) {
@@ -117,6 +124,10 @@ void HmdDriver::ShutdownUDP()
 
 void HmdDriver::OnEncodedPacket(uint8_t* data, int size, int64_t pts, bool keyframe)
 {
+    // Null/empty guard FIRST: the keyframe log below dereferences data[0] (L9).
+    if (!m_udpInitialized || m_udpSocket == INVALID_SOCKET || !data || size <= 0) {
+        return;
+    }
     if (keyframe && size >= 8) {
         DebugLog("[Encoded] size=%d, pts=%lld, keyframe=YES, first16=%02X %02X %02X %02X %02X %02X %02X %02X",
                   size, pts,
@@ -127,9 +138,25 @@ void HmdDriver::OnEncodedPacket(uint8_t* data, int size, int64_t pts, bool keyfr
                   size, pts, keyframe ? "YES" : "NO", data[0]);
     }
 
-    if (!m_udpInitialized || m_udpSocket == INVALID_SOCKET || size <= 0) {
-        return;
-    }
+    // One frame counted once, no matter how many fan-out copies go out (M14).
+    m_udpFramesSent.fetch_add(1, std::memory_order_relaxed);
+
+    // Reused scratch buffers so no per-frame malloc happens here (M9/R9:
+    // 1400B chunks raise datagram counts, so the per-frame allocs had to go).
+    // Encoding-thread only, like the rest of this path.
+    auto ensureScratch = [](std::vector<uint8_t>& buf, size_t need) -> uint8_t* {
+        if (buf.size() < need) buf.resize(need);
+        return buf.data();
+    };
+    // 4-byte big-endian length prefix + payload into pre-sized dst (L9: no
+    // malloc, so no null to check — the vector guarantees the storage).
+    auto writeLengthPrefixed = [](const uint8_t* src, int srcSize, uint8_t* dst) {
+        dst[0] = (uint8_t)((srcSize >> 24) & 0xFF);
+        dst[1] = (uint8_t)((srcSize >> 16) & 0xFF);
+        dst[2] = (uint8_t)((srcSize >> 8) & 0xFF);
+        dst[3] = (uint8_t)(srcSize & 0xFF);
+        memcpy(dst + 4, src, srcSize);
+    };
 
     // libx264 keyframes: SPS and PPS have NAL start codes, but IDR data follows
     // without one. Insert IDR start code after PPS for a valid H264 stream.
@@ -139,19 +166,18 @@ void HmdDriver::OnEncodedPacket(uint8_t* data, int size, int64_t pts, bool keyfr
     if (ppsEnd > 0) {
         // Build fixed buffer: [up to PPS end] + [IDR start code] + [remaining IDR data].
         int fixedSize = size + 5; // extra 5 bytes for NAL start + IDR header
-        uint8_t* fixed = (uint8_t*)malloc(fixedSize);
+        uint8_t* fixed = ensureScratch(m_scratchFixed, (size_t)fixedSize);
         memcpy(fixed, data, ppsEnd);
         memcpy(fixed + ppsEnd, kIdrPrefix, 5);
         memcpy(fixed + ppsEnd + 5, data + ppsEnd, size - ppsEnd);
 
         // Phone: 4-byte length prefix so MediaCodec can reconstruct the AVPacket.
-        int framedSize = 0;
-        uint8_t* framed = h264::BuildLengthPrefixedPacket(fixed, fixedSize, &framedSize);
+        int framedSize = fixedSize + 4;
+        uint8_t* framed = ensureScratch(m_scratchFramed, (size_t)framedSize);
+        writeLengthPrefixed(fixed, fixedSize, framed);
 
         // Preview: raw Annex-B (ffplay expects an unframed H.264 stream).
         SendFannedOut(fixed, fixedSize, framed, framedSize);
-        free(framed);
-        free(fixed);
         DebugLog("[UDP] Fixed keyframe: inserted IDR start code at offset %d", ppsEnd);
         return;
     }
@@ -159,12 +185,12 @@ void HmdDriver::OnEncodedPacket(uint8_t* data, int size, int64_t pts, bool keyfr
     // Phone: 4-byte length prefix so the receiver can reconstruct the exact
     // libx264 AVPacket (one full frame, including all of its slices) regardless
     // of UDP datagram boundaries.
-    int framedSize = 0;
-    uint8_t* framed = h264::BuildLengthPrefixedPacket(data, size, &framedSize);
+    int framedSize = size + 4;
+    uint8_t* framed = ensureScratch(m_scratchFramed, (size_t)framedSize);
+    writeLengthPrefixed(data, size, framed);
 
     // Preview: raw Annex-B — ffplay demuxes start codes directly.
     SendFannedOut(data, size, framed, framedSize);
-    free(framed);
     DebugLog("[UDP] Sent framed packet: payload=%d bytes", size);
 }
 
@@ -174,25 +200,32 @@ void HmdDriver::SendFannedOut(const uint8_t* raw, int rawSize,
     // Local preview copy — only when the bridge enabled it via BRIDGE_PREVIEW.
     // Raw Annex-B so ffplay demuxes start codes directly (no length prefix).
     if (m_previewEnabled.load(std::memory_order_relaxed)) {
-        SendFramedUdp(m_udpSocket, &m_previewAddr, raw, rawSize, &m_udpDroppedFrames);
-        m_udpFramesSent.fetch_add(1, std::memory_order_relaxed);
+        SendFramedUdp(m_udpSocket, &m_previewAddr, raw, rawSize, &m_udpDroppedPreview);
     }
 
     // Phone copy (only while a real phone target is set). Length-prefixed so
     // MediaCodec can reconstruct the exact AVPacket.
-    bool hasTarget = m_hasPhoneTarget.load(std::memory_order_relaxed);
+    // m_serverAddr is written under m_targetIpMutex (SwitchDataTarget /
+    // timeout-clear); snapshot it under the same mutex so we never send to a
+    // torn address (M11).
+    sockaddr_in phoneTarget{};
+    bool hasTarget = false;
+    {
+        std::lock_guard<std::mutex> lock(m_targetIpMutex);
+        hasTarget = m_hasPhoneTarget.load(std::memory_order_relaxed);
+        if (hasTarget) phoneTarget = m_serverAddr;
+    }
     if (hasTarget) {
         // Log phone send every 60 frames (~1 second at 60fps)
         static uint64_t phoneLogCounter = 0;
         if (++phoneLogCounter % 60 == 1) {
             char phoneIp[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &m_serverAddr.sin_addr, phoneIp, sizeof(phoneIp));
+            inet_ntop(AF_INET, &phoneTarget.sin_addr, phoneIp, sizeof(phoneIp));
             DriverLog("[UDP] Sending to phone %s:%d (frames=%llu, raw=%d, framed=%d)",
-                      phoneIp, ntohs(m_serverAddr.sin_port),
+                      phoneIp, ntohs(phoneTarget.sin_port),
                       (unsigned long long)phoneLogCounter, rawSize, framedSize);
         }
-        SendFramedUdp(m_udpSocket, &m_serverAddr, framed, framedSize, &m_udpDroppedFrames);
-        m_udpFramesSent.fetch_add(1, std::memory_order_relaxed);
+        SendFramedUdp(m_udpSocket, &phoneTarget, framed, framedSize, &m_udpDroppedPhone);
     } else {
         // Log when phone target is missing — every 5 seconds (300 frames)
         static uint64_t noTargetCounter = 0;

@@ -84,8 +84,27 @@ public class SettingsMenuController implements PopupMenu.OnMenuItemClickListener
         .setView(ipInput)
         .setPositiveButton(
             R.string.pc_ip_ok,
-            (dialog, which) -> appSettings.setPcIp(ipInput.getText().toString().trim()))
+            (dialog, which) -> {
+              String ip = ipInput.getText().toString().trim();
+              // Empty clears back to auto-discovery; anything else must parse
+              // (never persist garbage that would black-hole discovery).
+              if (!ip.isEmpty() && !isValidIp(ip)) {
+                Toast.makeText(context, R.string.pc_ip_invalid, Toast.LENGTH_LONG).show();
+                return;
+              }
+              appSettings.setPcIp(ip);
+            })
         .setNegativeButton(R.string.pc_ip_cancel, null)
         .show();
+  }
+
+  /** True when the string resolves to an IP address (v4 preferred, v6 accepted). */
+  static boolean isValidIp(String ip) {
+    try {
+      java.net.InetAddress.getByName(ip);
+      return true;
+    } catch (Exception e) {
+      return false;
+    }
   }
 }

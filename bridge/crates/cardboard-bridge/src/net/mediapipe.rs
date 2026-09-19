@@ -169,10 +169,17 @@ impl MediapipeClient {
 
     /// Push new model confidences (0.0-1.0) to the running server: the
     /// sidecar recreates its landmarker in place, no restart involved.
-    /// Returns false on any IO error (the caller logs; the next `detect()`
-    /// reconnects on its own, so a dead server heals without a bridge restart).
+    /// Uses its own short-lived connection so a wedged 2 s detect never
+    /// head-of-line-blocks tuning. The sidecar serves one connection at a
+    /// time, so the shared detect stream is parked first (it reconnects
+    /// lazily on the next `detect()` via the backoff path).
+    /// Returns false on any IO error (the caller logs).
     pub fn set_config(&self, det: f32, pres: f32, track: f32) -> bool {
-        let mut stream = match self.stream.lock() {
+        if let Ok(s) = self.stream.lock() {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+        let addr = format!("127.0.0.1:{}", self.port);
+        let mut stream = match Self::try_connect(&addr, 2, Duration::from_millis(100)) {
             Ok(s) => s,
             Err(_) => return false,
         };
@@ -188,6 +195,7 @@ impl MediapipeClient {
         let _ = stream.flush();
         let mut ack = [0u8; 1];
         stream.read_exact(&mut ack).is_ok()
+        // Fresh connection closes on drop here.
     }
 
     /// One request/response round-trip. Returns `None` on any IO error.
@@ -213,7 +221,8 @@ impl MediapipeClient {
         for _ in 0..n {
             let mut hand_buf = [0u8; 1 + 4 + 21 * 3 * 4]; // handedness + score + landmarks
             if stream.read_exact(&mut hand_buf).is_err() {
-                break;
+                // Torn TCP mid-reply: partial hands are worse than none.
+                return None;
             }
             let h_code = hand_buf[0];
             let score = f32::from_le_bytes([hand_buf[1], hand_buf[2], hand_buf[3], hand_buf[4]]);
@@ -254,8 +263,9 @@ pub enum Reclaim {
 /// PID currently LISTENING on `port`, via `netstat`. The listener row is
 /// identified by its `0.0.0.0:0` foreign endpoint, not the state word (which
 /// is localized on some Windows installs) — see `parse_listen_pid`.
+/// `pub(crate)` so the preview bind can surface who holds UDP 42069.
 #[cfg(windows)]
-fn listen_pid(port: u16) -> Option<u32> {
+pub(crate) fn listen_pid(port: u16) -> Option<u32> {
     let out = std::process::Command::new("netstat")
         .args(["-ano", "-p", "TCP"])
         .output()
@@ -267,7 +277,7 @@ fn listen_pid(port: u16) -> Option<u32> {
 }
 
 #[cfg(not(windows))]
-fn listen_pid(_port: u16) -> Option<u32> {
+pub(crate) fn listen_pid(_port: u16) -> Option<u32> {
     None
 }
 
@@ -571,18 +581,28 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let (tx, rx) = channel();
         std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
+            // Two sequential connections: the client's idle detect stream,
+            // then the short-lived config connection (`set_config` parks
+            // the first, exactly like production).
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else { return };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                 let mut buf = [0u8; 17];
-                let _ = stream.read_exact(&mut buf);
-                let _ = tx.send(buf);
-                let _ = stream.write_all(&[0x00]);
-                let _ = stream.flush();
+                match stream.read_exact(&mut buf) {
+                    Ok(()) if &buf[0..4] == &0xFFFFFFFFu32.to_le_bytes() => {
+                        let _ = tx.send(buf);
+                        let _ = stream.write_all(&[0x00]);
+                        let _ = stream.flush();
+                        return;
+                    }
+                    _ => {} // idle detect stream (or timeout) — wait for the next one
+                }
             }
         });
 
         let client = MediapipeClient::connect(port).unwrap();
         assert!(client.set_config(0.8, 0.7, 0.6));
-        let got = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let got = rx.recv_timeout(Duration::from_secs(10)).unwrap();
         assert_eq!(&got[0..4], &0xFFFFFFFFu32.to_le_bytes());
         assert_eq!(got[4], 0x01);
         assert_eq!(f32::from_le_bytes(got[5..9].try_into().unwrap()), 0.8);

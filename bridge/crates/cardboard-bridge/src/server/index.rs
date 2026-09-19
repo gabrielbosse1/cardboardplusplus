@@ -22,8 +22,8 @@ GET  /health   {\"ok\":true,\"app_version\":\"...\"}
               -H \"Content-Type: application/json\" \
               -d '{\"width\":2880,\"height\":1620,\"fps\":60,\"bitrate\":20,\"encoder\":\"gpu\"}'
 
-       encoder: \"gpu\" (driver picks AMF/NVENC/QSV) | \"cpu\" (libx264)
-       fields are optional; missing ones keep the current defaults.
+        encoder: \"gpu\" (driver picks AMF/NVENC/QSV) | \"cpu\" (libx264)
+        fields are optional; missing ones keep the currently applied session values.
 
 Port: set CARDBOARD_BRIDGE_PORT to override (default 8567).
 ";

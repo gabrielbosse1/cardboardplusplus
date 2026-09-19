@@ -1,6 +1,7 @@
 #include "VideoEncoder.h"
 #include "VideoEncoderFFmpeg.h"
 #include "VideoEncoderLog.h"
+#include <cassert>
 #include <dxgi.h>
 #include <dxgi1_2.h>
 #include <d3dcompiler.h>
@@ -37,29 +38,6 @@ VSOut main(uint id : SV_VertexID) {
     o.pos = float4(xy * float2(2, -2) + float2(-1, 1), 0, 1);
     o.uv = xy * float2(1, 1);  // (0,0)=top-left, (1,0)=top-right, (0,1)=bottom-left
     return o;
-}
-)";
-
-// Pixel shader with UV-based sampling and linear-to-sRGB conversion
-static const char* kBlitPSSource = R"(
-Texture2D<float4> src : register(t0);
-SamplerState samp : register(s0);
-
-struct PSIn {
-    float4 pos : SV_Position;
-    float2 uv : TEXCOORD0;
-};
-
-float4 linearToSrgb(float4 c) {
-    float3 lo = 12.92 * c.rgb;
-    float3 hi = 1.055 * pow(c.rgb, 1.0/2.4) - 0.055;
-    c.rgb = (c.rgb <= 0.0031308) ? lo : hi;
-    return saturate(c);
-}
-
-float4 main(PSIn input) : SV_Target {
-    float4 c = src.Sample(samp, input.uv);
-    return linearToSrgb(c);
 }
 )";
 
@@ -160,22 +138,9 @@ bool VideoEncoder::InitializeShaderConversion()
         return false;
     }
 
-    // Compile blit pixel shader
-    ID3DBlob* psBlob = CompileShader(kBlitPSSource, "BlitPS", "ps_5_0");
-    if (!psBlob) { vsBlob->Release(); return false; }
-
-    hr = m_pDevice->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(),
-                                       nullptr, &m_pBlitPS);
-    if (FAILED(hr)) {
-        ENCODER_ERROR("Failed to create pixel shader! HRESULT: 0x%x", hr);
-        vsBlob->Release();
-        psBlob->Release();
-        return false;
-    }
-
-    // Compile SBS pixel shader
+    // Compile SBS pixel shader (the only pixel shader on the live path)
     ID3DBlob* sbsPsBlob = CompileShader(kSBSPSSource, "SBSPS", "ps_5_0");
-    if (!sbsPsBlob) { vsBlob->Release(); psBlob->Release(); return false; }
+    if (!sbsPsBlob) { vsBlob->Release(); return false; }
 
     hr = m_pDevice->CreatePixelShader(sbsPsBlob->GetBufferPointer(), sbsPsBlob->GetBufferSize(),
                                        nullptr, &m_pSBSPS);
@@ -183,7 +148,6 @@ bool VideoEncoder::InitializeShaderConversion()
     if (FAILED(hr)) {
         ENCODER_ERROR("Failed to create SBS pixel shader! HRESULT: 0x%x", hr);
         vsBlob->Release();
-        psBlob->Release();
         return false;
     }
 
@@ -199,11 +163,11 @@ bool VideoEncoder::InitializeShaderConversion()
     if (FAILED(hr)) {
         ENCODER_ERROR("Failed to create sampler state! HRESULT: 0x%x", hr);
         vsBlob->Release();
-        psBlob->Release();
         return false;
     }
 
-    // Create blend state (no blending) — used by the simple blit/convert paths.
+    // Create blend state (no blending) — used for the base scene layer so the
+    // eye textures' (often zero) alpha can't make the scene invisible/black.
     D3D11_BLEND_DESC blendDesc = {};
     blendDesc.RenderTarget[0].BlendEnable = FALSE;
     blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
@@ -212,7 +176,6 @@ bool VideoEncoder::InitializeShaderConversion()
     if (FAILED(hr)) {
         ENCODER_ERROR("Failed to create blend state! HRESULT: 0x%x", hr);
         vsBlob->Release();
-        psBlob->Release();
         return false;
     }
 
@@ -232,7 +195,6 @@ bool VideoEncoder::InitializeShaderConversion()
     if (FAILED(hr)) {
         ENCODER_ERROR("Failed to create layer blend state! HRESULT: 0x%x", hr);
         vsBlob->Release();
-        psBlob->Release();
         return false;
     }
 
@@ -247,7 +209,6 @@ bool VideoEncoder::InitializeShaderConversion()
     if (FAILED(hr)) {
         ENCODER_ERROR("Failed to create bounds constant buffer! HRESULT: 0x%x", hr);
         vsBlob->Release();
-        psBlob->Release();
         return false;
     }
 
@@ -255,7 +216,6 @@ bool VideoEncoder::InitializeShaderConversion()
     D3D11_INPUT_ELEMENT_DESC inputDesc = { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 };
     hr = m_pDevice->CreateInputLayout(&inputDesc, 1, vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), &m_pBlitInputLayout);
     vsBlob->Release();
-    psBlob->Release();
 
     if (FAILED(hr)) {
         ENCODER_ERROR("Failed to create input layout! HRESULT: 0x%x", hr);
@@ -278,41 +238,6 @@ bool VideoEncoder::InitializeShaderConversion()
         return false;
     }
 
-    // Create private staging textures for safe reading from shared textures
-    // These are non-shared, private textures we copy to before shader conversion
-    D3D11_TEXTURE2D_DESC stagingDesc = {};
-    stagingDesc.Width = m_width / 2;  // Per-eye size for SBS
-    stagingDesc.Height = m_height;
-    stagingDesc.MipLevels = 1;
-    stagingDesc.ArraySize = 1;
-    stagingDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;  // Match our texture creation format
-    stagingDesc.SampleDesc.Count = 1;
-    stagingDesc.Usage = D3D11_USAGE_DEFAULT;
-    stagingDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-
-    hr = m_pDevice->CreateTexture2D(&stagingDesc, nullptr, &m_pLeftStaging);
-    if (FAILED(hr)) {
-        ENCODER_ERROR("Failed to create left staging texture! HRESULT: 0x%x", hr);
-        return false;
-    }
-
-    hr = m_pDevice->CreateTexture2D(&stagingDesc, nullptr, &m_pRightStaging);
-    if (FAILED(hr)) {
-        ENCODER_ERROR("Failed to create right staging texture! HRESULT: 0x%x", hr);
-        return false;
-    }
-
-    // Single staging for ConvertViaShader (full encoder width)
-    stagingDesc.Width = m_width;
-    hr = m_pDevice->CreateTexture2D(&stagingDesc, nullptr, &m_pSingleStaging);
-    if (FAILED(hr)) {
-        ENCODER_ERROR("Failed to create single staging texture! HRESULT: 0x%x", hr);
-        return false;
-    }
-
-    ENCODER_LOG("Private staging textures created (%dx%d per eye, %dx%d single)",
-                m_width / 2, m_height, m_width, m_height);
-
     m_shaderConversionReady = true;
     ENCODER_LOG("Shader-based texture conversion initialized successfully!");
     return true;
@@ -325,7 +250,6 @@ void VideoEncoder::CleanupShaderConversion()
     if (m_pConversionRT) { m_pConversionRT->Release(); m_pConversionRT = nullptr; }
     if (m_pConversionRTV) { m_pConversionRTV->Release(); m_pConversionRTV = nullptr; }
     if (m_pBlitVS) { m_pBlitVS->Release(); m_pBlitVS = nullptr; }
-    if (m_pBlitPS) { m_pBlitPS->Release(); m_pBlitPS = nullptr; }
     if (m_pSBSPS) { m_pSBSPS->Release(); m_pSBSPS = nullptr; }
     if (m_pBlitSampler) { m_pBlitSampler->Release(); m_pBlitSampler = nullptr; }
     if (m_pBlitBlend) { m_pBlitBlend->Release(); m_pBlitBlend = nullptr; }
@@ -333,73 +257,9 @@ void VideoEncoder::CleanupShaderConversion()
     if (m_pBoundsCB) { m_pBoundsCB->Release(); m_pBoundsCB = nullptr; }
     if (m_pBlitInputLayout) { m_pBlitInputLayout->Release(); m_pBlitInputLayout = nullptr; }
     if (m_pBlitVertexBuffer) { m_pBlitVertexBuffer->Release(); m_pBlitVertexBuffer = nullptr; }
-    if (m_pLeftStaging) { m_pLeftStaging->Release(); m_pLeftStaging = nullptr; }
-    if (m_pRightStaging) { m_pRightStaging->Release(); m_pRightStaging = nullptr; }
-    if (m_pSingleStaging) { m_pSingleStaging->Release(); m_pSingleStaging = nullptr; }
 
     m_shaderConversionReady = false;
     ENCODER_LOG("Shader conversion resources cleaned up.");
-}
-
-void VideoEncoder::SetupBlitPipeline(ID3D11ShaderResourceView* pSRV)
-{
-    // Set full-screen render target
-    float clearColor[4] = { 0, 0, 0, 1 };
-    m_pContext->ClearRenderTargetView(m_pConversionRTV, clearColor);
-    m_pContext->OMSetRenderTargets(1, &m_pConversionRTV, nullptr);
-
-    // Set viewport to full conversion RT
-    D3D11_VIEWPORT vp = {};
-    vp.Width = (float)m_width;
-    vp.Height = (float)m_height;
-    vp.MinDepth = 0.0f;
-    vp.MaxDepth = 1.0f;
-    m_pContext->RSSetViewports(1, &vp);
-
-    // Set shaders
-    m_pContext->VSSetShader(m_pBlitVS, nullptr, 0);
-    m_pContext->PSSetShader(m_pBlitPS, nullptr, 0);
-
-    // Bind source texture and sampler
-    m_pContext->PSSetShaderResources(0, 1, &pSRV);
-    m_pContext->PSSetSamplers(0, 1, &m_pBlitSampler);
-
-    // Set blend state
-    float blendFactor[4] = { 0, 0, 0, 0 };
-    m_pContext->OMSetBlendState(m_pBlitBlend, blendFactor, 0xFFFFFFFF);
-
-    // Set input layout and vertex buffer
-    m_pContext->IASetInputLayout(m_pBlitInputLayout);
-    UINT stride = 12;
-    UINT offset = 0;
-    m_pContext->IASetVertexBuffers(0, 1, &m_pBlitVertexBuffer, &stride, &offset);
-    m_pContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-}
-
-bool VideoEncoder::ReadBackBegin()
-{
-    // D3D11 only: Copy conversion RT to staging texture and map it for CPU read.
-    // Caller must call sws_scale on mapped data, then call ReadBackEnd().
-    m_pContext->CopySubresourceRegion(m_pStagingTexture, 0, 0, 0, 0, m_pConversionRT, 0, nullptr);
-
-    D3D11_MAPPED_SUBRESOURCE mapped;
-    HRESULT hr = m_pContext->Map(m_pStagingTexture, 0, D3D11_MAP_READ, 0, &mapped);
-    if (FAILED(hr)) {
-        ENCODER_ERROR("Failed to map staging texture! HRESULT: 0x%x", hr);
-        return false;
-    }
-
-    m_mappedRowPitch = mapped.RowPitch;
-    m_mappedData = mapped.pData;
-    return true;
-}
-
-bool VideoEncoder::ReadBackEnd()
-{
-    // D3D11 only: unmap the staging texture after CPU read is done.
-    m_pContext->Unmap(m_pStagingTexture, 0);
-    m_mappedData = nullptr;
-    return true;
 }
 
 bool VideoEncoder::ReadbackToBuffer()
@@ -427,9 +287,10 @@ bool VideoEncoder::ReadbackToBuffer()
         m_pReadbackBuffer = new uint8_t[bufSize];
         m_readbackBufferSize = bufSize;
     }
-    m_readbackRowPitch = mapped.RowPitch;
 
-    // Copy row by row (staging RowPitch may differ from our expected stride)
+    // Copy row by row into a packed buffer (staging RowPitch may exceed width*4).
+    // SwsConvert relies on this packed layout (M8); the assert pins the precondition.
+    assert(mapped.RowPitch >= m_width * 4);
     for (int y = 0; y < m_height; y++) {
         memcpy(m_pReadbackBuffer + y * m_width * 4,
                (uint8_t*)mapped.pData + y * mapped.RowPitch,
@@ -464,85 +325,6 @@ bool VideoEncoder::ReadbackToBuffer()
 
     m_pContext->Unmap(m_pStagingTexture, 0);
     return true;
-}
-
-bool VideoEncoder::ReadBackConversionRT()
-{
-    if (!ReadBackBegin()) return false;
-
-    // CPU-only: convert BGRA8 -> NV12
-    uint8_t* srcSlice[1] = { (uint8_t*)m_mappedData };
-    int srcStride[1] = { static_cast<int>(m_mappedRowPitch) };
-
-    uint8_t* dstSlice[2] = { m_pSoftwareFrameBuffer, m_pSoftwareFrameBuffer + m_width * m_height };
-    int dstStride[2] = { m_width, m_width };
-
-    int ret = sws_scale(m_pConvertContext, srcSlice, srcStride, 0, m_height,
-                        dstSlice, dstStride);
-
-    if (!ReadBackEnd()) return false;
-
-    if (ret != m_height) {
-        ENCODER_ERROR("swscale conversion failed! Returned %d, expected %d", ret, m_height);
-        return false;
-    }
-
-    return true;
-}
-
-bool VideoEncoder::ConvertViaShader(ID3D11Texture2D* pSource)
-{
-    if (!m_shaderConversionReady) {
-        ENCODER_ERROR("Shader conversion not ready!");
-        return false;
-    }
-
-    D3D11_TEXTURE2D_DESC srcDesc;
-    pSource->GetDesc(&srcDesc);
-
-    // Create SRV directly from source texture
-    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-    srvDesc.Format = srcDesc.Format;
-    srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-    srvDesc.Texture2D.MipLevels = 1;
-    srvDesc.Texture2D.MostDetailedMip = 0;
-
-    ID3D11ShaderResourceView* pSRV = nullptr;
-    HRESULT hr = m_pDevice->CreateShaderResourceView(pSource, &srvDesc, &pSRV);
-    if (FAILED(hr)) {
-        ENCODER_ERROR("Failed to create SRV for source texture! HRESULT: 0x%x", hr);
-        return false;
-    }
-
-    // Save current render state
-    ID3D11RenderTargetView* pOldRTV = nullptr;
-    ID3D11DepthStencilView* pOldDSV = nullptr;
-    m_pContext->OMGetRenderTargets(1, &pOldRTV, &pOldDSV);
-
-    D3D11_VIEWPORT oldViewport;
-    UINT numViewports = 1;
-    m_pContext->RSGetViewports(&numViewports, &oldViewport);
-
-    // Setup blit pipeline (sets RT, viewport, shaders, sampler, blend)
-    SetupBlitPipeline(pSRV);
-
-    // Draw fullscreen triangle (3 vertices via SV_VertexID)
-    m_pContext->Draw(3, 0);
-
-    // Unbind SRV
-    ID3D11ShaderResourceView* nullSRV[1] = { nullptr };
-    m_pContext->PSSetShaderResources(0, 1, nullSRV);
-
-    // Restore render state
-    m_pContext->OMSetRenderTargets(1, &pOldRTV, pOldDSV);
-    m_pContext->RSSetViewports(1, &oldViewport);
-
-    if (pOldRTV) pOldRTV->Release();
-    if (pOldDSV) pOldDSV->Release();
-    pSRV->Release();
-
-    // Read back and convert to NV12
-    return ReadBackConversionRT();
 }
 
 bool VideoEncoder::ComposeSBSLayer(ID3D11Texture2D* pLeft, ID3D11Texture2D* pRight,
@@ -688,32 +470,4 @@ bool VideoEncoder::ComposeSBSGPU(const std::vector<ID3D11Texture2D*>& lefts,
     if (pOldDSV) pOldDSV->Release();
 
     return true;
-}
-
-bool VideoEncoder::ConvertTextureToFrame(ID3D11Texture2D* pTexture)
-{
-    D3D11_TEXTURE2D_DESC desc;
-    pTexture->GetDesc(&desc);
-
-    // BGRA8 at matching resolution -> direct copy + sws_scale
-    if (desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM &&
-        desc.Width == (UINT)m_width && desc.Height == (UINT)m_height) {
-        m_pContext->CopySubresourceRegion(m_pStagingTexture, 0, 0, 0, 0, pTexture, 0, nullptr);
-
-        D3D11_MAPPED_SUBRESOURCE mapped;
-        HRESULT hr = m_pContext->Map(m_pStagingTexture, 0, D3D11_MAP_READ, 0, &mapped);
-        if (FAILED(hr)) return false;
-
-        uint8_t* srcSlice[1] = { (uint8_t*)mapped.pData };
-        int srcStride[1] = { static_cast<int>(mapped.RowPitch) };
-        uint8_t* dstSlice[2] = { m_pSoftwareFrameBuffer, m_pSoftwareFrameBuffer + m_width * m_height };
-        int dstStride[2] = { m_width, m_width };
-
-        int ret = sws_scale(m_pConvertContext, srcSlice, srcStride, 0, m_height, dstSlice, dstStride);
-        m_pContext->Unmap(m_pStagingTexture, 0);
-        return (ret == m_height);
-    }
-
-    // R10G10B10A2 or any other format -> shader conversion (CopySubresourceRegion returns uniform values on AMD)
-    return ConvertViaShader(pTexture);
 }

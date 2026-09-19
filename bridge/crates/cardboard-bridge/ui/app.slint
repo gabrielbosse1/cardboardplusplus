@@ -81,6 +81,7 @@ export global BridgeState {
     callback wizard-done();
     callback install-driver();
     callback open-steamvr();
+    callback reopen-wizard(int);
     callback test-link();
     callback hand-toggled(bool);
     callback overlay-toggled(bool);
@@ -1427,6 +1428,53 @@ component DiagnosticsPage inherits VerticalLayout {
     }
 
     Card {
+        title: "Installers";
+        hint: "Re-install the SteamVR driver (pinned FFmpeg runtimes included) or revisit phone setup.";
+
+        VerticalLayout {
+            spacing: 8px;
+
+            HorizontalLayout {
+                spacing: 10px;
+                cross-axis-alignment: center;
+
+                PrimaryButton {
+                    width: 170px;
+                    text: BridgeState.install-busy ? "Installing…" : "Re-install driver";
+                    enabled: !BridgeState.install-busy;
+                    clicked => {
+                        BridgeState.install-driver();
+                    }
+                }
+
+                SecondaryButton {
+                    width: 170px;
+                    text: "Reinstall phone app";
+                    clicked => {
+                        BridgeState.reopen-wizard(2);
+                    }
+                }
+
+                Rectangle {
+                    horizontal-stretch: 1;
+                }
+
+                StatusPill {
+                    label: "driver present";
+                    ok: BridgeState.driver-present;
+                }
+            }
+
+            if BridgeState.install-note != "" : Text {
+                text: BridgeState.install-note;
+                color: Theme.text-mid;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+        }
+    }
+
+    Card {
         title: "Sensors";
         hint: "Latest phone IMU sample from the telemetry uplink (UDP 42071).";
 
@@ -1535,6 +1583,32 @@ component GeneralPage inherits VerticalLayout {
             color: Theme.text-dim;
             font-size: 11px;
             wrap: word-wrap;
+        }
+    }
+
+    Card {
+        title: "Setup wizard";
+
+        HorizontalLayout {
+            spacing: 10px;
+            cross-axis-alignment: center;
+
+            Text {
+                text: "Re-run the guided setup (driver install, phone app, SteamVR).";
+                color: Theme.text-mid;
+                font-size: 12px;
+                wrap: word-wrap;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+            }
+
+            SecondaryButton {
+                width: 190px;
+                text: "Back to setup wizard";
+                clicked => {
+                    BridgeState.reopen-wizard(0);
+                }
+            }
         }
     }
 

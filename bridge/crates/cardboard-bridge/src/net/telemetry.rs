@@ -9,8 +9,8 @@
 //!     (25 bytes total; the real head-tracking path)
 //!   * `0x13` net stats — u64 timestamp_ms, u32 frames decoded since last
 //!     report, u32 stall count (monotonic), f32 decoded fps (21 bytes total).
-//!     Sent every ~2 s by the phone's NetStatsReporter; drives the bridge's
-//!     adaptive bitrate.
+//!     Sent every ~2 s by the phone's NetStatsReporter; surfaced in the UI
+//!     only — bitrate moves via manual Apply, never automatically.
 //!   * `0x20` ping — a bare tag byte, used only to keep the link alive
 //!
 //! Plus one text frame: `CARDBOARD_PHONE_HELLO vN` when the phone first joins.
@@ -49,13 +49,13 @@ pub struct NetStats {
     pub decoded_fps: f32,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum TelemetryPacket {
     Gyro(GyroSample),
     Hand(HandFrame),
     Rotation(RotationSample),
     NetStats(NetStats),
-    Hello,
+    Hello(String),
     Ping,
     Unknown,
 }
@@ -84,8 +84,8 @@ pub fn parse_packet(buf: &[u8]) -> TelemetryPacket {
         0x13 if buf.len() >= NET_STATS_PACKET_LEN => TelemetryPacket::NetStats(parse_net_stats(buf)),
         0x20 => TelemetryPacket::Ping,
         _ => {
-            if is_phone_hello(buf) {
-                TelemetryPacket::Hello
+            if let Some(version) = phone_hello_version(buf) {
+                TelemetryPacket::Hello(version)
             } else {
                 TelemetryPacket::Unknown
             }
@@ -127,11 +127,20 @@ fn parse_net_stats(buf: &[u8]) -> NetStats {
     }
 }
 
-/// The greeting a phone sends on first contact over the telemetry link.
-fn is_phone_hello(buf: &[u8]) -> bool {
-    String::from_utf8_lossy(buf)
-        .trim_start()
-        .starts_with("CARDBOARD_PHONE_HELLO")
+/// The greeting a phone sends on first contact over the telemetry link:
+/// `CARDBOARD_PHONE_HELLO v1 [<commit-count>]`. Returns the trailing version
+/// ("" when an old client sent no suffix) so the bridge can report it.
+pub fn phone_hello_version(buf: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(buf);
+    let rest = text.trim_start().strip_prefix("CARDBOARD_PHONE_HELLO")?;
+    let rest = rest.trim_start();
+    if rest.is_empty() {
+        return Some(String::new()); // legacy bare hello, no protocol token
+    }
+    // tok0 = "v1" (protocol), tok1 = commit-count version (if present).
+    let mut toks = rest.split_whitespace();
+    toks.next()?;
+    Some(toks.next().unwrap_or("").to_string())
 }
 
 /// Read a little-endian u64 at `offset` (length guaranteed by `parse_packet`).
@@ -147,18 +156,6 @@ fn read_f32(buf: &[u8], offset: usize) -> f32 {
 /// Read a little-endian u32 at `offset` (bounds guaranteed by `parse_packet`).
 fn read_u32(buf: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(buf[offset..offset + 4].try_into().expect("fixed-size u32 slice"))
-}
-
-/// Encode the phone-side greeting (kept for tests/reference — the real phone
-/// sends this over the wire).
-#[allow(dead_code)]
-pub fn encode_hello(version: u32) -> Vec<u8> {
-    format!("CARDBOARD_PHONE_HELLO v{}", version).into_bytes()
-}
-
-#[allow(dead_code)]
-pub fn encode_ack() -> Vec<u8> {
-    b"BRIDGE_ACK".to_vec()
 }
 
 #[cfg(test)]
@@ -229,8 +226,22 @@ mod tests {
         assert!(matches!(parse_packet(&[0x20]), TelemetryPacket::Ping));
         assert!(matches!(
             parse_packet(b"CARDBOARD_PHONE_HELLO v1"),
-            TelemetryPacket::Hello
+            TelemetryPacket::Hello(_)
         ));
+    }
+
+    #[test]
+    fn hello_version_extracts_commit_count_suffix() {
+        match parse_packet(b"CARDBOARD_PHONE_HELLO v1 542") {
+            TelemetryPacket::Hello(v) => assert_eq!(v, "542"),
+            other => panic!("expected Hello, got {other:?}"),
+        }
+        // Old clients sent no suffix — still hello, just no version.
+        match parse_packet(b"CARDBOARD_PHONE_HELLO v1") {
+            TelemetryPacket::Hello(v) => assert_eq!(v, ""),
+            other => panic!("expected Hello, got {other:?}"),
+        }
+        assert!(phone_hello_version(b"random noise").is_none());
     }
 
     #[test]

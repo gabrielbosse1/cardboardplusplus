@@ -27,7 +27,13 @@
 
 #define LOG_TAG "cardboardplusplus"
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
+// Debug logs compile out in release (NDEBUG) so release logcat stays clean.
+// Warnings and errors always fire.
+#ifdef NDEBUG
+#define LOGD(...) ((void)0)
+#else
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+#endif
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define CARDBOARDPLUSPLUS_CHECK(condition)                                    \
   if (!(condition)) {                                                      \
@@ -67,30 +73,12 @@ struct Quatf {
 };
 
 /**
- * Converts an array of floats to a matrix.
- *
- * @param vec GL array
- * @return Obtained matrix
- */
-Matrix4x4 GetMatrixFromGlArray(float* vec);
-
-/**
  * Construct a translation matrix.
  *
  * @param translation Translation array
  * @return Obtained matrix
  */
 Matrix4x4 GetTranslationMatrix(const std::array<float, 3>& translation);
-
-/**
- * Computes the angle between two vectors.
- *
- * @param vec1 First vector
- * @param vec2 Second vector
- * @return Angle between the vectors
- */
-float AngleBetweenVectors(const std::array<float, 4>& vec1,
-                          const std::array<float, 4>& vec2);
 
 /**
  * Returns an identity matrix.
@@ -105,23 +93,6 @@ Matrix4x4 GetIdentityMatrix();
  * @return System boot time in nanoseconds
  */
 int64_t GetBootTimeNano();
-
-/**
- * Generates a random floating point number between |min| and |max|.
- *
- * @param min Minimum range
- * @param max Maximum range
- * @return Random float number
- */
-float RandomUniformFloat(float min, float max);
-
-/**
- * Generates a random integer in the range [0, max_val).
- *
- * @param max_val Maximum range
- * @return Random int number
- */
-int RandomUniformInt(int max_val);
 
 /**
  * Checks for OpenGL errors, and crashes if one has occurred.  Note that this
@@ -164,31 +135,6 @@ class TexturedMesh {
   std::vector<GLushort> indices_;
   GLuint position_attrib_{0};
   GLuint uv_attrib_{0};
-};
-
-class Texture {
- public:
-  Texture() = default;
-
-  ~Texture();
-
-  // Initializes the texture.
-  //
-  // After this is called the texture will be bound, replacing any previously
-  // bound texture.
-  //
-  // @return True if initialization was successful.
-  // TODO(b/138789810): Share some parts of the code between Android and iOS samples.
-  bool Initialize(JNIEnv* env, jobject java_asset_mgr,
-                  const std::string& texture_path);
-
-  // Binds the texture, replacing any previously bound texture.
-  void Bind() const;
-
-  GLuint texture_id() const { return texture_id_; }
-
- private:
-  GLuint texture_id_{0};
 };
 
 }  // namespace ndk_cardboardplusplus

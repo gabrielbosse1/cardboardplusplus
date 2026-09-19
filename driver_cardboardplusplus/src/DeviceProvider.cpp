@@ -5,7 +5,12 @@
 
 using namespace vr;
 
-// Device provider entry point. Registers controller and HMD drivers with SteamVR.
+// Device provider entry point. Registers the HMD driver with SteamVR.
+//
+// The example controller from the OpenVR template is intentionally NOT
+// registered (M1): it drove a hardcoded joystick forward input plus a sine
+// bob with no real hardware behind it. Hands ship via the bridge hand
+// pipeline instead, never as a ghost device.
 EVRInitError DeviceProvider::Init(IVRDriverContext* pDriverContext)
 {
     EVRInitError initError = InitServerDriverContext(pDriverContext);
@@ -14,22 +19,16 @@ EVRInitError DeviceProvider::Init(IVRDriverContext* pDriverContext)
         return initError;
     }
     
-    VRDriverLog()->Log("Initializing example controller"); //this is how you log out Steam's log file.
-
-    m_controllerDriver = new ControllerDriver();
-    VRServerDriverHost()->TrackedDeviceAdded("example_controller", TrackedDeviceClass_Controller, m_controllerDriver); //add all your devices like this.
-
-    VRDriverLog()->Log("Initializing example virtual HMD");
+    VRDriverLog()->Log("Initializing cardboardplusplus virtual HMD");
     m_hmdDriver = new HmdDriver();
-    VRServerDriverHost()->TrackedDeviceAdded("example_virtual_hmd", TrackedDeviceClass_HMD, m_hmdDriver);
+    VRServerDriverHost()->TrackedDeviceAdded("cardboardplusplus_hmd", TrackedDeviceClass_HMD, m_hmdDriver);
 
     return vr::VRInitError_None;
 }
 
 void DeviceProvider::Cleanup()
 {
-    delete m_controllerDriver;
-    m_controllerDriver = NULL;
+    // m_controllerDriver is never created (ghost controller not registered).
     delete m_hmdDriver;
     m_hmdDriver = NULL;
 }
@@ -43,7 +42,6 @@ void DeviceProvider::RunFrame()
     static int count = 0;
     count++;
     if (count == 1) VRDriverLog()->Log("DeviceProvider::RunFrame FIRST CALL");
-    m_controllerDriver->RunFrame();
     m_hmdDriver->RunFrame();
 }
 

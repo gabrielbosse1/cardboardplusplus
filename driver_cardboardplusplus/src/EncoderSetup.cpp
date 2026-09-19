@@ -30,12 +30,15 @@ bool HmdDriver::InitializeVideoEncoder()
         return false;
     }
 
-    // SBS resolution: 1440x1620 per eye -> 2880x1620 (defaults, clamped to decoder cap)
-    m_encoderW = 2880;
-    m_encoderH = 1620;
+    // Default to the compositor render size (SBS 1920x1080), not an
+    // upscaled 2880x1620 that only encodes interpolated pixels (M3).
+    // Sanitized like every other write: even + 16-aligned.
+    m_encoderW = 1920;
+    m_encoderH = 1080;
     m_encoderFps = 60;
     m_encoderBitrate = 20000000;
     m_encoderUseGpu = false;
+    SanitizeEncoderDims(m_encoderW, m_encoderH);
     ClampEncoderToCap();
 
     int width = m_encoderW;
@@ -50,9 +53,7 @@ bool HmdDriver::InitializeVideoEncoder()
     DriverLog("  Bitrate: %d bps (%d kbps)", bitrate, bitrate / 1000);
     DriverLog("  GPU Encoding: %s", useGpuEncoding ? "YES" : "NO");
 
-    m_pVideoEncoder->SetEncodedPacketCallback([this](uint8_t* data, int size, int64_t pts, bool keyframe) {
-        OnEncodedPacket(data, size, pts, keyframe);
-    });
+    RegisterEncoderCallbacks(m_pVideoEncoder);
 
     if (!m_pVideoEncoder->Initialize(m_pD3D11Device, m_pD3D11DeviceContext, width, height, fps, bitrate, useGpuEncoding)) {
         DriverLog("VideoEncoder::Initialize failed!");
@@ -103,7 +104,15 @@ void HmdDriver::ClampEncoderToCap()
     newW = (newW / 16) * 16;
     newH = (newH / 16) * 16;
 
-    if (newW > 0 && newH > 0) {
+    // Never clamp to a degenerate size: an absurd cap (or align-down of a
+    // tiny encoder) must keep the old resolution, not kill the stream (M4).
+    if (newW < 320 || newH < 160) {
+        DriverLog("Hardware cap %dx%d would clamp to degenerate %dx%d, keeping %dx%d",
+                  m_pendingCapW, m_pendingCapH, newW, newH, m_encoderW, m_encoderH);
+        return;
+    }
+
+    {
         DriverLog("Clamping encoder to hardware cap %dx%d: %dx%d -> %dx%d",
                   m_pendingCapW, m_pendingCapH, m_encoderW, m_encoderH, newW, newH);
         m_encoderW = newW;
@@ -111,79 +120,38 @@ void HmdDriver::ClampEncoderToCap()
     }
 }
 
-bool HmdDriver::ApplyBridgeCfg(int fps, int bitrateKbps, const char* codec)
+// Range-check + align encoder dims in place (H5/M3/M4). Returns false when the
+// proposed size is outside 320x180..7680 or aligns down to nothing — the
+// caller must then reject-and-keep-old. 16-align implies even (H.264 4:2:0).
+bool HmdDriver::SanitizeEncoderDims(int& w, int& h)
 {
-    // Same re-init discipline as ApplyHardwareCap: never tear down while the
-    // background thread may still be reading encoder resources.
-    WaitEncoderIdle();
-
-    std::lock_guard<std::mutex> lock(m_encoderMutex);
-
-    int newFps = (fps > 0 && fps <= 120) ? fps : m_encoderFps;
-    int newBitrate = (bitrateKbps > 0 && bitrateKbps <= 100000) ? bitrateKbps * 1000 : m_encoderBitrate;
-    // Named codecs pin the backend; "auto" (or unknown) keeps the current one
-    // so a bitrate-only push never flips HW<->SW underneath the stream.
-    // "gpu"/"cpu" are the bridge's coarse switch: GPU lets VideoEncoder probe
-    // the hardware backends for the installed card, CPU forces libx264.
-    bool newGpu = m_encoderUseGpu;
-    if (codec) {
-        if (strcmp(codec, "libx264") == 0 || strcmp(codec, "cpu") == 0) newGpu = false;
-        else if (strcmp(codec, "h264_amf") == 0 || strcmp(codec, "h264_nvenc") == 0
-                 || strcmp(codec, "h264_qsv") == 0 || strcmp(codec, "gpu") == 0) newGpu = true;
-    }
-
-    if (!m_encoderInitialized || !m_pVideoEncoder) {
-        // Encoder not up yet; values apply at initialization time.
-        m_encoderFps = newFps;
-        m_encoderBitrate = newBitrate;
-        m_encoderUseGpu = newGpu;
-        DriverLog("BRIDGE_CFG stored (encoder not ready, applied on init)");
-        return true;
-    }
-
-    bool meaningful = (newFps != m_encoderFps || newBitrate != m_encoderBitrate || newGpu != m_encoderUseGpu);
-    if (!meaningful) {
+    if (w < 320 || h < 180 || w > 7680 || h > 7680)
         return false;
-    }
-
-    DriverLog("Re-initializing encoder from BRIDGE_CFG: @%d fps, %d kbps, gpu=%d",
-              newFps, newBitrate / 1000, newGpu ? 1 : 0);
-
-    m_encoderFps = newFps;
-    m_encoderBitrate = newBitrate;
-    m_encoderUseGpu = newGpu;
-    ClampEncoderToCap();
-
-    m_pVideoEncoder->Shutdown();
-    delete m_pVideoEncoder;
-    m_pVideoEncoder = nullptr;
-    m_encoderInitialized = false;
-
-    m_pVideoEncoder = new VideoEncoder();
-    if (!m_pVideoEncoder) {
-        DriverLog("Failed to allocate VideoEncoder during BRIDGE_CFG re-init!");
-        return false;
-    }
-
-    m_pVideoEncoder->SetEncodedPacketCallback([this](uint8_t* data, int size, int64_t pts, bool keyframe) {
-        OnEncodedPacket(data, size, pts, keyframe);
-    });
-
-    if (!m_pVideoEncoder->Initialize(m_pD3D11Device, m_pD3D11DeviceContext,
-                                     m_encoderW, m_encoderH, m_encoderFps, m_encoderBitrate, m_encoderUseGpu)) {
-        DriverLog("VideoEncoder re-init failed under BRIDGE_CFG!");
-        delete m_pVideoEncoder;
-        m_pVideoEncoder = nullptr;
-        return false;
-    }
-
-    m_encoderInitialized = true;
-    m_encoderPts = 0;
-    DriverLog("Encoder re-initialized at %dx%d @%d fps from BRIDGE_CFG", m_encoderW, m_encoderH, m_encoderFps);
-    return true;
+    w = (w / 16) * 16;
+    h = (h / 16) * 16;
+    // Align-down costs at most 15px, so a sane input can only land just under
+    // the floor; anything smaller was degenerate to begin with.
+    return w >= 320 && h >= 160;
 }
 
-bool HmdDriver::ApplyHardwareCap(int capW, int capH)
+void HmdDriver::RegisterEncoderCallbacks(VideoEncoder* enc)
+{
+    enc->SetEncodedPacketCallback([this](uint8_t* data, int size, int64_t pts, bool keyframe) {
+        OnEncodedPacket(data, size, pts, keyframe);
+    });
+    // Without this, BridgeServer::PublishTelemetry is never called and the SHM
+    // status ring stays empty (H3). Every (re-)init must go through here (H4).
+    enc->SetTelemetryCallback([this](const cbpp::PayloadTelemetry& t) {
+        if (m_bridgeInitialized.load(std::memory_order_relaxed) && m_bridgeServer.running()) {
+            m_bridgeServer.PublishTelemetry(t);
+        }
+    });
+}
+
+// Single validated applier behind the SHM (ApplyStreamSettings) and UDP
+// (ApplyBridgeCfg / ApplyHardwareCap) control planes (M5). Out-of-range
+// fields keep their old values; a fully-noop change skips the re-init.
+bool HmdDriver::ApplyEncoderSettings(int w, int h, int fps, int bitrateBps, bool useGpu, const char* reason)
 {
     // Never tear down encoder resources while the background thread may still
     // be reading them (queued compose / in-flight readback).
@@ -191,26 +159,43 @@ bool HmdDriver::ApplyHardwareCap(int capW, int capH)
 
     std::lock_guard<std::mutex> lock(m_encoderMutex);
 
-    m_pendingCapW = capW;
-    m_pendingCapH = capH;
-
-    if (!m_encoderInitialized || !m_pVideoEncoder) {
-        // Encoder not up yet; cap will be applied at initialization time.
-        DriverLog("Hardware cap %dx%d received (encoder not ready, applied on init)", capW, capH);
-        return true;
+    int newW = w, newH = h;
+    if (!SanitizeEncoderDims(newW, newH)) {
+        DriverLog("%s: rejecting bad dims %dx%d, keeping %dx%d",
+                  reason, w, h, m_encoderW, m_encoderH);
+        newW = m_encoderW;
+        newH = m_encoderH;
     }
+    int newFps = (fps >= 1 && fps <= 120) ? fps : m_encoderFps;
+    // bitrateBps <= 0 is the caller's "keep old" sentinel; >100Mbps is insane.
+    int newBitrate = (bitrateBps >= 1000 && bitrateBps <= 100 * 1000 * 1000) ? bitrateBps : m_encoderBitrate;
+    bool newGpu = useGpu;
 
     int oldW = m_encoderW;
     int oldH = m_encoderH;
+    int oldFps = m_encoderFps;
+    int oldBitrate = m_encoderBitrate;
+    bool oldGpu = m_encoderUseGpu;
+
+    m_encoderW = newW;
+    m_encoderH = newH;
+    m_encoderFps = newFps;
+    m_encoderBitrate = newBitrate;
+    m_encoderUseGpu = newGpu;
     ClampEncoderToCap();
 
-    if (m_encoderW == oldW && m_encoderH == oldH) {
-        DriverLog("Hardware cap %dx%d >= current encoder %dx%d, no change", capW, capH, oldW, oldH);
-        return false;
+    if (!m_encoderInitialized || !m_pVideoEncoder) {
+        DriverLog("%s stored (encoder not ready, applied on init)", reason);
+        return true;
     }
 
-    DriverLog("Re-initializing encoder under hardware cap %dx%d: %dx%d -> %dx%d",
-              capW, capH, oldW, oldH, m_encoderW, m_encoderH);
+    bool meaningful = (m_encoderW != oldW || m_encoderH != oldH || m_encoderFps != oldFps ||
+                       m_encoderBitrate != oldBitrate || m_encoderUseGpu != oldGpu);
+    if (!meaningful)
+        return false;
+
+    DriverLog("Re-initializing encoder from %s: %dx%d @%d fps, %d kbps, gpu=%d",
+              reason, m_encoderW, m_encoderH, m_encoderFps, m_encoderBitrate / 1000, m_encoderUseGpu ? 1 : 0);
 
     m_pVideoEncoder->Shutdown();
     delete m_pVideoEncoder;
@@ -219,17 +204,15 @@ bool HmdDriver::ApplyHardwareCap(int capW, int capH)
 
     m_pVideoEncoder = new VideoEncoder();
     if (!m_pVideoEncoder) {
-        DriverLog("Failed to allocate VideoEncoder during cap re-init!");
+        DriverLog("Failed to allocate VideoEncoder during %s re-init!", reason);
         return false;
     }
 
-    m_pVideoEncoder->SetEncodedPacketCallback([this](uint8_t* data, int size, int64_t pts, bool keyframe) {
-        OnEncodedPacket(data, size, pts, keyframe);
-    });
+    RegisterEncoderCallbacks(m_pVideoEncoder);
 
     if (!m_pVideoEncoder->Initialize(m_pD3D11Device, m_pD3D11DeviceContext,
                                      m_encoderW, m_encoderH, m_encoderFps, m_encoderBitrate, m_encoderUseGpu)) {
-        DriverLog("VideoEncoder re-init failed under cap!");
+        DriverLog("VideoEncoder re-init failed under %s!", reason);
         delete m_pVideoEncoder;
         m_pVideoEncoder = nullptr;
         return false;
@@ -237,6 +220,71 @@ bool HmdDriver::ApplyHardwareCap(int capW, int capH)
 
     m_encoderInitialized = true;
     m_encoderPts = 0;
-    DriverLog("Encoder re-initialized at %dx%d under hardware cap", m_encoderW, m_encoderH);
+    DriverLog("Encoder re-initialized at %dx%d @%d fps from %s", m_encoderW, m_encoderH, m_encoderFps, reason);
     return true;
+}
+
+bool HmdDriver::ApplyBridgeCfg(int fps, int bitrateKbps, const char* codec)
+{
+    // Named codecs pin the backend; "auto" (or unknown) keeps the current one
+    // so a bitrate-only push never flips HW<->SW underneath the stream.
+    // "gpu"/"cpu" are the bridge's coarse switch: GPU lets VideoEncoder probe
+    // the hardware backends for the installed card, CPU forces libx264.
+    // (m_encoderUseGpu is read lock-free here; ApplyEncoderSettings re-checks
+    // the final value under the mutex — worst case a concurrent change wins.)
+    bool newGpu = m_encoderUseGpu;
+    if (codec) {
+        if (strcmp(codec, "libx264") == 0 || strcmp(codec, "cpu") == 0) newGpu = false;
+        else if (strcmp(codec, "h264_amf") == 0 || strcmp(codec, "h264_nvenc") == 0
+                 || strcmp(codec, "h264_qsv") == 0 || strcmp(codec, "gpu") == 0) newGpu = true;
+    }
+    // W/H untouched by BRIDGE_CFG: propose current (re-validated inside).
+    // kbps clamp before *1000 so the multiply can't overflow (H5).
+    int bps = (bitrateKbps >= 1 && bitrateKbps <= 100000) ? bitrateKbps * 1000 : -1;
+    return ApplyEncoderSettings(m_encoderW, m_encoderH, fps, bps, newGpu, "BRIDGE_CFG");
+}
+
+bool HmdDriver::ApplyHardwareCap(int capW, int capH)
+{
+    // Validate BEFORE storing: a poisoned cap used to stick forever (M4).
+    if (capW < 320 || capH < 180 || capW > 7680 || capH > 7680) {
+        DriverLog("Hardware cap %dx%d out of range (320x180-7680), ignored", capW, capH);
+        return false;
+    }
+    capW &= ~1;
+    capH &= ~1;
+
+    int clampedW, clampedH, fps, bitrate;
+    bool gpu;
+    {
+        std::lock_guard<std::mutex> lock(m_encoderMutex);
+        m_pendingCapW = capW;
+        m_pendingCapH = capH;
+
+        if (!m_encoderInitialized || !m_pVideoEncoder) {
+            // Encoder not up yet; cap will be applied at initialization time.
+            DriverLog("Hardware cap %dx%d received (encoder not ready, applied on init)", capW, capH);
+            return true;
+        }
+
+        int oldW = m_encoderW;
+        int oldH = m_encoderH;
+        ClampEncoderToCap();
+
+        if (m_encoderW == oldW && m_encoderH == oldH) {
+            DriverLog("Hardware cap %dx%d >= current encoder %dx%d, no change", capW, capH, oldW, oldH);
+            return false;
+        }
+
+        DriverLog("Re-initializing encoder under hardware cap %dx%d: %dx%d -> %dx%d",
+                  capW, capH, oldW, oldH, m_encoderW, m_encoderH);
+        clampedW = m_encoderW;
+        clampedH = m_encoderH;
+        fps = m_encoderFps;
+        bitrate = m_encoderBitrate;
+        gpu = m_encoderUseGpu;
+    }
+    // Same validated re-init path as every other settings source (M5). The
+    // dims were just clamped above; re-validation inside is a no-op.
+    return ApplyEncoderSettings(clampedW, clampedH, fps, bitrate, gpu, "hardware-cap");
 }

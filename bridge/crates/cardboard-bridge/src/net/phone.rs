@@ -14,7 +14,8 @@ use crate::net::telemetry::{self, TelemetryPacket};
 use crate::net::{SENSOR_PORT, TELEMETRY_PORT};
 
 /// Cached UDP socket for bridge→driver forwarding (created once, reused).
-// ponytail: UDP 42074 is latest-wins fire-and-forget; move to shm CmdProducer PublishPose if reliable delivery needed.
+/// UDP 42074 is latest-wins fire-and-forget validated raw relay (see
+/// `relay_raw_to_driver`); no parse/rebuild happens on this path.
 static SENSOR_SOCK: OnceLock<UdpSocket> = OnceLock::new();
 
 fn sensor_sock() -> &'static UdpSocket {
@@ -55,12 +56,32 @@ pub fn spawn(state: SharedState) {
 fn telemetry_loop(sock: UdpSocket, state: SharedState) {
     let mut buf = [0u8; 65535];
     let mut last_seen = None::<Instant>;
+    let started = Instant::now();
+    let mut silence_hinted = false;
 
     loop {
         match sock.recv_from(&mut buf) {
             Ok((n, src)) => {
-                last_seen = Some(Instant::now());
                 let packet = telemetry::parse_packet(&buf[..n]);
+                // Liveness stamps on every well-formed packet (Ping is the
+                // intentional keepalive); garbage never extends the session.
+                if matches!(packet, TelemetryPacket::Unknown) {
+                    crate::debug_log!(
+                        state,
+                        "[phone] ignored unknown {}-byte datagram from {src}",
+                        n
+                    );
+                } else {
+                    last_seen = Some(Instant::now());
+                }
+                // Sensor relay straight from the wire: validated raw bytes,
+                // never parsed and rebuilt (see R10).
+                let raw = &buf[..n];
+                if !raw.is_empty()
+                    && ((raw[0] == 0x10 && n == 45) || (raw[0] == 0x12 && n == 25))
+                {
+                    relay_raw_to_driver(raw);
+                }
                 apply_packet(&state, packet, src);
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
@@ -73,27 +94,41 @@ fn telemetry_loop(sock: UdpSocket, state: SharedState) {
             }
         }
 
+        if !silence_hinted && last_seen.is_none() && started.elapsed() > Duration::from_secs(10) {
+            silence_hinted = true;
+            if let Ok(mut s) = state.lock() {
+                s.push_log(format!(
+                    "telemetry bound but silent after 10s — check Windows firewall inbound UDP {TELEMETRY_PORT} and the phone's Wi-Fi"
+                ));
+            }
+        }
         mark_phone_gone_if_stale(&state, last_seen);
     }
 }
 
-/// Fold one parsed telemetry packet into shared state. Every packet — even a
-/// bare ping — refreshes the "phone is alive" flag; only the hello announces
-/// the phone's address in the log (once per connection).
+/// Fold one parsed telemetry packet into shared state. Hello/Gyro/Rotation
+/// move `phone_ip` (roam); Hand/NetStats are honored only when already
+/// connected from the same IP (they are trivially forgeable, so they must
+/// never steal the address); Ping keeps the session alive but never moves
+/// the IP; Unknown is ignored entirely.
 fn apply_packet(state: &SharedState, packet: TelemetryPacket, src: SocketAddr) {
-    // Determine forwarding outside the lock so the UDP send never blocks the UI.
-    let mut forward_gyro: Option<telemetry::GyroSample> = None;
-    let mut forward_rot: Option<telemetry::RotationSample> = None;
-
+    // debug_log! re-locks the state, so verbose notes are collected here and
+    // emitted after the guard below drops (same-thread deadlock otherwise).
+    let mut debug_msg: Option<String> = None;
     if let Ok(mut s) = state.lock() {
         match packet {
-            TelemetryPacket::Hello => {
+            TelemetryPacket::Hello(version) => {
                 let new_ip = src.ip().to_string();
                 if s.phone_ip != new_ip {
                     s.phone_ip = new_ip;
                     s.push_log(format!("phone hello from {src}"));
                 } else if !s.phone_connected {
                     s.push_log(format!("phone hello from {src}"));
+                }
+                // Commit-count suffix ("... v1 <n>"); old clients send none.
+                if !version.is_empty() && s.phone_version != version {
+                    s.phone_version = version.clone();
+                    s.push_log(format!("phone version {version}"));
                 }
                 s.phone_connected = true;
             }
@@ -109,11 +144,15 @@ fn apply_packet(state: &SharedState, packet: TelemetryPacket, src: SocketAddr) {
                 }
                 s.note_gyro(&sample);
                 s.phone_connected = true;
-                forward_gyro = Some(sample);
             }
             TelemetryPacket::Hand(frame) => {
-                s.note_hand(frame.hands);
-                s.phone_connected = true;
+                if s.phone_connected && s.phone_ip == src.ip().to_string() {
+                    s.note_hand(frame.hands);
+                } else {
+                    debug_msg = Some(format!(
+                        "[phone] ignored hand frame from {src} (not the connected phone)"
+                    ));
+                }
             }
             TelemetryPacket::Rotation(sample) => {
                 let ip = src.ip().to_string();
@@ -122,32 +161,28 @@ fn apply_packet(state: &SharedState, packet: TelemetryPacket, src: SocketAddr) {
                     s.push_log(format!("phone IP updated to {src} (rotation)"));
                 }
                 s.phone_connected = true;
-                static ROT_DEBUG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let c = ROT_DEBUG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if c % 20 == 0 {
-                    eprintln!(
-                        "[rot-debug] phone quat=({:.4},{:.4},{:.4},{:.4}) ts={}",
-                        sample.quat[0], sample.quat[1], sample.quat[2], sample.quat[3], sample.timestamp_ms
-                    );
-                }
-                forward_rot = Some(sample);
+                debug_msg = Some(format!(
+                    "[phone] rotation quat=({:.4},{:.4},{:.4},{:.4}) ts={}",
+                    sample.quat[0], sample.quat[1], sample.quat[2], sample.quat[3],
+                    sample.timestamp_ms
+                ));
             }
             TelemetryPacket::NetStats(stats) => {
-                s.phone_connected = true;
-                // Counters only — bitrate moves via manual Apply (see Test Link).
-                s.note_net_stats(&stats);
+                if s.phone_connected && s.phone_ip == src.ip().to_string() {
+                    // Counters only — bitrate moves via manual Apply (see Test Link).
+                    s.note_net_stats(&stats);
+                } else {
+                    debug_msg = Some(format!(
+                        "[phone] ignored net-stats from {src} (not the connected phone)"
+                    ));
+                }
             }
             TelemetryPacket::Unknown => {}
         }
         s.recompute_fps();
     }
-
-    if let Some(sample) = forward_gyro {
-        forward_sensor_to_driver(&sample);
-    }
-    if let Some(sample) = forward_rot {
-        crate::debug_log!(state, "[phone] rotation quat=({:.4},{:.4},{:.4},{:.4}) ts={}", sample.quat[0], sample.quat[1], sample.quat[2], sample.quat[3], sample.timestamp_ms);
-        forward_rotation_to_driver(&sample);
+    if let Some(m) = debug_msg {
+        crate::debug_log!(state, "{m}");
     }
 }
 
@@ -167,51 +202,15 @@ fn mark_phone_gone_if_stale(state: &SharedState, last_seen: Option<Instant>) {
     }
 }
 
-/// Best-effort downlink to the phone (not currently used by the session, kept
-/// for future control messages).
-#[allow(dead_code)]
-pub fn send_to_phone(addr: SocketAddr, data: &[u8]) {
-    if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
-        let _ = sock.send_to(data, addr);
-    }
-}
-
-/// Forward the latest sensor sample to the driver via UDP 42074. The packet
-/// format is identical to the phone→bridge format (tag 0x10, 45 bytes LE) so
-/// the driver can reuse the same parser. Fire-and-forget: a dropped packet is
-/// replaced by the next sample within ~20 ms.
+/// Forward one validated sensor datagram to the driver via UDP 42074,
+/// byte-for-byte as it arrived (tag 0x10/45B gyro or 0x12/25B rotation, LE —
+/// endianness untouched). The caller guarantees the tag/len check, so spoofed
+/// or malformed bytes never reach the driver parser. Fire-and-forget: a
+/// dropped packet is replaced by the next sample within ~20 ms.
 /// Reuses a single socket — the previous per-packet bind caused port exhaustion at 200 Hz.
-fn forward_sensor_to_driver(sample: &telemetry::GyroSample) {
-    let mut buf = Vec::with_capacity(45);
-    buf.push(0x10); // tag: gyro sample
-    buf.extend_from_slice(&sample.timestamp_ms.to_le_bytes());
-    for v in sample.angular_velocity {
-        buf.extend_from_slice(&v.to_le_bytes());
-    }
-    for v in sample.acceleration {
-        buf.extend_from_slice(&v.to_le_bytes());
-    }
-    for v in sample.magnetic_field {
-        buf.extend_from_slice(&v.to_le_bytes());
-    }
-    if let Err(e) = sensor_sock().send_to(&buf, format!("127.0.0.1:{SENSOR_PORT}")) {
+fn relay_raw_to_driver(raw: &[u8]) {
+    if let Err(e) = sensor_sock().send_to(raw, format!("127.0.0.1:{SENSOR_PORT}")) {
         eprintln!("[sensor-fwd] send_to 42074 failed: {e}");
-    }
-}
-
-/// Forward the fused rotation quaternion to the driver via UDP 42074.
-/// The phone already converts the game rotation vector to absolute OpenVR
-/// space (Y-up world, VR device frame), so the bridge passes it through
-/// untouched — pitch/roll stay gravity-level, no reference capture needed.
-fn forward_rotation_to_driver(sample: &telemetry::RotationSample) {
-    let mut buf = Vec::with_capacity(25);
-    buf.push(0x12);
-    buf.extend_from_slice(&sample.timestamp_ms.to_le_bytes());
-    for v in sample.quat {
-        buf.extend_from_slice(&v.to_le_bytes());
-    }
-    if let Err(e) = sensor_sock().send_to(&buf, format!("127.0.0.1:{SENSOR_PORT}")) {
-        eprintln!("[rot-fwd] send_to 42074 failed: {e}");
     }
 }
 
@@ -235,7 +234,7 @@ mod tests {
     #[test]
     fn hello_sets_phone_connected() {
         let state = fresh_state();
-        apply_packet(&state, TelemetryPacket::Hello, fake_src());
+        apply_packet(&state, TelemetryPacket::Hello("1".into()), fake_src());
         let s = state.lock().unwrap();
         assert!(s.phone_connected);
     }
@@ -243,7 +242,7 @@ mod tests {
     #[test]
     fn hello_records_phone_ip() {
         let state = fresh_state();
-        apply_packet(&state, TelemetryPacket::Hello, fake_src());
+        apply_packet(&state, TelemetryPacket::Hello("1".into()), fake_src());
         let s = state.lock().unwrap();
         assert_eq!(s.phone_ip, "192.168.1.100");
     }
@@ -251,17 +250,32 @@ mod tests {
     #[test]
     fn hello_logs_on_first_connect() {
         let state = fresh_state();
-        apply_packet(&state, TelemetryPacket::Hello, fake_src());
+        apply_packet(&state, TelemetryPacket::Hello("1".into()), fake_src());
         let s = state.lock().unwrap();
         assert!(s.log.iter().any(|l| l.contains("phone hello")));
     }
 
     #[test]
+    fn hello_records_phone_version_and_logs_once() {
+        let state = fresh_state();
+        apply_packet(&state, TelemetryPacket::Hello("542".into()), fake_src());
+        assert_eq!(state.lock().unwrap().phone_version, "542");
+        assert!(state.lock().unwrap().log.iter().any(|l| l.contains("phone version 542")));
+        // Repeat hello with the same version logs nothing new.
+        let count_first = state.lock().unwrap().log.len();
+        apply_packet(&state, TelemetryPacket::Hello("542".into()), fake_src());
+        assert_eq!(state.lock().unwrap().log.len(), count_first);
+        // A rebuilt phone reports the new version.
+        apply_packet(&state, TelemetryPacket::Hello("543".into()), fake_src());
+        assert_eq!(state.lock().unwrap().phone_version, "543");
+    }
+
+    #[test]
     fn hello_does_not_log_on_repeat() {
         let state = fresh_state();
-        apply_packet(&state, TelemetryPacket::Hello, fake_src());
+        apply_packet(&state, TelemetryPacket::Hello("1".into()), fake_src());
         let count_first = state.lock().unwrap().log.len();
-        apply_packet(&state, TelemetryPacket::Hello, fake_src());
+        apply_packet(&state, TelemetryPacket::Hello("1".into()), fake_src());
         let count_second = state.lock().unwrap().log.len();
         assert_eq!(count_first, count_second);
     }
@@ -292,6 +306,8 @@ mod tests {
     #[test]
     fn hand_sets_phone_connected_and_records_hands() {
         let state = fresh_state();
+        // Hand frames only count once the phone is known (Hello first).
+        apply_packet(&state, TelemetryPacket::Hello("1".into()), fake_src());
         let frame = HandFrame {
             timestamp_ms: 100,
             hands: 2,
@@ -302,6 +318,53 @@ mod tests {
         let s = state.lock().unwrap();
         assert!(s.phone_connected);
         assert_eq!(s.hands_detected, 2);
+    }
+
+    #[test]
+    fn hand_from_unknown_phone_is_ignored() {
+        let state = fresh_state();
+        let frame = HandFrame {
+            timestamp_ms: 100,
+            hands: 2,
+            landmarks_per_hand: 21,
+            confidence: 0.9,
+        };
+        apply_packet(&state, TelemetryPacket::Hand(frame), fake_src());
+        let s = state.lock().unwrap();
+        assert!(!s.phone_connected);
+        assert_eq!(s.hands_detected, 0);
+    }
+
+    #[test]
+    fn hand_from_roamed_ip_is_ignored_until_hello() {
+        use std::net::SocketAddr;
+        let state = fresh_state();
+        let home: SocketAddr = fake_src();
+        let rogue: SocketAddr = "192.168.1.200:9999".parse().unwrap();
+        apply_packet(&state, TelemetryPacket::Hello("1".into()), home);
+        let frame = HandFrame {
+            timestamp_ms: 100,
+            hands: 2,
+            landmarks_per_hand: 21,
+            confidence: 0.9,
+        };
+        apply_packet(&state, TelemetryPacket::Hand(frame), rogue);
+        let s = state.lock().unwrap();
+        assert_eq!(s.phone_ip, "192.168.1.100");
+        assert_eq!(s.hands_detected, 0);
+    }
+
+    #[test]
+    fn ping_never_moves_phone_ip() {
+        use std::net::SocketAddr;
+        let state = fresh_state();
+        let home: SocketAddr = fake_src();
+        let rogue: SocketAddr = "192.168.1.200:9999".parse().unwrap();
+        apply_packet(&state, TelemetryPacket::Hello("1".into()), home);
+        apply_packet(&state, TelemetryPacket::Ping, rogue);
+        let s = state.lock().unwrap();
+        assert!(s.phone_connected);
+        assert_eq!(s.phone_ip, "192.168.1.100");
     }
 
     // --- apply_packet: Ping ---
@@ -334,6 +397,7 @@ mod tests {
             let mut s = state.lock().unwrap();
             s.driver_connected = true;
         }
+        apply_packet(&state, TelemetryPacket::Hello("1".into()), fake_src());
         let stats = NetStats {
             timestamp_ms: 1,
             frames_decoded: 120,
@@ -345,6 +409,22 @@ mod tests {
         assert!(s.phone_connected);
         assert_eq!(s.net_frames_decoded, 120);
         assert_eq!(s.net_decoded_fps, 60.0);
+    }
+
+    #[test]
+    fn net_stats_from_unknown_phone_is_ignored() {
+        use crate::net::telemetry::NetStats;
+        let state = fresh_state();
+        let stats = NetStats {
+            timestamp_ms: 1,
+            frames_decoded: 120,
+            stalls: 0,
+            decoded_fps: 60.0,
+        };
+        apply_packet(&state, TelemetryPacket::NetStats(stats), fake_src());
+        let s = state.lock().unwrap();
+        assert!(!s.phone_connected);
+        assert_eq!(s.net_frames_decoded, 0);
     }
 
     #[test]
@@ -364,6 +444,7 @@ mod tests {
         };
         // Counters update for the UI, but nothing is pushed: the applied
         // settings only change via manual Apply (see Test Link).
+        apply_packet(&state, TelemetryPacket::Hello("1".into()), fake_src());
         apply_packet(&state, TelemetryPacket::NetStats(stats), fake_src());
         let s = state.lock().unwrap();
         assert_eq!(s.net_stalls, 2);
@@ -429,7 +510,7 @@ mod tests {
         let src = fake_src();
 
         // Connect
-        apply_packet(&state, TelemetryPacket::Hello, src);
+        apply_packet(&state, TelemetryPacket::Hello("1".into()), src);
         assert!(state.lock().unwrap().phone_connected);
 
         // Timeout
@@ -438,7 +519,7 @@ mod tests {
         assert!(!state.lock().unwrap().phone_connected);
 
         // Reconnect
-        apply_packet(&state, TelemetryPacket::Hello, src);
+        apply_packet(&state, TelemetryPacket::Hello("1".into()), src);
         assert!(state.lock().unwrap().phone_connected);
     }
 }

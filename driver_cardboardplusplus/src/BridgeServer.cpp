@@ -181,9 +181,13 @@ bool BridgeServer::PollSettings(PayloadSettingsChange& out)
         cmd_cursor_ = 0;
 
     if (!CmdSlotValid(cmd_cursor_)) {
-        // Producer overwrote our slot before we read it; latest-wins.
-        cmd_cursor_ = ws;
-        return false;
+        // Producer overwrote our slot before we read it (latest-wins). Resync
+        // to the newest message instead of skipping it forever (M15).
+        cmd_cursor_ = ws > 0 ? ws - 1 : 0;
+        if (!CmdSlotValid(cmd_cursor_)) {
+            cmd_cursor_ = ws;
+            return false;
+        }
     }
 
     SlotHeader* slot = reinterpret_cast<SlotHeader*>(CmdSlotPtr(cmd_cursor_));

@@ -1,6 +1,10 @@
 //! REST control-plane bootstrap: resolve the port, bind the loopback HTTP
 //! server and hand each request to `handlers::handle`. All endpoint logic
 //! lives in `handlers`; the index page text lives in `index`.
+//!
+//! Loopback-only (`127.0.0.1`) is a deliberate security choice: the API can
+//! push stream settings with no auth, so it must never bind `0.0.0.0`.
+//! Adding a LAN-facing listener requires an auth story first.
 
 use std::sync::Arc;
 

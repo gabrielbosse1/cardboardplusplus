@@ -23,7 +23,6 @@
 
 #include <array>
 #include <cmath>
-#include <random>
 #include <sstream>
 #include <string>
 
@@ -32,65 +31,6 @@
 namespace ndk_cardboardplusplus {
 
 namespace {
-
-class RunAtEndOfScope {
- public:
-  RunAtEndOfScope(std::function<void()> function) : function_(function) {}
-
-  ~RunAtEndOfScope() { function_(); }
-
- private:
-  std::function<void()> function_;
-};
-
-/**
- * Loads a png file from assets folder and then assigns it to the OpenGL target.
- * This method must be called from the renderer thread since it will result in
- * OpenGL calls to assign the image to the texture target.
- *
- * @param env The JNIEnv to use.
- * @param java_asset_mgr The asset manager object.
- * @param target OpenGL texture target to load the image into.
- * @param path Path to the file, relative to the assets folder.
- * @return true if png is loaded correctly, otherwise false.
- */
-bool LoadPngFromAssetManager(JNIEnv* env, jobject java_asset_mgr, int target,
-                             const std::string& path) {
-  jclass bitmap_factory_class =
-      env->FindClass("android/graphics/BitmapFactory");
-  jclass asset_manager_class =
-      env->FindClass("android/content/res/AssetManager");
-  jclass gl_utils_class = env->FindClass("android/opengl/GLUtils");
-  jmethodID decode_stream_method = env->GetStaticMethodID(
-      bitmap_factory_class, "decodeStream",
-      "(Ljava/io/InputStream;)Landroid/graphics/Bitmap;");
-  jmethodID open_method = env->GetMethodID(
-      asset_manager_class, "open", "(Ljava/lang/String;)Ljava/io/InputStream;");
-  jmethodID tex_image_2d_method = env->GetStaticMethodID(
-      gl_utils_class, "texImage2D", "(IILandroid/graphics/Bitmap;I)V");
-
-  jstring j_path = env->NewStringUTF(path.c_str());
-  RunAtEndOfScope cleanup_j_path([&] {
-    if (j_path) {
-      env->DeleteLocalRef(j_path);
-    }
-  });
-
-  jobject image_stream =
-      env->CallObjectMethod(java_asset_mgr, open_method, j_path);
-  jobject image_obj = env->CallStaticObjectMethod(
-      bitmap_factory_class, decode_stream_method, image_stream);
-  if (env->ExceptionOccurred() != nullptr) {
-    LOGE("Java exception while loading image");
-    env->ExceptionClear();
-    image_obj = nullptr;
-    return false;
-  }
-
-  env->CallStaticVoidMethod(gl_utils_class, tex_image_2d_method, target, 0,
-                            image_obj, 0);
-  return true;
-}
 
 /**
  * Loads obj file from assets folder from the app.
@@ -313,32 +253,6 @@ bool LoadObjFile(AAssetManager* mgr, const std::string& file_name,
   return true;
 }
 
-/**
- * Calculates vector norm
- *
- * @param vec Vector
- * @return Norm value
- */
-float VectorNorm(const std::array<float, 4>& vec) {
-  return std::sqrt(vec[0] * vec[0] + vec[1] * vec[1] + vec[2] * vec[2]);
-}
-
-/**
- * Calculates dot product of two vectors
- *
- * @param vec1 First vector
- * @param vec2 Second vector
- * @return Dot product value.
- */
-float VectorDotProduct(const std::array<float, 4>& vec1,
-                       const std::array<float, 4>& vec2) {
-  float product = 0;
-  for (int i = 0; i < 3; i++) {
-    product += vec1[i] * vec2[i];
-  }
-  return product;
-}
-
 }  // anonymous namespace
 
 Matrix4x4 Matrix4x4::operator*(const Matrix4x4& right) {
@@ -406,12 +320,6 @@ Matrix4x4 Quatf::ToMatrix() {
   return m;
 }
 
-Matrix4x4 GetMatrixFromGlArray(float* vec) {
-  Matrix4x4 result;
-  memcpy(result.m, vec, 16 * sizeof(float));
-  return result;
-}
-
 Matrix4x4 GetTranslationMatrix(const std::array<float, 3>& translation) {
   return {{{1.0f, 0.0f, 0.0f, 0.0f},
            {0.0f, 1.0f, 0.0f, 0.0f},
@@ -426,33 +334,12 @@ Matrix4x4 GetIdentityMatrix() {
            {0.0f, 0.0f, 0.0f, 1.0f}}};
 }
 
-float AngleBetweenVectors(const std::array<float, 4>& vec1,
-                          const std::array<float, 4>& vec2) {
-  return std::acos(
-      std::max(-1.f, std::min(1.f, VectorDotProduct(vec1, vec2) /
-                                       (VectorNorm(vec1) * VectorNorm(vec2)))));
-}
-
 static constexpr uint64_t kNanosInSeconds = 1000000000;
 
 int64_t GetBootTimeNano() {
   struct timespec res;
   clock_gettime(CLOCK_BOOTTIME, &res);
   return (res.tv_sec * kNanosInSeconds) + res.tv_nsec;
-}
-
-float RandomUniformFloat(float min, float max) {
-  static std::random_device random_device;
-  static std::mt19937 random_generator(random_device());
-  static std::uniform_real_distribution<float> random_distribution(0, 1);
-  return random_distribution(random_generator) * (max - min) + min;
-}
-
-int RandomUniformInt(int max_val) {
-  static std::random_device random_device;
-  static std::mt19937 random_generator(random_device());
-  std::uniform_int_distribution<int> random_distribution(0, max_val - 1);
-  return random_distribution(random_generator);
 }
 
 void CheckGlError(const char* file, int line, const char* label) {
@@ -514,36 +401,6 @@ void TexturedMesh::Draw() const {
 
   glDrawElements(GL_TRIANGLES, indices_.size(), GL_UNSIGNED_SHORT,
                  indices_.data());
-}
-
-Texture::~Texture() {
-  if (texture_id_ != 0) {
-    glDeleteTextures(1, &texture_id_);
-  }
-}
-
-bool Texture::Initialize(JNIEnv* env, jobject java_asset_mgr,
-                         const std::string& texture_path) {
-  glGenTextures(1, &texture_id_);
-  Bind();
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
-                  GL_LINEAR_MIPMAP_NEAREST);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-  if (!LoadPngFromAssetManager(env, java_asset_mgr, GL_TEXTURE_2D,
-                               texture_path)) {
-    LOGE("Couldn't load texture.");
-    return false;
-  }
-  glGenerateMipmap(GL_TEXTURE_2D);
-  return true;
-}
-
-void Texture::Bind() const {
-  CARDBOARDPLUSPLUS_CHECK(texture_id_ != 0);
-  glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, texture_id_);
 }
 
 }  // namespace ndk_cardboardplusplus

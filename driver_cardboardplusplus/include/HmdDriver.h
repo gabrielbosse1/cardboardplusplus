@@ -66,7 +66,7 @@ struct PendingFrame {
  *   - DirectMode.cpp     swap texture sets + Present/SubmitLayer compositing
  *   - EncoderSetup.cpp   encoder lifecycle + hardware-cap reconfiguration
  *   - EncodingThread.cpp the background GPU-readback + encode thread loop
- *   - UdpTransport.cpp   H264 framing + UDP streaming to the bridge
+ *   - UdpTransport.cpp   H264 framing + UDP fan-out to the phone + localhost preview
  *   - Discovery.cpp      phone broadcast discovery + cap negotiation
  *
  * Every subsystem touched below is owned by this class (raw pointers are the
@@ -119,6 +119,14 @@ private:
     void ClampEncoderToCap();
     bool ApplyBridgeCfg(int fps, int bitrateKbps, const char* codec);
     void ApplyStreamSettings(const cbpp::PayloadSettingsChange& settings);
+    // Single validated applier behind the SHM + UDP control planes (M5): every
+    // settings change funnels through here. Out-of-range fields are rejected
+    // and the old value kept; W/H are evened + 16-aligned, then clamped to cap.
+    bool ApplyEncoderSettings(int w, int h, int fps, int bitrateBps, bool useGpu, const char* reason);
+    static bool SanitizeEncoderDims(int& w, int& h);
+    // Wires both encoder callbacks (packet + telemetry); every encoder
+    // (re-)init site must use this so re-inits never drop telemetry (H4).
+    void RegisterEncoderCallbacks(VideoEncoder* enc);
     void RunBridgeHeartbeat();
 
     // Bridge telemetry
@@ -184,8 +192,8 @@ private:
     VideoEncoder* m_pVideoEncoder;
     bool m_encoderInitialized;
     int64_t m_encoderPts;
-    int m_encoderW = 2880;
-    int m_encoderH = 1620;
+    int m_encoderW = 1920;
+    int m_encoderH = 1080;
     int m_encoderFps = 60;
     int m_encoderBitrate = 20000000;
     bool m_encoderUseGpu = false;
@@ -233,8 +241,13 @@ private:
     std::atomic<bool> m_hasPhoneTarget{false};  // m_serverAddr holds a real phone
     std::atomic<bool> m_previewEnabled{true};   // localhost preview send (BRIDGE_PREVIEW)
     bool m_udpInitialized;
-    uint32_t m_udpDroppedFrames;
-    std::atomic<uint64_t> m_udpFramesSent{0};   // total framed packets actually sent
+    uint32_t m_udpDroppedPreview; // preview-target drops (localhost:42069 full)
+    uint32_t m_udpDroppedPhone;   // phone-target drops (send buffer full)
+    std::atomic<uint64_t> m_udpFramesSent{0};   // framed packets handed to UDP (once per encoded frame)
+    // Scratch buffers reused across encoded frames so OnEncodedPacket never
+    // mallocs per frame (M9). Encoding-thread only.
+    std::vector<uint8_t> m_scratchFixed;
+    std::vector<uint8_t> m_scratchFramed;
 
     // ---- UDP discovery socket (phone broadcast) ----
     SOCKET m_discoverySocket;

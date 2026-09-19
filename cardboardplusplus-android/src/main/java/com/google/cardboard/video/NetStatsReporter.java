@@ -5,6 +5,7 @@ import android.util.Log;
 import com.google.cardboard.core.AppConstants;
 import com.google.cardboard.network.NetworkUtils;
 import com.google.cardboard.settings.AppSettings;
+import com.google.cardboard.telemetry.TelemetrySender;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
@@ -27,13 +28,15 @@ import java.util.function.Supplier;
 public class NetStatsReporter {
   private static final String TAG = NetStatsReporter.class.getSimpleName();
 
-  static final byte NET_STATS_TAG = 0x13;
+  static final byte NET_STATS_TAG = AppConstants.TELEMETRY_TAG_NETSTATS;
   static final int NET_STATS_LEN = 21;
   static final long REPORT_INTERVAL_MS = 2000;
   static final long STALL_MS = 3000;
 
   private final AppSettings appSettings;
   private final Supplier<VideoDecoder> decoderSupplier;
+  // Shared telemetry socket (no fresh socket + DNS per report); may be null.
+  private final TelemetrySender telemetrySender;
 
   private Thread reportThread = null;
   private volatile boolean running = false;
@@ -41,10 +44,17 @@ public class NetStatsReporter {
   private int lastTotalFrames = 0;
   private int stalls = 0;
   private boolean wasStalled = false;
+  private VideoDecoder lastDecoder;
 
   public NetStatsReporter(AppSettings appSettings, Supplier<VideoDecoder> decoderSupplier) {
+    this(appSettings, decoderSupplier, null);
+  }
+
+  public NetStatsReporter(
+      AppSettings appSettings, Supplier<VideoDecoder> decoderSupplier, TelemetrySender telemetrySender) {
     this.appSettings = appSettings;
     this.decoderSupplier = decoderSupplier;
+    this.telemetrySender = telemetrySender;
   }
 
   /** Pure packet builder (no Android deps) so unit tests can verify the wire format. */
@@ -96,8 +106,17 @@ public class NetStatsReporter {
     int frames = 0;
     float fps = 0f;
     if (decoder != null) {
+      // Decoder recreated (pause/resume): the new instance restarts its frame
+      // counter at 0, so reset the baseline instead of reporting a negative
+      // delta spike.
+      if (decoder != lastDecoder) {
+        lastDecoder = decoder;
+        lastTotalFrames = 0;
+        wasStalled = false;
+      }
       int total = decoder.getTotalDecodedFrames();
       frames = total - lastTotalFrames;
+      if (frames < 0) frames = total;
       lastTotalFrames = total;
       fps = frames * 1000f / REPORT_INTERVAL_MS;
       long last = decoder.getLastFrameAtMs();
@@ -107,7 +126,12 @@ public class NetStatsReporter {
       }
       wasStalled = stalled;
     }
-    byte[] data = buildPacket(System.currentTimeMillis(), frames, stalls, fps);
+    // Elapsed-realtime epoch, matching the 0x10/0x12 boot-ms timestamps the
+    // bridge forwards verbatim (wall-clock would corrupt rate math).
+    byte[] data = buildPacket(SystemClock.elapsedRealtime(), frames, stalls, fps);
+    if (telemetrySender != null && telemetrySender.sendDatagram(data)) {
+      return;
+    }
     InetAddress addr = NetworkUtils.getPcOrBroadcastAddress(appSettings.getPcIp());
     try (DatagramSocket socket = new DatagramSocket()) {
       socket.send(new DatagramPacket(data, data.length, addr, AppConstants.TELEMETRY_PORT));

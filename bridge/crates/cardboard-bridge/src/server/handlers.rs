@@ -6,7 +6,7 @@ use std::io::Read;
 
 use tiny_http::{Header, Method, Request, Response, StatusCode};
 
-use crate::core::{AppCore, APPLIED_DEFAULTS};
+use crate::core::AppCore;
 use crate::server::ENDPOINT_INDEX;
 
 /// Body size cap for requests (settings payloads are a few hundred bytes).
@@ -38,7 +38,9 @@ pub fn handle(mut request: Request, core: &AppCore) {
 }
 
 /// Current preview state: the driver's latest streaming stats. The preview
-/// itself is always on — there is no toggle.
+/// itself is always on — there is no toggle. GET-only by design: there is no
+/// POST /preview (AGENTS.md's POST /preview line is stale; AGENTS.md itself
+/// is shared across components so the correction lives here, not there).
 fn preview_payload(core: &AppCore) -> serde_json::Value {
     let s = core.status();
     serde_json::json!({
@@ -62,7 +64,7 @@ fn health_payload() -> serde_json::Value {
 /// `{"logs": [...]}` with the requested `n` (default 50) newest-first lines.
 fn logs_payload(core: &AppCore, query: Option<&str>) -> serde_json::Value {
     let n = query
-        .and_then(|q| q.strip_prefix("n="))
+        .and_then(|q| q.split('&').find_map(|part| part.strip_prefix("n=")))
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(50);
     serde_json::json!({ "logs": core.logs(n) })
@@ -73,7 +75,9 @@ fn logs_payload(core: &AppCore, query: Option<&str>) -> serde_json::Value {
 fn apply_settings(request: &mut Request, core: &AppCore) -> Response<std::io::Cursor<Vec<u8>>> {
     use serde::Deserialize;
 
-    /// Optional settings fields; absent ones fall back to `APPLIED_DEFAULTS`.
+    /// Optional settings fields; absent ones keep the live session values
+    /// (what the driver actually got), never the compiled defaults — so a
+    /// partial body like `{"bitrate":12}` leaves resolution/fps untouched.
     /// `bitrate` (mbps) has a dedicated wire alias matching the public API.
     /// `encoder` is "gpu" (driver picks the hardware backend) or "cpu".
     #[derive(Deserialize, Default)]
@@ -97,12 +101,13 @@ fn apply_settings(request: &mut Request, core: &AppCore) -> Response<std::io::Cu
         }
     };
 
+    let live = core.applied_settings();
     let applied = core.apply_settings(
-        parsed.width.unwrap_or(APPLIED_DEFAULTS.0),
-        parsed.height.unwrap_or(APPLIED_DEFAULTS.1),
-        parsed.fps.unwrap_or(APPLIED_DEFAULTS.2),
-        parsed.bitrate_mbps.unwrap_or(APPLIED_DEFAULTS.3),
-        parsed.encoder.as_deref().unwrap_or("gpu"),
+        parsed.width.unwrap_or(live.0),
+        parsed.height.unwrap_or(live.1),
+        parsed.fps.unwrap_or(live.2),
+        parsed.bitrate_mbps.unwrap_or(live.3),
+        parsed.encoder.as_deref().unwrap_or(&live.4),
     );
 
     ok_json(&serde_json::json!({

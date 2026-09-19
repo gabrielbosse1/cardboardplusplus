@@ -331,64 +331,6 @@ bool VideoEncoder::SwsConvert()
     return true;
 }
 
-bool VideoEncoder::FinishFrame(int64_t pts)
-{
-    if (!m_initialized) {
-        ENCODER_ERROR("FinishFrame called without valid encoder!");
-        return false;
-    }
-
-    LARGE_INTEGER t0, t1;
-    QueryPerformanceCounter(&t0);
-    if (m_lastCallUs != 0) {
-        int64_t intervalUs = ((t0.QuadPart - m_lastCallUs) * 1000000) / m_perfFreq.QuadPart;
-        m_intervalSumUs += intervalUs;
-        if (intervalUs > m_intervalMaxUs) m_intervalMaxUs = intervalUs;
-        m_intervalCount++;
-    }
-    m_lastCallUs = t0.QuadPart;
-
-    if (!ReadBackConversionRT()) {
-        ENCODER_ERROR("Failed to read back conversion RT!");
-        return false;
-    }
-
-    // Detect duplicate/stale capture (image-in-image symptom: same readback twice)
-    uint32_t hash = ComputeFrameHash();
-    if (m_lastFrameHash != 0 && hash == m_lastFrameHash) m_dupCount++;
-    m_lastFrameHash = hash;
-    m_summaryFrames++;
-
-    m_pFrame->pts = pts;
-    m_hasValidFrame = true;
-
-    if (!SendFrameToEncoder()) {
-        ENCODER_ERROR("Failed to send SBS frame to encoder!");
-        return false;
-    }
-
-    if (!ReceiveEncodedPackets()) {
-        ENCODER_ERROR("Failed to receive SBS encoded packets!");
-        return false;
-    }
-
-    QueryPerformanceCounter(&t1);
-    int64_t elapsedUs = ((t1.QuadPart - t0.QuadPart) * 1000000) / m_perfFreq.QuadPart;
-    m_encSumUs += elapsedUs;
-    if (elapsedUs > m_encMaxUs) m_encMaxUs = elapsedUs;
-    m_encCount++;
-
-    if (elapsedUs > 40000) {
-        ENCODER_LOG("[TELEMETRY] SLOW frame: %lldus encode (exceeds frame budget)", (long long)elapsedUs);
-    }
-
-    if (m_encCount > 0 && (m_encCount % m_summaryInterval == 0)) {
-        LogTelemetrySummary();
-    }
-
-    return true;
-}
-
 bool VideoEncoder::FinishEncode(int64_t pts)
 {
     if (!m_initialized) {
@@ -592,6 +534,20 @@ void VideoEncoder::LogTelemetrySummary()
                 (long long)m_encCount, (long long)avgEnc, (long long)m_encMaxUs,
                 (long long)avgInt, (long long)m_intervalMaxUs,
                 m_dupCount, dupRate);
+    // Feed the SHM telemetry chain (H3): without this PublishTelemetry is never
+    // called and the bridge status ring stays empty. Fires ~1/s from FinishEncode.
+    if (m_telemetryCallback) {
+        cbpp::PayloadTelemetry t{};
+        t.frames = (uint64_t)m_encCount;
+        t.avg_encode_us = (uint64_t)(avgEnc >= 0 ? avgEnc : 0);
+        t.max_encode_us = (uint64_t)(m_encMaxUs >= 0 ? m_encMaxUs : 0);
+        t.avg_interval_us = (uint64_t)(avgInt >= 0 ? avgInt : 0);
+        t.max_interval_us = (uint64_t)(m_intervalMaxUs >= 0 ? m_intervalMaxUs : 0);
+        t.dup_count = (uint64_t)(m_dupCount >= 0 ? m_dupCount : 0);
+        t.summary_frames = (uint64_t)m_summaryFrames;
+        t.pad = 0;
+        m_telemetryCallback(t);
+    }
     m_encSumUs = 0; m_encMaxUs = 0; m_encCount = 0;
     m_intervalSumUs = 0; m_intervalMaxUs = 0; m_intervalCount = 0;
     m_dupCount = 0; m_summaryFrames = 0;

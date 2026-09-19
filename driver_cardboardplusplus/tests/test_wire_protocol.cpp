@@ -53,6 +53,21 @@ static void test_bridge_ack_string() {
     printf("PASS: BRIDGE_ACK string matches (len=%zu)\n", wire::kBridgeAckLen);
 }
 
+static void test_bridge_ack_carries_build_version() {
+    // The driver sends "BRIDGE_ACK v1 <commit-count>" (see Discovery.cpp);
+    // the bridge only checks the BRIDGE_ACK prefix, so old and new bridges
+    // both accept it. Mirror that prefix check here.
+    char ack[64];
+    int n = snprintf(ack, sizeof(ack), "%s %s", wire::kBridgeAck, "542");
+    assert(n > 0 && n < (int)sizeof(ack));
+    assert(strncmp(ack, wire::kBridgeAck, wire::kBridgeAckLen) == 0);
+    // Version is the token after "v1".
+    const char* ver = ack + wire::kBridgeAckLen;
+    while (*ver == ' ') ver++;
+    assert(strcmp(ver, "542") == 0);
+    printf("PASS: versioned BRIDGE_ACK keeps prefix, version extracts\n");
+}
+
 static void test_bridge_cfg_string() {
     assert(strcmp(wire::kBridgeCfg, "BRIDGE_CFG") == 0);
     assert(wire::kBridgeCfgLen == sizeof("BRIDGE_CFG") - 1);
@@ -513,8 +528,22 @@ static DispatchResult simulate_dispatch(const char* buffer) {
     if (strncmp(buffer, wire::kKeyframeReq, wire::kKeyframeReqLen) == 0) {
         return DispatchResult::KeyframeReq;
     }
-    // Default: phone discovery (any other packet triggers SwitchDataTarget + ACK)
-    return DispatchResult::PhoneDiscovery;
+    // Mirror of Discovery.cpp IsPhoneDiscoveryPacket: only allowlisted phone
+    // identity tokens earn SwitchDataTarget + ACK. Anything else is dropped
+    // with a rate-limited log (M10/R2). Lengths are local literals because
+    // PHONE_HELLO is not part of the locked wire contract.
+    static const char kPhoneDiscovery[] = "CARDBOARD_DISCOVERY";
+    static const char kPhoneHello[] = "CARDBOARD_PHONE_HELLO";
+    size_t len = strlen(buffer);
+    if (len >= sizeof(kPhoneDiscovery) - 1 &&
+        strncmp(buffer, kPhoneDiscovery, sizeof(kPhoneDiscovery) - 1) == 0) {
+        return DispatchResult::PhoneDiscovery;
+    }
+    if (len >= sizeof(kPhoneHello) - 1 &&
+        strncmp(buffer, kPhoneHello, sizeof(kPhoneHello) - 1) == 0) {
+        return DispatchResult::PhoneDiscovery;
+    }
+    return DispatchResult::Unknown;
 }
 
 static void test_dispatch_cardboard_cap() {
@@ -558,17 +587,26 @@ static void test_dispatch_keyframe_req() {
 }
 
 static void test_dispatch_phone_discovery_triggers_ack() {
-    // Any packet that doesn't match the four known prefixes is treated as
-    // a phone discovery broadcast → SwitchDataTarget + ACK.
+    // Only allowlisted phone identity packets trigger SwitchDataTarget + ACK.
     assert(simulate_dispatch("CARDBOARD_DISCOVERY") == DispatchResult::PhoneDiscovery);
-    assert(simulate_dispatch("some random bytes") == DispatchResult::PhoneDiscovery);
-    printf("PASS: phone discovery messages trigger SwitchDataTarget + ACK\n");
+    assert(simulate_dispatch("CARDBOARD_PHONE_HELLO") == DispatchResult::PhoneDiscovery);
+    assert(simulate_dispatch("CARDBOARD_PHONE_HELLO v1") == DispatchResult::PhoneDiscovery);
+    printf("PASS: allowlisted phone discovery messages trigger SwitchDataTarget + ACK\n");
+}
+
+static void test_dispatch_unknown_dropped_without_ack() {
+    // Scanners and random LAN noise must NOT steal the video target or earn
+    // an ACK — they are dropped with a rate-limited log (M10/R2).
+    assert(simulate_dispatch("some random bytes") == DispatchResult::Unknown);
+    assert(simulate_dispatch("wake") == DispatchResult::Unknown);
+    assert(simulate_dispatch("ACK") == DispatchResult::Unknown);
+    assert(simulate_dispatch("") == DispatchResult::Unknown);
+    printf("PASS: unknown packets are dropped (no target switch, no ACK)\n");
 }
 
 static void test_dispatch_order_cap_before_hello() {
-    // CARDBOARD_CAP must be checked BEFORE BRIDGE_HELLO, because
-    // "CARDBOARD_CAP" starts with "C" while "BRIDGE_HELLO" starts with "B".
-    // If the order were wrong, a CAP message could be misrouted.
+    // Each known message has a distinct prefix, so dispatch order between
+    // unrelated branches cannot misroute — these tests pin the property.
     const char* cap = "CARDBOARD_CAP 1920 1080";
     // Verify CAP does NOT match BRIDGE_HELLO prefix.
     assert(strncmp(cap, wire::kBridgeHeartbeat, wire::kBridgeHeartbeatLen) != 0);
@@ -578,9 +616,8 @@ static void test_dispatch_order_cap_before_hello() {
 }
 
 static void test_dispatch_order_hello_before_preview() {
-    // BRIDGE_HELLO must be checked BEFORE BRIDGE_PREVIEW, because
-    // "BRIDGE_HELLO" starts with "BRIDGE_H" while "BRIDGE_PREVIEW" starts
-    // with "BRIDGE_P". Both share the "BRIDGE_" prefix (8 bytes).
+    // BRIDGE_HELLO and BRIDGE_PREVIEW share only the "BRIDGE_" prefix; the
+    // full tokens are distinct, so neither can be misrouted as the other.
     const char* hello = "BRIDGE_HELLO v1";
     // Verify HELLO does NOT match PREVIEW prefix.
     assert(strncmp(hello, wire::kBridgePreview, wire::kBridgePreviewLen) != 0);
@@ -657,6 +694,7 @@ int main() {
     test_discovery_ack_string();
     test_bridge_heartbeat_string();
     test_bridge_ack_string();
+    test_bridge_ack_carries_build_version();
     test_bridge_cfg_string();
     test_bridge_preview_string();
     test_bridge_stats_string();
@@ -698,6 +736,7 @@ int main() {
     test_dispatch_bridge_cfg();
     test_dispatch_keyframe_req();
     test_dispatch_phone_discovery_triggers_ack();
+    test_dispatch_unknown_dropped_without_ack();
     test_dispatch_order_cap_before_hello();
     test_dispatch_order_hello_before_preview();
     test_dispatch_order_preview_before_cfg();

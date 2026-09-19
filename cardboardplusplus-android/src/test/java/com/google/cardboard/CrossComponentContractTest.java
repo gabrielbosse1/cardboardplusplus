@@ -46,6 +46,7 @@ public class CrossComponentContractTest {
         byte[] packet = buf.array();
 
         // Verify tag
+        assertEquals(AppConstants.TELEMETRY_TAG_GYRO, packet[0]);
         assertEquals(0x10, packet[0]);
         // Verify length (1 + 8 + 9*4 = 45)
         assertEquals(45, packet.length);
@@ -100,7 +101,7 @@ public class CrossComponentContractTest {
     @Test
     public void helloPacketMatchesBridgeParser() {
         // Bridge telemetry.rs: is_phone_hello checks starts_with("CARDBOARD_PHONE_HELLO")
-        String hello = "CARDBOARD_PHONE_HELLO v1";
+        String hello = AppConstants.PHONE_HELLO;
         assertTrue(hello.startsWith("CARDBOARD_PHONE_HELLO"));
         byte[] packet = hello.getBytes();
         // Bridge uses String::from_utf8_lossy(buf).trim_start().starts_with(...)
@@ -120,7 +121,7 @@ public class CrossComponentContractTest {
         //   - kBridgePreview ("BRIDGE_PREVIEW")
         //   - kBridgeCfg ("BRIDGE_CFG")
         //   - kKeyframeReq ("KEYFRAME_REQ")
-        String discovery = "CARDBOARD_DISCOVERY";
+        String discovery = AppConstants.DISCOVERY_MESSAGE;
         assertFalse(discovery.startsWith("CARDBOARD_CAP"));
         assertFalse(discovery.startsWith("BRIDGE_HELLO"));
         assertFalse(discovery.startsWith("BRIDGE_PREVIEW"));
@@ -178,18 +179,17 @@ public class CrossComponentContractTest {
 
     @Test
     public void cameraPortMatchesBridgePort() {
-        // Phone sends JPEG on 42072, bridge listens on 42072
-        assertEquals(42072, 42072); // CameraStreamer.PC_PORT
+        // Phone sends JPEG on CAMERA_PORT, bridge listens on 42072.
+        assertEquals(42072, AppConstants.CAMERA_PORT);
     }
 
     @Test
     public void cameraJpegSizeGuardMatchesBridgeExpectation() {
-        // CameraStreamer drops frames whose JPEG + 2-byte seq header > 60000 bytes
+        // CameraStreamer drops frames whose JPEG + 2-byte seq header > CAMERA_MAX_DATAGRAM.
         // Bridge accepts any size (no guard)
         // This is a one-way contract: phone must stay under 60KB
-        int maxJpegSize = 60000;
-        assertTrue(maxJpegSize > 0);
-        assertTrue(maxJpegSize < 65535); // must fit in a single UDP datagram
+        assertEquals(60000, AppConstants.CAMERA_MAX_DATAGRAM);
+        assertTrue(AppConstants.CAMERA_MAX_DATAGRAM < 65535); // must fit in a single UDP datagram
     }
 
     @Test

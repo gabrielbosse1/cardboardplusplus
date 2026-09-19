@@ -12,8 +12,8 @@ import static org.junit.Assert.*;
  */
 public class DiscoveryManagerTest {
 
-    private static final String DISCOVERY_MESSAGE = "CARDBOARD_DISCOVERY";
-    private static final String ACK_RESPONSE = "ACK";
+    private static final String DISCOVERY_MESSAGE = AppConstants.DISCOVERY_MESSAGE;
+    private static final String ACK_RESPONSE = AppConstants.DISCOVERY_ACK;
 
     @Test
     public void discoveryMessageIsCorrect() {
@@ -27,15 +27,18 @@ public class DiscoveryManagerTest {
     }
 
     @Test
-    public void discoveryStopsOnAck() {
-        // Simulate: broadcasting = true, then ACK received.
+    public void discoveryBacksOffToHeartbeatOnAck() {
+        // Prod never stops on ACK (a restarted driver needs rediscovery): it
+        // backs off to a 1-per-5s heartbeat and resumes full rate after 5s
+        // without an ACK. Mirrors DiscoveryManager.broadcastUntilAck.
         FakeDiscovery discovery = new FakeDiscovery();
         discovery.startDiscovery();
         assertTrue(discovery.isBroadcasting());
 
-        // Simulate receiving ACK.
+        // Simulate receiving ACK: loop keeps running, now in heartbeat mode.
         discovery.onAckReceived();
-        assertFalse(discovery.isBroadcasting());
+        assertTrue("ACK must not stop discovery (heartbeat continues)", discovery.isBroadcasting());
+        assertTrue(discovery.isHeartbeat());
     }
 
     @Test
@@ -80,21 +83,24 @@ public class DiscoveryManagerTest {
     @Test
     public void decoderCapIsResentPeriodically() {
         // Mirrors DiscoveryManager: CAP goes out on the 1st, 61st, 121st... ACK
-        // (~every 30s), never just once — a restarted driver must learn the cap.
-        assertTrue(shouldSendCap(1));
-        assertFalse(shouldSendCap(2));
-        assertFalse(shouldSendCap(60));
-        assertTrue(shouldSendCap(61));
-        assertTrue(shouldSendCap(121));
+        // (~every 30s) with a set (non-zero) cap — never just once, and never
+        // with unset 0x0 dims, so a restarted driver always learns the cap.
+        assertTrue(shouldSendCap(1, 1920, 1080));
+        assertFalse(shouldSendCap(2, 1920, 1080));
+        assertFalse(shouldSendCap(60, 1920, 1080));
+        assertTrue(shouldSendCap(61, 1920, 1080));
+        assertTrue(shouldSendCap(121, 1920, 1080));
+        assertFalse(shouldSendCap(1, 0, 0));
     }
 
-    private static boolean shouldSendCap(int ackCount) {
-        return ackCount % 60 == 1;
+    private static boolean shouldSendCap(int ackCount, int w, int h) {
+        return w > 0 && h > 0 && ackCount % 60 == 1;
     }
 
     /** Minimal state machine mirroring DiscoveryManager's lifecycle. */
     private static class FakeDiscovery {
         private volatile boolean broadcasting = false;
+        private volatile boolean heartbeat = false;
 
         void startDiscovery() {
             if (broadcasting) return;
@@ -103,10 +109,12 @@ public class DiscoveryManagerTest {
 
         void stopDiscovery() {
             broadcasting = false;
+            heartbeat = false;
         }
 
         void onAckReceived() {
-            broadcasting = false;
+            // Prod backs off to heartbeat, it never stops.
+            heartbeat = true;
         }
 
         void onTimeout() {
@@ -114,5 +122,6 @@ public class DiscoveryManagerTest {
         }
 
         boolean isBroadcasting() { return broadcasting; }
+        boolean isHeartbeat() { return heartbeat; }
     }
 }

@@ -38,7 +38,6 @@ VideoEncoder::VideoEncoder()
     , m_pConversionRT(nullptr)
     , m_pConversionRTV(nullptr)
     , m_pBlitVS(nullptr)
-    , m_pBlitPS(nullptr)
     , m_pBlitSampler(nullptr)
     , m_pBlitBlend(nullptr)
     , m_pLayerBlend(nullptr)
@@ -46,9 +45,6 @@ VideoEncoder::VideoEncoder()
     , m_pBlitInputLayout(nullptr)
     , m_pBlitVertexBuffer(nullptr)
     , m_shaderConversionReady(false)
-    , m_pLeftStaging(nullptr)
-    , m_pRightStaging(nullptr)
-    , m_pSingleStaging(nullptr)
     , m_encSumUs(0)
     , m_encMaxUs(0)
     , m_encCount(0)
@@ -168,6 +164,13 @@ void VideoEncoder::Shutdown()
         m_pSoftwareFrameBuffer = nullptr;
     }
 
+    // ~18MB CPU readback buffer per re-init leaked here (M7).
+    if (m_pReadbackBuffer) {
+        delete[] m_pReadbackBuffer;
+        m_pReadbackBuffer = nullptr;
+    }
+    m_readbackBufferSize = 0;
+
     ReleaseEyeTextures();
 
     if (m_pEncContext) { m_pEncContext->Release(); m_pEncContext = nullptr; }
@@ -181,6 +184,15 @@ bool VideoEncoder::OpenSharedEyeTextures(const std::vector<std::pair<HANDLE, HAN
                                            std::vector<ID3D11Texture2D*>& outLeft,
                                            std::vector<ID3D11Texture2D*>& outRight)
 {
+    // Same layers as last frame: reuse the opened textures instead of paying
+    // OpenSharedResource per frame (M9). The handles name the resource, and
+    // Present() can't overwrite it mid-frame (at most 1 frame in flight), so
+    // a cache hit always reads the current frame's content.
+    if (!m_encEyeLefts.empty() && handles == m_openedHandles) {
+        outLeft = m_encEyeLefts;
+        outRight = m_encEyeRights;
+        return true;
+    }
     ReleaseEyeTextures();
 
     ID3D11Device* dev = m_pEncDevice ? m_pEncDevice : m_pDevice;
@@ -189,24 +201,27 @@ bool VideoEncoder::OpenSharedEyeTextures(const std::vector<std::pair<HANDLE, HAN
     m_encEyeLefts.reserve(handles.size());
     m_encEyeRights.reserve(handles.size());
     for (const auto& h : handles) {
-        if (!h.first || !h.second) return false;
+        if (!h.first || !h.second) { ReleaseEyeTextures(); return false; }
         ID3D11Texture2D* pL = nullptr;
         ID3D11Texture2D* pR = nullptr;
         HRESULT hr = dev->OpenSharedResource(h.first, __uuidof(ID3D11Texture2D), (void**)&pL);
         if (FAILED(hr)) {
             ENCODER_ERROR("OpenSharedResource(left) failed! HRESULT: 0x%x", hr);
+            ReleaseEyeTextures();
             return false;
         }
         hr = dev->OpenSharedResource(h.second, __uuidof(ID3D11Texture2D), (void**)&pR);
         if (FAILED(hr)) {
             ENCODER_ERROR("OpenSharedResource(right) failed! HRESULT: 0x%x", hr);
             pL->Release();
+            ReleaseEyeTextures();
             return false;
         }
         m_encEyeLefts.push_back(pL);
         m_encEyeRights.push_back(pR);
     }
 
+    m_openedHandles = handles;
     outLeft = m_encEyeLefts;
     outRight = m_encEyeRights;
     return true;
@@ -218,43 +233,7 @@ void VideoEncoder::ReleaseEyeTextures()
     for (auto* t : m_encEyeRights) { if (t) t->Release(); }
     m_encEyeLefts.clear();
     m_encEyeRights.clear();
-}
-
-bool VideoEncoder::EncodeFrame(ID3D11Texture2D* pTexture, int64_t pts)
-{
-    if (!m_initialized || !pTexture) {
-        ENCODER_ERROR("EncodeFrame called without valid encoder or texture!");
-        return false;
-    }
-
-    if (!ConvertTextureToFrame(pTexture)) {
-        ENCODER_ERROR("Failed to convert texture to frame!");
-        return false;
-    }
-
-    m_pFrame->pts = pts;
-    m_hasValidFrame = true;
-
-    if (!SendFrameToEncoder()) {
-        ENCODER_ERROR("Failed to send frame to encoder!");
-        return false;
-    }
-
-    if (!ReceiveEncodedPackets()) {
-        ENCODER_ERROR("Failed to receive encoded packets!");
-        return false;
-    }
-
-    return true;
-}
-
-bool VideoEncoder::EncodeFrameSBS(ID3D11Texture2D* pLeft, ID3D11Texture2D* pRight, int64_t pts)
-{
-    if (!ComposeSBSGPU({ pLeft }, { pRight }, { LayerBounds{} }, { LayerBounds{} })) {
-        return false;
-    }
-
-    return FinishFrame(pts);
+    m_openedHandles.clear();
 }
 
 void VideoEncoder::SetEncodedPacketCallback(EncodedPacketCallback callback)

@@ -32,7 +32,6 @@
 #include "util.h"
 
 #include "VideoReceiver.h"
-#include "H264Decoder.h"
 
 namespace ndk_cardboardplusplus {
 
@@ -102,8 +101,6 @@ class CardboardPlusPlusApp {
 
   void ResetCameraTexture();
 
-  void SetEyeTexture(int eye, int textureId);
-
   // MediaCodec-backed video path. The UDP receiver still runs in native code,
   // but decoded frames are forwarded to a Java MediaCodec (which owns a
   // SurfaceTexture/OES texture) via JNI. The GL thread samples that OES texture.
@@ -114,17 +111,15 @@ class CardboardPlusPlusApp {
 
   void StartVideoReceiver(int port);
   void StopVideoReceiver();
-  bool HasVideoFrame();
-  void UpdateVideoTexture();
 
   float GetIpdMeters() const;
 
   /**
    * Runs the frame-forwarding loop off the GL render thread. Pulls H.264
-   * access units from the receiver and hands them to the Java MediaCodec
-   * decoder (via JNI). The actual decode + YUV->RGBA + GPU upload all happen on
-   * the codec/SurfaceTexture side, so the GL render thread is never blocked by
-   * decoding.
+   * access units from the receiver (blocking on its condition variable, no
+   * polling) and hands them to the Java MediaCodec decoder via a reused
+   * direct ByteBuffer. The actual decode + GPU upload happen on the
+   * codec/SurfaceTexture side, so the GL render thread is never blocked.
    */
   void DecodeLoop();
 
@@ -167,12 +162,6 @@ class CardboardPlusPlusApp {
    * Draws a 2D texture quad for the given eye.
    */
   void DrawEyeQuad(GLuint texture_id);
-
-  /**
-   * Returns true if the H.264 access unit's first NAL unit is a keyframe
-   * (SPS type 7 or IDR type 5), matching VideoReceiver's keyframe detection.
-   */
-  static bool IsKeyframe(const uint8_t* data, int size);
 
   jobject java_asset_mgr_;
   AAssetManager* asset_mgr_;
@@ -227,7 +216,8 @@ class CardboardPlusPlusApp {
   bool show_camera_texture_;
 
   // Java MediaCodec decoder handle (global JNI ref) + cached method id for
-  // feeding it H.264 access units from the native decode-forwarding thread.
+  // feeding it H.264 access units from the native decode-forwarding thread
+  // via a reused direct ByteBuffer (single alloc, no per-frame JNI array).
   jobject video_decoder_obj_ = nullptr;
   jmethodID mid_feed_video_ = nullptr;
   bool video_active_ = false;
@@ -243,7 +233,6 @@ class CardboardPlusPlusApp {
 
   // Video streaming
   std::unique_ptr<VideoReceiver> video_receiver_;
-  std::unique_ptr<H264Decoder> h264_decoder_;
   GLuint video_texture_;
   // Texture id retired by StopVideoReceiver (UI thread, no GL context).
   // Deleted on the GL thread before the next glGenTextures/frame. Must only
@@ -254,24 +243,13 @@ class CardboardPlusPlusApp {
   int video_width_;
   int video_height_;
 
-  // Decode thread + latest-frame handoff (decouples decode from the GL thread).
+  // Decode thread (frame forwarding only; decode happens in Java MediaCodec).
   std::thread decode_thread_;
   bool decode_thread_running_ = false;
-  std::mutex video_frame_mutex_;
-  // Two RGBA buffers the decode thread alternates between. The GL thread uploads
-  // the published one directly (no extra copy), so the decode thread only
-  // reuses a slot once the GL thread has released it (see held_slot_).
-  std::shared_ptr<std::vector<uint8_t>> video_buf_a_;
-  std::shared_ptr<std::vector<uint8_t>> video_buf_b_;
-  std::shared_ptr<std::vector<uint8_t>> video_latest_;
-  int video_latest_slot_ = -1;  // 0 = buf_a, 1 = buf_b, -1 = none
-  int held_slot_ = -1;          // slot the GL thread is currently uploading from
-  int video_latest_w_ = 0;
-  int video_latest_h_ = 0;
-  bool video_latest_ready_ = false;
-  // Currently allocated GPU texture size (for glTexSubImage2D vs realloc).
-  int video_tex_w_ = 0;
-  int video_tex_h_ = 0;
+  // Reused direct-buffer handoff: one malloc'd region wrapped per frame in a
+  // short-lived DirectByteBuffer (no per-frame JNI array alloc/copy).
+  uint8_t* direct_buf_ = nullptr;
+  size_t direct_buf_cap_ = 0;
 };
 
 }  // namespace ndk_cardboardplusplus

@@ -2,6 +2,7 @@
 #include "DriverLog.h"
 #include "DebugLog.h"
 #include "CardboardWire.h"
+#include "DriverVersion.h"
 #include <cstdio>
 #include <cstring>
 
@@ -11,12 +12,36 @@ using namespace vr;
 // Phone discovery: broadcast UDP exchange that learns the phone's IP and
 // reports its hardware decoder cap.
 //
-// The phone broadcasts on port 42070; every non-cap packet makes the driver
-// switch the video stream (UdpTransport.cpp) to the sender's IP and ACK it.
+// Only allowlisted phone packets switch the video target: "CARDBOARD_DISCOVERY"
+// and "CARDBOARD_PHONE_HELLO*" (R2/M10 — legacy-tolerant, but scanners and
+// random LAN noise must never steal the stream or earn an ACK). Everything
+// else known (cap / bridge / keyframe) is handled in place; unknown packets
+// are dropped with a rate-limited log.
 // A "CARDBOARD_CAP <w> <h>" packet only reconfigures the encoder via
 // ApplyHardwareCap() and is NOT acknowledged (see the wire contract in
 // CardboardWire.h).
 // ---------------------------------------------------------------------------
+
+namespace {
+// Phone identity tokens: matched by prefix so version-suffixed variants
+// ("CARDBOARD_PHONE_HELLO v2") keep working. Kept here (not CardboardWire.h)
+// because PHONE_HELLO is not part of the locked wire contract.
+constexpr char kPhoneDiscovery[] = "CARDBOARD_DISCOVERY";
+constexpr char kPhoneHello[] = "CARDBOARD_PHONE_HELLO";
+} // namespace
+
+// True when buf (len bytes) is an allowlisted phone packet. len-guarded:
+// strncmp past the received bytes would read stale buffer contents (M10).
+static bool IsPhoneDiscoveryPacket(const char* buf, int len)
+{
+    constexpr int kDiscoveryLen = (int)sizeof(kPhoneDiscovery) - 1;
+    constexpr int kHelloLen = (int)sizeof(kPhoneHello) - 1;
+    if (len >= kDiscoveryLen && strncmp(buf, kPhoneDiscovery, kDiscoveryLen) == 0)
+        return true;
+    if (len >= kHelloLen && strncmp(buf, kPhoneHello, kHelloLen) == 0)
+        return true;
+    return false;
+}
 
 bool HmdDriver::InitializeDiscovery()
 {
@@ -100,7 +125,7 @@ void HmdDriver::DiscoveryThreadFunc()
 {
     DriverLog("Discovery thread started");
 
-    char buffer[256];
+    char buffer[256] = {}; // zeroed: prefix matches below must never read stale bytes past bytesReceived
     sockaddr_in senderAddr;
     int senderAddrLen = sizeof(senderAddr);
 
@@ -144,6 +169,8 @@ void HmdDriver::DiscoveryThreadFunc()
                 if (sscanf_s(buffer, "CARDBOARD_CAP %d %d", &capW, &capH) == 2) {
                     DriverLog("Hardware decoder cap received from %s: %dx%d", senderIpStr, capW, capH);
                     ApplyHardwareCap(capW, capH);
+                } else {
+                    DriverLog("Malformed CARDBOARD_CAP from %s ignored: '%s'", senderIpStr, buffer);
                 }
                 continue;
             }
@@ -155,11 +182,20 @@ void HmdDriver::DiscoveryThreadFunc()
                 // heartbeat cadence drives the stats rate). NEVER touch the video
                 // data target — the bridge lives on 127.0.0.1 and would otherwise
                 // hijack the stream.
+                // The ACK carries our build version ("BRIDGE_ACK v1 <count>")
+                // so the bridge can show which commit this driver was built
+                // from; old bridges only check the BRIDGE_ACK prefix.
+                char ack[64];
+                int ackLen = snprintf(ack, sizeof(ack), "%s %s", wire::kBridgeAck, DRIVER_BUILD_VERSION);
+                if (ackLen <= 0 || ackLen >= (int)sizeof(ack)) {
+                    ackLen = (int)wire::kBridgeAckLen;
+                    memcpy(ack, wire::kBridgeAck, ackLen);
+                }
                 sockaddr_in responseAddr;
                 responseAddr.sin_family = AF_INET;
                 responseAddr.sin_port = senderAddr.sin_port;
                 responseAddr.sin_addr.s_addr = senderAddr.sin_addr.s_addr;
-                sendto(m_discoverySocket, wire::kBridgeAck, (int)wire::kBridgeAckLen, 0,
+                sendto(m_discoverySocket, ack, ackLen, 0,
                        (sockaddr*)&responseAddr, sizeof(responseAddr));
                 SendBridgeStats(responseAddr);
                 DebugLog("BRIDGE_HELLO from %s:%d acked with BRIDGE_ACK + BRIDGE_STATS (data target untouched)", senderIpStr, ntohs(senderAddr.sin_port));
@@ -170,9 +206,16 @@ void HmdDriver::DiscoveryThreadFunc()
                 // Bridge toggles the localhost preview stream: "BRIDGE_PREVIEW 1"
                 // keeps 127.0.0.1:42069 flowing (bridge UI / ffplay), "BRIDGE_PREVIEW 0"
                 // cuts it. Only the preview target is affected, never the phone's.
-                bool enabled = (strstr(buffer, "1") != nullptr);
-                m_previewEnabled.store(enabled, std::memory_order_relaxed);
-                DebugLog("BRIDGE_PREVIEW from %s:%d -> local preview %s", senderIpStr, ntohs(senderAddr.sin_port), enabled ? "ON" : "OFF");
+                // Parsed as an explicit trailing token (L10): a strstr "1" check
+                // would misfire on values like "10".
+                int previewVal = -1;
+                if (sscanf_s(buffer, "BRIDGE_PREVIEW %d", &previewVal) == 1) {
+                    bool enabled = (previewVal != 0);
+                    m_previewEnabled.store(enabled, std::memory_order_relaxed);
+                    DebugLog("BRIDGE_PREVIEW from %s:%d -> local preview %s", senderIpStr, ntohs(senderAddr.sin_port), enabled ? "ON" : "OFF");
+                } else {
+                    DebugLog("BRIDGE_PREVIEW from %s:%d malformed, ignored", senderIpStr, ntohs(senderAddr.sin_port));
+                }
                 continue;
             }
 
@@ -207,19 +250,30 @@ void HmdDriver::DiscoveryThreadFunc()
                 continue;
             }
 
-            // Switch data target to the phone's IP
-            SwitchDataTarget(senderIpStr);
-            m_lastPhonePacketMs.store(GetTickCount64(), std::memory_order_relaxed);
+            // Allowlisted phone packets only: switch the video target to the
+            // sender's IP and ACK it (M10/R2). Anything else is LAN noise or a
+            // scanner — dropped with a rate-limited log, no target switch, no ACK.
+            if (IsPhoneDiscoveryPacket(buffer, bytesReceived)) {
+                SwitchDataTarget(senderIpStr);
+                m_lastPhonePacketMs.store(GetTickCount64(), std::memory_order_relaxed);
 
-            // Send acknowledgment back to the phone (wire constant "ACK")
-            sockaddr_in responseAddr;
-            responseAddr.sin_family = AF_INET;
-            responseAddr.sin_port = senderAddr.sin_port;
-            responseAddr.sin_addr.s_addr = senderAddr.sin_addr.s_addr;
-            sendto(m_discoverySocket, wire::kDiscoveryAck, (int)wire::kDiscoveryAckLen, 0,
-                   (sockaddr*)&responseAddr, sizeof(responseAddr));
+                // Send acknowledgment back to the phone (wire constant "ACK")
+                sockaddr_in responseAddr;
+                responseAddr.sin_family = AF_INET;
+                responseAddr.sin_port = senderAddr.sin_port;
+                responseAddr.sin_addr.s_addr = senderAddr.sin_addr.s_addr;
+                sendto(m_discoverySocket, wire::kDiscoveryAck, (int)wire::kDiscoveryAckLen, 0,
+                       (sockaddr*)&responseAddr, sizeof(responseAddr));
 
-            DebugLog("Discovery ACK sent to %s", senderIpStr);
+                DebugLog("Discovery ACK sent to %s", senderIpStr);
+            } else {
+                static uint64_t unknownCount = 0;
+                if (++unknownCount <= 3 || unknownCount % 50 == 1) {
+                    DriverLog("Discovery: ignoring unknown packet from %s:%d (size=%d, count=%llu)",
+                              senderIpStr, ntohs(senderAddr.sin_port), bytesReceived,
+                              (unsigned long long)unknownCount);
+                }
+            }
         }
 
         // Check if the phone has timed out (no packets for kPhoneTimeoutMs).
@@ -248,40 +302,17 @@ void HmdDriver::DiscoveryThreadFunc()
 // thread is needed. Numbers are read without locks: fps/bitrate change only
 // via settings, and the frame counters are monotonic atomics — a torn snapshot
 // between them is fine for a monitoring packet.
-static void AppendPaddedNumber(char* buf, int* pos, int capacity, unsigned long long value)
-{
-    char tmp[24];
-    sprintf_s(tmp, sizeof(tmp), "%llu", value);
-    // Copy without a leading colon so the payload ends up "fps=<n>" etc.
-    size_t need = strlen(tmp);
-    if (*pos + (int)need < capacity) {
-        memcpy(buf + *pos, tmp, need);
-        *pos += (int)need;
-    }
-}
 
 void HmdDriver::SendBridgeStats(const sockaddr_in& addr)
 {
     char stats[160];
-    // "BRIDGE_STATS fps=<fps> bitrate=<kbps> frames=<frames> drops=<drops>"
-    int n = sprintf_s(stats, sizeof(stats), "%s fps=%d bitrate=", wire::kBridgeStats, m_encoderFps);
-    if (n > 0) {
-        AppendPaddedNumber(stats, &n, (int)sizeof(stats), (unsigned long long)(m_encoderBitrate / 1000));
-        // Copy tag WITHOUT the literal's NUL terminator: " frames=" is 8 bytes,
-        // " drops=" is 7. A stray NUL between '=' and the digits would make the
-        // bridge parse the field as empty.
-        static const char kFramesTag[] = " frames=";
-        static const char kDropsTag[] = " drops=";
-        if (n + (int)sizeof(kFramesTag) - 1 < (int)sizeof(stats)) {
-            memcpy(stats + n, kFramesTag, sizeof(kFramesTag) - 1);
-            n += (int)sizeof(kFramesTag) - 1;
-        }
-        AppendPaddedNumber(stats, &n, (int)sizeof(stats), m_udpFramesSent.load(std::memory_order_relaxed));
-        if (n + (int)sizeof(kDropsTag) - 1 < (int)sizeof(stats)) {
-            memcpy(stats + n, kDropsTag, sizeof(kDropsTag) - 1);
-            n += (int)sizeof(kDropsTag) - 1;
-        }
-        AppendPaddedNumber(stats, &n, (int)sizeof(stats), m_udpDroppedFrames);
+    // "BRIDGE_STATS fps=<fps> bitrate=<kbps> frames=<n> drops=<n>"
+    // Single snprintf (L7): no hand-rolled number appender, no stray-NUL risk.
+    int n = snprintf(stats, sizeof(stats), "%s fps=%d bitrate=%d frames=%llu drops=%u",
+                     wire::kBridgeStats, m_encoderFps, m_encoderBitrate / 1000,
+                     (unsigned long long)m_udpFramesSent.load(std::memory_order_relaxed),
+                     m_udpDroppedPreview + m_udpDroppedPhone);
+    if (n > 0 && n < (int)sizeof(stats)) {
         sendto(m_discoverySocket, stats, n, 0, (sockaddr*)&addr, sizeof(addr));
     }
 }
@@ -306,7 +337,12 @@ void HmdDriver::SwitchDataTarget(const char* phoneIp)
 
     m_serverAddr.sin_family = AF_INET;
     m_serverAddr.sin_port = htons(wire::kDataPort);
-    inet_pton(AF_INET, phoneIp, &m_serverAddr.sin_addr);
+    // L11: never install a garbage address — the allowlist guarantees a phone
+    // sender, but a malformed IP string must not poison the video target.
+    if (inet_pton(AF_INET, phoneIp, &m_serverAddr.sin_addr) != 1) {
+        DriverLog("SwitchDataTarget: inet_pton rejected '%s', target unchanged", phoneIp);
+        return;
+    }
     m_hasPhoneTarget.store(true, std::memory_order_relaxed);
 
     DebugLog("Data target switched to %s:%d (phone copy enabled alongside local preview)", phoneIp, wire::kDataPort);

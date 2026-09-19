@@ -22,6 +22,7 @@
 
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 
@@ -204,14 +205,17 @@ CardboardPlusPlusApp::CardboardPlusPlusApp(JavaVM* vm, jobject obj,
                                         kVelocityFilterCutoffFrequency);
 
   video_receiver_ = std::make_unique<VideoReceiver>();
-  h264_decoder_ = std::make_unique<H264Decoder>();
 }
 
 CardboardPlusPlusApp::~CardboardPlusPlusApp() {
   decode_thread_running_ = false;
+  if (video_receiver_) video_receiver_->Stop();
   if (decode_thread_.joinable()) {
     decode_thread_.join();
   }
+  free(direct_buf_);
+  direct_buf_ = nullptr;
+  direct_buf_cap_ = 0;
   if (video_texture_ != 0) {
     glDeleteTextures(1, &video_texture_);
     video_texture_ = 0;
@@ -297,10 +301,10 @@ void CardboardPlusPlusApp::SetVideoDecoder(JNIEnv* env, jobject decoder) {
   if (decoder) {
     video_decoder_obj_ = env->NewGlobalRef(decoder);
     jclass cls = env->GetObjectClass(decoder);
-    mid_feed_video_ = env->GetMethodID(cls, "feedFrame", "([BZ)V");
+    mid_feed_video_ = env->GetMethodID(cls, "feedDirect", "(Ljava/nio/ByteBuffer;IZ)V");
     env->DeleteLocalRef(cls);
     if (!mid_feed_video_) {
-      LOGE("SetVideoDecoder: feedFrame method not found");
+      LOGE("SetVideoDecoder: feedDirect method not found");
     }
   }
   LOGD("SetVideoDecoder: decoder=%p", (void*)video_decoder_obj_);
@@ -309,22 +313,6 @@ void CardboardPlusPlusApp::SetVideoDecoder(JNIEnv* env, jobject decoder) {
 void CardboardPlusPlusApp::OnVideoActive() {
   video_active_ = true;
   LOGD("Video decoder active");
-}
-
-bool CardboardPlusPlusApp::IsKeyframe(const uint8_t* data, int size) {
-  for (int i = 0; i + 3 < size; ++i) {
-    if (data[i] == 0x00 && data[i + 1] == 0x00 && (data[i + 2] & 0xFF) <= 0x01) {
-      int sc = (data[i + 2] == 0x00 && i + 3 < size && data[i + 3] == 0x01)
-                   ? 4
-                   : (data[i + 2] == 0x01 ? 3 : 0);
-      if (sc > 0) {
-        int type = data[i + sc] & 0x1F;
-        if (type == 5 || type == 7) return true;
-        i += sc;
-      }
-    }
-  }
-  return false;
 }
 
 void CardboardPlusPlusApp::SetScreenParams(int width, int height) {
@@ -667,18 +655,6 @@ void CardboardPlusPlusApp::ResetCameraTexture() {
   LOGD("Camera texture reset for pause");
 }
 
-void CardboardPlusPlusApp::SetEyeTexture(int eye, int textureId) {
-  if (eye == 0) {
-    left_eye_custom_texture_ = static_cast<GLuint>(textureId);
-    left_eye_texture_set_ = (textureId != 0);
-    LOGD("Left eye texture set: id=%d", textureId);
-  } else if (eye == 1) {
-    right_eye_custom_texture_ = static_cast<GLuint>(textureId);
-    right_eye_texture_set_ = (textureId != 0);
-    LOGD("Right eye texture set: id=%d", textureId);
-  }
-}
-
 void CardboardPlusPlusApp::StartVideoReceiver(int port) {
   if (video_receiver_started_) {
     LOGD("Video receiver already started");
@@ -706,13 +682,13 @@ void CardboardPlusPlusApp::StopVideoReceiver() {
 
   LOGD("Stopping video receiver");
 
+  // Signal the forwarding thread first, then wake it out of its blocking
+  // wait via receiver Stop() before joining (join-before-stop would hang).
   decode_thread_running_ = false;
+  video_receiver_->Stop();
   if (decode_thread_.joinable()) {
     decode_thread_.join();
   }
-
-  video_receiver_->Stop();
-  h264_decoder_->Shutdown();
 
   video_active_ = false;
 
@@ -725,18 +701,6 @@ void CardboardPlusPlusApp::StopVideoReceiver() {
 
   video_receiver_started_ = false;
   LOGD("Video receiver stopped");
-}
-
-bool CardboardPlusPlusApp::HasVideoFrame() {
-  if (!video_receiver_started_) return false;
-  return video_receiver_->HasFrame();
-}
-
-void CardboardPlusPlusApp::UpdateVideoTexture() {
-  // The video texture is now an OES texture owned by a Java SurfaceTexture fed
-  // by MediaCodec. The GL thread calls SurfaceTexture.updateTexImage() (via
-  // VideoDecoder.updateVideoTexture in Java) before onDrawFrame, which draws
-  // the texture directly. No CPU upload happens here anymore.
 }
 
 void CardboardPlusPlusApp::DecodeLoop() {
@@ -762,23 +726,35 @@ void CardboardPlusPlusApp::DecodeLoop() {
   while (decode_thread_running_) {
     uint8_t* frame_data = nullptr;
     int frame_size = 0;
-    if (!video_receiver_->GetFrame(&frame_data, &frame_size)) {
-      // No packet queued yet; yield briefly instead of busy-spinning.
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    bool is_key = false;
+    // Blocks on the receiver's condition variable (no 1ms spin); returns
+    // false when Stop() drained the queue. is_key was computed once at
+    // receive time, so no rescan here — Java only rescans keyframes for SPS.
+    if (!video_receiver_->WaitAndGetFrame(&frame_data, &frame_size, &is_key)) {
+      if (!decode_thread_running_) break;
       continue;
     }
 
-    const bool is_key = IsKeyframe(frame_data, frame_size);
-
-    jbyteArray arr = env->NewByteArray(frame_size);
-    if (!arr) {
+    // Reused direct-buffer handoff: one malloc'd region (grown as needed),
+    // wrapped per frame without copying into a JNI array.
+    if ((size_t)frame_size > direct_buf_cap_) {
+      uint8_t* grown =
+          static_cast<uint8_t*>(realloc(direct_buf_, (size_t)frame_size));
+      if (!grown) {
+        LOGE("DecodeLoop: direct buffer realloc failed (%d)", frame_size);
+        continue;
+      }
+      direct_buf_ = grown;
+      direct_buf_cap_ = (size_t)frame_size;
+    }
+    memcpy(direct_buf_, frame_data, (size_t)frame_size);
+    jobject buf = env->NewDirectByteBuffer(direct_buf_, (jlong)frame_size);
+    if (!buf) {
       continue;
     }
-    env->SetByteArrayRegion(arr, 0, frame_size,
-                            reinterpret_cast<jbyte*>(frame_data));
-    env->CallVoidMethod(video_decoder_obj_, mid_feed_video_, arr,
-                        is_key ? JNI_TRUE : JNI_FALSE);
-    env->DeleteLocalRef(arr);
+    env->CallVoidMethod(video_decoder_obj_, mid_feed_video_, buf,
+                        (jint)frame_size, is_key ? JNI_TRUE : JNI_FALSE);
+    env->DeleteLocalRef(buf);
 
     if (env->ExceptionCheck()) {
       env->ExceptionDescribe();

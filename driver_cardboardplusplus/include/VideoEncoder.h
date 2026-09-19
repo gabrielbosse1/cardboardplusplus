@@ -42,22 +42,16 @@ public:
     
     void Shutdown();
 
-    bool EncodeFrame(ID3D11Texture2D* pTexture, int64_t pts);
-    bool EncodeFrameSBS(ID3D11Texture2D* pLeft, ID3D11Texture2D* pRight, int64_t pts);
-
-    // Split-frame API for the async encode pipeline:
-    // ComposeSBSGPU runs on the compositor thread while the sync texture mutex
-    // is held (queues the SBS GPU pass). FinishFrame runs on the background
-    // encoder thread (GPU readback + sws_scale + H264 encode + packet drain).
+    // Split-frame API for the async encode pipeline (all on the encoding thread:
+    // ComposeSBSGPU composites submitted layers to the conversion RT,
+    // ReadbackToBuffer copies it to the CPU buffer, SwsConvert does BGRA->NV12,
+    // FinishEncode hashes + sends to the encoder + drains packets + telemetry).
     bool ComposeSBSGPU(const std::vector<ID3D11Texture2D*>& lefts,
                        const std::vector<ID3D11Texture2D*>& rights,
                        const std::vector<LayerBounds>& leftBounds,
                        const std::vector<LayerBounds>& rightBounds);
-    bool FinishFrame(int64_t pts);
-    bool SwsConvert();                   // sws_scale BGRA→NV12 on mapped data
+    bool SwsConvert();                   // sws_scale BGRA→NV12 from the readback buffer
     bool FinishEncode(int64_t pts);      // hash + send + receive + telemetry (no D3D11)
-    bool ReadBackBegin();   // D3D11: CopySubresourceRegion + Map
-    bool ReadBackEnd();     // D3D11: Unmap
     bool ReadbackToBuffer();  // D3D11: CopySubresourceRegion + Map + memcpy + Unmap (all in one)
 
     void SetEncodedPacketCallback(EncodedPacketCallback callback);
@@ -81,17 +75,12 @@ private:
     bool InitializeShaderConversion();
     void CleanupShaderConversion();
 
-    bool ConvertTextureToFrame(ID3D11Texture2D* pTexture);
-    bool ConvertViaShader(ID3D11Texture2D* pSource);
     // Draws one layer's eyes into the SBS conversion RT (left eye → left half,
     // right eye → right half) using the layer blend state. Caller clears the RT
     // once and sets the viewport; this is invoked once per submitted layer.
     bool ComposeSBSLayer(ID3D11Texture2D* pLeft, ID3D11Texture2D* pRight,
                          const LayerBounds& leftBounds, const LayerBounds& rightBounds,
                          ID3D11BlendState* blendState);
-
-    void SetupBlitPipeline(ID3D11ShaderResourceView* pSRV);
-    bool ReadBackConversionRT();
 
     bool SendFrameToEncoder();
     bool ReceiveEncodedPackets();
@@ -107,9 +96,12 @@ private:
     ID3D11Device* m_pEncDevice = nullptr;
     ID3D11DeviceContext* m_pEncContext = nullptr;
 
-    // Shared eye textures opened on the encoding device (one pair per layer)
+    // Shared eye textures opened on the encoding device (one pair per layer).
+    // Cached across frames while the handles are unchanged (M9); released on
+    // handle change, error, or Shutdown.
     std::vector<ID3D11Texture2D*> m_encEyeLefts;
     std::vector<ID3D11Texture2D*> m_encEyeRights;
+    std::vector<std::pair<HANDLE, HANDLE>> m_openedHandles;
 
     AVCodecContext* m_pCodecContext;
     AVBufferRef* m_pHwDeviceCtx;
@@ -134,11 +126,10 @@ private:
     uint8_t* m_pSoftwareFrameBuffer;
     bool m_hasValidFrame;
 
-    // Shader-based format conversion (for R10G10B10A2_UNORM textures)
+    // Shader-based SBS compositing (handles any eye format, e.g. R10G10B10A2).
     ID3D11Texture2D* m_pConversionRT;
     ID3D11RenderTargetView* m_pConversionRTV;
     ID3D11VertexShader* m_pBlitVS;
-    ID3D11PixelShader* m_pBlitPS;
     ID3D11PixelShader* m_pSBSPS;
     ID3D11SamplerState* m_pBlitSampler;
     ID3D11BlendState* m_pBlitBlend;
@@ -147,11 +138,6 @@ private:
     ID3D11InputLayout* m_pBlitInputLayout;
     ID3D11Buffer* m_pBlitVertexBuffer;
     bool m_shaderConversionReady;
-
-    // Private staging copies for reading shared textures safely
-    ID3D11Texture2D* m_pLeftStaging;
-    ID3D11Texture2D* m_pRightStaging;
-    ID3D11Texture2D* m_pSingleStaging;
 
     // Telemetry for diagnosing capture/encode stalls (image-in-image artifact)
     LARGE_INTEGER m_perfFreq;
@@ -170,12 +156,6 @@ private:
     uint32_t ComputeFrameHash();
     void LogTelemetrySummary();
 
-    std::mutex* m_pD3dMutex = nullptr;
-
-    // Mapped staging data between ReadBackBegin/ReadBackEnd
-    void* m_mappedData = nullptr;
-    UINT m_mappedRowPitch = 0;
-
     // CPU readback buffer (Populate in ReadbackToBuffer, consumed by SwsConvert)
     uint8_t* m_pReadbackBuffer = nullptr;
 
@@ -188,7 +168,6 @@ private:
     // SendFrameToEncoder, so NACK bursts collapse into a single keyframe.
     std::atomic<bool> m_forceKeyframe{false};
     int m_readbackBufferSize = 0;
-    int m_readbackRowPitch = 0;
 
     // DIAG (Test A): remember the eye texture formats of the last SBS compose so a
     // black-frame detection in ReadbackToBuffer can report them (H6 format check).

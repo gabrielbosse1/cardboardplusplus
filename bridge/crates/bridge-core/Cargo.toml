@@ -8,3 +8,4 @@ description = "Core bridge logic: consumes the shared ring, portable default pat
 
 [dependencies]
 bridge-shm = { path = "../bridge-shm" }
+serde_json = "1"

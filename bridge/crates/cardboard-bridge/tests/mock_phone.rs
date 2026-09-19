@@ -94,8 +94,20 @@ fn hello_packet_is_recognized() {
     let packet = build_hello_packet(1);
     assert!(matches!(
         cardboard_bridge::net::telemetry::parse_packet(&packet),
-        cardboard_bridge::net::telemetry::TelemetryPacket::Hello
+        cardboard_bridge::net::telemetry::TelemetryPacket::Hello(_)
     ));
+}
+
+#[test]
+fn hello_packet_carries_commit_count_version() {
+    use cardboard_bridge::net::telemetry::{parse_packet, phone_hello_version, TelemetryPacket};
+    let mut packet = build_hello_packet(1);
+    packet.extend_from_slice(b" 542");
+    match parse_packet(&packet) {
+        TelemetryPacket::Hello(v) => assert_eq!(v, "542"),
+        other => panic!("expected Hello, got {other:?}"),
+    }
+    assert_eq!(phone_hello_version(&packet).unwrap(), "542");
 }
 
 #[test]

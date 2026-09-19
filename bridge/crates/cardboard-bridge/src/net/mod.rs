@@ -38,6 +38,8 @@ pub enum EncoderChoice {
 
 impl From<i32> for EncoderChoice {
     /// Maps the UI's encoder picker index (0 = GPU, 1 = CPU) to a variant.
+    /// Unknown indices fall back to GPU (and log it) so a stale config
+    /// never bricks the session.
     fn from(index: i32) -> Self {
         match index {
             1 => EncoderChoice::Cpu,
@@ -45,7 +47,10 @@ impl From<i32> for EncoderChoice {
             3 => EncoderChoice::Qsv,
             4 => EncoderChoice::Libx264,
             0 => EncoderChoice::Gpu,
-            _ => EncoderChoice::Gpu,
+            _ => {
+                eprintln!("[bridge] unknown encoder index {index}, falling back to gpu");
+                EncoderChoice::Gpu
+            }
         }
     }
 }
@@ -62,7 +67,10 @@ impl EncoderChoice {
             "libx264" => EncoderChoice::Libx264,
             "gpu" => EncoderChoice::Gpu,
             "cpu" => EncoderChoice::Cpu,
-            _ => EncoderChoice::Auto,
+            _ => {
+                eprintln!("[bridge] unknown encoder name {name:?}, falling back to auto");
+                EncoderChoice::Auto
+            }
         }
     }
 

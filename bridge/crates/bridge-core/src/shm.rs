@@ -18,6 +18,7 @@ pub struct ShmService {
     pub last_write_seq: u64,
     pub dropped_total: u64,
     pub msgs_total: u64,
+    dropped_seen: u64,
 }
 
 impl ShmService {
@@ -28,6 +29,7 @@ impl ShmService {
             last_write_seq: 0,
             dropped_total: 0,
             msgs_total: 0,
+            dropped_seen: 0,
         })
     }
 
@@ -47,7 +49,11 @@ impl ShmService {
             out.push(msg);
         }
         self.last_write_seq = self.consumer.write_seq();
-        self.dropped_total += self.consumer.dropped();
+        // `consumer.dropped()` is cumulative: only the delta since the last
+        // drain counts, or every drain double-counts the same drops.
+        let cur = self.consumer.dropped();
+        self.dropped_total += cur.saturating_sub(self.dropped_seen);
+        self.dropped_seen = cur;
         out
     }
 }

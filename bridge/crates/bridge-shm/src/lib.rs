@@ -12,7 +12,7 @@
 //!
 //! The on-wire layout is defined in `protocol.rs` and **must stay byte-for-byte
 //! identical** with `driver_cardboardplusplus/include/BridgeProtocol.h`. See
-//! `bridge/docs/TRANSPORT.md` for the authoritative spec.
+//! `protocol.rs` for the authoritative spec.
 //!
 //! **Platforms**
 //! - Windows: named file mapping `Local\CardboardPPBridge` via

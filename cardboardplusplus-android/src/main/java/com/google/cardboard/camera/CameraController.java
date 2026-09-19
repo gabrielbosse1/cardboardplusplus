@@ -58,6 +58,10 @@ public class CameraController {
 
   private int cameraWidth = AppConstants.DEFAULT_CAMERA_WIDTH;
   private int cameraHeight = AppConstants.DEFAULT_CAMERA_HEIGHT;
+  // ImageReader (streamer) capture size: small YUV output requested directly
+  // from the sensor so the streamer rarely has to downscale in Java.
+  private int streamWidth = AppConstants.CAMERA_STREAM_WIDTH;
+  private int streamHeight = AppConstants.CAMERA_STREAM_HEIGHT;
 
   public CameraController(Context context, NativeBridge bridge) {
     this.context = context;
@@ -125,6 +129,14 @@ public class CameraController {
               map, AppConstants.MIN_CAMERA_WIDTH, AppConstants.MIN_CAMERA_HEIGHT);
       cameraWidth = chosen.getWidth();
       cameraHeight = chosen.getHeight();
+      // Streamer frames come from the YUV_420_888 ImageReader output, whose
+      // size list differs from SurfaceTexture's — query it separately and ask
+      // for stream size directly (falls back to 640x480, still cheap).
+      Size yuvChosen =
+          CameraUtils.chooseYuvOutputSize(
+              map, AppConstants.CAMERA_STREAM_WIDTH, AppConstants.CAMERA_STREAM_HEIGHT);
+      streamWidth = yuvChosen.getWidth();
+      streamHeight = yuvChosen.getHeight();
 
       if (cameraSurfaceTexture != null) {
         cameraSurfaceTexture.setDefaultBufferSize(cameraWidth, cameraHeight);
@@ -138,7 +150,8 @@ public class CameraController {
 
       cameraManager.openCamera(backCameraId, new CameraDeviceCallback(), cameraHandler);
 
-      Log.i(TAG, "Camera opening, size: " + cameraWidth + "x" + cameraHeight);
+      Log.i(TAG, "Camera opening, size: " + cameraWidth + "x" + cameraHeight
+          + " stream: " + streamWidth + "x" + streamHeight);
     } catch (Exception e) {
       Log.w(TAG, "Could not open camera: " + e.getMessage());
     }
@@ -149,10 +162,12 @@ public class CameraController {
       return;
     }
     try {
-      // Create ImageReader for raw frame access (YUV_420_888 gives NV21-like data).
+      // Create ImageReader for raw frame access at the small streamer size
+      // (YUV_420_888 gives NV21-like data). Requesting small directly keeps
+      // conversion + JPEG encode cheap; the preview Surface keeps full res.
       imageReader =
           ImageReader.newInstance(
-              cameraWidth, cameraHeight, ImageFormat.YUV_420_888, /*maxImages=*/ 2);
+              streamWidth, streamHeight, ImageFormat.YUV_420_888, /*maxImages=*/ 2);
       imageReader.setOnImageAvailableListener(
           reader -> {
             Image image = reader.acquireLatestImage();

@@ -1,4 +1,7 @@
 # compile-app.ps1 — Build the Android APK
+# NOTE: debug universal APK only (no ABI splits / Bundle): the app is
+# sideloaded via install-app.ps1, so one APK must install everywhere.
+# Add splits + bundleRelease when a Play release path exists.
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Write-Host "Building Android app..." -ForegroundColor Cyan

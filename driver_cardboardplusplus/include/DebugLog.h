@@ -1,7 +1,8 @@
 #pragma once
-// Conditional debug logging for the SteamVR driver. Debug messages only fire
-// when CARDBOARD_DEBUG=1 is set in the environment, keeping the production
-// SteamVR log file small. Warnings and errors always fire.
+// Conditional debug logging for the SteamVR driver. Debug builds always log;
+// release builds (NDEBUG) only log when CARDBOARD_DEBUG=1 is set in the
+// environment, keeping the production SteamVR log file (vrserver.txt) free of
+// DEBUG lines by default. Warnings and errors always fire.
 //
 // Usage:
 //   DebugLog("sensor pkt #%d: gyro=(%.3f,%.3f,%.3f)", count, x, y, z);
@@ -17,14 +18,19 @@
 namespace cbpp_debug {
 
 // Check once at load time; env var can't change mid-session (SteamVR restarts
-// the driver DLL anyway).
+// the driver DLL anyway). Debug builds always return true; release builds
+// (NDEBUG) honor the env var so release defaults off with opt-in.
 inline bool debug_enabled() {
+#ifdef NDEBUG
     static const bool enabled = [] {
         char val[2] = {};
         return GetEnvironmentVariableA("CARDBOARD_DEBUG", val, sizeof(val)) == 1 &&
                val[0] == '1';
     }();
     return enabled;
+#else
+    return true;
+#endif
 }
 
 inline void log_msg(const char* tag, const char* pFormat, ...) {
@@ -42,7 +48,8 @@ inline void log_msg(const char* tag, const char* pFormat, ...) {
 
 } // namespace cbpp_debug
 
-// Debug log — only fires when CARDBOARD_DEBUG=1.
+// Debug log — always fires in debug builds; in release (NDEBUG) only when
+// CARDBOARD_DEBUG=1, so release vrserver.txt stays clean by default.
 #define DebugLog(...) \
     do { if (cbpp_debug::debug_enabled()) cbpp_debug::log_msg("DEBUG", __VA_ARGS__); } while(0)
 

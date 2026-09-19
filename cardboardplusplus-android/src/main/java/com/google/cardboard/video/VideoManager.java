@@ -5,6 +5,7 @@ import com.google.cardboard.NativeBridge;
 import com.google.cardboard.core.AppConstants;
 import com.google.cardboard.core.DebugLog;
 import com.google.cardboard.settings.AppSettings;
+import com.google.cardboard.telemetry.TelemetrySender;
 
 /**
  * Owns the video decode pipeline: creates the OES texture + MediaCodec-backed {@link VideoDecoder}
@@ -25,10 +26,16 @@ public class VideoManager {
   private Runnable reconnectAction;
   private VideoWatchdog watchdog;
   private NetStatsReporter netStats;
+  private TelemetrySender telemetrySender;
 
   public VideoManager(NativeBridge bridge, AppSettings appSettings) {
     this.bridge = bridge;
     this.appSettings = appSettings;
+  }
+
+  /** Share the telemetry socket for NetStats 0x13 reports (no fresh socket/DNS per report). */
+  public void setTelemetrySender(TelemetrySender telemetrySender) {
+    this.telemetrySender = telemetrySender;
   }
 
   /** Query the hardware decoder cap (max supported resolution). */
@@ -43,6 +50,12 @@ public class VideoManager {
 
   /** Create the OES texture and MediaCodec decoder. Must run on the GL thread. */
   public void onSurfaceCreated() {
+    // Guard against double-create (VrRenderer + activity resume race): release
+    // the old decoder first so we never leak a MediaCodec instance.
+    if (decoder != null) {
+      decoder.release();
+      decoder = null;
+    }
     int texId = bridge.createVideoTexture();
     decoder =
         new VideoDecoder(
@@ -89,7 +102,7 @@ public class VideoManager {
    */
   private void startNetStats() {
     if (netStats == null) {
-      netStats = new NetStatsReporter(appSettings, () -> decoder);
+      netStats = new NetStatsReporter(appSettings, () -> decoder, telemetrySender);
     }
     netStats.start();
   }

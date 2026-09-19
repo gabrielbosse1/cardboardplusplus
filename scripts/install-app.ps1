@@ -25,9 +25,14 @@ if (-not (Test-Path $apk)) {
 
 Write-Host "Checking for connected devices..." -ForegroundColor Cyan
 $devices = & $adb devices 2>&1
-if (-not ($devices -match "\tdevice$")) { throw "No Android device connected - plug in a phone and enable USB debugging" }
+$attached = @($devices | Select-String "`tdevice$" | ForEach-Object { $_.Line })
+if ($attached.Count -eq 0) { throw "No Android device connected - plug in a phone and enable USB debugging" }
+if ($attached.Count -gt 1) {
+    $serials = ($attached | ForEach-Object { ($_ -split "`t")[0] }) -join ", "
+    throw "Multiple devices connected ($serials) - re-run with a target, e.g.: & `$adb -s <serial> install -r -g $apk"
+}
 
 Write-Host "Installing APK to phone..." -ForegroundColor Cyan
-& $adb install -r $apk
+& $adb install -r -g $apk
 if ($LASTEXITCODE -ne 0) { throw "adb install failed" }
 Write-Host "APK installed successfully" -ForegroundColor Green

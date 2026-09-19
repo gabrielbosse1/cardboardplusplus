@@ -11,11 +11,6 @@ use std::time::Duration;
 
 const DRIVER_PORT: u16 = 42070;
 
-fn find_free_port() -> u16 {
-    let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
-    sock.local_addr().unwrap().port()
-}
-
 #[test]
 fn bridge_hello_wire_is_exactly_15_bytes() {
     // The bridge sends b"BRIDGE_HELLO v1" — verify the exact wire bytes.
@@ -72,6 +67,7 @@ fn cardboard_cap_wire_format() {
 }
 
 #[test]
+#[ignore = "binds the real driver port 42070 — stop the bridge/driver first, then run with --ignored"]
 fn mock_driver_can_exchange_heartbeat_with_bridge() {
     // Simulate the driver side: bind on 42070, wait for BRIDGE_HELLO,
     // reply with BRIDGE_ACK. This verifies the bridge can talk to a mock driver.
@@ -107,6 +103,11 @@ fn stats_parser_handles_various_field_combinations() {
     assert_eq!(parsed.2, 0);  // frames defaults to 0
     assert_eq!(parsed.3, 0);  // drops defaults to 0
 
+    // Zero valid fields is a reject, not idle-zeros.
+    assert!(parse_bridge_stats("BRIDGE_STATS").is_none());
+    assert!(parse_bridge_stats("BRIDGE_STATS future=none").is_none());
+    assert!(parse_bridge_stats("BRIDGE_STATS fps=abc").is_none());
+
     // Unknown prefix
     assert!(parse_bridge_stats("BRIDGE_ACK v1").is_none());
     assert!(parse_bridge_stats("hello").is_none());
@@ -114,21 +115,47 @@ fn stats_parser_handles_various_field_combinations() {
 
 /// Mirror of the bridge's stats parsing logic.
 fn parse_bridge_stats(msg: &str) -> Option<(i32, i32, u64, u64)> {
-    let rest = msg.strip_prefix("BRIDGE_STATS")?;
+    let rest = msg.trim_start().strip_prefix("BRIDGE_STATS")?;
     let clean: String = rest.chars().filter(|c| !c.is_control()).collect();
     let mut fps = 0i32;
     let mut kbps = 0i32;
     let mut frames = 0u64;
     let mut drops = 0u64;
+    let mut parsed = 0u32;
     for field in clean.split_whitespace() {
-        let (key, value) = field.split_once('=')?;
+        let Some((key, value)) = field.split_once('=') else {
+            continue;
+        };
         match key {
-            "fps" => fps = value.parse().unwrap_or(0),
-            "bitrate" => kbps = value.parse().unwrap_or(0),
-            "frames" => frames = value.parse().unwrap_or(0),
-            "drops" => drops = value.parse().unwrap_or(0),
+            "fps" => {
+                if let Ok(v) = value.parse() {
+                    fps = v;
+                    parsed += 1;
+                }
+            }
+            "bitrate" => {
+                if let Ok(v) = value.parse() {
+                    kbps = v;
+                    parsed += 1;
+                }
+            }
+            "frames" => {
+                if let Ok(v) = value.parse() {
+                    frames = v;
+                    parsed += 1;
+                }
+            }
+            "drops" => {
+                if let Ok(v) = value.parse() {
+                    drops = v;
+                    parsed += 1;
+                }
+            }
             _ => {}
         }
+    }
+    if parsed == 0 {
+        return None;
     }
     Some((fps, kbps, frames, drops))
 }

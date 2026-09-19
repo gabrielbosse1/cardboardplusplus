@@ -41,4 +41,9 @@ public class PermissionManager {
     return ActivityCompat.shouldShowRequestPermissionRationale(
         activity, Manifest.permission.READ_EXTERNAL_STORAGE);
   }
+
+  public boolean shouldShowCameraRationale() {
+    return ActivityCompat.shouldShowRequestPermissionRationale(
+        activity, Manifest.permission.CAMERA);
+  }
 }

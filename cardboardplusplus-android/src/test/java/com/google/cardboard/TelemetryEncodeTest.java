@@ -1,5 +1,6 @@
 package com.google.cardboard;
 
+import com.google.cardboard.core.AppConstants;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import org.junit.Test;
@@ -13,9 +14,9 @@ import static org.junit.Assert.*;
  */
 public class TelemetryEncodeTest {
 
-    private static final byte GYRO_TAG = 0x10;
-    private static final byte HAND_TAG = 0x11;
-    private static final byte PING_TAG = 0x20;
+    private static final byte GYRO_TAG = AppConstants.TELEMETRY_TAG_GYRO;
+    private static final byte HAND_TAG = AppConstants.TELEMETRY_TAG_HAND;
+    private static final byte PING_TAG = AppConstants.TELEMETRY_TAG_PING;
 
     @Test
     public void gyroPacketHasCorrectTagAndLength() {
@@ -60,9 +61,19 @@ public class TelemetryEncodeTest {
 
     @Test
     public void helloPacketStartsWithCorrectPrefix() {
-        String hello = "CARDBOARD_PHONE_HELLO v1";
-        assertTrue(hello.startsWith("CARDBOARD_PHONE_HELLO"));
-        assertEquals("CARDBOARD_PHONE_HELLO v1", hello);
+        assertEquals("CARDBOARD_PHONE_HELLO v1", AppConstants.PHONE_HELLO);
+        assertTrue(AppConstants.PHONE_HELLO.startsWith("CARDBOARD_PHONE_HELLO"));
+    }
+
+    @Test
+    public void phoneHelloAppendsBuildVersion() {
+        // The bridge only checks the prefix; the trailing commit count
+        // tells it which build this phone runs.
+        assertEquals("CARDBOARD_PHONE_HELLO v1 542", AppConstants.phoneHello("542"));
+        assertTrue(AppConstants.phoneHello("542").startsWith(AppConstants.PHONE_HELLO_PREFIX));
+        // Null/empty version falls back to the bare hello (old behavior).
+        assertEquals(AppConstants.PHONE_HELLO, AppConstants.phoneHello(null));
+        assertEquals(AppConstants.PHONE_HELLO, AppConstants.phoneHello(""));
     }
 
     @Test

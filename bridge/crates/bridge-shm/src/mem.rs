@@ -66,8 +66,11 @@ type ShmHandle = Option<windows::Win32::Foundation::HANDLE>;
 
 #[cfg(windows)]
 impl SharedMemory {
-    /// Create (producer) the named region. Fails if a region with the same
-    /// name already exists, which would mean two drivers are running.
+    /// Create (producer) the named region. On Windows `CreateFileMappingW`
+    /// opens an existing mapping with the same name instead of failing, so
+    /// this does NOT guarantee exclusivity — two producers would attach to
+    /// the same live region (check `GetLastError() == ERROR_ALREADY_EXISTS`
+    /// if that ever matters).
     pub fn create(name: &str, size: usize, _flags: u32) -> MemResult<Self> {
         use windows::core::PCWSTR;
         use windows::Win32::Foundation::HANDLE;

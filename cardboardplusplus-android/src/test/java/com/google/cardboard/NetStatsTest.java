@@ -1,5 +1,6 @@
 package com.google.cardboard;
 
+import com.google.cardboard.core.AppConstants;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import org.junit.Test;
@@ -13,7 +14,7 @@ import static org.junit.Assert.*;
  */
 public class NetStatsTest {
 
-    private static final byte NET_STATS_TAG = 0x13;
+    private static final byte NET_STATS_TAG = AppConstants.TELEMETRY_TAG_NETSTATS;
 
     private static byte[] buildNetStats(long timestampMs, int frames, int stalls, float fps) {
         ByteBuffer buf = ByteBuffer.allocate(21).order(ByteOrder.LITTLE_ENDIAN);

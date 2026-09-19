@@ -1,5 +1,6 @@
 package com.google.cardboard;
 
+import com.google.cardboard.core.AppConstants;
 import org.junit.Test;
 import static org.junit.Assert.*;
 
@@ -11,7 +12,7 @@ import static org.junit.Assert.*;
  */
 public class DecoderCapabilityTest {
 
-    private static final String CAP_PREFIX = "CARDBOARD_CAP ";
+    private static final String CAP_PREFIX = AppConstants.CAP_PREFIX;
 
     @Test
     public void capMessageFormatMatchesDriver() {
@@ -52,8 +53,8 @@ public class DecoderCapabilityTest {
 
     @Test
     public void capSendAttemptsAndGapAreReasonable() {
-        // The reporter sends 3 times with 500ms gap.
-        // These constants are in DecoderCapabilityReporter.java.
+        // DiscoveryManager sends the CAP burst 3 times with 500ms gap.
+        // These constants live in DiscoveryManager.java (CAP_SEND_ATTEMPTS/CAP_SEND_GAP_MS).
         int sendAttempts = 3;
         long sendGapMs = 500;
         assertEquals(3, sendAttempts);
@@ -61,11 +62,18 @@ public class DecoderCapabilityTest {
     }
 
     @Test
-    public void capMessageWithZeroDimensions() {
-        // Edge case: zero dimensions should still produce valid format
-        String msg = CAP_PREFIX + 0 + " " + 0;
-        assertEquals("CARDBOARD_CAP 0 0", msg);
-        assertTrue(msg.startsWith("CARDBOARD_CAP"));
+    public void zeroDecoderCapIsNeverAnnounced() {
+        // DiscoveryManager guards w>0&&h>0 before every CAP send (unset 0x0 must
+        // never reach the driver, or it would clamp the encoder to nothing).
+        assertFalse("unset cap must not send", shouldSendCap(1, 0, 0));
+        assertFalse("unset cap must not send", shouldSendCap(1, 1920, 0));
+        assertTrue("set cap sends on 1st ACK", shouldSendCap(1, 1920, 1080));
+        assertFalse("set cap skips 2nd ACK", shouldSendCap(2, 1920, 1080));
+    }
+
+    /** Mirrors DiscoveryManager's CAP gate: ackCount % 60 == 1 with a set (non-zero) cap. */
+    private static boolean shouldSendCap(int ackCount, int w, int h) {
+        return w > 0 && h > 0 && ackCount % 60 == 1;
     }
 
     @Test
