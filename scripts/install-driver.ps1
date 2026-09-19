@@ -14,8 +14,17 @@ if (-not (Test-Path "$SteamVR\drivers")) {
     throw "SteamVR drivers directory not found at $SteamVR\drivers - check -SteamVR path or install SteamVR"
 }
 
+$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) { Write-Warning "Not running as Administrator - install may fail writing to $dstDir" }
+
 Write-Host "Installing driver to $dstDir ..." -ForegroundColor Cyan
 New-Item -ItemType Directory -Path $dstDir -Force | Out-Null
+$dstDll = Join-Path $dstDir "driver_cardboardplusplus.dll"
+if (Test-Path $dstDll) {
+    $bak = "$dstDll.bak"
+    Copy-Item $dstDll $bak -Force
+    Write-Host "Backed up existing DLL to $bak" -ForegroundColor Yellow
+}
 Copy-Item $srcDll $dstDir -Force
 if (Test-Path $srcFfmpeg) {
     Copy-Item "$srcFfmpeg\*.dll" $dstDir -Force

@@ -5,6 +5,7 @@ edition = "2021"
 description = "Cardboard++ control plane: talks to the SteamVR driver and the phone, without touching the video stream"
 
 [dependencies]
+bridge-core = { path = "../bridge-core" }
 slint = "1.17"
 tiny_http = { version = "0.12", default-features = false }
 serde = { version = "1", features = ["derive"] }

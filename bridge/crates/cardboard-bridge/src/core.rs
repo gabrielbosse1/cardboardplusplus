@@ -14,6 +14,8 @@ use crate::app::{AppState, SharedState};
 use crate::net::mediapipe::{MediapipeClient, Reclaim};
 use crate::net::{self, EncoderChoice, DRIVER_DISCOVERY_PORT, MEDIAPIPE_PORT, VIDEO_PORT};
 
+use bridge_core::paths;
+
 /// Version read from Cargo.toml at compile time.
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -68,6 +70,11 @@ pub struct StatusSnapshot {
     pub hand_min_detection: i32,
     pub hand_min_presence: i32,
     pub hand_min_tracking: i32,
+    // -- appended (never reordered): setup wizard installer state --
+    pub install_busy: bool,
+    pub install_note: String,
+    pub driver_present: bool,
+    pub steamvr_note: String,
 }
 
 impl From<&AppState> for StatusSnapshot {
@@ -113,6 +120,10 @@ impl From<&AppState> for StatusSnapshot {
             hand_min_detection: s.hand_min_detection,
             hand_min_presence: s.hand_min_presence,
             hand_min_tracking: s.hand_min_tracking,
+            install_busy: s.install_busy,
+            install_note: s.install_note.clone(),
+            driver_present: s.driver_present,
+            steamvr_note: s.steamvr_note.clone(),
         }
     }
 }
@@ -474,6 +485,69 @@ impl AppCore {
         });
     }
 
+    /// Re-check whether the driver DLL is present inside SteamVR. Cheap
+    /// local stat call — the UI poller runs it so the wizard step can show
+    /// "detected" without an install.
+    pub fn refresh_driver_present(&self) -> bool {
+        let present = std::path::Path::new(&driver_target_dll()).exists();
+        if let Ok(mut s) = self.state.lock() {
+            s.driver_present = present;
+        }
+        present
+    }
+
+    /// One-click SteamVR driver install (wizard step 2): copy the compiled
+    /// DLL into the SteamVR driver dir with backup + manifest, on a thread.
+    /// No-op while an install is already running.
+    pub fn install_driver(&self) {
+        {
+            let Ok(mut s) = self.state.lock() else {
+                return;
+            };
+            if s.install_busy {
+                return;
+            }
+            s.install_busy = true;
+            s.install_note = "installing…".into();
+            s.push_log("installing SteamVR driver…".into());
+        }
+        let state = self.state.clone();
+        thread::spawn(move || {
+            let result = install_driver_files();
+            if let Ok(mut s) = state.lock() {
+                s.install_busy = false;
+                s.install_note = match &result {
+                    Ok(out) => format!("done — {out}"),
+                    Err(e) => format!("failed — {e}"),
+                };
+                s.driver_present = std::path::Path::new(&driver_target_dll()).exists();
+                let note = s.install_note.clone();
+                s.push_log(format!("driver install: {note}"));
+            }
+        });
+    }
+
+    /// Launch SteamVR via vrserver.exe (wizard step 2, after install).
+    /// SteamVR picks up the installed driver on start.
+    pub fn start_steamvr(&self) {
+        let state = self.state.clone();
+        thread::spawn(move || {
+            let vrserver = format!("{}\\bin\\win64\\vrserver.exe", steamvr_root());
+            let note = if !std::path::Path::new(&vrserver).exists() {
+                format!("vrserver.exe not found at {vrserver}")
+            } else {
+                match Command::new(&vrserver).spawn() {
+                    Ok(_) => format!("started {vrserver}"),
+                    Err(e) => format!("failed to start SteamVR: {e}"),
+                }
+            };
+            if let Ok(mut s) = state.lock() {
+                s.steamvr_note = note.clone();
+                s.push_log(note);
+            }
+        });
+    }
+
     /// Kill the spawned MediaPipe server (if we started one) so the Python
     /// process doesn't outlive the bridge. Called on shutdown.
     pub fn shutdown(&self) {
@@ -680,6 +754,88 @@ impl AppCore {
     }
 }
 
+/// Compiled driver DLL produced by the C++ build, resolved from the repo
+/// checkout (empty when the checkout can't be located — the caller must
+/// surface an error, never a personal path).
+fn driver_dll_src() -> String {
+    paths::default_driver_dll()
+}
+/// SteamVR addon home for this driver (standard Steam location by default).
+fn steamvr_drivers_dir() -> String {
+    paths::default_steamvr_drivers_dir()
+}
+/// SteamVR root (drivers dir minus the last two segments).
+fn steamvr_root() -> String {
+    paths::steamvr_root_from_drivers_dir(&steamvr_drivers_dir())
+}
+
+/// Target path of the driver DLL inside SteamVR.
+fn driver_target_dll() -> String {
+    format!("{}\\bin\\win64\\driver_cardboardplusplus.dll", steamvr_drivers_dir())
+}
+
+/// Copy the compiled DLL into SteamVR with backup + manifest (same steps
+/// as the legacy bridge-ui installer). Runs on the install thread.
+fn install_driver_files() -> Result<String, String> {
+    use std::path::Path;
+    let src = driver_dll_src();
+    if src.is_empty() || !Path::new(&src).exists() {
+        return Err(format!(
+            "compiled dll not found at {src} (build the driver first)"
+        ));
+    }
+    let target_dir = format!("{}\\bin\\win64", steamvr_drivers_dir());
+    std::fs::create_dir_all(&target_dir).map_err(|e| format!("mkdir {target_dir}: {e}"))?;
+    let target_dll = driver_target_dll();
+
+    if Path::new(&target_dll).exists() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let backup = format!("{target_dll}.bak-{stamp}");
+        std::fs::copy(&target_dll, &backup).map_err(|e| format!("backup {backup}: {e}"))?;
+    }
+
+    let tmp_dll = format!("{target_dll}.tmp-{}", std::process::id());
+    if let Err(e) = std::fs::copy(&src, &tmp_dll) {
+        let _ = std::fs::remove_file(&tmp_dll);
+        return Err(format!("copy to {tmp_dll}: {e}"));
+    }
+    if let Err(e) = std::fs::rename(&tmp_dll, &target_dll) {
+        let _ = std::fs::remove_file(&tmp_dll);
+        return Err(format!("rename {tmp_dll} -> {target_dll}: {e}"));
+    }
+
+    // Ship the manifest + bindings for a from-scratch install.
+    let src_root = Path::new(&src)
+        .parent()
+        .and_then(|p| p.parent())
+        .unwrap_or(Path::new("."));
+    let res_src = src_root.join("resources");
+    if res_src.is_dir() {
+        let drivers_dir = steamvr_drivers_dir();
+        let res_dst = Path::new(&drivers_dir).join("resources");
+        let _ = std::fs::create_dir_all(&res_dst);
+        for name in [
+            "driver.vrdrivermanifest",
+            "controller_profile.json",
+            "legacy_bindings_example.json",
+        ] {
+            let dst = res_dst.join(name);
+            if !dst.exists() {
+                let _ = std::fs::copy(res_src.join(name), &dst);
+            }
+        }
+        let _ = std::fs::copy(
+            src_root.join("driver.vrdrivermanifest"),
+            Path::new(&drivers_dir).join("driver.vrdrivermanifest"),
+        );
+    }
+
+    Ok(format!("installed driver into {target_dir}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -730,6 +886,13 @@ mod tests {
         let test_pos = json.find("link_test_active").unwrap();
         assert!(camera_pos < net_pos);
         assert!(net_pos < test_pos);
+        // Wizard installer fields are appended last (never reordered).
+        let hand_pos = json.find("hand_min_tracking").unwrap();
+        let install_pos = json.find("install_busy").unwrap();
+        let present_pos = json.find("driver_present").unwrap();
+        assert!(test_pos < hand_pos);
+        assert!(hand_pos < install_pos);
+        assert!(install_pos < present_pos);
     }
 
     #[test]

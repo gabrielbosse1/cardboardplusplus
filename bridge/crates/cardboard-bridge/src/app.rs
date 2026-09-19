@@ -82,6 +82,11 @@ pub struct AppState {
     pub hand_min_detection: i32, // 0-100, MediaPipe min_hand_detection_confidence
     pub hand_min_presence: i32,  // 0-100, MediaPipe min_hand_presence_confidence
     pub hand_min_tracking: i32,  // 0-100, MediaPipe min_tracking_confidence
+    // -- setup wizard: one-click SteamVR driver install + launch --
+    pub install_busy: bool,   // install thread running; wizard button spins
+    pub install_note: String, // last install result ("" = never ran)
+    pub driver_present: bool, // driver_cardboardplusplus.dll found in SteamVR
+    pub steamvr_note: String, // last SteamVR launch result ("" = never ran)
     // -- private accounting used to derive the per-second fps figures above --
     gyro_pulse_count: u64,
     hand_pulse_count: u64,
@@ -137,6 +142,10 @@ impl Default for AppState {
             hand_min_detection: 50,
             hand_min_presence: 50,
             hand_min_tracking: 50,
+            install_busy: false,
+            install_note: String::new(),
+            driver_present: false,
+            steamvr_note: String::new(),
             gyro_pulse_count: 0,
             hand_pulse_count: 0,
             camera_pulse_count: 0,

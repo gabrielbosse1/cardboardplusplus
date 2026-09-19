@@ -77,11 +77,22 @@ the whole project before touching any code.
 ## Video transport (decided)
 
 - **Keep UDP for the video stream**: the driver encodes H264 in `VideoEncoder.cpp`
-  and sends it over UDP (`m_udpSocket`) to the phone. This stays as-is.
-- The **Bridge does NOT decode video** and does NOT sit in the video path. It is a
-  control + telemetry plane over shared memory (`bridge-shm`):
-  - driver → Bridge: status, frame counts, telemetry, encoder stats
-  - Bridge → driver: settings (resolution, bitrate, speed, etc.)
+  and sends it over UDP (`m_udpSocket`) to the phone (port 42069, 4-byte
+  big-endian length-prefixed). This stays as-is.
+- The **Bridge never sits in the video path** — video goes driver → phone
+  directly. The driver additionally sends a raw Annex-B copy to localhost:42069,
+  which the Bridge binds and pipes to ffmpeg purely for **preview display**
+  (decoded to RGBA in a separate process; no frame copies in Rust).
+- The Bridge is the **control + telemetry plane over UDP**:
+  - Bridge ↔ driver discovery/control (UDP 42070: `BRIDGE_HELLO`/`BRIDGE_ACK`/
+    `BRIDGE_STATS`/`BRIDGE_CFG`/`BRIDGE_PREVIEW`)
+  - Phone → Bridge telemetry (UDP 42071) and camera JPEGs (UDP 42072),
+    forwarded Bridge → driver as sensors (UDP 42074)
+  - MediaPipe sidecar over TCP 42073, REST API on 8567
+- A **local shared-memory channel** (`bridge-shm`, `protocol.rs` mirrored by
+  the driver's `BridgeProtocol.h`) additionally carries driver → Bridge
+  status/telemetry and settings. It is NOT for video frames and no new
+  SHM channels should be added — new data paths go over UDP/TCP.
 - The phone app decodes the UDP H264 with MediaCodec and renders. It streams
   camera JPEGs to the Bridge, which is the hand-tracking compute node
   (MediaPipe sidecar, TCP 42073).
@@ -109,17 +120,19 @@ the whole project before touching any code.
     (backup existing DLL first).
   - Install/update the APK on a connected phone (`adb install`, discovery already
     exists on both sides).
-- ADB-over-Tailscale is a supported remote workflow today: the phone connects via
-  its Tailscale IP and `adb connect <ip>:<port>`; the PC is the host.
+- ADB-over-Tailscale is a maintainer remote-test workflow (needs your own
+  Tailscale setup; no guide yet): the phone connects via its Tailscale IP and
+  `adb connect <ip>:<port>`; the PC is the host.
 
 ## Current implementation status (so agents don't re-derive it)
 
 ### bridge/ (Rust workspace)
-- `crates/bridge-shm` — mah shared-memory transport. `protocol.rs` defines the wire
-  layout (RegionHeader + slot ring, latest-wins). Authoritative copy.
+- `crates/bridge-shm` — the shared-memory transport. `protocol.rs` defines the
+  SHM layout (RegionHeader + slot ring, latest-wins). Authoritative copy for
+  the SHM layout (the UDP wire contract lives in `CardboardWire.h` instead).
 - `crates/bridge-core` — consumer facade (`shm.rs` + future `glue`/`d3d11`).
-- `crates/bridge-ui` — Slint desktop UI skeleton. Currently only a status pane that
-  drains `bridge-shm` messages; settings + top bar + side bar are NOT built yet.
+- `crates/bridge-ui` — Slint desktop UI (status, stream/camera settings,
+  installers, diagnostics; see README "Current state" for what works today).
   This is where the real product UI goes.
 
 ### driver_cardboardplusplus/ (C++, MSVC)
@@ -130,16 +143,18 @@ the whole project before touching any code.
   `include/BridgeProtocol.h` is the C mirror of the Rust protocol (keep in sync).
 - Wire-layout sizes were verified: payloads use NATURAL alignment (not packed).
 
-### cardboardplusplus-android/ (Kotlin + Cardboard SDK)
+### cardboardplusplus-android/ (Java + JNI/C++ + Cardboard SDK)
 - Renders VR, decodes H264 (MediaCodec), camera passthrough (Camera2), UDP client,
   discovery sender, decoder-cap reporting, PC-IP override setting.
 
 ## Non-negotiables for future agents
 
-1. **The only single source of truth for the wire layout is
-   `bridge/crates/bridge-shm/src/protocol.rs`**; the C header
-   `driver_cardboardplusplus/include/BridgeProtocol.h` must mirror it byte-for-byte
-   (natural alignment, verified sizes). Touch both together.
+1. **Two locked contracts, each with one source of truth:**
+   `driver_cardboardplusplus/include/CardboardWire.h` for the UDP wire
+   (ports, strings, telemetry tags); `bridge/crates/bridge-shm/src/protocol.rs`
+   for the SHM layout, with `driver_cardboardplusplus/include/BridgeProtocol.h`
+   mirroring it byte-for-byte (natural alignment, verified sizes).
+   Touch both sides of whichever contract you change.
 2. **The Bridge is the product.** No driver-only, app-only, or ad-hoc feature
    mutations that bypass the Bridge. Settings, installs, monitoring, and the
    on/off switch live in the Bridge.

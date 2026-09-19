@@ -21,22 +21,12 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use bridge_core::paths;
 use bridge_core::shm::{SettingsChannel, ShmService};
 use bridge_shm::protocol::{BridgeMessage, DEFAULT_REGION_SIZE};
 
 const APP_DIR: &str = "CardboardPlusPlus";
 const CONFIG_FILE: &str = "bridge.json";
-const MSBUILD: &str = "C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\MSBuild\\Current\\Bin\\MSBuild.exe";
-
-const DEFAULT_DRIVER_DLL: &str =
-    "C:\\Users\\admin000\\StudioProjects\\cardboardplusplus\\driver_cardboardplusplus\\x64\\Release\\driver_cardboardplusplus.dll";
-const DEFAULT_STEAMVR_DRIVERS: &str =
-    "C:\\Program Files (x86)\\Steam\\steamapps\\common\\SteamVR\\drivers\\cardboardplusplus";
-const DEFAULT_APK: &str =
-    "C:\\Users\\admin000\\StudioProjects\\cardboardplusplus\\cardboardplusplus-android\\build\\outputs\\apk\\debug\\app-debug.apk";
-const DEFAULT_ADB: &str =
-    "C:\\Users\\admin000\\AppData\\Local\\Android\\Sdk\\platform-tools\\adb.exe";
-const DEFAULT_PHONE: &str = "100.103.133.73:37269";
 
 /// Persistent settings. The Bridge owns all configuration; nothing about the
 /// stream lives in the driver or the app.
@@ -64,11 +54,12 @@ impl Default for BridgeConfig {
             bitrate_kbps: 20000,
             encoder: 0,
             stream_enabled: true,
-            driver_dll_src: DEFAULT_DRIVER_DLL.to_string(),
-            steamvr_drivers_dir: DEFAULT_STEAMVR_DRIVERS.to_string(),
-            apk_path: DEFAULT_APK.to_string(),
-            adb_path: DEFAULT_ADB.to_string(),
-            phone_endpoint: DEFAULT_PHONE.to_string(),
+            driver_dll_src: paths::default_driver_dll(),
+            steamvr_drivers_dir: paths::default_steamvr_drivers_dir(),
+            apk_path: paths::default_apk(),
+            adb_path: paths::default_adb(),
+            // No default: the user enters their phone's ADB endpoint.
+            phone_endpoint: String::new(),
         }
     }
 }
@@ -262,9 +253,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     {
+        let shared = shared.clone();
         let ui_weak = ui.as_weak();
         ui.on_start_steamvr(move || {
-            spawn_start_steamvr(ui_weak.clone());
+            let drivers_dir = shared.cfg.lock().unwrap().steamvr_drivers_dir.clone();
+            spawn_start_steamvr(ui_weak.clone(), drivers_dir);
         });
     }
 
@@ -538,12 +531,11 @@ fn build_driver(cfg: BridgeConfig) -> Result<String, String> {
         return Err(format!("solution not found at {}", sln.display()));
     }
     let sol = sln.to_str().unwrap_or("").to_string();
-    let msbuild = MSBUILD;
-    if !Path::new(msbuild).exists() {
-        return Err(format!("MSBuild not found at {msbuild}"));
-    }
+    let Some(msbuild) = paths::find_msbuild() else {
+        return Err("MSBuild not found - install the Visual Studio C++ build tools".into());
+    };
     run_capture(
-        msbuild,
+        &msbuild,
         &[
             &sol,
             "/p:Configuration=Release",
@@ -626,20 +618,19 @@ fn install_apk(cfg: BridgeConfig) -> Result<String, String> {
     if !Path::new(&cfg.apk_path).exists() {
         return Err(format!("apk not found at {}", cfg.apk_path));
     }
+    if cfg.phone_endpoint.trim().is_empty() {
+        return Err("no phone endpoint - enter the phone's ADB address (ip:port)".into());
+    }
     run_capture(&cfg.adb_path, &["connect", &cfg.phone_endpoint])?;
     run_capture(&cfg.adb_path, &["-s", &cfg.phone_endpoint, "install", "-r", &cfg.apk_path])?;
     Ok(format!("APK installed on {}", cfg.phone_endpoint))
 }
 
-fn spawn_start_steamvr(ui: slint::Weak<MainWindow>) {
+fn spawn_start_steamvr(ui: slint::Weak<MainWindow>, drivers_dir: String) {
     std::thread::spawn(move || {
         // Derive the SteamVR root from the configured drivers dir.
-        let mut parts: Vec<&str> = DEFAULT_STEAMVR_DRIVERS.split('\\').collect();
-        // ...\SteamVR\drivers\cardboardplusplus -> remove last three segments.
-        let dropped = parts.split_off(parts.len() - 3);
-        let _ = dropped; // segments: cardboardplusplus, drivers, SteamVR
-        let root = parts.join("\\");
-        let vrserver = format!("{}\\bin\\win64\\vrserver.exe", root);
+        let root = paths::steamvr_root_from_drivers_dir(&drivers_dir);
+        let vrserver = format!("{root}\\bin\\win64\\vrserver.exe");
         let msg = if Path::new(&vrserver).exists() {
             match std::process::Command::new(&vrserver).spawn() {
                 Ok(_) => format!("Started {}", vrserver),

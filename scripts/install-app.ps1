@@ -3,14 +3,18 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $apk = "$root\cardboardplusplus-android\build\outputs\apk\debug\app-debug.apk"
 
-# Find adb: prefer ANDROID_HOME/ANDROID_SDK_ROOT, fall back to default path
+# Find adb: prefer ANDROID_HOME/ANDROID_SDK_ROOT (User or Machine scope),
+# fall back to the default SDK location under %LOCALAPPDATA%
 $adb = $null
 foreach ($envVar in @("ANDROID_HOME", "ANDROID_SDK_ROOT")) {
-    $val = [System.Environment]::GetEnvironmentVariable($envVar, "User")
-    if ($val -and (Test-Path "$val\platform-tools\adb.exe")) { $adb = "$val\platform-tools\adb.exe"; break }
+    foreach ($scope in @("User", "Machine")) {
+        $val = [System.Environment]::GetEnvironmentVariable($envVar, $scope)
+        if ($val -and (Test-Path "$val\platform-tools\adb.exe")) { $adb = "$val\platform-tools\adb.exe"; break }
+    }
+    if ($adb) { break }
 }
 if (-not $adb) {
-    $default = "C:\Users\admin000\AppData\Local\Android\Sdk\platform-tools\adb.exe"
+    $default = Join-Path $env:LOCALAPPDATA "Android\Sdk\platform-tools\adb.exe"
     if (Test-Path $default) { $adb = $default }
 }
 if (-not $adb) { throw "adb.exe not found - set ANDROID_HOME or install Android SDK" }

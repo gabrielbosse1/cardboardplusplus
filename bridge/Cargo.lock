@@ -809,6 +809,7 @@ name = "cardboard-bridge"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bridge-core",
  "jpeg-decoder",
  "serde",
  "serde_json",

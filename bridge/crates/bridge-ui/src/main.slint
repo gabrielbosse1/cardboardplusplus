@@ -228,12 +228,13 @@ export component MainWindow inherits Window {
     in property <string> camera_status: "Placeholder - hand tracking ships with the stream";
 
     // ---- General (installers + config) ----
+    // Empty until Rust fills them from portable defaults + saved config.
     in property <string> general_status: "Ready";
-    in-out property <string> driver_dll_src: "C:/Users/admin000/StudioProjects/cardboardplusplus/driver_cardboardplusplus/x64/Release/driver_cardboardplusplus.dll";
-    in-out property <string> steamvr_drivers_dir: "C:/Program Files (x86)/Steam/steamapps/common/SteamVR/drivers/cardboardplusplus";
-    in-out property <string> apk_path: "C:/Users/admin000/StudioProjects/cardboardplusplus/cardboardplusplus-android/build/outputs/apk/debug/app-debug.apk";
-    in-out property <string> adb_path: "C:/Users/admin000/AppData/Local/Android/Sdk/platform-tools/adb.exe";
-    in-out property <string> phone_endpoint: "100.103.133.73:37269";
+    in-out property <string> driver_dll_src: "";
+    in-out property <string> steamvr_drivers_dir: "";
+    in-out property <string> apk_path: "";
+    in-out property <string> adb_path: "";
+    in-out property <string> phone_endpoint: "";
 
     // ---- Callbacks into Rust ----
     callback apply_settings();

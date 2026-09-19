@@ -11,7 +11,7 @@ There is no end-user installer — you must build and install everything manuall
 
 The project goal is: bring features normally exclusive to expensive VR headsets (like the Meta Quest) to a simple Google Cardboard. Features include hand tracking, 6DoF, SteamVR compatibility, and using Xbox controllers as virtual VR controllers.
 
-> **A note on code quality:** This project was largely vibecoded, I left an LLM working on the encoder and Android app while I focused on hand-coding another project. I'm aware that some parts of the codebase are rough, have redundant work, or do things the wrong way. I'm actively fixing these issues. If you're here to help, you're welcome, and we really need some help.
+> **A note on code quality:** Parts of the codebase are rough or contain redundant work; cleanup is in progress. Contributions are welcome.
 
 ---
 
@@ -25,8 +25,8 @@ The project is functional but needs cleanup. The SteamVR driver captures frames,
 - Slint desktop UI: status, stream/camera settings, driver + APK installers, diagnostics log (200-line ring buffer)
 - REST API on `127.0.0.1:8567`: `GET /health /status /logs?n= /preview /debug`, `POST /preview /settings /debug`
 - Driver link (UDP 42070): `BRIDGE_HELLO` heartbeat every 500ms, handles `BRIDGE_ACK` + `BRIDGE_STATS`, sends `BRIDGE_CFG` / `BRIDGE_PREVIEW` / `CARDBOARD_CAP`
-- Phone telemetry ingest (UDP 42071): gyro `0x10` (45B), hand `0x11` (15B), ping `0x20`, `CARDBOARD_PHONE_HELLO`; forwards sensors to driver on UDP 42074
-- Camera ingest (UDP 42072 JPEG) → MediaPipe over TCP 42073 (`mediapipe_server.py`), 21-landmark hand skeleton overlay
+- Phone telemetry ingest (UDP 42071): gyro `0x10` (45B), hand `0x11` (15B), rotation quat `0x12` (25B, the real head-tracking path), net-stats `0x13` (21B), ping `0x20`, `CARDBOARD_PHONE_HELLO`; forwards sensors to driver on UDP 42074
+- Camera ingest (UDP 42072 JPEG) → MediaPipe over TCP 42073 (`mediapipe_server.py`, 21-landmark hand skeleton overlay; model file `models/hand_landmarker.task` is vendored)
 - Preview: binds UDP 42069, pipes to ffmpeg → RGBA, optional ffplay popup
 - Installed-artifact serving: driver DLL + APK install/update from the UI (ADB supported) (Still in development, going to ship in the finished app)
 
@@ -49,8 +49,8 @@ The project is functional but needs cleanup. The SteamVR driver captures frames,
 ### What I'm working on now
 
 - **Fixing redundant work** — there are places where the same data gets converted multiple times (AVCC→Annex B→length-prefix→Annex B). Cleaning this up.
-- **Moving CPU work to GPU** — the BGRA→NV12 color conversion currently happens on the CPU via FFmpeg's sws_scale (AI didn't know what is was doing). Moving this to a compute shader.
-- **Understanding and cleaning the codebase** — removing dead code, fixing misleading flags, aligning resolution values (like the use GPU encoding that is doing absolutely nothing if i set to false, and does not need to exist at all).
+- **Moving CPU work to GPU** — the BGRA→NV12 color conversion currently happens on the CPU via FFmpeg's sws_scale. Moving this to a compute shader.
+- **Understanding and cleaning the codebase** — removing dead code, fixing misleading flags, aligning resolution values.
 - **Linux support** — after the core fixes are done, making the driver work on Linux (replacing D3D11 with Vulkan on the linux version).
 
 ### Not yet ported / incomplete
@@ -84,7 +84,7 @@ cardboardplusplus/
 │       ├── VrActivity.java             # Entry point (root package)
 │       └── NativeBridge.java           # JNI interface (root package)
 ├── scripts/                            # compile-bridge/driver/app/all.ps1, install-driver/app.ps1
-├── docs/                               # PROJECT_VISION.md (architecture), LLM_DEBUG_GUIDE.md
+├── docs/                               # PROJECT_VISION.md (architecture), LLM_DEBUG_GUIDE.md, CAMERA_REBUILD_PLAN.md (camera plan)
 ├── sdk/ third_party/ proto/            # Cardboard SDK, Unity XR headers, device-params protobuf
 └── LICENSE                             # GPL v3
 ```
@@ -154,17 +154,21 @@ cargo test --manifest-path bridge/Cargo.toml   # bridge unit + integration (mock
 Open `driver_cardboardplusplus/driver_cardboardplusplus.sln` in Visual Studio. Build `Release|x64`.
 
 Requires:
-- FFmpeg (bundled in `lib/ffmpeg/`)
+- Visual Studio 2022 with C++ workload + Windows SDK (for MSBuild, found via vswhere)
+- FFmpeg (bundled in `driver_cardboardplusplus/lib/ffmpeg/` — `lib` + `include` only; `lib/ffmpeg/doc/` is git-ignored, not vendored)
 - OpenVR SDK (bundled in `include/` and `lib/`)
 
 ### Android app (manual)
 
-Open `cardboardplusplus/` (not `cardboardplusplus-android/`) in Android Studio. Build and install on your phone.
+Open the repo root in Android Studio — `settings.gradle` maps the `:app` module to `cardboardplusplus-android/`, so the root project is what loads it. Build and install on your phone. Copy `local.properties.example` to `local.properties` and set `sdk.dir` to your Android SDK path.
 
 Requires:
-- Android SDK (API 24+)
+- JDK 17 (matches CI), Android SDK (API 24+, build-tools + platform + licenses accepted)
 - NDK (for native C++ code)
 - Google Cardboard SDK (bundled)
+- Rust stable toolchain (edition 2021, for the bridge)
+- Python 3 with `mediapipe`, `opencv-python`, `numpy` (for `mediapipe_server.py` on TCP 42073)
+- ffmpeg/ffplay on PATH (for bridge preview decode)
 
 ---
 

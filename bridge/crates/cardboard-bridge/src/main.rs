@@ -47,19 +47,109 @@ fn keep_alive_without_ui() -> ! {
     }
 }
 
-/// Drive the Slint window: forward "apply settings" to the core and keep the
-/// `BridgeState` global refreshed from the core every 250 ms.
+/// Drive the Slint windows: the small setup wizard first, then the hub.
+/// One event loop serves both — the wizard hides itself and opens the hub.
 fn run_window(core: Arc<AppCore>) {
+    let wizard = WizardWindow::new().expect("failed to build the setup wizard");
+    // False once the hub is open (manual Skip/Open hub or phone auto-pass).
+    let wizard_open = std::rc::Rc::new(std::cell::Cell::new(true));
+    {
+        let core = core.clone();
+        let weak = wizard.as_weak();
+        let wizard_open = wizard_open.clone();
+        wizard.global::<BridgeState>().on_wizard_done(move || {
+            if let Some(w) = weak.upgrade() {
+                advance_from_wizard(&w, &core, &wizard_open);
+            }
+        });
+    }
+    {
+        let c = core.clone();
+        // Globals are singletons: wiring here serves the wizard window and,
+        // later, the hub window alike.
+        wizard.global::<BridgeState>().on_install_driver(move || {
+            c.install_driver();
+        });
+        let c = core.clone();
+        wizard.global::<BridgeState>().on_open_steamvr(move || {
+            c.start_steamvr();
+        });
+    }
+    start_wizard_watcher(core.clone(), wizard.as_weak(), wizard_open);
+    wizard.show().expect("show setup wizard");
+
+    println!("[bridge] running — press Ctrl+C to quit");
+    // until_quit, not run_event_loop: the wizard hides during the hub
+    // handoff (zero windows for a moment), which would end the loop early.
+    slint::run_event_loop_until_quit().expect("bridge event loop failed");
+    core.shutdown();
+}
+
+/// Hide the wizard and open the hub exactly once, no matter which path
+/// (Skip, Open hub, phone auto-pass) gets here first. The hub is shown
+/// BEFORE the wizard hides: the event loop quits once no window is left,
+/// so hiding first would end the process before the hub appears.
+fn advance_from_wizard(
+    w: &WizardWindow,
+    core: &Arc<AppCore>,
+    wizard_open: &std::rc::Rc<std::cell::Cell<bool>>,
+) {
+    if wizard_open.replace(false) {
+        eprintln!("[bridge] setup done — opening hub…");
+        open_main(core);
+        let _ = w.hide();
+        eprintln!("[bridge] hub shown");
+    }
+}
+
+/// While the wizard is open, push install/phone state into it every 500 ms
+/// and auto-pass to the hub once the phone app connects on the last step.
+fn start_wizard_watcher(
+    core: Arc<AppCore>,
+    weak: slint::Weak<WizardWindow>,
+    wizard_open: std::rc::Rc<std::cell::Cell<bool>>,
+) {
+    let timer = slint::Timer::default();
+    timer.start(TimerMode::Repeated, Duration::from_millis(500), move || {
+        if !wizard_open.get() {
+            return;
+        }
+        core.refresh_driver_present();
+        let snap = core.status();
+        let Some(w) = weak.upgrade() else {
+            wizard_open.set(false);
+            return;
+        };
+        let global = w.global::<BridgeState>();
+        global.set_phone_connected(snap.phone_connected);
+        global.set_phone_ip(snap.phone_ip.clone().into());
+        global.set_driver_present(snap.driver_present);
+        global.set_install_busy(snap.install_busy);
+        global.set_install_note(snap.install_note.clone().into());
+        global.set_steamvr_note(snap.steamvr_note.clone().into());
+        if snap.phone_connected && global.get_wizard_step() == 3 {
+            advance_from_wizard(&w, &core, &wizard_open);
+        }
+    });
+    Box::leak(Box::new(timer));
+}
+
+/// Build and show the hub window. The handle is leaked for the process
+/// lifetime (same pattern as the state poller timer below).
+fn open_main(core: &Arc<AppCore>) {
     let ui = MainWindow::new().expect("failed to build the bridge UI");
     ui.global::<BridgeState>()
         .set_app_version(format!("v{}", core::APP_VERSION).into());
 
-    wire_callbacks(&core, &ui);
+    wire_callbacks(core, &ui);
     start_state_poller(core.clone(), ui.as_weak());
 
-    println!("[bridge] running — press Ctrl+C to quit");
-    ui.run().expect("bridge event loop failed");
-    core.shutdown();
+    ui.window().on_close_requested(|| {
+        let _ = slint::quit_event_loop();
+        slint::CloseRequestResponse::HideWindow
+    });
+    ui.show().expect("show bridge UI");
+    Box::leak(Box::new(ui));
 }
 
 /// Delegate the UI's callbacks to the core, converting the Slint encoder index

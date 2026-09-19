@@ -31,7 +31,7 @@
             Enter PC IP address</string>
     <string name="pc_ip_hint"
             description="Hint shown inside the PC IP input field. [CHAR_LIMIT=30]">
-            100.117.27.126</string>
+            192.168.1.10</string>
     <string name="pc_ip_ok"
             description="Text of the confirm button in the PC IP dialog. [CHAR_LIMIT=20]">
             Save</string>

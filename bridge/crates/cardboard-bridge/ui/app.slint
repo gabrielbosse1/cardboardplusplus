@@ -18,6 +18,11 @@ export global Theme {
 
 export global BridgeState {
     in-out property <int> current-tab: 0;
+    in-out property <int> wizard-step: 0;
+    in-out property <bool> install-busy: false;
+    in-out property <string> install-note: "";
+    in-out property <bool> driver-present: false;
+    in-out property <string> steamvr-note: "";
 
     in-out property <bool> driver-connected: false;
     in-out property <bool> phone-connected: false;
@@ -73,6 +78,9 @@ export global BridgeState {
     in-out property <string> mag-z: "0.00";
 
     callback apply-settings(int, int, int, int, int);
+    callback wizard-done();
+    callback install-driver();
+    callback open-steamvr();
     callback test-link();
     callback hand-toggled(bool);
     callback overlay-toggled(bool);
@@ -684,6 +692,12 @@ component StreamPage inherits HorizontalLayout {
         horizontal-stretch: 1;
         spacing: 14px;
 
+        Text {
+            text: "STATS";
+            color: Theme.text-dim;
+            font-size: 10px;
+        }
+
         Rectangle {
             background: Theme.surface;
             border-width: 1px;
@@ -822,6 +836,12 @@ component StreamPage inherits HorizontalLayout {
             }
         }
 
+        Text {
+            text: "VIEWER · STEAMVR";
+            color: Theme.text-dim;
+            font-size: 10px;
+        }
+
         Rectangle {
             vertical-stretch: 1;
             min-height: 140px;
@@ -847,6 +867,12 @@ component StreamPage inherits HorizontalLayout {
         right-col := VerticalLayout {
             spacing: 14px;
             width: parent.width;
+
+    Text {
+        text: "OPTIONS";
+        color: Theme.text-dim;
+        font-size: 10px;
+    }
 
     Card {
         title: "Preview";
@@ -1039,6 +1065,12 @@ component HandPage inherits HorizontalLayout {
         horizontal-stretch: 1;
         spacing: 14px;
 
+        Text {
+            text: "STATS";
+            color: Theme.text-dim;
+            font-size: 10px;
+        }
+
         Rectangle {
             background: Theme.surface;
             border-width: 1px;
@@ -1175,6 +1207,12 @@ component HandPage inherits HorizontalLayout {
             }
         }
 
+        Text {
+            text: "VIEWER · PHONE CAMERA";
+            color: Theme.text-dim;
+            font-size: 10px;
+        }
+
         Rectangle {
             vertical-stretch: 1;
             min-height: 140px;
@@ -1200,6 +1238,12 @@ component HandPage inherits HorizontalLayout {
         hand-right-col := VerticalLayout {
             spacing: 14px;
             width: parent.width;
+
+            Text {
+                text: "OPTIONS";
+                color: Theme.text-dim;
+                font-size: 10px;
+            }
 
             Card {
                 title: "Status";
@@ -1503,6 +1547,248 @@ component GeneralPage inherits VerticalLayout {
             font-size: 12px;
             wrap: word-wrap;
         }
+    }
+}
+
+export component WizardWindow inherits Window {
+    title: "Cardboard++ setup";
+    preferred-width: 560px;
+    preferred-height: 600px;
+    min-width: 480px;
+    min-height: 540px;
+
+    background: Theme.surface;
+
+    VerticalLayout {
+        padding: 28px;
+        spacing: 14px;
+
+                    HorizontalLayout {
+                        spacing: 12px;
+                        cross-axis-alignment: center;
+
+                        Image {
+                            source: @image-url("icons/logo.svg");
+                            width: 36px;
+                            height: 36px;
+                        }
+
+                        VerticalLayout {
+                            spacing: 2px;
+                            horizontal-stretch: 1;
+
+                            Text {
+                                text: "Cardboard++ setup";
+                                color: Theme.text-hi;
+                                font-size: 17px;
+                                font-weight: 700;
+                            }
+
+                            Text {
+                                text: "Step " + (BridgeState.wizard-step + 1) + " of 4 · skip anytime";
+                                color: Theme.text-dim;
+                                font-size: 11px;
+                            }
+                        }
+
+                        SecondaryButton {
+                            text: "Skip";
+                            width: 72px;
+                            clicked => {
+                                BridgeState.wizard-done();
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        min-height: 262px;
+
+                    if BridgeState.wizard-step == 0 : VerticalLayout {
+                        alignment: start;
+                        spacing: 10px;
+
+                        Text {
+                            text: "Get started";
+                            color: Theme.text-hi;
+                            font-size: 15px;
+                            font-weight: 600;
+                            wrap: word-wrap;
+                        }
+
+                        Text {
+                            text: "Cardboard++ turns a cheap Cardboard headset and an Android phone into a full SteamVR system — video and hand tracking together. You need a gaming PC with SteamVR, a Cardboard viewer, and an Android phone on the same Wi-Fi.";
+                            color: Theme.text-mid;
+                            font-size: 13px;
+                            wrap: word-wrap;
+                        }
+                    }
+
+                    if BridgeState.wizard-step == 1 : VerticalLayout {
+                        alignment: start;
+                        spacing: 10px;
+
+                        Text {
+                            text: "Install the SteamVR driver";
+                            color: Theme.text-hi;
+                            font-size: 15px;
+                            font-weight: 600;
+                            wrap: word-wrap;
+                        }
+
+                        Text {
+                            text: BridgeState.driver-present ? "Driver detected inside SteamVR. You can re-install to update, then open SteamVR so it loads." : "One click copies the driver into SteamVR. Then open SteamVR so it loads, and allow the Cardboard++ addon under Settings → Startup/Shutdown → Add-ons.";
+                            color: Theme.text-mid;
+                            font-size: 13px;
+                            wrap: word-wrap;
+                        }
+
+                        PrimaryButton {
+                            text: BridgeState.install-busy ? "Installing…" : (BridgeState.driver-present ? "Re-install driver" : "Install driver");
+                            enabled: !BridgeState.install-busy;
+                            clicked => {
+                                BridgeState.install-driver();
+                            }
+                        }
+
+                        if BridgeState.install-note != "" : Text {
+                            text: BridgeState.install-note;
+                            color: Theme.text-mid;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+
+                        SecondaryButton {
+                            text: "Open SteamVR";
+                            clicked => {
+                                BridgeState.open-steamvr();
+                            }
+                        }
+
+                        if BridgeState.steamvr-note != "" : Text {
+                            text: BridgeState.steamvr-note;
+                            color: Theme.text-mid;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                    }
+
+                    if BridgeState.wizard-step == 2 : VerticalLayout {
+                        alignment: start;
+                        spacing: 10px;
+
+                        Text {
+                            text: "Get the phone app";
+                            color: Theme.text-hi;
+                            font-size: 15px;
+                            font-weight: 600;
+                            wrap: word-wrap;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 14px;
+
+                            Image {
+                                source: @image-url("icons/qr-releases.png");
+                                width: 150px;
+                                height: 150px;
+                            }
+
+                            VerticalLayout {
+                                spacing: 8px;
+                                horizontal-stretch: 1;
+
+                                Text {
+                                    text: "1 · Scan the code — it opens the GitHub releases page. Download the APK from there.";
+                                    color: Theme.text-mid;
+                                    font-size: 13px;
+                                    wrap: word-wrap;
+                                }
+
+                                Text {
+                                    text: "2 · Android blocks installs at first: when asked, allow “Install unknown apps” for your browser, then open the APK to install it.";
+                                    color: Theme.text-mid;
+                                    font-size: 13px;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                    }
+
+                    if BridgeState.wizard-step == 3 : VerticalLayout {
+                        alignment: start;
+                        spacing: 10px;
+
+                        Text {
+                            text: "Connect your phone";
+                            color: Theme.text-hi;
+                            font-size: 15px;
+                            font-weight: 600;
+                            wrap: word-wrap;
+                        }
+
+                        Text {
+                            text: "Open the Cardboard++ app on your phone now (same Wi-Fi as this PC). The hub opens by itself once the phone connects.";
+                            color: Theme.text-mid;
+                            font-size: 13px;
+                            wrap: word-wrap;
+                        }
+
+                        Text {
+                            text: BridgeState.phone-connected ? "Phone connected: " + BridgeState.phone-ip + " — opening hub…" : "Waiting for phone…";
+                            color: BridgeState.phone-connected ? Theme.ok : Theme.text-dim;
+                            font-size: 13px;
+                            font-weight: 600;
+                            wrap: word-wrap;
+                        }
+                    }
+                    } // step container — fixed height so text can never reach the buttons
+
+                    Rectangle {
+                        vertical-stretch: 1;
+                    }
+
+                    HorizontalLayout {
+                        alignment: center;
+                        spacing: 6px;
+
+                        for i in [0, 1, 2, 3] : Rectangle {
+                            width: i == BridgeState.wizard-step ? 22px : 8px;
+                            height: 8px;
+                            border-radius: 4px;
+                            background: i == BridgeState.wizard-step ? Theme.accent : Theme.surface3;
+
+                            animate width {
+                                duration: 150ms;
+                            }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 10px;
+
+                        SecondaryButton {
+                            text: "Back";
+                            enabled: BridgeState.wizard-step > 0;
+                            horizontal-stretch: 1;
+                            clicked => {
+                                if BridgeState.wizard-step > 0 {
+                                    BridgeState.wizard-step -= 1;
+                                }
+                            }
+                        }
+
+                        PrimaryButton {
+                            text: BridgeState.wizard-step < 3 ? "Next" : "Open hub";
+                            horizontal-stretch: 1;
+                            clicked => {
+                                if BridgeState.wizard-step < 3 {
+                                    BridgeState.wizard-step += 1;
+                                } else {
+                                    BridgeState.wizard-done();
+                                }
+                            }
+                        }
+                    }
     }
 }
 

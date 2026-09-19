@@ -1,10 +1,10 @@
 **Persona:** Careful Listener - senior dev pair-programmer who asks before assuming
 
-> **START HERE before any task: read `docs/PROJECT_VISION.md`.** It defines the
+> **START HERE before any task: read `GOAL.md` first if present, else `docs/PROJECT_VISION.md`.** The vision doc defines the
 > whole product (Bridge desktop app + SteamVR driver + Android client), who owns
 > what, and the non-negotiables (video stays on UDP; the Bridge is the product;
-> stream + hand tracking ship together; protocol.rs is the single source of truth
-> for the wire layout, mirrored by BridgeProtocol.h).
+> stream + hand tracking ship together; two locked contracts: `CardboardWire.h`
+> for the UDP wire, `protocol.rs` mirrored by `BridgeProtocol.h` for the SHM layout).
 
 > **Debugging issues? Read `docs/LLM_DEBUG_GUIDE.md`.** It explains how to
 > enable debug logging on all three components, where to find logs, and how to
@@ -15,7 +15,7 @@
 2. **Websearch before guessing** - especially for OpenVR/SteamVR APIs (Every object name and function you will need)
 3. **Short, plain answers** - no preamble/postamble
 4. **Report changes in chat** - say what/where before and after editing
-5. **Embrace jerky prompts** - extract the real question from messy input
+5. **Extract the real question** - prompts may be messy; clarify before acting
 
 **Communication:**
 - DO: simple direct sentences, 1-3 answers, say "I don't know", ask "do you want me to proceed?"
@@ -27,21 +27,21 @@
 
 ## Goal-Driven Workflow
 
-This project follows goal-driven development. Always read `GOAL.md` before
-starting work. It defines the current objective, success criteria, and what
-needs to change.
+This project follows goal-driven development. If a `GOAL.md` file exists at the
+repo root, it defines the current objective — read it first. If it does not
+exist, work from the user's request directly; do not create one unasked.
 
 ### How to work toward a goal:
-1. **Read GOAL.md first** - understand what success looks like
+1. **Read GOAL.md first (if present)** - understand what success looks like
 2. **Check what's already done** - search the codebase, don't re-implement
 3. **Plan before coding** - outline changes in each file you'll touch
-4. **Change one thing at a time** - build + test after each logical change
+4. **Change one thing at a time** - build + install + launch after each logical change (see Mandatory Build-Install-Launch gate)
 5. **Report what you did** - file paths and line numbers, not summaries
 6. **Verify the goal** - does the change actually satisfy the requirement?
 
 ### When you finish a goal item:
-- Mark it complete in GOAL.md (check off or remove)
-- Build and test before moving to the next item
+- Mark it complete in GOAL.md (check off or remove) — only if GOAL.md exists
+- Build, install, and launch before moving to the next item
 - If something blocks you, stop and report the blocker
 
 ---
@@ -50,10 +50,12 @@ needs to change.
 
 ```
 cardboardplusplus/
-├── cardboardplusplus-bridge/          # Rust — the central control plane
-│   ├── src/                         # Main source (app, core, net/*, server)
-│   ├── tests/                       # Integration tests (mock driver + mock phone)
-│   └── Cargo.toml
+├── bridge/                              # Rust workspace (Cargo.toml here)
+│   ├── crates/cardboard-bridge/         # Main bridge binary (app, core, net/*, server)
+│   ├── crates/bridge-ui/                # Slint desktop UI
+│   ├── crates/bridge-shm/               # Shared-memory protocol (protocol.rs = source of truth)
+│   ├── crates/bridge-core/              # Shared core lib
+│   └── Cargo.toml                       # Workspace manifest (`cargo test` runs from here)
 ├── driver_cardboardplusplus/        # C++ — SteamVR driver DLL
 │   ├── src/                         # Discovery, HmdDriver, ControllerDriver, etc.
 │   ├── include/                     # Headers (CardboardWire.h = locked contract)
@@ -69,7 +71,7 @@ cardboardplusplus/
 │   ├── compile-all.ps1
 │   ├── install-driver.ps1
 │   └── install-app.ps1
-└── GOAL.md                          # Current objective
+└── GOAL.md (optional — only present during maintainer goal-driven work; do not create one unasked)
 ```
 
 ## Testing Strategy
@@ -78,7 +80,7 @@ Each component is tested against **mocked collaborators**:
 
 | Component | Tests pretend to be... | Test location |
 |-----------|----------------------|---------------|
-| **Bridge** | Driver (sends BRIDGE_ACK/STATS), Phone (sends gyro/hand/camera) | `cardboardplusplus-bridge/tests/` |
+| **Bridge** | Driver (sends BRIDGE_ACK/STATS), Phone (sends gyro/hand/camera) | `bridge/crates/cardboard-bridge/tests/` |
 | **Driver** | SteamVR (OpenVR API), Bridge (sends BRIDGE_HELLO), Phone (sends discovery) | `driver_cardboardplusplus/tests/` |
 | **Phone App** | Bridge (sends discovery ACK), Driver (receives video) | `cardboardplusplus-android/src/test/` |
 
@@ -90,10 +92,11 @@ Each component is tested against **mocked collaborators**:
 | 42071 | UDP binary | Phone → Bridge (telemetry) |
 | 42072 | UDP JPEG | Phone → Bridge (camera) |
 | 42073 | TCP binary | Bridge → Python MediaPipe |
+| 42074 | UDP binary | Bridge → Driver (sensor forward) |
 | 8567 | HTTP REST | External → Bridge |
 
 ### Key Commands
-- `cargo test --manifest-path cardboardplusplus-bridge/Cargo.toml` — bridge unit + integration tests
+- `cargo test --manifest-path bridge/Cargo.toml` — bridge unit + integration tests
 - `scripts/compile-all.ps1` — build everything
 - `scripts/install-driver.ps1` — install driver to SteamVR
 - `scripts/install-app.ps1` — install APK to phone
@@ -175,6 +178,8 @@ src/main/java/com/google/cardboard/
 ├── render/         # VrRenderer, FpsCounter (GL rendering)
 ├── settings/       # AppSettings, SettingsMenuController (user prefs)
 ├── streaming/      # CameraStreamer (camera → UDP JPEG)
+├── telemetry/      # TelemetrySender (gyro/quat/hello → UDP 42071)
+├── tracking/       # reserved for on-phone inference (currently empty)
 ├── ui/             # ImmersiveMode (system UI)
 ├── video/          # VideoManager, VideoDecoder, VideoWatchdog, H264NalParser,
 │                   # DecoderCapabilityReporter
@@ -293,7 +298,7 @@ Use the `task` tool to delegate work when:
 
 **Example good subagent prompt:**
 ```
-Read every .rs file in cardboardplusplus-bridge/src/net/. For each file, report:
+Read every .rs file in bridge/crates/cardboard-bridge/src/net/. For each file, report:
 1. What it does (1 sentence)
 2. The UDP/TCP port it uses and why
 3. Key functions with line numbers
@@ -309,17 +314,19 @@ After any code change, run the relevant test command:
 
 | Component | Test command | Build command |
 |-----------|-------------|---------------|
-| Bridge (Rust) | `cargo test --manifest-path cardboardplusplus-bridge/Cargo.toml` | `scripts/compile-bridge.ps1` |
+| Bridge (Rust) | `cargo test --manifest-path bridge/Cargo.toml` | `scripts/compile-bridge.ps1` |
 | Driver (C++) | `scripts/compile-driver.ps1` | Same (tests are post-build events) |
 | Android | `gradlew.bat testDebugUnitTest` (in `cardboardplusplus-android/`) | `scripts/compile-app.ps1` |
 | Everything | `scripts/compile-all.ps1` | Builds all three |
 
 ### CI pipeline (matches GitHub Actions)
 ```
-push/PR → [bridge test] ──┐
-push/PR → [driver build] ─┼→ [installer] ─┐
-push/PR → [android test] ─┘               └→ [release (on v* tags only)]
+push/PR → [android build (.github/workflows/gradle.yml)]
+push/PR → [driver build (.github/workflows/build-driver.yml)]
+push/PR → [bridge tests (.github/workflows/bridge.yml)]
 ```
+Note: there is currently no installer/release workflow —
+`scripts/install-*.ps1` run locally only.
 
 ---
 
@@ -368,6 +375,8 @@ Binary packets:
 |-----|------|------|---------|
 | `0x10` | Gyro | 45B | u64 timestamp LE + 9×f32 LE (ang_vel[3] + accel[3] + mag[3]); mag used for bridge diagnostics only (driver tracks via 0x12) |
 | `0x11` | Hand | 15B | u64 timestamp LE + u8 hands + u8 landmarks + f32 confidence LE |
+| `0x12` | Rotation | 25B | u64 timestamp LE + 4×f32 LE quat [w,x,y,z]; the real head-tracking path (phone fuses game rotation vector; bridge forwards Bridge→driver on UDP 42074 as `0x12`) |
+| `0x13` | NetStats | 21B | u64 timestamp LE + u32 frames_decoded LE + u32 stalls LE + f32 decoded_fps LE (sent ~every 2s, drives adaptive bitrate) |
 | `0x20` | Ping | 1B | bare tag byte |
 | text | Hello | variable | `"CARDBOARD_PHONE_HELLO vN"` |
 
@@ -388,12 +397,14 @@ Binary packets:
 - `GET /preview` → preview state JSON
 - `POST /preview` → toggle preview / open ffplay
 - `POST /settings` → apply settings, echo back
+- `GET /debug` → `{"debug":true/false}`, `POST /debug {"enabled":true}` → toggle debug at runtime (see `docs/LLM_DEBUG_GUIDE.md`)
 
 ---
 
 ## CardboardWire.h — DO NOT CHANGE
 
-`driver_cardboardplusplus/include/CardboardWire.h` is the locked contract.
+`driver_cardboardplusplus/include/CardboardWire.h` is the locked contract for
+the **UDP wire** (ports, discovery/control strings, telemetry tags).
 All wire constants are `static constexpr` in `namespace wire`:
 - `kDataPort` (42069), `kDiscoveryPort` (42070)
 - `kCardboardCap`, `kDiscoveryAck`, `kBridgeHeartbeat`, `kBridgeAck`, `kBridgeCfg`, `kBridgePreview`, `kBridgeStats`
@@ -403,7 +414,7 @@ The bridge and Android app have their own copies of these constants.
 **Changing any value breaks all three components.** If you need to change a
 wire constant, update ALL of:
 1. `driver_cardboardplusplus/include/CardboardWire.h`
-2. `cardboardplusplus-bridge/src/net/mod.rs` (port constants)
+2. `bridge/crates/cardboard-bridge/src/net/mod.rs` (port constants)
 3. `cardboardplusplus-android/src/main/java/.../core/AppConstants.java`
 4. All contract tests in all 3 components
 5. This file (AGENTS.md)
@@ -412,7 +423,11 @@ wire constant, update ALL of:
 
 ## Common Pitfalls
 
-1. **Don't add shared memory for IPC** — use UDP/TCP. Shared memory is platform-specific and adds synchronization complexity. The current UDP approach works across Windows/Android.
+1. **Don't add new shared-memory channels** — SHM (`bridge-shm` /
+   `BridgeProtocol.h`) carries only driver→Bridge status/telemetry and settings.
+   New data paths go over UDP/TCP (see Transport Choices above). Shared memory
+   is platform-specific and adds synchronization complexity; the UDP approach
+   works across Windows/Android.
 
 2. **Don't copy video frames into the bridge** — the driver sends to localhost:42069, the bridge reads from that socket directly. Adding a copy makes the bridge heavier for no benefit.
 
@@ -436,52 +451,70 @@ wire constant, update ALL of:
 - [ ] Does your change affect the wire protocol? If yes, update all 3 components
 - [ ] Does your change affect test constants? Update contract tests
 - [ ] Did you run the relevant test command?
-- [ ] Did you verify the build still works?
+- [ ] Did you pass the gate below (external: steps 1–2; maintainer: full gate)?
+- [ ] Is the fresh build installed where it runs (SteamVR driver, phone APK)?
 - [ ] Is your change the smallest possible diff that solves the problem?
 - [ ] Are you adding a new dependency? Is it truly necessary? (prefer stdlib)
 - [ ] Are you adding a new file? Does it belong in an existing folder?
 
 ---
 
-## Mandatory End-to-End Testing
+## Mandatory Build-Install-Launch Gate
 
-After any code change, you MUST test the full stack when hardware is available.
-Don't just run unit tests — verify the real thing works.
+> **External contributors:** steps 1–2 (test + build) are the PR bar. Steps 3–5
+> need physical hardware (SteamVR PC + Android phone) — the maintainer runs
+> them; just say how you tested in the PR description.
 
-### What to test and how
+**No code change is done until it is built, installed, and launched.**
+Unit tests alone are never sufficient. After every change, work through the
+gate in order and stop at the first failure — fix it before moving on.
 
-| Component | How to test | What to check |
-|-----------|------------|---------------|
-| **Bridge** | `cargo test --manifest-path bridge/crates/cardboard-bridge/Cargo.toml` | All tests pass |
-| **Bridge UI** | Run `bridge/target/debug/cardboard-bridge.exe`, open the window | Diagnostics tab shows live sensor values, status pills update |
+### The gate (in order, every time)
+
+1. **Test** — run the changed component's test command (see Build & Test
+   Verification table above). All tests must pass.
+2. **Build** — compile what you changed:
+   - Bridge → `scripts\compile-bridge.ps1`
+   - Driver → `scripts\compile-driver.ps1`
+   - Phone app → `scripts\compile-app.ps1`
+   - Unsure / touched shared contract → `scripts\compile-all.ps1`
+3. **Install** — put the fresh build where it actually runs:
+   - Driver → `scripts\install-driver.ps1` (DLL into SteamVR)
+   - Phone app → `scripts\install-app.ps1` (APK onto phone via ADB —
+     never assume the phone already has the latest build, reinstall it)
+4. **Launch** — open everything so the user just tests, no setup:
+   - Start the bridge (`bridge\target\debug\cardboard-bridge.exe`)
+   - Restart SteamVR so the new driver loads
+   - Launch the phone app
+5. **Verify** — confirm the real behavior, not just "it compiles":
+
+| Component | How to verify | What to check |
+|-----------|--------------|---------------|
+| **Bridge** | `cargo test --manifest-path bridge/Cargo.toml` | All tests pass |
+| **Bridge UI** | Run the bridge exe, open the window | Diagnostics tab shows live sensor values, status pills update |
 | **Driver** | Restart SteamVR, launch a VR app | HMD tracks head movement, no sine-wave bob |
-| **Phone app** | `adb install -r` the APK, launch the app | App starts, sends telemetry, green line is gone |
+| **Phone app** | Launch the freshly installed app | App starts, sends telemetry, green line is gone |
 | **Phone → Bridge** | Check bridge log for "phone connected", check gyro-fps > 0 | Telemetry packets arriving |
 | **Phone → Driver** | Move the phone, check SteamVR display | Head rotation matches phone movement |
 | **Video stream** | Launch VR app, check phone display | SBS video renders, no green line on bottom |
 
-### Test sequence after a change
-
-1. `cargo test` — unit tests pass
-2. `scripts\compile-all.ps1` — everything compiles
-3. `scripts\install-app.ps1` — APK on phone
-4. `scripts\install-driver.ps1` — DLL in SteamVR
-5. Launch bridge (`cardboard-bridge.exe`)
-6. Restart SteamVR
-7. Launch phone app
-8. Verify: bridge shows sensor data, driver tracks head, video renders clean
+Only after step 5 passes is the change reportable as done. Report what you
+built, installed, and launched (exact commands + outcome), then hand over to
+the user for testing.
 
 ### ADB phone connection
 
-If a phone is reachable on the network, always connect via ADB and install the
-latest build. Don't assume "it's already installed" — the user expects to test
-the latest code. Use:
+If a phone is reachable on the network, ask the user for the IP and confirm
+before running `adb connect` / `adb install`. Don't assume "it's already
+installed" — offer to install the latest build, but never push to a network
+phone without explicit confirmation. Resolve adb portably (never hardcode a user profile path):
 
 ```
-$adb = "C:\Users\admin000\AppData\Local\Android\Sdk\platform-tools\adb.exe"
+$adb = Join-Path $env:LOCALAPPDATA "Android\Sdk\platform-tools\adb.exe"
+# (or $env:ANDROID_HOME / $env:ANDROID_SDK_ROOT if set)
 & $adb connect "<ip>:<port>"
 & $adb install -r <apk_path>
 ```
 
 If ADB connection fails, tell the user what port to enable on the phone.
-Never skip the install step.
+Never assume the phone already has the latest build — always offer to install it.

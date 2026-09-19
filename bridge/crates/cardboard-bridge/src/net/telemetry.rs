@@ -5,6 +5,8 @@
 //!     3x f32 acceleration, 3x f32 magnetic field (45 bytes total)
 //!   * `0x11` hand frame — u64 timestamp_ms, u8 hands, u8 landmarks/hand,
 //!     f32 confidence (15 bytes total)
+//!   * `0x12` rotation — u64 timestamp_ms, 4x f32 quaternion [w, x, y, z]
+//!     (25 bytes total; the real head-tracking path)
 //!   * `0x13` net stats — u64 timestamp_ms, u32 frames decoded since last
 //!     report, u32 stall count (monotonic), f32 decoded fps (21 bytes total).
 //!     Sent every ~2 s by the phone's NetStatsReporter; drives the bridge's

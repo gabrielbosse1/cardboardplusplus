@@ -19,10 +19,13 @@ This product includes software developed by:
   Licensed under GNU Lesser General Public License v2.1 or later
   https://ffmpeg.org/legal.html
 
-  libx264
-  Copyright (C) 2003-2026 x264 project
-  Licensed under GNU General Public License v2 or later
-  https://www.videolan.org/developers/x264.html
+   libx264
+   Copyright (C) 2003-2026 x264 project
+   Licensed under GNU General Public License v2 or later
+   https://www.videolan.org/developers/x264.html
+
+ Binary distributions of this project combine the above with libx264 and
+ are therefore licensed under GPL v3 (see LICENSE), matching the README.
 
   OpenVR
   Copyright (c) 2015 Valve Corporation

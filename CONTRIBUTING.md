@@ -17,6 +17,7 @@ Before you hit the submit button, make sure:
 We value real-world verification:
 
 - **Human testing is mandatory:** AI tools are great, but they don't know how VR feels on a phone strapped to your head, and most agents can't even test things like the SteamVR driver and Android app. Every change needs to be tested by a human.
+- **No rig? Say so:** if you have no SteamVR PC / Android phone, say how you tested (unit tests + build) in the PR description and the maintainer covers hardware testing.
 - **Tell me how you tested it:** Just a quick note on what you did to verify the fix or feature.
 
 ## Stability and Documentation

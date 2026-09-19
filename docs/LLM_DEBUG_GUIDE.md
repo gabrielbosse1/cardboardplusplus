@@ -95,7 +95,7 @@ GET  /status         → full state snapshot
 | Android | `adb logcat` (runtime only) |
 | Bridge | Ring log in memory + REST API |
 | Driver | `%LOCALAPPDATA%\OpenVR\vrserver.txt` |
-| Driver (legacy) | `C:\Temp\cbpp_pose.log` (REMOVED — now uses DebugLog) |
+| Driver (legacy) | Removed — old `C:\Temp\cbpp_pose.log` file logging was replaced by DebugLog |
 
 ### 8. Debug flag sources
 

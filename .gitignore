@@ -1,5 +1,4 @@
-.idea/*
-!.idea/codeStyles/
+.idea/
 
 *.iml
 .gradle
@@ -18,12 +17,33 @@ driver_cardboardplusplus/driver_c.*/
 # Rust build output
 bridge/target/
 
-# Android build outputs
+# Android build outputs (note: two prebuilt Cardboard .so files under
+# libraries/jni/ are tracked intentionally; tracked files ignore this rule)
 cardboardplusplus-android/build/
 cardboardplusplus-android/libraries/
 
+# Vendored build inputs (tracked intentionally — documented in README):
+# - driver_cardboardplusplus/lib/ffmpeg/lib+include (FFmpeg + OpenVR .lib)
+# - bridge/crates/cardboard-bridge/models/hand_landmarker.task (MediaPipe model)
+# Untracked noise from the same drops:
+driver_cardboardplusplus/lib/ffmpeg/doc/
+
 # Leftover test artifacts
 *.obj
+*.exe
+*.dll
+*.apk
+*.aab
+*.keystore
+*.jks
+*.pdb
+*.user
+.env
+.log
+bridge-*.log
 bridge_*.txt
 bridge/*.txt
 __pycache__/
+*.pyc
+venv/
+.vs/

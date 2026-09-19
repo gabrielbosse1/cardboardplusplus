@@ -11,4 +11,5 @@
 //! see `bridge/docs/MIGRATION_STATUS.md` for the order.
 
 pub mod d3d11;
+pub mod paths;
 pub mod shm;
