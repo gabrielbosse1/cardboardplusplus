@@ -51,6 +51,11 @@ fn keep_alive_without_ui() -> ! {
 /// One event loop serves both — the wizard hides itself and opens the hub.
 fn run_window(core: Arc<AppCore>) {
     let wizard = WizardWindow::new().expect("failed to build the setup wizard");
+    // One-time install: after the first completed setup, start on the
+    // Connect-phone step (3) every launch — same screen, same Skip/Back.
+    if bridge_core::paths::is_setup_done() {
+        wizard.global::<BridgeState>().set_wizard_step(3);
+    }
     // False once the hub is open (manual Skip/Open hub or phone auto-pass).
     let wizard_open = std::rc::Rc::new(std::cell::Cell::new(true));
     {
@@ -95,6 +100,7 @@ fn advance_from_wizard(
     wizard_open: &std::rc::Rc<std::cell::Cell<bool>>,
 ) {
     if wizard_open.replace(false) {
+        bridge_core::paths::mark_setup_done();
         eprintln!("[bridge] setup done — opening hub…");
         open_main(core);
         let _ = w.hide();

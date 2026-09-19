@@ -381,8 +381,8 @@ Binary packets:
 | text | Hello | variable | `"CARDBOARD_PHONE_HELLO vN"` |
 
 ### Port 42072 — Camera (UDP, Phone → Bridge)
-- Raw JPEG in single UDP datagram, max 60KB
-- Bridge decodes JPEG → RGB → RGBA, optionally runs MediaPipe hand detection
+- `[u16 seq BE][JPEG 256x192 q38]` in single UDP datagram, max 60KB
+- Bridge decodes JPEG straight to RGBA (zune-jpeg), optionally runs MediaPipe hand detection
 
 ### Port 42073 — MediaPipe (TCP, Bridge → Python)
 - Bridge sends: `[u32 length LE][JPEG data]`

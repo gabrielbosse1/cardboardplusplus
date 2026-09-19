@@ -16,3 +16,9 @@ repository = "https://github.com/gabrielbosse1/cardboardplusplus"
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+# zune-jpeg relies on SIMD intrinsics that are very slow in debug builds.
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+[profile.dev.package.zune-core]
+opt-level = 3

@@ -217,21 +217,15 @@ fn detect_loop(
 }
 
 /// JPEG → (w, h, RGBA). Pure-Rust decode of a ~256x192 frame (~50 kpx).
+/// Decodes straight to RGBA (no RGB→RGBA repack pass).
 fn decode_jpeg(jpeg_data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
-    let mut decoder = jpeg_decoder::Decoder::new(jpeg_data);
-    let pixels = decoder.decode().ok()?;
+    use zune_core::bytestream::ZCursor;
+    use zune_core::colorspace::ColorSpace;
+    use zune_core::options::DecoderOptions;
+
+    let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGBA);
+    let mut decoder = zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(jpeg_data), options);
+    let rgba = decoder.decode().ok()?;
     let info = decoder.info()?;
-    let w = info.width as u32;
-    let h = info.height as u32;
-    let mut rgba = Vec::with_capacity((w * h) as usize * 4);
-    for chunk in pixels.chunks(3) {
-        if chunk.len() < 3 {
-            break;
-        }
-        rgba.push(chunk[0]);
-        rgba.push(chunk[1]);
-        rgba.push(chunk[2]);
-        rgba.push(255);
-    }
-    Some((w, h, rgba))
+    Some((info.width as u32, info.height as u32, rgba))
 }

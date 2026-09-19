@@ -109,6 +109,33 @@ pub fn steamvr_root_from_drivers_dir(dir: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Marker file recording that the install wizard completed once.
+/// Same dir convention as the legacy `%LOCALAPPDATA%\CardboardPlusPlus\bridge.json`.
+pub fn setup_done_file() -> PathBuf {
+    let mut dir = std::env::var("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir());
+    if std::env::var("LOCALAPPDATA").is_ok() {
+        dir.push("CardboardPlusPlus");
+    }
+    dir.join("setup.done")
+}
+
+/// True once the install wizard has completed (marker file exists).
+pub fn is_setup_done() -> bool {
+    setup_done_file().exists()
+}
+
+/// Record wizard completion. Best-effort: errors are ignored, the wizard
+/// just shows fully next launch.
+pub fn mark_setup_done() {
+    let path = setup_done_file();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, "done");
+}
+
 /// MSBuild via vswhere (same lookup as `scripts/compile-driver.ps1`).
 /// `None` when no Visual Studio C++ build tools are installed.
 pub fn find_msbuild() -> Option<String> {

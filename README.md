@@ -43,7 +43,7 @@ The project is functional but needs cleanup. The SteamVR driver captures frames,
 - Video (`video/`): UDP reassembly → MediaCodec hardware decode, stall watchdog re-triggers discovery, decoder-cap reporting (`CARDBOARD_CAP W H`)
 - Discovery (`discovery/`): broadcasts `CARDBOARD_DISCOVERY` every 500ms until `ACK`, then sends cap
 - Telemetry (`telemetry/`): gyro/accel/mag `0x10` + game-rotation-vector quaternion `0x12` + hello → UDP 42071
-- Camera (`camera/` + `streaming/`): Camera2 → 320x240 JPEG q50 @15fps → UDP 42072
+- Camera (`camera/` + `streaming/`): Camera2 → 256x192 JPEG q38 @30fps + u16 seq header → UDP 42072
 - Settings UI (`settings/`): resolution/FPS/bitrate/codec persisted in SharedPreferences; codec fallback H264 → HEVC/AV1 probe (`codec/`)
 
 ### What I'm working on now
@@ -70,7 +70,7 @@ cardboardplusplus/
 │       ├── cardboard-bridge/           # Real app: Slint UI, REST :8567, UDP workers, MediaPipe TCP client
 │       │   └── src/                    # main.rs, app.rs, core.rs, server.rs (+handlers), net/, hand_overlay.rs
 │       ├── bridge-shm/                 # SHM transport; protocol.rs = wire-layout source of truth
-│       ├── bridge-core/                # SHM consumer facade (shm.rs, d3d11.rs)
+ │       ├── bridge-core/                # SHM consumer facade (shm.rs) + default paths (paths.rs)
 │       └── bridge-ui/                  # New Slint product UI (status/stream/camera/install/diagnostics)
 ├── driver_cardboardplusplus/           # SteamVR driver (C++ DLL)
 │   ├── src/                            # HmdDriver, VideoEncoder*, EncodingThread, UdpTransport,
@@ -84,7 +84,7 @@ cardboardplusplus/
 │       ├── VrActivity.java             # Entry point (root package)
 │       └── NativeBridge.java           # JNI interface (root package)
 ├── scripts/                            # compile-bridge/driver/app/all.ps1, install-driver/app.ps1
-├── docs/                               # PROJECT_VISION.md (architecture), LLM_DEBUG_GUIDE.md, CAMERA_REBUILD_PLAN.md (camera plan)
+├── docs/                               # PROJECT_VISION.md (architecture), LLM_DEBUG_GUIDE.md
 ├── sdk/ third_party/ proto/            # Cardboard SDK, Unity XR headers, device-params protobuf
 └── LICENSE                             # GPL v3
 ```

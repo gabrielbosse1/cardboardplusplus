@@ -23,7 +23,7 @@ public class CameraStreamer implements CameraController.FrameCallback {
   private static final String TAG = CameraStreamer.class.getSimpleName();
   private static final DebugLog DBG = new DebugLog(TAG);
   // Wire format: [u16 seq BE][JPEG 256x192 q38]. Downscale YUV first,
-  // single JPEG encode — no Bitmap round-trip (see docs/CAMERA_REBUILD_PLAN.md).
+  // single JPEG encode — no Bitmap round-trip.
   private static final int TARGET_WIDTH = AppConstants.CAMERA_STREAM_WIDTH;
   private static final int TARGET_HEIGHT = AppConstants.CAMERA_STREAM_HEIGHT;
   private static final int JPEG_QUALITY = AppConstants.CAMERA_JPEG_QUALITY;
