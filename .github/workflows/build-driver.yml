@@ -22,11 +22,7 @@ jobs:
       uses: microsoft/setup-msbuild@v2
 
     - name: Bake commit count into DriverVersion.h
-      run: |
-        $count = (git rev-list --count HEAD).Trim()
-        Set-Content -LiteralPath driver_cardboardplusplus\include\DriverVersion.h -Value '#pragma once
-        #define DRIVER_BUILD_VERSION "' + $count + '"
-        '
+      run: ./scripts/bake-driver-version.ps1
       shell: pwsh
 
     - name: Build Driver

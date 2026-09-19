@@ -52,11 +52,10 @@ jobs:
       with:
         fetch-depth: 0
     - name: Bake commit count into DriverVersion.h
-      run: |
-        $count = (git rev-list --count HEAD).Trim()
-        Set-Content -LiteralPath driver_cardboardplusplus\include\DriverVersion.h -Value '#pragma once
-        #define DRIVER_BUILD_VERSION "' + $count + '"
-        '
+      # The version job's count (also the release tag) wins over a fresh
+      # rev-list, so the baked driver can never drift from the tag when
+      # master advances mid-release.
+      run: ./scripts/bake-driver-version.ps1 -Count "${{ needs.version.outputs.count }}"
       shell: pwsh
     - name: Add MSBuild to PATH
       uses: microsoft/setup-msbuild@v2
