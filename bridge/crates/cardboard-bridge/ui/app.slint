@@ -1031,23 +1031,153 @@ component StreamPage inherits HorizontalLayout {
     } // right ScrollView
 }
 
-component HandPage inherits VerticalLayout {
+component HandPage inherits HorizontalLayout {
     spacing: 14px;
     padding: 20px;
 
-    Text {
-        text: "Hand Tracking";
-        color: Theme.text-hi;
-        font-size: 22px;
-        font-weight: 700;
-    }
-
-    Card {
-        title: "Camera feed";
-        hint: "Live JPEG frames from the phone camera (UDP 42072). Hand skeleton overlay drawn in real time.";
+    VerticalLayout {
+        horizontal-stretch: 1;
+        spacing: 14px;
 
         Rectangle {
-            height: 420px;
+            background: Theme.surface;
+            border-width: 1px;
+            border-color: Theme.border;
+            border-radius: 14px;
+
+            VerticalLayout {
+                padding: 12px;
+                spacing: 10px;
+
+                HorizontalLayout {
+                    spacing: 10px;
+
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        height: 46px;
+                        border-radius: 10px;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        background: Theme.surface2;
+
+                        VerticalLayout {
+                            padding: 6px;
+                            spacing: 0px;
+                            alignment: center;
+
+                            Text {
+                                text: "Phone · Camera";
+                                color: BridgeState.camera-connected ? Theme.text-hi : Theme.text-dim;
+                                font-size: 11px;
+                                font-weight: 600;
+                                horizontal-alignment: center;
+                            }
+
+                            Text {
+                                text: BridgeState.camera-connected ? "sending JPEG frames" : "not connected";
+                                color: BridgeState.camera-connected ? Theme.ok : Theme.err;
+                                font-size: 10px;
+                                horizontal-alignment: center;
+                            }
+                        }
+                    }
+
+                    Text {
+                        text: "→";
+                        color: Theme.text-mid;
+                        font-size: 18px;
+                        vertical-alignment: center;
+                    }
+
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        height: 46px;
+                        border-radius: 10px;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        background: Theme.surface2;
+
+                        VerticalLayout {
+                            padding: 6px;
+                            spacing: 0px;
+                            alignment: center;
+
+                            Text {
+                                text: "Bridge · MediaPipe";
+                                color: BridgeState.hand-enabled ? Theme.text-hi : Theme.text-dim;
+                                font-size: 11px;
+                                font-weight: 600;
+                                horizontal-alignment: center;
+                            }
+
+                            Text {
+                                text: BridgeState.hand-enabled ? "detecting hands" : "disabled";
+                                color: BridgeState.hand-enabled ? Theme.ok : Theme.err;
+                                font-size: 10px;
+                                horizontal-alignment: center;
+                            }
+                        }
+                    }
+                }
+
+                Text {
+                    text: "Camera UDP 42072 · landmarks TCP 42073";
+                    color: Theme.text-dim;
+                    font-size: 10px;
+                    wrap: word-wrap;
+                }
+
+                GridLayout {
+                    spacing: 8px;
+
+                    Row {
+                        MiniMetric {
+                            label: "Camera FPS";
+                            value: BridgeState.camera-fps + " fps";
+                            horizontal-stretch: 1;
+                        }
+
+                        MiniMetric {
+                            label: "Hands Detected";
+                            value: BridgeState.hands-detected + "";
+                            horizontal-stretch: 1;
+                        }
+                    }
+
+                    Row {
+                        MiniMetric {
+                            label: "Landmarks / Hand";
+                            value: BridgeState.landmark-count + "";
+                            horizontal-stretch: 1;
+                        }
+
+                        MiniMetric {
+                            label: "Hand FPS";
+                            value: BridgeState.hand-fps + " fps";
+                            horizontal-stretch: 1;
+                        }
+                    }
+
+                    Row {
+                        MiniMetric {
+                            label: "Detection Conf";
+                            value: BridgeState.hand-det + "%";
+                            horizontal-stretch: 1;
+                        }
+
+                        MiniMetric {
+                            label: "Presence Conf";
+                            value: BridgeState.hand-pres + "%";
+                            horizontal-stretch: 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            vertical-stretch: 1;
+            min-height: 140px;
             border-radius: 12px;
             clip: true;
             background: #000;
@@ -1063,113 +1193,123 @@ component HandPage inherits VerticalLayout {
         }
     }
 
-    Card {
-        title: "Detection Model";
-        hint: "MediaPipe Hand Landmarker runs in a Python sidecar (TCP 42073). Applying pushes the new thresholds live — no restart, no dropped frames.";
+    ScrollView {
+        width: 380px;
+        horizontal-scrollbar-policy: always-off;
+        viewport-height: hand-right-col.preferred-height;
+        hand-right-col := VerticalLayout {
+            spacing: 14px;
+            width: parent.width;
 
-        Toggle {
-            label: "Enable hand tracking";
-            checked: BridgeState.hand-enabled;
-            changed(b) => {
-                BridgeState.hand-toggled(b);
-            }
-        }
+            Card {
+                title: "Status";
 
-        Toggle {
-            label: "Draw skeleton overlay on the camera feed";
-            checked: BridgeState.hand-overlay;
-            changed(b) => {
-                BridgeState.overlay-toggled(b);
-            }
-        }
+                if !BridgeState.hand-enabled : Text {
+                    text: "Hand tracking is disabled. Frames are not being requested from the phone.";
+                    color: Theme.text-dim;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
 
-        Stepper {
-            label: "Detection confidence";
-            value: BridgeState.hand-det;
-            min: 1;
-            max: 100;
-            step: 5;
-            unit: "%";
-            changed(v) => {
-                BridgeState.hand-det = v;
-            }
-        }
+                if BridgeState.hand-enabled && BridgeState.hands-detected == 0 : Text {
+                    text: "No hands detected yet. Keep your hands in the phone camera frustum.";
+                    color: Theme.warn;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
 
-        Stepper {
-            label: "Presence confidence";
-            value: BridgeState.hand-pres;
-            min: 1;
-            max: 100;
-            step: 5;
-            unit: "%";
-            changed(v) => {
-                BridgeState.hand-pres = v;
-            }
-        }
-
-        Stepper {
-            label: "Tracking confidence";
-            value: BridgeState.hand-track;
-            min: 1;
-            max: 100;
-            step: 5;
-            unit: "%";
-            changed(v) => {
-                BridgeState.hand-track = v;
-            }
-        }
-
-        PrimaryButton {
-            text: "Apply Model Settings";
-            clicked => {
-                BridgeState.apply-hand-model(BridgeState.hand-det, BridgeState.hand-pres, BridgeState.hand-track);
-            }
-        }
-    }
-
-    Card {
-        title: "Status";
-
-        if !BridgeState.hand-enabled : Text {
-            text: "Hand tracking is disabled. Frames are not being requested from the phone.";
-            color: Theme.text-dim;
-            font-size: 12px;
-            wrap: word-wrap;
-        }
-
-        if BridgeState.hand-enabled && BridgeState.hands-detected == 0 : Text {
-            text: "No hands detected yet. Keep your hands in the phone camera frustum.";
-            color: Theme.warn;
-            font-size: 12px;
-            wrap: word-wrap;
-        }
-
-        if BridgeState.hand-enabled && BridgeState.hands-detected > 0 : Text {
-            text: "Tracking active.";
-            color: Theme.ok;
-            font-size: 12px;
-            wrap: word-wrap;
-        }
-
-        HorizontalLayout {
-            spacing: 12px;
-
-            Metric {
-                label: "Hands Detected";
-                value: BridgeState.hands-detected + "";
-                horizontal-stretch: 1;
+                if BridgeState.hand-enabled && BridgeState.hands-detected > 0 : Text {
+                    text: "Tracking active.";
+                    color: Theme.ok;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
             }
 
-            Metric {
-                label: "Landmarks / Hand";
-                value: BridgeState.landmark-count + "";
-                horizontal-stretch: 1;
+            Card {
+                title: "Detection Model";
+                hint: "MediaPipe Hand Landmarker runs in a Python sidecar (TCP 42073). Applying pushes the new thresholds live — no restart, no dropped frames.";
+
+                Toggle {
+                    label: "Enable hand tracking";
+                    checked: BridgeState.hand-enabled;
+                    changed(b) => {
+                        BridgeState.hand-toggled(b);
+                    }
+                }
+
+                Toggle {
+                    label: "Draw skeleton overlay on the camera feed";
+                    checked: BridgeState.hand-overlay;
+                    changed(b) => {
+                        BridgeState.overlay-toggled(b);
+                    }
+                }
+
+                Stepper {
+                    label: "Detection confidence";
+                    value: BridgeState.hand-det;
+                    min: 1;
+                    max: 100;
+                    step: 5;
+                    unit: "%";
+                    changed(v) => {
+                        BridgeState.hand-det = v;
+                    }
+                }
+
+                Stepper {
+                    label: "Presence confidence";
+                    value: BridgeState.hand-pres;
+                    min: 1;
+                    max: 100;
+                    step: 5;
+                    unit: "%";
+                    changed(v) => {
+                        BridgeState.hand-pres = v;
+                    }
+                }
+
+                Stepper {
+                    label: "Tracking confidence";
+                    value: BridgeState.hand-track;
+                    min: 1;
+                    max: 100;
+                    step: 5;
+                    unit: "%";
+                    changed(v) => {
+                        BridgeState.hand-track = v;
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 12px;
+
+                    Metric {
+                        label: "Hands Detected";
+                        value: BridgeState.hands-detected + "";
+                        horizontal-stretch: 1;
+                    }
+
+                    Metric {
+                        label: "Landmarks / Hand";
+                        value: BridgeState.landmark-count + "";
+                        horizontal-stretch: 1;
+                    }
+
+                    Metric {
+                        label: "Hand FPS";
+                        value: BridgeState.hand-fps + " fps";
+                        horizontal-stretch: 1;
+                    }
+                }
             }
 
-            Metric {
-                label: "Hand FPS";
-                value: BridgeState.hand-fps + " fps";
-                horizontal-stretch: 1;
+            PrimaryButton {
+                text: "Apply Model Settings";
+                clicked => {
+                    BridgeState.apply-hand-model(BridgeState.hand-det, BridgeState.hand-pres, BridgeState.hand-track);
+                }
             }
         }
     }
@@ -1394,13 +1534,10 @@ export component MainWindow inherits Window {
                     width: parent.width;
                     height: parent.height;
                 }
-                if BridgeState.current-tab == 1 : ScrollView {
+                if BridgeState.current-tab == 1 : HandPage {
                     x: 0; y: 0;
                     width: parent.width;
                     height: parent.height;
-                    horizontal-scrollbar-policy: always-off;
-                    s1 := HandPage {}
-                    viewport-height: s1.preferred-height;
                 }
                 if BridgeState.current-tab == 2 : ScrollView {
                     x: 0; y: 0;
