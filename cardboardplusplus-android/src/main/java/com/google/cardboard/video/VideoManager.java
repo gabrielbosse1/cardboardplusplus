@@ -1,57 +1,41 @@
 package com.google.cardboard.video;
-
 import android.util.Log;
 import com.google.cardboard.NativeBridge;
 import com.google.cardboard.core.AppConstants;
 import com.google.cardboard.core.DebugLog;
 import com.google.cardboard.settings.AppSettings;
 import com.google.cardboard.telemetry.TelemetrySender;
-
-/**
- * Owns the video decode pipeline: creates the OES texture + MediaCodec-backed {@link VideoDecoder}
- * on the GL thread, starts the native UDP receiver that forwards H.264 access units to the decoder,
- * and drives {@link VideoDecoder#updateVideoTexture()} each frame.
- */
+// Playback coordinator in video/; VrActivity and VrRenderer drive surface, start, texture, and pause.
 public class VideoManager {
   private static final String TAG = VideoManager.class.getSimpleName();
   private static final DebugLog DBG = new DebugLog(TAG);
-
   private final NativeBridge bridge;
   private final AppSettings appSettings;
   private VideoDecoder decoder;
   private boolean surfaceCreated = false;
-
-  // If the video stream stalls (e.g. SteamVR restarted behind the running phone),
-  // re-broadcast discovery so the PC driver re-routes video to this phone.
   private Runnable reconnectAction;
   private VideoWatchdog watchdog;
   private NetStatsReporter netStats;
   private TelemetrySender telemetrySender;
-
+  // Stores the native bridge and settings; called from VrActivity.onCreate on the UI thread.
   public VideoManager(NativeBridge bridge, AppSettings appSettings) {
     this.bridge = bridge;
     this.appSettings = appSettings;
   }
-
-  /** Share the telemetry socket for NetStats 0x13 reports (no fresh socket/DNS per report). */
+  // Registers the telemetry path for net-stats; called from VrActivity.onCreate on the UI thread.
   public void setTelemetrySender(TelemetrySender telemetrySender) {
     this.telemetrySender = telemetrySender;
   }
-
-  /** Query the hardware decoder cap (max supported resolution). */
+  // Returns the hardware decode ceiling; called from VrActivity's decoder-cap thread.
   public int[] queryDecoderCap() {
     return DecoderCapabilityReporter.queryDecoderCapability();
   }
-
-  /** Called by the activity when the user re-runs discovery (e.g. after a PC restart). */
+  // Registers the stall-recovery hook; called from VrActivity.onCreate with DiscoveryManager.pokeNow.
   public void setReconnectAction(Runnable reconnectAction) {
     this.reconnectAction = reconnectAction;
   }
-
-  /** Create the OES texture and MediaCodec decoder. Must run on the GL thread. */
+  // Creates the decoder on a fresh video texture; called from VrActivity start and VrRenderer setup on the GL thread.
   public void onSurfaceCreated() {
-    // Guard against double-create (VrRenderer + activity resume race): release
-    // the old decoder first so we never leak a MediaCodec instance.
     if (decoder != null) {
       decoder.release();
       decoder = null;
@@ -64,7 +48,7 @@ public class VideoManager {
     surfaceCreated = true;
     Log.i(TAG, "Video decoder created (tex=" + texId + ")");
   }
-
+  // Starts native reception plus watchdog and net-stats; called from VrActivity start and VrRenderer setup on the GL thread.
   public void start() {
     if (!surfaceCreated) {
       Log.w(TAG, "start() called before surface created; ignoring");
@@ -72,56 +56,42 @@ public class VideoManager {
     }
     bridge.startVideoReceiver(AppConstants.VIDEO_PORT);
     Log.i(TAG, "Video receiver started on port " + AppConstants.VIDEO_PORT);
-    // Decoder cap is now announced by DiscoveryManager on its proven socket
-    // (the separate-socket send was silently dropped by Windows firewall).
     startWatchdog();
     startNetStats();
   }
-
-  /**
-   * Starts the stall watchdog that re-runs discovery when the video channel goes dead.
-   *
-   * <p>See {@link VideoWatchdog} for why this is necessary and how the re-broadcast is throttled.
-   */
+  // Lazily starts the stall watchdog; called from start on the GL thread.
   private void startWatchdog() {
     if (watchdog == null) {
       watchdog = new VideoWatchdog(TAG, reconnectAction, () -> decoder);
     }
     watchdog.start();
   }
-
+  // Stops the stall watchdog; called from onPause on the UI thread.
   private void stopWatchdog() {
     if (watchdog != null) {
       watchdog.stop();
     }
   }
-
-  /**
-   * Starts the net-stats reporter that feeds the bridge's adaptive bitrate.
-   * Shares the decoder supplier with the watchdog so both observe the same pipeline.
-   */
+  // Lazily starts net-stats reporting; called from start on the GL thread.
   private void startNetStats() {
     if (netStats == null) {
       netStats = new NetStatsReporter(appSettings, () -> decoder, telemetrySender);
     }
     netStats.start();
   }
-
+  // Stops net-stats reporting; called from onPause on the UI thread.
   private void stopNetStats() {
     if (netStats != null) {
       netStats.stop();
     }
   }
-
-
-  /** Present the latest decoded frame into the GL OES texture. Call from the GL thread. */
+  // Drains decoder output into the GL texture; called from VrRenderer.onDrawFrame on the GL thread.
   public void updateTexture() {
     if (decoder != null) {
       decoder.updateVideoTexture();
     }
   }
-
-  /** Tear down the decoder and stop the receiver. Call on pause. */
+  // Releases the decoder and stops native reception; called from VrActivity.onPause on the UI thread.
   public void onPause() {
     stopWatchdog();
     stopNetStats();
@@ -132,7 +102,7 @@ public class VideoManager {
     bridge.stopVideoReceiver();
     surfaceCreated = false;
   }
-
+  // Reports whether the decoder surface exists; called from VrActivity startSession on the GL thread.
   public boolean isStarted() {
     return surfaceCreated;
   }

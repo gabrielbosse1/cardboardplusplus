@@ -1,104 +1,68 @@
 package com.google.cardboard.core;
-
 import android.util.Log;
 import com.google.cardboard.BuildConfig;
-
-/**
- * Conditional debug logging. Every verbose log call in the app goes through
- * here; when debug is off, the calls compile away to a boolean check.
- *
- * <p>Usage:
- * <pre>
- *   private static final DebugLog DBG = new DebugLog("MyTag");
- *   DBG.d("sensor values: %.3f, %.3f, %.3f", x, y, z);
- * </pre>
- *
- * <p>Normal {@link Log#w} and {@link Log#e} calls are NOT gated — warnings
- * and errors always fire regardless of the debug flag.
- */
+// Per-tag gated logger; every manager owns one and VrActivity toggles the global switch from settings.
 public final class DebugLog {
     private final String tag;
     private volatile boolean enabled;
-
+    // Creates a logger for the given log tag; called from each owning class field initializer.
     public DebugLog(String tag) {
         this.tag = tag;
     }
-
-    /** Call once per session or when the user toggles the setting. */
+    // Sets the instance-level gate; called from tests and ad-hoc per-class enabling.
     public void setEnabled(boolean enabled) {
-        // Instance flag only — never touch the global here, or one module's
-        // setting would clobber every other module's logging. The global flag
-        // is owned by VrActivity via setGlobalEnabled().
         this.enabled = enabled;
     }
-
+    // Reports the instance-level gate; called from TelemetrySender start logging.
     public boolean isEnabled() {
         return enabled;
     }
-
-    // Global flag so DebugLog instances created without AppSettings still work.
     private static volatile boolean globalEnabled = false;
-
-    /** Set the global debug flag. Called from VrActivity on create/resume. */
+    // Flips the app-wide gate; called from VrActivity lifecycle and SettingsMenuController toggle.
     public static void setGlobalEnabled(boolean enabled) {
         globalEnabled = enabled;
     }
-
-    /** Check the global debug flag (used by instances without explicit AppSettings). */
+    // Debug output passes in debug builds or when either gate is on; called from all d/i/v helpers.
     private boolean isEnabledGlobal() {
-        // Debug builds always debug; release builds honor the runtime toggle
-        // (SharedPreferences via VrActivity), defaulting off.
         return BuildConfig.DEBUG || enabled || globalEnabled;
     }
-
-    /** Debug-level log. Only fires when debug is enabled. */
+    // Emits a debug line when gates allow; called from hot paths across managers.
     public void d(String msg) {
         if (isEnabledGlobal()) Log.d(tag, msg);
     }
-
-    /** Debug-level log with format args. Only fires when debug is enabled. */
+    // Emits a formatted debug line; called from DiscoveryManager and sensor enumeration.
     public void d(String fmt, Object... args) {
         if (isEnabledGlobal()) Log.d(tag, String.format(fmt, args));
     }
-
-    /** Info-level log. Only fires when debug is enabled. */
+    // Emits an info line when gates allow; called for lifecycle and capability reports.
     public void i(String msg) {
         if (isEnabledGlobal()) Log.i(tag, msg);
     }
-
-    /** Info-level log with format args. Only fires when debug is enabled. */
+    // Emits a formatted info line; called for decoder caps, fps, and streamer stats.
     public void i(String fmt, Object... args) {
         if (isEnabledGlobal()) Log.i(tag, String.format(fmt, args));
     }
-
-    /** Verbose-level log. Only fires when debug is enabled. */
+    // Emits a verbose line when gates allow; called from low-volume diagnostics.
     public void v(String msg) {
         if (isEnabledGlobal()) Log.v(tag, msg);
     }
-
-    /** Verbose-level log with format args. Only fires when debug is enabled. */
+    // Emits a formatted verbose line; called from low-volume diagnostics.
     public void v(String fmt, Object... args) {
         if (isEnabledGlobal()) Log.v(tag, String.format(fmt, args));
     }
-
-    // --- Always-on helpers (not gated) ---
-
-    /** Warning log — always fires regardless of debug flag. */
+    // Always emits a warning; called from sensor-missing and throttled-failure paths.
     public void w(String msg) {
         Log.w(tag, msg);
     }
-
-    /** Warning log with throwable — always fires. */
+    // Always emits a warning with throwable; called from paths that carry an exception.
     public void w(String msg, Throwable t) {
         Log.w(tag, msg, t);
     }
-
-    /** Error log — always fires regardless of debug flag. */
+    // Always emits an error; called from unrecoverable per-component failures.
     public void e(String msg) {
         Log.e(tag, msg);
     }
-
-    /** Error log with throwable — always fires. */
+    // Always emits an error with throwable; called from paths that carry an exception.
     public void e(String msg, Throwable t) {
         Log.e(tag, msg, t);
     }

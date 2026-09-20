@@ -1,26 +1,17 @@
 package com.google.cardboard.render;
-
 import com.google.cardboard.core.DebugLog;
-
-/**
- * Counts rendered frames and logs the render rate once per second.
- *
- * <p>Extracted from {@link VrRenderer} so the renderer's per-frame work is purely "do the next
- * frame" and diagnostics like this live in a self-contained object. The log tag is supplied by the
- * caller so existing log output stays unchanged. Logging is gated on the debug
- * flag (VrActivity owns the global) so release sessions stay quiet.
- */
+// Per-second GL frame-rate logger: counts onDrawFrame calls and emits one
+// FPS line per second. Debug-gated via DebugLog; owned by VrRenderer.
 final class FpsCounter {
   private final DebugLog dbg;
-
   private long frameCount;
   private long lastLogNs;
-
+  // Binds the counter to the owner's log tag (VrRenderer's).
   FpsCounter(String tag) {
     this.dbg = new DebugLog(tag);
   }
-
-  /** Account for one rendered frame; logs FPS when a full second has elapsed. */
+  // Records one rendered frame; logs and resets the window each full second.
+  // Called from VrRenderer.onDrawFrame on the GL thread.
   void onFrameRendered() {
     frameCount++;
     long now = System.nanoTime();

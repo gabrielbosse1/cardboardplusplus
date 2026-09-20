@@ -28,7 +28,9 @@ cardboardplusplus-android/libraries/
 # Untracked noise from the same drops:
 driver_cardboardplusplus/lib/ffmpeg/doc/
 
-# Leftover test artifacts
+# Installer staging + output (rebuilt by scripts/compile-installer.ps1)
+installer/stage/
+installer/dist/
 *.obj
 *.exe
 *.dll

@@ -1,23 +1,14 @@
 package com.google.cardboard.camera;
-
 import android.annotation.SuppressLint;
 import android.hardware.camera2.CameraAccessException;
 import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.params.StreamConfigurationMap;
 import android.util.Size;
-
-/**
- * Camera-related static helpers used by {@link CameraController}.
- *
- * <p>Lives next to {@link CameraController} in the {@code camera} package because it exists only to
- * serve the Camera2 lifecycle (device selection + output-size negotiation), not general purpose
- * camera code.
- */
+// Camera2 selection helpers; owns back-camera lookup and output-size choice for CameraController.
 public final class CameraUtils {
   private CameraUtils() {}
-
-  /** Returns the id of the first back-facing camera, or null if none is available. */
+  // Returns the back-facing camera id or null; called from CameraController.openCamera on the UI thread.
   @SuppressLint("MissingPermission")
   public static String findBackCameraId(CameraManager manager) throws CameraAccessException {
     String[] cameraIds = manager.getCameraIdList();
@@ -30,14 +21,7 @@ public final class CameraUtils {
     }
     return null;
   }
-
-  /**
-   * Picks the smallest output size that is at least {@code minWidth}x{@code minHeight},
-   * falling back to the requested minimum size when nothing qualifies.
-   * Smallest-qualifying keeps the sensor in a fast readout mode (high fps);
-   * the old first-match picked the largest (e.g. 2304x1728) and capped the
-   * streamer at ~8fps.
-   */
+  // Picks the smallest SurfaceTexture size meeting the minimums; called from CameraController.openCamera for preview.
   public static Size chooseOutputSize(
       StreamConfigurationMap map, int minWidth, int minHeight) {
     Size best = null;
@@ -57,13 +41,7 @@ public final class CameraUtils {
     }
     return best != null ? best : new Size(minWidth, minHeight);
   }
-
-  /**
-   * Same smallest-qualifying pick but for {@link android.media.ImageReader}
-   * (YUV_420_888) outputs, whose supported sizes differ from SurfaceTexture's.
-   * The streamer only needs 256x192, so request small directly instead of
-   * capturing full-res and downscaling every frame in Java.
-   */
+  // Picks the smallest YUV_420_888 size meeting the minimums; called from CameraController.openCamera for streaming.
   public static Size chooseYuvOutputSize(
       StreamConfigurationMap map, int minWidth, int minHeight) {
     Size best = null;

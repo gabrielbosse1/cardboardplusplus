@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 package com.google.cardboard;
-
 import android.annotation.SuppressLint;
 import android.content.Intent;
 import android.content.res.AssetManager;
@@ -34,10 +33,8 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.Toast;
-
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
-
 import com.google.cardboard.camera.CameraController;
 import com.google.cardboard.core.AppConstants;
 import com.google.cardboard.core.DebugLog;
@@ -51,31 +48,19 @@ import com.google.cardboard.streaming.CameraStreamer;
 import com.google.cardboard.telemetry.TelemetrySender;
 import com.google.cardboard.ui.ImmersiveMode;
 import com.google.cardboard.video.VideoManager;
-
-/**
- * Entry point / orchestrator for the Cardboard++ VR app.
- *
- * <p>This Activity owns the native app instance and the JNI surface (native methods are hard-bound
- * to this class name in the C++ layer), and wires together the extracted subsystems: camera, video
- * receiver, discovery, permissions, settings and rendering. Subsystem behaviour lives in their own
- * packages and is reached through {@link NativeBridge}.
- */
-// TODO(b/184737638): Remove decorator once the AndroidX migration is completed.
 @SuppressWarnings("deprecation")
 public class VrActivity extends AppCompatActivity implements NativeBridge {
+  // Entry point: owns the GL view, native Cardboard SDK handle, and every
+  // subsystem (camera, video, discovery, telemetry, camera uplink). Lifecycle
+  // is onCreate once, then onResume/onPause per foreground transition; all
+  // streaming starts in startSession and stops in onPause.
   static {
     System.loadLibrary("cardboard_jni");
   }
-
   private static final String TAG = VrActivity.class.getSimpleName();
   private static final DebugLog DBG = new DebugLog(TAG);
-
-  // Opaque native pointer to the native CardboardApp instance.
-  // This object is owned by the VrActivity instance and passed to the native methods.
   private long nativeApp;
-
   private GLSurfaceView glView;
-
   private PermissionManager permissionManager;
   private CameraController cameraController;
   private VideoManager videoManager;
@@ -83,37 +68,30 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
   private AppSettings appSettings;
   private CameraStreamer cameraStreamer;
   private TelemetrySender telemetrySender;
-
-  // Keeps the device awake while the VR session is active. FLAG_KEEP_SCREEN_ON alone is
-  // overridden by the proximity sensor on many OEMs (the phone reads "covered" inside the
-  // Cardboard viewer and the OS forces the screen off), so a wake lock is required.
   private PowerManager.WakeLock wakeLock;
   private WifiManager.WifiLock wifiLock;
   private SensorManager sensorManager;
   private Sensor proximitySensor;
+  // Proximity guard: re-acquires the wake lock when the face covers the
+  // sensor, so VR never sleeps mid-session.
   private final SensorEventListener proximityListener =
       new SensorEventListener() {
         @Override
         public void onSensorChanged(SensorEvent event) {
           if (event.sensor.getType() != Sensor.TYPE_PROXIMITY) return;
-          // Keep the wake lock held while the session is active. Some OEMs force the screen
-          // off when the proximity sensor reads "covered" (phone in the viewer); holding the
-          // lock on every "near" event defends against that. We deliberately never release here
-          // — the lock is released only in onPause() so the device can sleep once the app exits.
           acquireWakeLock();
         }
-
         @Override
         public void onAccuracyChanged(Sensor sensor, int accuracy) {}
       };
-
+  // One-time setup: native SDK handle, prefs, all managers, decoder-cap probe
+  // (reported to discovery for the bridge's resolution clamp), GL view with
+  // the VrRenderer, touch-to-trigger, sticky immersive mode, max brightness.
   @SuppressLint("ClickableViewAccessibility")
   @Override
   public void onCreate(Bundle savedInstance) {
     super.onCreate(savedInstance);
-
     nativeApp = nativeOnCreate(getAssets());
-
     appSettings = new AppSettings(this);
     DebugLog.setGlobalEnabled(appSettings.isDebugLogging());
     DBG.i("VrActivity created, debug=%b", appSettings.isDebugLogging());
@@ -125,10 +103,6 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
     videoManager = new VideoManager(this, appSettings);
     videoManager.setTelemetrySender(telemetrySender);
     discoveryManager = new DiscoveryManager(appSettings);
-    // Query the hardware decoder cap off the UI thread (MediaCodecList.ALL can
-    // block); DiscoveryManager announces it to the driver once known.
-    // If discovery ACKs arrive first, the CAP re-announce (every 60 ACKs)
-    // picks the cap up later — unset (0x0) is never announced.
     new Thread(
         () -> {
           int[] decoderCap = videoManager.queryDecoderCap();
@@ -137,11 +111,7 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
         },
         "decoder-cap-query")
         .start();
-    // If the video stream stalls (e.g. SteamVR restarted behind the running phone),
-    // poke a single discovery+CAP on the live socket so the PC driver re-routes
-    // video to this phone (falls back to full discovery if no socket is live).
     videoManager.setReconnectAction(() -> discoveryManager.pokeNow());
-
     setContentView(R.layout.activity_vr);
     glView = findViewById(R.id.surface_view);
     glView.setEGLContextClientVersion(2);
@@ -151,15 +121,11 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
     glView.setOnTouchListener(
         (v, event) -> {
           if (event.getAction() == MotionEvent.ACTION_DOWN) {
-            // Signal a trigger event.
             glView.queueEvent(() -> onTriggerEvent());
             return true;
           }
           return false;
         });
-
-    // TODO(b/139010241): Avoid that action and status bar are displayed when pressing settings
-    // button.
     ImmersiveMode.applySticky(getWindow());
     View decorView = getWindow().getDecorView();
     decorView.setOnSystemUiVisibilityChangeListener(
@@ -168,34 +134,21 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
             ImmersiveMode.applySticky(getWindow());
           }
         });
-
-    // Forces screen to max brightness.
     WindowManager.LayoutParams layout = getWindow().getAttributes();
     layout.screenBrightness = 1.f;
     getWindow().setAttributes(layout);
-
-    // Prevents screen from dimming/locking.
     getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
   }
-
+  // Backgrounding: pauses native SDK, stops discovery/telemetry/camera
+  // uplink, releases wake/wifi locks, and pauses camera/video/GL in order.
   @Override
   protected void onPause() {
     super.onPause();
     DBG.i("onPause");
-
-    // 1. Tell native to stop head tracking FIRST
     onNativePause();
-
-    // 2. Stop discovery
     discoveryManager.stopDiscovery();
-
-    // 2b. Stop camera streaming
     cameraStreamer.stop();
-
-    // 2c. Stop telemetry
     telemetrySender.stop();
-
-    // Release the wake lock and proximity listener so the device can sleep again.
     if (sensorManager != null && proximitySensor != null) {
       sensorManager.unregisterListener(proximityListener, proximitySensor);
     }
@@ -205,44 +158,28 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
     if (wifiLock != null && wifiLock.isHeld()) {
       wifiLock.release();
     }
-
-    // 3. Stop camera hardware and release texture so it gets recreated fresh on resume
     cameraController.onPause();
-
-    // 3b. Tear down the video decoder + receiver.
     videoManager.onPause();
-
-    // 4. Stop GL thread LAST
     glView.onPause();
   }
-
+  // Foregrounding: refreshes the debug gate and either waits for permissions
+  // or starts the full session (streaming, telemetry, discovery).
   @Override
   protected void onResume() {
     super.onResume();
     DebugLog.setGlobalEnabled(appSettings.isDebugLogging());
     DBG.i("onResume, debug=%b", appSettings.isDebugLogging());
-
-    // The rest of resume must not run until the app holds every permission it
-    // NEEDS, so block early (and request them) if any is missing.
     if (delayResumeUntilPermissionsGranted()) {
       return;
     }
-
     startSession();
   }
-
-  /**
-   * Actually start the VR session. Kept separate from {@link #onResume()} so the same path can be
-   * re-run from {@link #onRequestPermissionsResult} once a permission is granted — otherwise a
-   * first-run install (camera permission dialog) would leave the GL surface never resumed and the
-   * screen permanently black.
-   */
+  // Starts everything stream-related: GL resume, native resume, wake/wifi
+  // locks, proximity listener, discovery broadcasts, telemetry uplink, video
+  // decode (on the GL thread), and camera + its bridge uplink (also GL).
   private void startSession() {
     glView.onResume();
     onNativeResume();
-
-    // Keep the screen on for the whole VR session. The proximity listener refreshes this
-    // whenever the phone is inside the viewer (and releases it when taken out).
     acquireWakeLock();
     acquireWifiLock();
     if (sensorManager == null) {
@@ -255,16 +192,8 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
       sensorManager.registerListener(
           proximityListener, proximitySensor, SensorManager.SENSOR_DELAY_NORMAL);
     }
-
     discoveryManager.startDiscovery();
-
-    // Start telemetry (gyro/accel/mag → bridge)
     telemetrySender.start();
-
-    // Recreate the video decoder + restart the receiver on the GL thread.
-    // onSurfaceCreated() only fires when the GL context is recreated; after a
-    // plain pause/resume (context preserved) it never runs, so restart here,
-    // guarded to avoid duplicates.
     glView.queueEvent(
         () -> {
           if (!videoManager.isStarted()) {
@@ -272,8 +201,6 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
             videoManager.start();
           }
         });
-
-    // Queue camera setup on GL thread (guards prevent duplicates)
     glView.queueEvent(
         () -> {
           if (!cameraController.isTexturePassed()) {
@@ -285,12 +212,8 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
           cameraStreamer.start();
         });
   }
-
-  /**
-   * Acquires a screen-bright wake lock (idempotent). Held until {@link #onPause()}. This is what
-   * actually prevents the headset from going to standby inside the Cardboard viewer — the proximity
-   * sensor otherwise makes the OS turn the screen off.
-   */
+  // Keeps the screen bright during VR (non-reference-counted: one acquire,
+  // one release in onPause).
   @SuppressLint("Wakelock")
   private void acquireWakeLock() {
     if (wakeLock == null) {
@@ -305,8 +228,8 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
       wakeLock.acquire();
     }
   }
-
-  /** Acquire a WiFi multicast lock to prevent power-save from throttling UDP telemetry. */
+  // High-performance WiFi lock so the video/telemetry UDP streams never
+  // sleep mid-session. Best-effort: logs and continues when denied.
   private void acquireWifiLock() {
     try {
       WifiManager wm = (WifiManager) getApplicationContext().getSystemService(WIFI_SERVICE);
@@ -322,30 +245,20 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
       Log.w(TAG, "WiFi lock acquisition failed: " + e.getMessage());
     }
   }
-
-  /**
-   * Requests any permissions required before the GL surface can resume.
-   *
-   * <p>On Android P and below, checks for activity to READ_EXTERNAL_STORAGE. When it is not
-   * granted, the application will request them. For Android Q and above, READ_EXTERNAL_STORAGE is
-   * optional and scoped storage will be used instead. If it is provided (but not checked) and there
-   * are device parameters saved in external storage those will be migrated to scoped storage.
-   *
-   * @return true when resume must be deferred until permissions arrive.
-   */
+  // Requests storage (pre-Q) then camera permission in order. True means
+  // "hold the session": onResume returns and the grant callback starts it.
   private boolean delayResumeUntilPermissionsGranted() {
     if (VERSION.SDK_INT < VERSION_CODES.Q && !permissionManager.isReadExternalStorageGranted()) {
       permissionManager.requestReadExternalStorage();
       return true;
     }
-
     if (!permissionManager.isCameraGranted()) {
       permissionManager.requestCamera();
       return true;
     }
     return false;
   }
-
+  // Final teardown: releases the camera and destroys the native SDK handle.
   @Override
   protected void onDestroy() {
     super.onDestroy();
@@ -353,7 +266,8 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
     nativeOnDestroy(nativeApp);
     nativeApp = 0;
   }
-
+  // Re-applies sticky immersive mode whenever the window regains focus
+  // (system dialogs clear it).
   @Override
   public void onWindowFocusChanged(boolean hasFocus) {
     super.onWindowFocusChanged(hasFocus);
@@ -361,24 +275,17 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
       ImmersiveMode.applySticky(getWindow());
     }
   }
-
-  /** Callback for when close button is pressed. */
+  // Layout button: exits the VR sample.
   public void closeSample(View view) {
     if (BuildConfig.DEBUG) Log.d(TAG, "Leaving VR sample");
     finish();
   }
-
-  /** Callback for when settings_menu button is pressed. */
+  // Layout button: opens the settings popup (viewer, PC IP, debug).
   public void showSettings(View view) {
     new SettingsMenuController(view, this, appSettings).show();
   }
-
-  /**
-   * Callback for the result from requesting permissions.
-   *
-   * <p>When READ_EXTERNAL_STORAGE permission is not granted, the settings view will be launched
-   * with a toast explaining why it is required.
-   */
+  // Permission result fan-in: only our two request codes are handled, both
+  // delegate to handlePermissionRequestResult.
   @Override
   public void onRequestPermissionsResult(
       int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
@@ -388,11 +295,11 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
       handlePermissionRequestResult(requestCode);
     }
   }
-
+  // Applies a grant/deny: storage denial exits (with a settings shortcut
+  // when permanently denied); camera grant starts the session, denial
+  // explains and stays put.
   private void handlePermissionRequestResult(int requestCode) {
     if (requestCode == AppConstants.PERMISSIONS_REQUEST_CODE) {
-      // Device-params migration needs READ_EXTERNAL_STORAGE; the app cannot
-      // proceed without it, so explain and leave if it is still missing.
       if (!permissionManager.isReadExternalStorageGranted()) {
         Toast.makeText(this, R.string.read_storage_permission, Toast.LENGTH_LONG).show();
         if (!permissionManager.shouldShowStorageRationale()) {
@@ -400,17 +307,13 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
         }
         finish();
       } else {
-        // Storage granted: re-run the rest of the resume flow (camera check -> start).
         onResume();
       }
     } else if (requestCode == AppConstants.CAMERA_PERMISSIONS_REQUEST_CODE) {
       if (permissionManager.isCameraGranted()) {
-        // Camera will be initialized in onSurfaceCreated when GL context is ready.
         Log.i(TAG, "Camera permission granted, starting session");
         startSession();
       } else {
-        // Mirror the storage path: a permanent denial needs the Settings
-        // redirect, a plain denial just needs the explanation toast.
         Toast.makeText(this, "Camera permission is required for passthrough", Toast.LENGTH_LONG)
             .show();
         if (!permissionManager.shouldShowCameraRationale()) {
@@ -419,135 +322,97 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
       }
     }
   }
-
+  // Opens the app's system settings page for permanently-denied permissions.
   private void launchPermissionsSettings() {
     Intent intent = new Intent();
     intent.setAction(Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
     intent.setData(android.net.Uri.fromParts("package", getPackageName(), null));
     startActivity(intent);
   }
-
-  // ---------------------------------------------------------------------------
-  // Native glue (JNI). Method names are bound to Java_com_google_cardboard_VrActivity_*
-  // in the C++ layer, so these declarations must remain in this class.
-  // ---------------------------------------------------------------------------
-
+  // JNI boundary (implemented in cardboard_jni): lifecycle, per-frame draw,
+  // trigger, screen params, viewer switch, camera/video textures, and the UDP
+  // video receiver. nativeApp is the opaque handle threading them together.
   private native long nativeOnCreate(AssetManager assetManager);
-
   private native void nativeOnDestroy(long nativeApp);
-
   private native void nativeOnSurfaceCreated(long nativeApp);
-
   private native void nativeOnDrawFrame(long nativeApp);
-
   private native void nativeOnTriggerEvent(long nativeApp);
-
   private native void nativeOnPause(long nativeApp);
-
   private native void nativeOnResume(long nativeApp);
-
   private native void nativeSetScreenParams(long nativeApp, int width, int height);
-
   private native void nativeSwitchViewer(long nativeApp);
-
   private native void nativeOnCameraTextureInitialized(
       long nativeApp, int textureId, int width, int height);
-
   private native int nativeCreateCameraTexture(long nativeApp);
-
   private native int nativeCreateVideoTexture(long nativeApp);
-
   private native void nativeSetVideoDecoder(long nativeApp, Object decoder);
-
   private native void nativeOnVideoActive(long nativeApp);
-
   private native void nativeSetVideoVMax(long nativeApp, float vMax);
-
   private native void nativeResetCameraTexture(long nativeApp);
-
   private native void nativeStartVideoReceiver(long nativeApp, int port);
-
   private native void nativeStopVideoReceiver(long nativeApp);
-
-  // ---------------------------------------------------------------------------
-  // NativeBridge implementation
-  // ---------------------------------------------------------------------------
-
+  // NativeBridge impl: one-line forwards into JNI (VrRenderer, VideoManager,
+  // and CameraController call these; each just passes nativeApp through).
   @Override
   public void onSurfaceCreated() {
     nativeOnSurfaceCreated(nativeApp);
   }
-
   @Override
   public void onDrawFrame() {
     nativeOnDrawFrame(nativeApp);
   }
-
   @Override
   public void onTriggerEvent() {
     nativeOnTriggerEvent(nativeApp);
   }
-
   @Override
   public void onNativePause() {
     nativeOnPause(nativeApp);
   }
-
   @Override
   public void onNativeResume() {
     nativeOnResume(nativeApp);
   }
-
   @Override
   public void setScreenParams(int width, int height) {
     nativeSetScreenParams(nativeApp, width, height);
   }
-
   @Override
   public void switchViewer() {
     nativeSwitchViewer(nativeApp);
   }
-
   @Override
   public void onCameraTextureInitialized(int textureId, int width, int height) {
     nativeOnCameraTextureInitialized(nativeApp, textureId, width, height);
   }
-
   @Override
   public int createCameraTexture() {
     return nativeCreateCameraTexture(nativeApp);
   }
-
   @Override
   public int createVideoTexture() {
     return nativeCreateVideoTexture(nativeApp);
   }
-
   @Override
   public void setVideoDecoder(Object decoder) {
     nativeSetVideoDecoder(nativeApp, decoder);
   }
-
   @Override
   public void onVideoActive() {
     nativeOnVideoActive(nativeApp);
   }
-
   @Override
   public void setVideoVMax(float vMax) {
     nativeSetVideoVMax(nativeApp, vMax);
   }
-
   @Override
   public void resetCameraTexture() {
     nativeResetCameraTexture(nativeApp);
   }
-
   @Override
   public void startVideoReceiver(int port) {
     nativeStartVideoReceiver(nativeApp, port);
   }
-
   @Override
   public void stopVideoReceiver() {
     nativeStopVideoReceiver(nativeApp);

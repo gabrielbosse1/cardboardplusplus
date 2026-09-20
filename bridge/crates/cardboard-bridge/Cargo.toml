@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 description = "Cardboard++ control plane: talks to the SteamVR driver and the phone, without touching the video stream"
 
+# Service-style binary name: normies launch via Start Menu / Setup, nobody
+# clicks a "-svc" exe by hand. Package name stays (deps use it).
+[[bin]]
+name = "cardboard-bridge-svc"
+path = "src/main.rs"
+
 [dependencies]
 bridge-core = { path = "../bridge-core" }
 bridge-shm = { path = "../bridge-shm" }

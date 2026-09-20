@@ -3,19 +3,8 @@
 #include "VideoEncoderLog.h"
 #include <dxgi.h>
 #include <dxgi1_2.h>
-
-// ---------------------------------------------------------------------------
-// VideoEncoder lifecycle + top-level frame entry points.
-//
-// The class is split by concern:
-//   - this file:          construction, Initialize/Shutdown, shared-eye opening
-//   - VideoEncoderShaders.cpp: D3D11 convert/compose pipeline (shaders + RT + readback)
-//   - VideoEncoderFFmpeg.cpp:  H264 encode path (FFmpeg + swscale + telemetry)
-// All private helpers are declared in VideoEncoder.h so the split is purely a
-// translation-unit organization; ownership (m_pDevice / m_pCodecContext / ...)
-// lives entirely inside this class.
-// ---------------------------------------------------------------------------
-
+// Zero-initializes all D3D/FFmpeg handles and telemetry counters; starts the perf clock.
+// Releases FFmpeg and shader resources; called from Shutdown paths and the destructor.
 VideoEncoder::VideoEncoder()
     : m_pDevice(nullptr)
     , m_pContext(nullptr)
@@ -59,12 +48,12 @@ VideoEncoder::VideoEncoder()
 {
     QueryPerformanceFrequency(&m_perfFreq);
 }
-
+// Releases FFmpeg and shader resources; called from Shutdown paths and the destructor.
 VideoEncoder::~VideoEncoder()
 {
     Shutdown();
 }
-
+// Builds the private encode device, FFmpeg codec, shader conversion, and staging/scale buffers for width x height at fps/bitrate.
 bool VideoEncoder::Initialize(ID3D11Device* pDevice, ID3D11DeviceContext* pContext,
                              int width, int height, int fps, int bitrate, bool useGpuEncoding)
 {
@@ -75,22 +64,18 @@ bool VideoEncoder::Initialize(ID3D11Device* pDevice, ID3D11DeviceContext* pConte
     ENCODER_LOG("  Bitrate: %d kbps", bitrate / 1000);
     ENCODER_LOG("  GPU Encoding: %s", useGpuEncoding ? "YES" : "NO");
     ENCODER_LOG("========================================");
-
     if (m_initialized) {
         ENCODER_ERROR("Encoder already initialized!");
         return false;
     }
-
     if (!pDevice || !pContext) {
         ENCODER_ERROR("Invalid D3D11 device or context!");
         return false;
     }
-
     if (width <= 0 || height <= 0) {
         ENCODER_ERROR("Invalid dimensions: %dx%d", width, height);
         return false;
     }
-
     m_pDevice = pDevice;
     m_pContext = pContext;
     m_width = width;
@@ -99,10 +84,6 @@ bool VideoEncoder::Initialize(ID3D11Device* pDevice, ID3D11DeviceContext* pConte
     m_bitrate = bitrate;
     m_useGpuEncoding = useGpuEncoding;
     m_frameCount = 0;
-
-    // Create a SECOND D3D11 device for the encoding thread. This device
-    // is independent from the compositor's device, so the encoding thread
-    // can use D3D11 without contention while Present() runs on device 1.
     D3D_FEATURE_LEVEL featureLevel;
     HRESULT hr2 = D3D11CreateDevice(
         nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
@@ -116,88 +97,67 @@ bool VideoEncoder::Initialize(ID3D11Device* pDevice, ID3D11DeviceContext* pConte
     } else {
         ENCODER_LOG("Created second D3D11 device for encoding thread (feature level: 0x%x)", featureLevel);
     }
-
-    // Point GPU resources at the encoding device if available, else compositor device.
     ID3D11Device* gpuDevice = m_pEncDevice ? m_pEncDevice : m_pDevice;
     ID3D11DeviceContext* gpuContext = m_pEncContext ? m_pEncContext : m_pContext;
     m_pDevice = gpuDevice;
     m_pContext = gpuContext;
-
     LogFFmpegVersion();
-
     if (!InitializeFFmpeg()) {
         ENCODER_ERROR("Failed to initialize FFmpeg!");
         CleanupFFmpeg();
         return false;
     }
-
     if (!InitializeShaderConversion()) {
         ENCODER_ERROR("Failed to initialize shader conversion!");
         CleanupShaderConversion();
         CleanupFFmpeg();
         return false;
     }
-
     m_initialized = true;
     ENCODER_LOG("VideoEncoder initialized successfully!");
     return true;
 }
-
+// Frees codec, shader, staging, and eye-texture state and marks the encoder idle; safe to call twice.
 void VideoEncoder::Shutdown()
 {
     if (!m_initialized && !m_pCodecContext && !m_pFrame && !m_pPacket) {
         return;
     }
-
     ENCODER_LOG("Shutting down VideoEncoder...");
-
     CleanupShaderConversion();
     CleanupFFmpeg();
-
     if (m_pStagingTexture) {
         m_pStagingTexture->Release();
         m_pStagingTexture = nullptr;
     }
-
     if (m_pSoftwareFrameBuffer) {
         av_free(m_pSoftwareFrameBuffer);
         m_pSoftwareFrameBuffer = nullptr;
     }
-
-    // ~18MB CPU readback buffer per re-init leaked here (M7).
     if (m_pReadbackBuffer) {
         delete[] m_pReadbackBuffer;
         m_pReadbackBuffer = nullptr;
     }
     m_readbackBufferSize = 0;
-
     ReleaseEyeTextures();
-
     if (m_pEncContext) { m_pEncContext->Release(); m_pEncContext = nullptr; }
     if (m_pEncDevice) { m_pEncDevice->Release(); m_pEncDevice = nullptr; }
-
     m_initialized = false;
     ENCODER_LOG("VideoEncoder shutdown complete.");
 }
-
+// Opens the Present-thread shared eye handles on the encode device and caches them; outLeft/outRight receive the textures.
 bool VideoEncoder::OpenSharedEyeTextures(const std::vector<std::pair<HANDLE, HANDLE>>& handles,
                                            std::vector<ID3D11Texture2D*>& outLeft,
                                            std::vector<ID3D11Texture2D*>& outRight)
 {
-    // Same layers as last frame: reuse the opened textures instead of paying
-    // OpenSharedResource per frame (M9). The handles name the resource, and
-    // Present() can't overwrite it mid-frame (at most 1 frame in flight), so
-    // a cache hit always reads the current frame's content.
     if (!m_encEyeLefts.empty() && handles == m_openedHandles) {
         outLeft = m_encEyeLefts;
         outRight = m_encEyeRights;
         return true;
     }
     ReleaseEyeTextures();
-
     ID3D11Device* dev = m_pEncDevice ? m_pEncDevice : m_pDevice;
     if (!dev || handles.empty()) return false;
-
     m_encEyeLefts.reserve(handles.size());
     m_encEyeRights.reserve(handles.size());
     for (const auto& h : handles) {
@@ -220,13 +180,13 @@ bool VideoEncoder::OpenSharedEyeTextures(const std::vector<std::pair<HANDLE, HAN
         m_encEyeLefts.push_back(pL);
         m_encEyeRights.push_back(pR);
     }
-
     m_openedHandles = handles;
     outLeft = m_encEyeLefts;
     outRight = m_encEyeRights;
     return true;
 }
-
+// Releases cached eye textures opened above; called on handle change and at Shutdown.
+// Registers the HmdDriver packet sink invoked by ReceiveEncodedPackets for each access unit.
 void VideoEncoder::ReleaseEyeTextures()
 {
     for (auto* t : m_encEyeLefts) { if (t) t->Release(); }
@@ -235,12 +195,12 @@ void VideoEncoder::ReleaseEyeTextures()
     m_encEyeRights.clear();
     m_openedHandles.clear();
 }
-
+// Registers the HmdDriver packet sink invoked by ReceiveEncodedPackets for each access unit.
 void VideoEncoder::SetEncodedPacketCallback(EncodedPacketCallback callback)
 {
     m_encodedPacketCallback = callback;
 }
-
+// Registers the bridge telemetry sink invoked by LogTelemetrySummary every summaryInterval frames.
 void VideoEncoder::SetTelemetryCallback(TelemetryCallback callback)
 {
     m_telemetryCallback = callback;

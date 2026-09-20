@@ -42,7 +42,48 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: bridge-r${{ needs.version.outputs.count }}
-        path: bridge/target/release/cardboard-bridge.exe
+        path: bridge/target/release/cardboard-bridge-svc.exe
+
+  bridge-files:
+    # Payload the web installer downloads (stable asset name bridge-files.zip):
+    # exe + sidecar + model + embedded Python with deps preinstalled.
+    needs: version
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@stable
+    - name: Stage bridge payload
+      run: ./scripts/stage-bridge-files.ps1 -Release
+      shell: pwsh
+    - name: Upload bridge payload
+      uses: actions/upload-artifact@v4
+      with:
+        name: bridge-files
+        path: installer/dist/bridge-files.zip
+
+  installer:
+    # Web Setup.exe: tiny, downloads bridge-files.zip from the release.
+    # No Rust needed: the payload is never inside Setup.exe.
+    needs: version
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - name: Install Inno Setup 6
+      run: winget install --id JRSoftware.InnoSetup -e --silent --accept-package-agreements --accept-source-agreements
+      shell: pwsh
+    - name: Build Setup.exe
+      run: ./scripts/compile-installer.ps1 -SkipBridge
+      shell: pwsh
+    - name: Upload Setup.exe
+      uses: actions/upload-artifact@v4
+      with:
+        name: setup
+        path: installer/dist/CardboardBridge-Setup-*.exe
 
   driver:
     needs: version
@@ -90,7 +131,7 @@ jobs:
         path: cardboardplusplus-android/build/outputs/apk/debug/app-debug.apk
 
   publish:
-    needs: [version, bridge, driver, apk]
+    needs: [version, bridge, bridge-files, installer, driver, apk]
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
@@ -106,14 +147,17 @@ jobs:
         COUNT="${{ needs.version.outputs.count }}"
         SHA="${{ needs.version.outputs.sha }}"
         TAG="r$COUNT"
-        mv "dist/bridge-r$COUNT/cardboard-bridge.exe" "dist/cardboard-bridge-r$COUNT.exe"
+        mv "dist/bridge-r$COUNT/cardboard-bridge-svc.exe" "dist/cardboard-bridge-svc-r$COUNT.exe"
         mv "dist/driver-r$COUNT/driver_cardboardplusplus.dll" "dist/driver_cardboardplusplus-r$COUNT.dll"
         mv "dist/app-r$COUNT/app-debug.apk" "dist/cardboardplusplus-r$COUNT.apk"
+        # Stable names: the web installer fetches these from latest/download.
+        mv dist/bridge-files/bridge-files.zip dist/bridge-files.zip
+        mv dist/setup/CardboardBridge-Setup-*.exe dist/CardboardBridge-Setup.exe
         NOTES="$(git log -1 --format='%h %s')"
         if gh release view "$TAG" >/dev/null 2>&1; then
           # Re-run on the same commit: just refresh the files.
-          gh release upload "$TAG" dist/cardboard-bridge-r$COUNT.exe dist/driver_cardboardplusplus-r$COUNT.dll dist/cardboardplusplus-r$COUNT.apk --clobber
+          gh release upload "$TAG" dist/cardboard-bridge-svc-r$COUNT.exe dist/driver_cardboardplusplus-r$COUNT.dll dist/cardboardplusplus-r$COUNT.apk dist/bridge-files.zip dist/CardboardBridge-Setup.exe --clobber
         else
-          gh release create "$TAG" dist/cardboard-bridge-r$COUNT.exe dist/driver_cardboardplusplus-r$COUNT.dll dist/cardboardplusplus-r$COUNT.apk \
+          gh release create "$TAG" dist/cardboard-bridge-svc-r$COUNT.exe dist/driver_cardboardplusplus-r$COUNT.dll dist/cardboardplusplus-r$COUNT.apk dist/bridge-files.zip dist/CardboardBridge-Setup.exe \
             --title "r$COUNT ($SHA)" --notes "$NOTES"
         fi

@@ -1,21 +1,10 @@
-//! Cross-platform shared-memory mapping.
-//!
-//! - **Windows**: named file mapping `Local\cardboard_pp_bridge`
-//!   (`CreateFileMappingW` + `MapViewOfFile`). The producer creates it, the
-//!   consumer opens it by name.
-//! - **Linux**: POSIX shared memory `/cardboard_pp_bridge`
-//!   (`shm_open` + `ftruncate` + `mmap`).
-//!
-//! The layout is the same on both platforms; only the mechanism differs.
-
 use std::fmt;
-
+/// Errors from creating, opening, or mapping a shared-memory region. Surfaced to callers in `ring.rs` and `bridge-core/src/shm.rs`.
 #[derive(Debug)]
 pub enum MemError {
     Platform(String),
     InvalidState(&'static str),
 }
-
 impl fmt::Display for MemError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -24,58 +13,45 @@ impl fmt::Display for MemError {
         }
     }
 }
-
 impl std::error::Error for MemError {}
-
+/// Shorthand result for shared-memory operations.
 pub type MemResult<T> = Result<T, MemError>;
-
-/// The full platform name used to address the region.
 #[cfg(windows)]
+/// Returns the driver→bridge region name in the session namespace. Called by `BridgeConsumer::open`.
 pub fn region_name() -> String {
     format!("Local\\{}", crate::protocol::NAME_PREFIX)
 }
-
-/// The full platform name used to address the command (settings) region.
 #[cfg(windows)]
+/// Returns the bridge→driver command region name. Called by `CmdProducer::open`.
 pub fn cmd_region_name() -> String {
     format!("Local\\{}", crate::protocol::CMD_NAME_PREFIX)
 }
-
-/// The full platform name used to address the region.
 #[cfg(not(windows))]
+/// Returns the POSIX shm path for the driver→bridge region. Called by `BridgeConsumer::open`.
 pub fn region_name() -> String {
     format!("/{}", crate::protocol::NAME_PREFIX)
 }
-
-/// The full platform name used to address the command (settings) region.
 #[cfg(not(windows))]
+/// Returns the POSIX shm path for the bridge→driver command region. Called by `CmdProducer::open`.
 pub fn cmd_region_name() -> String {
     format!("/{}", crate::protocol::CMD_NAME_PREFIX)
 }
-
-/// A mapped shared-memory region.
 #[allow(dead_code)]
+/// RAII handle for one mapped shared-memory region. `handle` owns the OS object, `base`/`size` describe the mapping used by `ring.rs`.
 pub struct SharedMemory {
     handle: ShmHandle,
     base: *mut u8,
     size: usize,
 }
-
 #[cfg(windows)]
 type ShmHandle = Option<windows::Win32::Foundation::HANDLE>;
-
 #[cfg(windows)]
 impl SharedMemory {
-    /// Create (producer) the named region. On Windows `CreateFileMappingW`
-    /// opens an existing mapping with the same name instead of failing, so
-    /// this does NOT guarantee exclusivity — two producers would attach to
-    /// the same live region (check `GetLastError() == ERROR_ALREADY_EXISTS`
-    /// if that ever matters).
+    /// Creates a pagefile-backed file mapping of `size` bytes and maps it. `_flags` is reserved for future open modes.
     pub fn create(name: &str, size: usize, _flags: u32) -> MemResult<Self> {
         use windows::core::PCWSTR;
         use windows::Win32::Foundation::HANDLE;
         use windows::Win32::System::Memory::*;
-
         let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
         let h = unsafe {
             CreateFileMappingW(
@@ -93,12 +69,10 @@ impl SharedMemory {
         }
         Self::map(h, size)
     }
-
-    /// Open (consumer) an existing named region.
+    /// Opens an existing Windows file mapping and maps a view over it. Called by `BridgeConsumer::open`.
     pub fn open(name: &str, size: usize) -> MemResult<Self> {
         use windows::core::PCWSTR;
         use windows::Win32::System::Memory::*;
-
         let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
         let access = FILE_MAP_READ.0 | FILE_MAP_WRITE.0;
         let h = unsafe { OpenFileMappingW(access, false, PCWSTR(wide.as_ptr())) }
@@ -108,7 +82,7 @@ impl SharedMemory {
         }
         Self::map(h, size)
     }
-
+    /// Maps the Windows handle into this process and stores the base pointer. Called by `create`/`open` above.
     fn map(h: windows::Win32::Foundation::HANDLE, size: usize) -> MemResult<Self> {
         use windows::Win32::System::Memory::*;
         let view = unsafe {
@@ -121,18 +95,16 @@ impl SharedMemory {
         Ok(Self { handle: Some(h), base, size })
     }
 }
-
 #[cfg(not(windows))]
+/// POSIX handle triple: fd plus ownership/name so `Drop` can unlink. Used only by the `SharedMemory` below.
 struct ShmHandle {
     shm_fd: libc::c_int,
-    /// 1 if we created the region (and should unlink on drop).
     owner: bool,
-    /// Name of the region this handle owns, so Drop unlinks the right one.
     name: String,
 }
-
 #[cfg(not(windows))]
 impl SharedMemory {
+    /// Creates and sizes a POSIX shm object, then maps it. `_flags` is reserved for future open modes.
     pub fn create(name: &str, size: usize, _flags: u32) -> MemResult<Self> {
         let cname = std::ffi::CString::new(name).map_err(|_| MemError::InvalidState("bad name"))?;
         let fd = unsafe {
@@ -155,7 +127,7 @@ impl SharedMemory {
         }
         Self::map(ShmHandle { shm_fd: fd, owner: true, name: name.to_string() }, size)
     }
-
+    /// Opens an existing POSIX shm object without resizing it. Called by `BridgeConsumer::open`.
     pub fn open(name: &str, size: usize) -> MemResult<Self> {
         let cname = std::ffi::CString::new(name).map_err(|_| MemError::InvalidState("bad name"))?;
         let fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_RDWR, 0) };
@@ -167,7 +139,7 @@ impl SharedMemory {
         }
         Self::map(ShmHandle { shm_fd: fd, owner: false, name: name.to_string() }, size)
     }
-
+    /// Mmaps the POSIX fd shared into this process. Called by `create`/`open` above.
     fn map(h: ShmHandle, size: usize) -> MemResult<Self> {
         let ptr = unsafe {
             libc::mmap(
@@ -187,16 +159,16 @@ impl SharedMemory {
         Ok(Self { handle: h, base: ptr as *mut u8, size })
     }
 }
-
 impl SharedMemory {
+    /// Returns the raw base pointer of the mapping. Read by `ring.rs` to reach the region header and slots.
     pub fn base(&self) -> *mut u8 {
         self.base
     }
+    /// Returns the mapped byte length. Used for bounds checks before draining slots.
     pub fn size(&self) -> usize {
         self.size
     }
 }
-
 impl Drop for SharedMemory {
     fn drop(&mut self) {
         unsafe {
@@ -215,8 +187,6 @@ impl Drop for SharedMemory {
                     libc::munmap(self.base as *mut libc::c_void, self.size);
                     libc::close(self.handle.shm_fd);
                     if self.handle.owner {
-                        // Best-effort unlink of the region WE own; ignore when
-                        // another consumer still has it open.
                         if let Ok(s) = std::ffi::CString::new(self.handle.name.as_str()) {
                             libc::shm_unlink(s.as_ptr());
                         }
@@ -226,6 +196,4 @@ impl Drop for SharedMemory {
         }
     }
 }
-
-// Raw pointers are not Send; the region is used from a single consumer thread.
 unsafe impl Send for SharedMemory {}

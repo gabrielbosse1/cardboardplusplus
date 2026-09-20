@@ -1,7 +1,6 @@
-// Bakes the git commit count into the exe as BRIDGE_BUILD_COUNT, so a
-// release bridge knows which GitHub release (`r<count>`) to download its
-// driver DLL from. Falls back to "dev" when git is unavailable (e.g.
-// source export); the install flow then requires a local checkout build.
+/// Bakes the git commit count into BRIDGE_BUILD_COUNT at compile time.
+/// Non-git checkouts (source exports) get "dev", which disables the release
+/// DLL download path in driver_install.
 fn main() {
     let count = std::process::Command::new("git")
         .args(["rev-list", "--count", "HEAD"])

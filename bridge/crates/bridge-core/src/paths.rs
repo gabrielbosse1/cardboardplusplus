@@ -1,21 +1,13 @@
-//! Portable default install paths shared by the bridge crates.
-//!
-//! Nothing here may contain a machine-specific path. Defaults resolve from
-//! the running executable's location (repo checkout) and well-known
-//! environment variables, so a fresh clone works on any PC. Anything
-//! unresolvable returns an empty string and the caller must surface an
-//! error telling the user what to fill in.
-
 use std::path::PathBuf;
-
-/// Marker file that identifies the repo root (sits next to `bridge/`).
+/// Presence probe identifying the repo root: the driver solution file only
+/// exists at the top of a checkout, so walking up to it works from any
+/// build output directory (target/debug, staged install, ...).
 const REPO_MARKER: &str = "driver_cardboardplusplus/driver_cardboardplusplus.sln";
-
-/// Walk up from the running executable looking for the repo checkout.
+/// Walks up from the running exe to the repo root. Returns None for installs
+/// outside a checkout (then callers fall back to exe-relative defaults).
 pub fn repo_root() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let mut dir = exe.parent()?.to_path_buf();
-    // ponytail: 6 levels covers bridge/target/(debug|release)/deps plus installed layouts.
     for _ in 0..6 {
         if dir.join(REPO_MARKER).exists() {
             return Some(dir);
@@ -26,7 +18,8 @@ pub fn repo_root() -> Option<PathBuf> {
     }
     None
 }
-
+/// Joins path parts onto the repo root. Empty string when the root is
+/// unknown; callers treat that as "artifact not staged".
 fn exe_relative(parts: &[&str]) -> String {
     let Some(mut p) = repo_root() else {
         return String::new();
@@ -36,8 +29,8 @@ fn exe_relative(parts: &[&str]) -> String {
     }
     p.to_string_lossy().into_owned()
 }
-
-/// Compiled driver DLL produced by the C++ build.
+/// Release driver DLL produced by compile-driver.ps1. Read by the General
+/// tab installer before copying into the SteamVR drivers directory.
 pub fn default_driver_dll() -> String {
     exe_relative(&[
         "driver_cardboardplusplus",
@@ -46,8 +39,8 @@ pub fn default_driver_dll() -> String {
         "driver_cardboardplusplus.dll",
     ])
 }
-
-/// Built Android APK.
+/// Debug APK produced by compile-app.ps1. Read by the General tab installer
+/// before pushing to the phone over ADB.
 pub fn default_apk() -> String {
     exe_relative(&[
         "cardboardplusplus-android",
@@ -58,9 +51,9 @@ pub fn default_apk() -> String {
         "app-debug.apk",
     ])
 }
-
-/// adb.exe: `ANDROID_HOME`/`ANDROID_SDK_ROOT` first, then the default SDK
-/// location under `%LOCALAPPDATA%`. Empty when no SDK is installed.
+/// Locates adb.exe without a hardcoded user path: ANDROID_HOME /
+/// ANDROID_SDK_ROOT first, then the default LOCALAPPDATA SDK install.
+/// Empty string when no SDK is found (installer then prompts the user).
 pub fn default_adb() -> String {
     for var in ["ANDROID_HOME", "ANDROID_SDK_ROOT"] {
         if let Ok(v) = std::env::var(var) {
@@ -82,9 +75,9 @@ pub fn default_adb() -> String {
     }
     String::new()
 }
-
-/// SteamVR addon home. The standard Steam install location under
-/// `%ProgramFiles(x86)%` — not personal, just the default; user-editable.
+/// SteamVR driver slot the installer copies into:
+/// <SteamVR>/drivers/cardboardplusplus. ProgramFiles(x86) first because
+/// SteamVR installs 32-bit by default.
 pub fn default_steamvr_drivers_dir() -> String {
     let pf = std::env::var("ProgramFiles(x86)")
         .or_else(|_| std::env::var("ProgramFiles"))
@@ -99,8 +92,8 @@ pub fn default_steamvr_drivers_dir() -> String {
         .to_string_lossy()
         .into_owned()
 }
-
-/// `...\SteamVR\drivers\cardboardplusplus` -> `...\SteamVR`.
+/// Climbs two levels from the driver slot to the SteamVR root. Used to find
+/// vrserver / vrpathreg when registering the driver.
 pub fn steamvr_root_from_drivers_dir(dir: &str) -> String {
     PathBuf::from(dir.trim_end_matches(['\\', '/']))
         .parent()
@@ -108,9 +101,8 @@ pub fn steamvr_root_from_drivers_dir(dir: &str) -> String {
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default()
 }
-
-/// Marker file recording that the install wizard completed once.
-/// Same dir convention as the legacy `%LOCALAPPDATA%\CardboardPlusPlus\bridge.json`.
+/// One-time install wizard marker: %LOCALAPPDATA%/CardboardPlusPlus/setup.done.
+/// The bridge shows the wizard when this file is absent.
 pub fn setup_done_file() -> PathBuf {
     let mut dir = std::env::var("LOCALAPPDATA")
         .map(PathBuf::from)
@@ -120,14 +112,12 @@ pub fn setup_done_file() -> PathBuf {
     }
     dir.join("setup.done")
 }
-
-/// True once the install wizard has completed (marker file exists).
+/// True after the wizard completed once. Checked at bridge startup.
 pub fn is_setup_done() -> bool {
     setup_done_file().exists()
 }
-
-/// Record wizard completion. Best-effort: errors are ignored, the wizard
-/// just shows fully next launch.
+/// Writes the wizard marker (creating the directory). Called when the user
+/// finishes or dismisses the one-time setup wizard.
 pub fn mark_setup_done() {
     let path = setup_done_file();
     if let Some(parent) = path.parent() {
@@ -135,9 +125,8 @@ pub fn mark_setup_done() {
     }
     let _ = std::fs::write(&path, "done");
 }
-
-/// MSBuild via vswhere (same lookup as `scripts/compile-driver.ps1`).
-/// `None` when no Visual Studio C++ build tools are installed.
+/// Finds MSBuild via vswhere for the driver build step. None when Visual
+/// Studio is missing (the installer then tells the user what to install).
 pub fn find_msbuild() -> Option<String> {
     let pf = std::env::var("ProgramFiles(x86)").ok()?;
     let vswhere = PathBuf::from(pf)

@@ -1,13 +1,9 @@
 ﻿import { VerticalBox, HorizontalBox, TextEdit, Slider, ComboBox, ScrollView, Palette } from "std-widgets.slint";
-
-// =============================================================
-// Cardboard++ Bridge — the product UI.
-//
-// Widget style is pinned to fluent-dark at compile time (build.rs);
-// rounded buttons, sized inputs, and titled settings sections.
-// =============================================================
-
-// ---- A status pill shown in the top bar ---------------------
+// Legacy standalone UI: nav + status header, stream/installer tabs, and the
+// diagnostics view. Properties are written by bridge-ui main.rs (worker-loop,
+// update-status); the six MainWindow callbacks trigger its build/install
+// actions. The cardboard-bridge service UI (ui/app.slint) is the current face.
+// Colored dot + label pill showing one connection state in the header.
 component StatusChip inherits Rectangle {
     in property <string> label;
     in property <color> dot: #7d7d8a;
@@ -18,20 +14,17 @@ component StatusChip inherits Rectangle {
     border-width: 1px;
     border-color: #30303c;
     border-radius: 13px;
-
     HorizontalBox {
         padding-left: 12px;
         padding-right: 12px;
         spacing: 7px;
         alignment: center;
-
         Rectangle {
             width: 8px;
             height: 8px;
             border-radius: 4px;
             background: root.dot;
         }
-
         Text {
             text: root.label;
             font-size: 12px;
@@ -41,8 +34,7 @@ component StatusChip inherits Rectangle {
         }
     }
 }
-
-// ---- Side-bar navigation button ------------------------------
+// Left-rail tab button; active shows the accent bar, clicked switches tabs.
 component NavButton inherits Rectangle {
     in property <string> text;
     in property <bool> active: false;
@@ -52,7 +44,6 @@ component NavButton inherits Rectangle {
     vertical-stretch: 0;
     border-radius: 10px;
     background: active ? #242f42 : transparent;
-
     Rectangle {
         x: 0;
         y: (parent.height - 22px) / 2;
@@ -61,7 +52,6 @@ component NavButton inherits Rectangle {
         border-radius: 2px;
         background: active ? #6ea8ff : transparent;
     }
-
     Text {
         x: 16px;
         y: 0;
@@ -73,7 +63,6 @@ component NavButton inherits Rectangle {
         color: active ? #9fc0ff : #9494a2;
         vertical-alignment: center;
     }
-
     TouchArea {
         x: 0;
         y: 0;
@@ -83,11 +72,11 @@ component NavButton inherits Rectangle {
         clicked => { root.clicked(); }
     }
 }
-
-// ---- Rounded action button -----------------------------------
+// Variant action button (primary/success/danger/neutral) with hover, press,
+// and disabled states; clicked is ignored while disabled.
 component ActionButton inherits Rectangle {
     in property <string> text;
-    in property <string> variant: "primary"; // primary | neutral | danger | success
+    in property <string> variant: "primary";
     in property <bool> disabled: false;
     callback clicked;
     height: 38px;
@@ -95,7 +84,6 @@ component ActionButton inherits Rectangle {
     horizontal-stretch: 0;
     vertical-stretch: 0;
     border-radius: 10px;
-
     states [
         disabled when root.disabled : {
             i-bg.background: #26262f;
@@ -117,7 +105,6 @@ component ActionButton inherits Rectangle {
                 #5b93ef;
         }
     ]
-
     i-bg := Rectangle {
         width: 100%;
         height: 100%;
@@ -128,7 +115,6 @@ component ActionButton inherits Rectangle {
             root.variant == "neutral" ? #2c2c38 :
             #4d8ae8;
         animate background { duration: 120ms; }
-
         i-border := Rectangle {
             width: 100%;
             height: 100%;
@@ -136,7 +122,6 @@ component ActionButton inherits Rectangle {
             border-width: 1px;
             border-color: root.variant == "neutral" ? #3d3d4b : transparent;
         }
-
         i-label := Text {
             width: 100%;
             height: 100%;
@@ -148,7 +133,6 @@ component ActionButton inherits Rectangle {
             vertical-alignment: center;
         }
     }
-
     i-ta := TouchArea {
         x: 0;
         y: 0;
@@ -159,8 +143,7 @@ component ActionButton inherits Rectangle {
         clicked => { root.clicked(); }
     }
 }
-
-// ---- Raised card used to group settings ----------------------
+// Rounded settings card grouping one concern per tab.
 component Panel inherits Rectangle {
     horizontal-stretch: 1;
     background: #1d1d27;
@@ -168,19 +151,19 @@ component Panel inherits Rectangle {
     border-color: #2b2b36;
     border-radius: 12px;
 }
-
+// Section heading inside a Panel.
 component SectionTitle inherits Text {
     font-size: 13px;
     font-weight: 600;
     color: #c9c9d6;
 }
-
+// Small dimmed explainer line under a setting.
 component HintText inherits Text {
     font-size: 11px;
     color: #7d7d8a;
     wrap: word-wrap;
 }
-
+// Right-aligned live value (fps, paths) next to a setting row.
 component ValueText inherits Text {
     font-size: 13px;
     font-weight: 600;
@@ -188,34 +171,23 @@ component ValueText inherits Text {
     horizontal-alignment: right;
     vertical-alignment: center;
 }
-
-// =============================================================
-// Main window
-// =============================================================
+// Legacy window root: header chips, tab rail, and the stream/installer
+// panels. Properties mirror BridgeConfig + worker-loop readouts; the six
+// callbacks map 1:1 to the actions wired in main.rs (apply reads the form,
+// toggle flips stream_enabled, build/install/start run their tools).
 export component MainWindow inherits Window {
-    // The widget style is pinned to fluent-dark in build.rs, so no explicit
-    // palette switching is needed here.
-
     title: "Cardboard++ Bridge";
     preferred-width: 1180px;
     preferred-height: 780px;
     min-width: 1000px;
     min-height: 680px;
     background: #0f0f15;
-
-    // ---- Tab (0=Stream, 1=Camera, 2=General, 3=Diagnostics) ----
     in-out property <int> current_tab: 0;
-
-    // ---- Top bar (live) ----
     in property <string> connection_status: "Idle";
     in property <string> live_fps: "0.0 fps";
     in property <string> stream_state: "Stopped";
     in property <string> client_state: "No client";
-
-    // ---- Diagnostics pane ----
     in property <string> diagnostics: "";
-
-    // ---- Stream settings (owned by the bridge; pushed to the driver) ----
     in-out property <string> stream_width_s: "2880";
     in-out property <string> stream_height_s: "1620";
     in-out property <int> stream_fps: 60;
@@ -223,39 +195,28 @@ export component MainWindow inherits Window {
     in-out property <int> stream_encoder: 0;
     in property <bool> stream_enabled: true;
     in property <string> telemetry_line: "no encoder telemetry yet";
-
-    // ---- Camera (placeholder) ----
     in property <string> camera_status: "Placeholder - hand tracking ships with the stream";
-
-    // ---- General (installers + config) ----
-    // Empty until Rust fills them from portable defaults + saved config.
     in property <string> general_status: "Ready";
     in-out property <string> driver_dll_src: "";
     in-out property <string> steamvr_drivers_dir: "";
     in-out property <string> apk_path: "";
     in-out property <string> adb_path: "";
     in-out property <string> phone_endpoint: "";
-
-    // ---- Callbacks into Rust ----
     callback apply_settings();
     callback toggle_stream();
     callback build_driver();
     callback install_driver();
     callback install_apk();
     callback start_steamvr();
-
     VerticalBox {
-        // ===================== TOP BAR =====================
         Rectangle {
             height: 54px;
             background: #16161e;
-
             HorizontalBox {
                 padding-left: 18px;
                 padding-right: 18px;
                 spacing: 12px;
                 alignment: center;
-
                 HorizontalBox {
                     spacing: 9px;
                     alignment: center;
@@ -273,9 +234,7 @@ export component MainWindow inherits Window {
                         vertical-alignment: center;
                     }
                 }
-
                 Rectangle { horizontal-stretch: 1; }
-
                 StatusChip {
                     label: "Driver · \{connection_status}";
                     dot: connection_status == "Connected" ? #3ecf7b : (connection_status == "Error" ? #f0564f : #7d7d8a);
@@ -294,42 +253,32 @@ export component MainWindow inherits Window {
                 }
             }
         }
-
         Rectangle {
             height: 1px;
             background: #24242f;
         }
-
-        // ===================== BODY =====================
         HorizontalBox {
             padding: 12px;
             spacing: 12px;
-
-            // ---------- SIDE BAR ----------
             Rectangle {
                 width: 214px;
                 horizontal-stretch: 0;
                 border-radius: 14px;
                 background: #14141b;
-
                 VerticalBox {
                     padding: 14px;
                     spacing: 6px;
-
                     Text {
                         text: "BRIDGE";
                         font-size: 12px;
                         font-weight: 700;
                         color: #6f6f7d;
                     }
-
                     NavButton { text: "Stream";      active: current_tab == 0; clicked() => { current_tab = 0; } }
                     NavButton { text: "Camera";      active: current_tab == 1; clicked() => { current_tab = 1; } }
                     NavButton { text: "General";     active: current_tab == 2; clicked() => { current_tab = 2; } }
                     NavButton { text: "Diagnostics"; active: current_tab == 3; clicked() => { current_tab = 3; } }
-
                     Rectangle { vertical-stretch: 1; }
-
                     Text {
                         text: "video · UDP\nhand tracking · MediaPipe";
                         font-size: 10px;
@@ -338,32 +287,25 @@ export component MainWindow inherits Window {
                     }
                 }
             }
-
-            // ---------- CONTENT ----------
             Rectangle {
                 horizontal-stretch: 1;
                 border-radius: 14px;
                 background: #17171f;
                 clip: true;
-
                 ScrollView {
-                    // ==================== STREAM ====================
                     if current_tab == 0 : VerticalBox {
                         padding: 20px;
                         spacing: 14px;
-
                         Text { text: "STREAM"; font-size: 21px; font-weight: 700; color: #ebebf3; }
                         Text {
                             text: "Encoding & delivery — settings are owned here and pushed to the SteamVR driver.";
                             font-size: 12px;
                             color: #85858f;
                         }
-
                         Panel {
                             VerticalBox {
                                 padding: 18px;
                                 spacing: 12px;
-
                                 SectionTitle { text: "Resolution (SBS width × height)"; }
                                 HorizontalBox {
                                     spacing: 10px;
@@ -390,9 +332,7 @@ export component MainWindow inherits Window {
                                         vertical-stretch: 0;
                                     }
                                 }
-
                                 Rectangle { height: 1px; background: #2b2b36; }
-
                                 HorizontalBox {
                                     spacing: 14px;
                                     SectionTitle { text: "Speed / FPS"; vertical-alignment: center; }
@@ -405,9 +345,7 @@ export component MainWindow inherits Window {
                                     value: stream_fps;
                                     changed(v) => { stream_fps = v; }
                                 }
-
                                 Rectangle { height: 1px; background: #2b2b36; }
-
                                 HorizontalBox {
                                     spacing: 14px;
                                     SectionTitle { text: "Bitrate"; vertical-alignment: center; }
@@ -420,9 +358,7 @@ export component MainWindow inherits Window {
                                     value: stream_bitrate_kbps;
                                     changed(v) => { stream_bitrate_kbps = v; }
                                 }
-
                                 Rectangle { height: 1px; background: #2b2b36; }
-
                                 SectionTitle { text: "Encoder"; }
                                 ComboBox {
                                     model: ["Software (libx264)", "GPU (NVENC/AMF)"];
@@ -431,9 +367,7 @@ export component MainWindow inherits Window {
                                 }
                             }
                         }
-
                         HintText { text: telemetry_line; }
-
                         HorizontalBox {
                             spacing: 12px;
                             alignment: end;
@@ -450,19 +384,15 @@ export component MainWindow inherits Window {
                             }
                         }
                     }
-
-                    // ==================== CAMERA ====================
                     if current_tab == 1 : VerticalBox {
                         padding: 20px;
                         spacing: 14px;
-
                         Text { text: "CAMERA"; font-size: 21px; font-weight: 700; color: #ebebf3; }
                         Text {
                             text: "Phone camera passthrough + MediaPipe hand tracking.";
                             font-size: 12px;
                             color: #85858f;
                         }
-
                         Panel {
                             VerticalBox {
                                 padding: 18px;
@@ -471,28 +401,22 @@ export component MainWindow inherits Window {
                                 HintText { text: camera_status; font-size: 12px; }
                             }
                         }
-
                         HintText {
                             text: "Hand tracking ships together with the stream — the Bridge is the single switch for both."; }
                     }
-
-                    // ==================== GENERAL ====================
                     if current_tab == 2 : VerticalBox {
                         padding: 20px;
                         spacing: 14px;
-
                         Text { text: "GENERAL"; font-size: 21px; font-weight: 700; color: #ebebf3; }
                         Text {
                             text: "One-click installer / updater for the whole product (driver DLL + Android APK).";
                             font-size: 12px;
                             color: #85858f;
                         }
-
                         Panel {
                             VerticalBox {
                                 padding: 18px;
                                 spacing: 10px;
-
                                 SectionTitle { text: "SteamVR driver"; }
                                 HintText { text: "Built DLL → install dir (any current driver is backed up first)."; }
                                 TextEdit {
@@ -525,12 +449,10 @@ export component MainWindow inherits Window {
                                 }
                             }
                         }
-
                         Panel {
                             VerticalBox {
                                 padding: 18px;
                                 spacing: 10px;
-
                                 SectionTitle { text: "Android client"; }
                                 HintText { text: "APK path (built artifact)."; }
                                 TextEdit {
@@ -556,12 +478,10 @@ export component MainWindow inherits Window {
                                 }
                             }
                         }
-
                         Panel {
                             VerticalBox {
                                 padding: 18px;
                                 spacing: 10px;
-
                                 SectionTitle { text: "Remote PC ⇄ phone (ADB over Tailscale)"; }
                                 HorizontalBox {
                                     spacing: 10px;
@@ -590,7 +510,6 @@ export component MainWindow inherits Window {
                                 }
                             }
                         }
-
                         Panel {
                             VerticalBox {
                                 padding: 14px;
@@ -600,19 +519,15 @@ export component MainWindow inherits Window {
                             }
                         }
                     }
-
-                    // ==================== DIAGNOSTICS ====================
                     if current_tab == 3 : VerticalBox {
                         padding: 20px;
                         spacing: 14px;
-
                         Text { text: "DIAGNOSTICS"; font-size: 21px; font-weight: 700; color: #ebebf3; }
                         Text {
                             text: "Readout of the shared-memory status region (bridge-shm).";
                             font-size: 12px;
                             color: #85858f;
                         }
-
                         Panel {
                             VerticalBox {
                                 padding: 18px;

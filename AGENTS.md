@@ -352,6 +352,28 @@ Note: there is currently no installer/release workflow —
 
 ---
 
+## Comment Policy (DO NOT WRITE FIX-CHATTER)
+
+Comments explain what the code does **right now**, for the next reader.
+They never narrate the request, the fix, or the history.
+
+**Write:**
+- What the function does in this moment, what each parameter means, and
+  where the function is used / who calls it (1–2 lines per function)
+- Group notes for constant blocks (ports, tags, tiers) — not one line per constant
+- One pattern note per test module (the descriptive test names are the spec)
+
+**Never write:**
+- `fix`, `fixed`, `bug`, `previously`, `workaround`, `requested`, `reverted`,
+  ticket/issue refs, or "user asked" phrasing
+- History of any kind ("used to", "now", "added for X", "restored")
+- A comment per test function (names already read as sentences)
+
+Good: `/// Clears the connected pill when no ack arrived within DRIVER_ACK_TIMEOUT. Logs the transition once.`
+Bad: `// Fixed: driver stayed connected after disconnect (user asked to clear flag)`
+
+---
+
 ## Wire Protocol Details
 
 ### Port 42069 — H.264 Video (UDP, Driver → Phone + Bridge)
@@ -483,7 +505,7 @@ gate in order and stop at the first failure — fix it before moving on.
    - Phone app → `scripts\install-app.ps1` (APK onto phone via ADB —
      never assume the phone already has the latest build, reinstall it)
 4. **Launch** — open everything so the user just tests, no setup:
-   - Start the bridge (`bridge\target\debug\cardboard-bridge.exe`)
+   - Start the bridge (`bridge\target\debug\cardboard-bridge-svc.exe`)
    - Restart SteamVR so the new driver loads
    - Launch the phone app
 5. **Verify** — confirm the real behavior, not just "it compiles":

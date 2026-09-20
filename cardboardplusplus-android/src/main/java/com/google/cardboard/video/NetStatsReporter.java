@@ -1,5 +1,4 @@
 package com.google.cardboard.video;
-
 import android.os.SystemClock;
 import android.util.Log;
 import com.google.cardboard.core.AppConstants;
@@ -12,52 +11,34 @@ import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.function.Supplier;
-
-/**
- * Reports video-path health to the bridge so it can adapt the encoder.
- *
- * <p>Every {@link #REPORT_INTERVAL_MS} the reporter samples the decoder (frames decoded since the
- * last report, time since the last frame) and sends one tag-{@code 0x13} datagram to the bridge
- * telemetry port (UDP 42071):
- * <pre>
- *   [0x13][u64 timestamp_ms LE][u32 frames decoded LE][u32 stalls LE][f32 decoded fps LE]
- * </pre>
- * 21 bytes total. The video stream itself is the load probe — arrival rate, stalls and decode
- * rate measure the actual driver→phone path, which no generic speed test can see.
- */
+// Decoder health reporter in video/; VideoManager runs it to send 0x13 packets for bridge bitrate control.
 public class NetStatsReporter {
   private static final String TAG = NetStatsReporter.class.getSimpleName();
-
   static final byte NET_STATS_TAG = AppConstants.TELEMETRY_TAG_NETSTATS;
   static final int NET_STATS_LEN = 21;
   static final long REPORT_INTERVAL_MS = 2000;
   static final long STALL_MS = 3000;
-
   private final AppSettings appSettings;
   private final Supplier<VideoDecoder> decoderSupplier;
-  // Shared telemetry socket (no fresh socket + DNS per report); may be null.
   private final TelemetrySender telemetrySender;
-
   private Thread reportThread = null;
   private volatile boolean running = false;
-
   private int lastTotalFrames = 0;
   private int stalls = 0;
   private boolean wasStalled = false;
   private VideoDecoder lastDecoder;
-
+  // Stores settings, decoder source, and optional telemetry path; called from VideoManager.startNetStats.
   public NetStatsReporter(AppSettings appSettings, Supplier<VideoDecoder> decoderSupplier) {
     this(appSettings, decoderSupplier, null);
   }
-
+  // Stores settings, decoder source, and telemetry sender; called from VideoManager.startNetStats.
   public NetStatsReporter(
       AppSettings appSettings, Supplier<VideoDecoder> decoderSupplier, TelemetrySender telemetrySender) {
     this.appSettings = appSettings;
     this.decoderSupplier = decoderSupplier;
     this.telemetrySender = telemetrySender;
   }
-
-  /** Pure packet builder (no Android deps) so unit tests can verify the wire format. */
+  // Encodes one 21-byte 0x13 packet; called from sendReport on the reporter thread.
   public static byte[] buildPacket(long timestampMs, int framesDecoded, int stalls, float decodedFps) {
     ByteBuffer buf = ByteBuffer.allocate(NET_STATS_LEN).order(ByteOrder.LITTLE_ENDIAN);
     buf.put(NET_STATS_TAG);
@@ -67,7 +48,7 @@ public class NetStatsReporter {
     buf.putFloat(decodedFps);
     return buf.array();
   }
-
+  // Starts the 2s report loop; called from VideoManager.start on the GL thread.
   public void start() {
     if (running || (reportThread != null && reportThread.isAlive())) {
       return;
@@ -77,7 +58,7 @@ public class NetStatsReporter {
     reportThread.setDaemon(true);
     reportThread.start();
   }
-
+  // Stops the report loop; called from VideoManager.onPause on the UI thread.
   public void stop() {
     running = false;
     if (reportThread != null) {
@@ -85,7 +66,7 @@ public class NetStatsReporter {
       reportThread = null;
     }
   }
-
+  // Sleeps 2s between reports and sends each sample; runs on the netstats reporter thread.
   private void reportLoop() {
     while (running) {
       try {
@@ -100,15 +81,12 @@ public class NetStatsReporter {
       }
     }
   }
-
+  // Samples decoder counters and sends one packet; called from reportLoop on the reporter thread.
   private void sendReport() throws Exception {
     VideoDecoder decoder = decoderSupplier != null ? decoderSupplier.get() : null;
     int frames = 0;
     float fps = 0f;
     if (decoder != null) {
-      // Decoder recreated (pause/resume): the new instance restarts its frame
-      // counter at 0, so reset the baseline instead of reporting a negative
-      // delta spike.
       if (decoder != lastDecoder) {
         lastDecoder = decoder;
         lastTotalFrames = 0;
@@ -126,8 +104,6 @@ public class NetStatsReporter {
       }
       wasStalled = stalled;
     }
-    // Elapsed-realtime epoch, matching the 0x10/0x12 boot-ms timestamps the
-    // bridge forwards verbatim (wall-clock would corrupt rate math).
     byte[] data = buildPacket(SystemClock.elapsedRealtime(), frames, stalls, fps);
     if (telemetrySender != null && telemetrySender.sendDatagram(data)) {
       return;

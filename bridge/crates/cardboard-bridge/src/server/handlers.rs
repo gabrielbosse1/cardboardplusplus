@@ -1,27 +1,19 @@
-//! Endpoint implementations for the REST control plane. Each handler builds a
-//! `Response` from the `AppCore` it shares with the UI, so the REST API is
-//! just another view over the same state the window renders.
-
 use std::io::Read;
-
 use tiny_http::{Header, Method, Request, Response, StatusCode};
-
 use crate::core::AppCore;
 use crate::server::ENDPOINT_INDEX;
-
-/// Body size cap for requests (settings payloads are a few hundred bytes).
+/// Cap on POST bodies (settings/debug). Anything larger is truncated, keeping
+/// a malicious client from growing bridge memory.
 const MAX_BODY_BYTES: u64 = 64 * 1024;
-
-/// Route one HTTP request and answer it. The path/query split happens once so
-/// the matches are simple and the query string stays available for per-route
-/// parameters such as `n=`.
+/// Routes one HTTP request to its handler by (method, path) and responds.
+/// Unknown routes get a 404 pointing at the endpoint index. Runs on the
+/// server.rs background thread, one request at a time.
 pub fn handle(mut request: Request, core: &AppCore) {
     let method = request.method().clone();
     let (path, query) = match request.url().split_once('?') {
         Some((p, q)) => (p.to_string(), Some(q.to_string())),
         None => (request.url().to_string(), None),
     };
-
     let response = match (method, path.as_str()) {
         (_, "/") | (_, "/index") => text(StatusCode(200), ENDPOINT_INDEX),
         (Method::Get, "/health") => ok_json(&health_payload()),
@@ -33,14 +25,10 @@ pub fn handle(mut request: Request, core: &AppCore) {
         (Method::Post, "/debug") => set_debug(&mut request),
         _ => text(StatusCode(404), NOT_FOUND_BODY),
     };
-
     let _ = request.respond(response);
 }
-
-/// Current preview state: the driver's latest streaming stats. The preview
-/// itself is always on — there is no toggle. GET-only by design: there is no
-/// POST /preview (AGENTS.md's POST /preview line is stale; AGENTS.md itself
-/// is shared across components so the correction lives here, not there).
+/// GET /preview shape: the driver's self-reported stream stats (from
+/// BRIDGE_STATS) that power the bridge preview readout.
 fn preview_payload(core: &AppCore) -> serde_json::Value {
     let s = core.status();
     serde_json::json!({
@@ -52,16 +40,16 @@ fn preview_payload(core: &AppCore) -> serde_json::Value {
         },
     })
 }
-
-/// The endpoint index behaves like the page literal: served as raw text.
+/// GET /health shape: liveness plus the baked app version. Used by
+/// installers and smoke tests to confirm the bridge is up.
 fn health_payload() -> serde_json::Value {
     serde_json::json!({
         "ok": true,
         "app_version": crate::core::APP_VERSION,
     })
 }
-
-/// `{"logs": [...]}` with the requested `n` (default 50) newest-first lines.
+/// GET /logs?n=50 shape: newest-first ring-log lines, default 50. `query` is
+/// the raw URL query string; unparsable n falls back to the default.
 fn logs_payload(core: &AppCore, query: Option<&str>) -> serde_json::Value {
     let n = query
         .and_then(|q| q.split('&').find_map(|part| part.strip_prefix("n=")))
@@ -69,17 +57,11 @@ fn logs_payload(core: &AppCore, query: Option<&str>) -> serde_json::Value {
         .unwrap_or(50);
     serde_json::json!({ "logs": core.logs(n) })
 }
-
-/// POST /settings — parse an optional-fields payload, push the merged config
-/// to the driver, and echo exactly what was applied.
+/// POST /settings handler. Accepts a partial JSON object (missing fields keep
+/// the live session values), pushes the merged set to the driver via
+/// CARDBOARD_CAP + BRIDGE_CFG, and echoes what was sent. 400 on non-JSON.
 fn apply_settings(request: &mut Request, core: &AppCore) -> Response<std::io::Cursor<Vec<u8>>> {
     use serde::Deserialize;
-
-    /// Optional settings fields; absent ones keep the live session values
-    /// (what the driver actually got), never the compiled defaults — so a
-    /// partial body like `{"bitrate":12}` leaves resolution/fps untouched.
-    /// `bitrate` (mbps) has a dedicated wire alias matching the public API.
-    /// `encoder` is "gpu" (driver picks the hardware backend) or "cpu".
     #[derive(Deserialize, Default)]
     struct SettingsPayload {
         width: Option<i32>,
@@ -89,7 +71,6 @@ fn apply_settings(request: &mut Request, core: &AppCore) -> Response<std::io::Cu
         bitrate_mbps: Option<i32>,
         encoder: Option<String>,
     }
-
     let body = read_body_bytes(request);
     let parsed: SettingsPayload = match serde_json::from_slice(&body) {
         Ok(p) => p,
@@ -100,7 +81,6 @@ fn apply_settings(request: &mut Request, core: &AppCore) -> Response<std::io::Cu
             );
         }
     };
-
     let live = core.applied_settings();
     let applied = core.apply_settings(
         parsed.width.unwrap_or(live.0),
@@ -109,26 +89,21 @@ fn apply_settings(request: &mut Request, core: &AppCore) -> Response<std::io::Cu
         parsed.bitrate_mbps.unwrap_or(live.3),
         parsed.encoder.as_deref().unwrap_or(&live.4),
     );
-
     ok_json(&serde_json::json!({
         "ok": true,
         "sent": applied,
         "message": "CARDBOARD_CAP + BRIDGE_CFG pushed to the driver over UDP",
     }))
 }
-
-/// Read the request body up to `MAX_BODY_BYTES`; read errors are ignored so a
-/// truncated upload just yields an empty body (and usually a 400 from the
-/// parse above).
+/// Reads up to MAX_BODY_BYTES from a POST body. Short reads just yield
+/// fewer bytes; over-long bodies are cut, never buffered whole.
 fn read_body_bytes(request: &mut Request) -> Vec<u8> {
     let mut body = Vec::new();
     let _ = request.as_reader().take(MAX_BODY_BYTES).read_to_end(&mut body);
     body
 }
-
-// -------------------------------------------------------- response helpers
-
-/// JSON response with CORS, so a browser-based control page can read it too.
+/// Builds a JSON response with CORS open (the UI and local tools call from
+/// any origin). Serialization cannot fail on the json! payloads used here.
 fn json<T: serde::Serialize>(code: StatusCode, body: &T) -> Response<std::io::Cursor<Vec<u8>>> {
     let bytes = serde_json::to_string(body).unwrap_or_else(|_| "{}".into());
     Response::from_data(bytes)
@@ -138,38 +113,31 @@ fn json<T: serde::Serialize>(code: StatusCode, body: &T) -> Response<std::io::Cu
             Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap(),
         )
 }
-
-/// Plain-text response with status; deliberately no Content-Type header, so
-/// consumers get the raw body bytes exactly as authored (e.g. the index page).
+/// Builds a plain-text response (endpoint index, 404 body).
 fn text(code: StatusCode, body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
     Response::from_data(body.to_string()).with_status_code(code)
 }
-
-/// Convenience for 200 + JSON.
+/// 200 + JSON shorthand for the success paths.
 fn ok_json<T: serde::Serialize>(body: &T) -> Response<std::io::Cursor<Vec<u8>>> {
     json(StatusCode(200), body)
 }
-
-/// Fallback for unknown routes (kept as raw text, matching `/`).
 const NOT_FOUND_BODY: &str = "{\"error\":\"not found — GET / for the endpoint index\"}";
-
-/// GET /debug — current debug state.
+/// GET /debug shape: current verbose-logging flag plus the toggle hint.
 fn debug_payload() -> serde_json::Value {
     serde_json::json!({
         "debug": crate::app::debug_enabled(),
         "hint": "POST /debug {\"enabled\":true} to toggle verbose logging",
     })
 }
-
-/// POST /debug — toggle debug logging at runtime.
+/// POST /debug handler: flips verbose logging at runtime from
+/// {"enabled":bool}. Takes effect immediately for all debug_log! calls.
+/// 400 on non-JSON.
 fn set_debug(request: &mut Request) -> Response<std::io::Cursor<Vec<u8>>> {
     use serde::Deserialize;
-
     #[derive(Deserialize)]
     struct DebugPayload {
         enabled: bool,
     }
-
     let body = read_body_bytes(request);
     let parsed: DebugPayload = match serde_json::from_slice(&body) {
         Ok(p) => p,
@@ -180,7 +148,6 @@ fn set_debug(request: &mut Request) -> Response<std::io::Cursor<Vec<u8>>> {
             );
         }
     };
-
     crate::app::set_debug_enabled(parsed.enabled);
     ok_json(&serde_json::json!({
         "ok": true,

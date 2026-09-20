@@ -1,35 +1,20 @@
-//! Slint desktop UI for the Cardboard++ Bridge — the product.
-//!
-//! - **Top bar**: connection status (Connected/Idle/Error from bridge-shm
-//!   liveness), live framerate, stream state, client state.
-//! - **Stream** side-bar section: resolution/FPS/bitrate/encoder settings owned
-//!   by the bridge and pushed down to the SteamVR driver over the command
-//!   channel (`bridge_shm::CmdProducer`), plus the start/stop switch (the
-//!   single on/off for the whole product).
-//! - **Camera** section: placeholder for phone camera passthrough + MediaPipe
-//!   hand tracking.
-//! - **General** section: automatic installer for the SteamVR driver (DLL
-//!   backup first) and ADB install of the Android APK.
-//! - **Diagnostics** pane: readout of the shared-memory status region.
-
 slint::include_modules!();
-
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
 use bridge_core::paths;
 use bridge_core::shm::{SettingsChannel, ShmService};
 use bridge_shm::protocol::{BridgeMessage, DEFAULT_REGION_SIZE};
-
+/// Standalone bridge UI binary (legacy control surface): persists stream +
+/// install paths to bridge.json, pushes settings over SHM, and monitors the
+/// driver region. The cardboard-bridge service is the current product UI.
 const APP_DIR: &str = "CardboardPlusPlus";
 const CONFIG_FILE: &str = "bridge.json";
-
-/// Persistent settings. The Bridge owns all configuration; nothing about the
-/// stream lives in the driver or the app.
+/// Persisted UI state: stream geometry/encoder plus install locations. Read
+/// at startup, written on every apply; install buttons consume the paths.
 #[derive(Clone, Serialize, Deserialize)]
 struct BridgeConfig {
     width: u32,
@@ -44,8 +29,9 @@ struct BridgeConfig {
     adb_path: String,
     phone_endpoint: String,
 }
-
 impl Default for BridgeConfig {
+    /// Fresh-install defaults: 2880x1620 @ 60fps 20Mbps with every path
+    /// resolved from the checkout / SDK environment.
     fn default() -> Self {
         Self {
             width: 2880,
@@ -58,19 +44,19 @@ impl Default for BridgeConfig {
             steamvr_drivers_dir: paths::default_steamvr_drivers_dir(),
             apk_path: paths::default_apk(),
             adb_path: paths::default_adb(),
-            // No default: the user enters their phone's ADB endpoint.
             phone_endpoint: String::new(),
         }
     }
 }
-
+/// %LOCALAPPDATA%/CardboardPlusPlus/bridge.json (temp dir fallback).
 fn config_path() -> std::path::PathBuf {
     let base = std::env::var_os("LOCALAPPDATA")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
     base.join(APP_DIR).join(CONFIG_FILE)
 }
-
+/// Loads persisted config, falling back to defaults on missing/corrupt
+/// files (warns instead of failing so the UI always opens).
 fn load_config() -> BridgeConfig {
     let path = config_path();
     let mut cfg = BridgeConfig::default();
@@ -83,7 +69,8 @@ fn load_config() -> BridgeConfig {
     }
     cfg
 }
-
+/// Persists config as pretty JSON (creating the directory). Write failures
+/// only warn — losing a settings edit is never fatal.
 fn save_config(cfg: &BridgeConfig) {
     let path = config_path();
     if let Some(dir) = path.parent() {
@@ -100,15 +87,16 @@ fn save_config(cfg: &BridgeConfig) {
         }
     }
 }
-
-/// Shared between the worker loop and the UI callbacks.
+/// Cross-thread UI state: the SHM settings channel (lazy-opened), the live
+/// config, and the last pushed fingerprint for change detection.
 struct Shared {
     channel: Mutex<Option<SettingsChannel>>,
     cfg: Mutex<BridgeConfig>,
-    // last pushed fingerprint so we don't spam the driver with no-ops.
     last_pushed: Mutex<Option<(u32, u32, u32, u32, u32, u32)>>,
 }
-
+/// Pushes current settings into the command ring when they changed since the
+/// last push (fingerprint compare). Opens the channel lazily; warns and
+/// skips when the driver is not polling yet.
 fn push_settings(shared: &Shared) {
     let cfg = shared.cfg.lock().unwrap().clone();
     let fingerprint = (
@@ -146,24 +134,20 @@ fn push_settings(shared: &Shared) {
         );
     }
 }
-
+/// Entry: loads config, builds the window, wires the six callbacks (apply,
+/// stream toggle, build/install driver, install APK, start SteamVR), spawns
+/// the SHM monitor thread, and runs the event loop.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
     let cfg = load_config();
     info!("loaded config: {}x{} @{}fps, {}kbps", cfg.width, cfg.height, cfg.fps, cfg.bitrate_kbps);
-
     let ui = MainWindow::new()?;
-
     let shared = Arc::new(Shared {
         channel: Mutex::new(None),
         cfg: Mutex::new(cfg.clone()),
         last_pushed: Mutex::new(None),
     });
-
     apply_config_to_ui(&ui, &cfg);
-
-    // ---- UI callbacks ----
     {
         let shared = shared.clone();
         let ui_weak = ui.as_weak();
@@ -172,7 +156,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut cfg = shared.cfg.lock().unwrap().clone();
             cfg.width = ui.get_stream_width_s().to_string().parse::<u32>().unwrap_or(2880).max(320).min(7680);
             cfg.height = ui.get_stream_height_s().to_string().parse::<u32>().unwrap_or(1620).max(180).min(4320);
-            // Align down to 16 (H.264 macroblock requirement).
             cfg.width -= cfg.width % 16;
             cfg.height -= cfg.height % 16;
             cfg.fps = ui.get_stream_fps().clamp(30, 120) as u32;
@@ -197,7 +180,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
         });
     }
-
     {
         let shared = shared.clone();
         let ui_weak = ui.as_weak();
@@ -218,7 +200,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
         });
     }
-
     {
         let shared = shared.clone();
         let ui_weak = ui.as_weak();
@@ -229,7 +210,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 |cfg| build_driver(cfg), "Building SteamVR driver (MSVC Release|x64)...");
         });
     }
-
     {
         let shared = shared.clone();
         let ui_weak = ui.as_weak();
@@ -240,7 +220,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 |cfg| install_driver(cfg), "Installing / updating SteamVR driver...");
         });
     }
-
     {
         let shared = shared.clone();
         let ui_weak = ui.as_weak();
@@ -251,7 +230,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 |cfg| install_apk(cfg), "Installing APK on phone over ADB...");
         });
     }
-
     {
         let shared = shared.clone();
         let ui_weak = ui.as_weak();
@@ -260,18 +238,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             spawn_start_steamvr(ui_weak.clone(), drivers_dir);
         });
     }
-
-    // ---- Worker: drain the status ring, compute FPS/telemetry, drive UI ----
     {
         let ui_handle = ui.as_weak();
         let shared = shared.clone();
         std::thread::spawn(move || worker_loop(ui_handle, shared));
     }
-
     ui.run()?;
     Ok(())
 }
-
+/// Copies persisted config into the window fields at startup.
 fn apply_config_to_ui(ui: &MainWindow, cfg: &BridgeConfig) {
     ui.set_stream_width_s(cfg.width.to_string().into());
     ui.set_stream_height_s(cfg.height.to_string().into());
@@ -285,26 +260,23 @@ fn apply_config_to_ui(ui: &MainWindow, cfg: &BridgeConfig) {
     ui.set_adb_path(cfg.adb_path.clone().into());
     ui.set_phone_endpoint(cfg.phone_endpoint.clone().into());
 }
-
+/// SHM monitor thread (50ms): attaches to the driver region when SteamVR
+/// creates it, drains messages into FPS/telemetry/client readouts, re-pushes
+/// settings after a driver restart (write_seq went backwards), and reports
+/// Connected/Error/Idle from write freshness. Runs until process exit.
 fn worker_loop(ui_handle: slint::Weak<MainWindow>, shared: Arc<Shared>) {
     info!("bridge-ui worker: waiting for driver shared-memory region...");
-
     let mut service: Option<ShmService> = None;
     let mut ever_connected = false;
     let mut last_write_at = Instant::now();
-
     let mut msg_history: VecDeque<String> = VecDeque::with_capacity(14);
     let mut frames_bucket = 0u64;
     let mut bucket_start = Instant::now();
-
     let mut last_telemetry: Option<String> = None;
     let mut cap_seen_at = Instant::now() - Duration::from_secs(30);
     let mut prev_write_seq = 0u64;
-
     loop {
         let now = Instant::now();
-
-        // (Re)attach to the driver's region.
         if service.is_none() {
             match ShmService::open(DEFAULT_REGION_SIZE) {
                 Ok(svc) => {
@@ -313,12 +285,9 @@ fn worker_loop(ui_handle: slint::Weak<MainWindow>, shared: Arc<Shared>) {
                     ever_connected = true;
                     last_write_at = now;
                     prev_write_seq = 0;
-                    // Welcome push so the driver inherits persisted settings on
-                    // first contact (the fingerprint guards against re-pushes).
                     push_settings(&shared);
                 }
                 Err(_) => {
-                    // Driver not up yet; keep the UI honest.
                     update_status(&ui_handle,
                         "Idle",
                         &format!("{:.1} fps", 0.0),
@@ -331,7 +300,6 @@ fn worker_loop(ui_handle: slint::Weak<MainWindow>, shared: Arc<Shared>) {
                 }
             }
         }
-
         if let Some(svc) = service.as_mut() {
             let msgs = svc.drain();
             for m in &msgs {
@@ -339,9 +307,6 @@ fn worker_loop(ui_handle: slint::Weak<MainWindow>, shared: Arc<Shared>) {
                 match m {
                     BridgeMessage::FrameSubmitted(_) => frames_bucket += 1,
                     BridgeMessage::Telemetry(t) => {
-                        // The driver heartbeats ~1/s with a frames=0 telemetry to
-                        // keep the region alive while SteamVR is idle. Don't let
-                        // that clobber the real encoder readout below.
                         if !(t.frames == 0 && t.avg_encode_us == 0) {
                             let enc_fps = if t.avg_interval_us > 0 {
                                 1_000_000.0 / t.avg_interval_us as f64
@@ -367,9 +332,6 @@ fn worker_loop(ui_handle: slint::Weak<MainWindow>, shared: Arc<Shared>) {
                 }
             }
             if svc.last_write_seq != prev_write_seq {
-                // write_seq went backwards: the driver restarted (SteamVR
-                // cycle). It re-initialized with hardcoded defaults, so force a
-                // settings re-push and re-anchor liveness.
                 if svc.last_write_seq < prev_write_seq {
                     *shared.last_pushed.lock().unwrap() = None;
                     push_settings(&shared);
@@ -378,8 +340,6 @@ fn worker_loop(ui_handle: slint::Weak<MainWindow>, shared: Arc<Shared>) {
                 prev_write_seq = svc.last_write_seq;
                 last_write_at = now;
             }
-
-            // Liveness: the driver heartbeats ~1/s while SteamVR runs.
             let fresh = now.duration_since(last_write_at) < Duration::from_secs(8);
             let status = if fresh {
                 "Connected"
@@ -388,14 +348,11 @@ fn worker_loop(ui_handle: slint::Weak<MainWindow>, shared: Arc<Shared>) {
             } else {
                 "Idle"
             };
-
-            // Periodic UI refresh (1 Hz).
             if now.duration_since(bucket_start) >= Duration::from_secs(1) {
                 let fps = frames_bucket as f64
                     / now.duration_since(bucket_start).as_secs_f64().max(1e-3);
                 frames_bucket = 0;
                 bucket_start = now;
-
                 let cfg = shared.cfg.lock().unwrap().clone();
                 let stream_state = if cfg.stream_enabled {
                     if fps > 0.0 { "Streaming" } else { "Enabled (no frames)" }
@@ -407,7 +364,6 @@ fn worker_loop(ui_handle: slint::Weak<MainWindow>, shared: Arc<Shared>) {
                 } else {
                     "No client"
                 };
-
                 let diag = format!(
                     "write_seq: {}\nqueued: {}\nframe messages/s: {:.0}\ndropped total: {}\nlast messages: {}",
                     svc.last_write_seq,
@@ -416,24 +372,23 @@ fn worker_loop(ui_handle: slint::Weak<MainWindow>, shared: Arc<Shared>) {
                     svc.dropped_total,
                     msg_history.iter().rev().take(9).cloned().collect::<Vec<_>>().join(", "),
                 );
-
                 update_status(&ui_handle, status, &format!("{fps:.1} fps"), stream_state,
                     client_state, &diag, last_telemetry.as_deref().unwrap_or(""));
                 push_settings(&shared);
             }
         }
-
         std::thread::sleep(Duration::from_millis(50));
     }
 }
-
+/// Appends a message tag to the rolling 14-entry diagnostics history.
 fn push_tag(history: &mut VecDeque<String>, tag: String) {
     history.push_back(tag);
     while history.len() > 14 {
         history.pop_front();
     }
 }
-
+/// Marshals one status update onto the Slint event loop (worker threads must
+/// never touch UI properties directly). Empty telemetry keeps the last line.
 fn update_status(
     ui_handle: &slint::Weak<MainWindow>,
     connection: &str,
@@ -463,7 +418,9 @@ fn update_status(
         }
     });
 }
-
+/// Runs a build/install closure on a worker thread with status updates:
+/// posts `running_msg` first, then "OK" or "FAILED" with the result. Shared
+/// by the build-driver, install-driver, and install-APK buttons.
 fn spawn_install<F>(
     what: &str,
     shared: Arc<Shared>,
@@ -481,7 +438,6 @@ fn spawn_install<F>(
             u.set_general_status(running_msg.into());
         }
     });
-
     std::thread::spawn(move || {
         let cfg = shared.cfg.lock().unwrap().clone();
         let result = f(cfg);
@@ -496,7 +452,8 @@ fn spawn_install<F>(
         });
     });
 }
-
+/// Runs an external tool and captures trimmed stdout+stderr. Err carries the
+/// exit code plus both streams for the status line. Used by MSBuild and adb.
 fn run_capture(prog: &str, args: &[&str]) -> Result<String, String> {
     info!("run: {} {}", prog, args.join(" "));
     let out = std::process::Command::new(prog)
@@ -516,11 +473,13 @@ fn run_capture(prog: &str, args: &[&str]) -> Result<String, String> {
     }
     Ok(format!("{}\n{}", stdout.trim(), stderr.trim()).trim().to_string())
 }
-
+/// bin/win64 under the configured drivers dir: where the driver DLL lands.
 fn dll_install_dir(cfg: &BridgeConfig) -> String {
     format!("{}\\bin\\win64", cfg.steamvr_drivers_dir.trim_end_matches('\\'))
 }
-
+/// Builds the driver solution (Release x64) via the vswhere-located MSBuild.
+/// The .sln is derived from the configured DLL path; errors when the
+/// solution, MSBuild, or the resulting DLL is missing.
 fn build_driver(cfg: BridgeConfig) -> Result<String, String> {
     let sln = {
         let dll = Path::new(&cfg.driver_dll_src);
@@ -550,14 +509,15 @@ fn build_driver(cfg: BridgeConfig) -> Result<String, String> {
     }
     Ok(format!("built {}", cfg.driver_dll_src))
 }
-
+/// Installs the driver into the configured slot: resolves the DLL (local
+/// path, checkout build, or release download), backs up the existing DLL,
+/// swaps in via tmp+rename, then installs FFmpeg runtime, resources, and
+/// forces vrsettings on. Returns the summary line for the status bar.
 fn install_driver(cfg: BridgeConfig) -> Result<String, String> {
     use bridge_core::driver_install::{
         DriverDllSource, download_to, driver_dll_source, force_driver_enabled,
         install_ffmpeg_standalone, install_resources,
     };
-    // Configured DLL wins when present; otherwise the shared standalone
-    // resolver (local checkout build, then version-matched GitHub release).
     let mut downloaded: Option<std::path::PathBuf> = None;
     let src = if Path::new(&cfg.driver_dll_src).exists() {
         std::path::PathBuf::from(&cfg.driver_dll_src)
@@ -576,8 +536,6 @@ fn install_driver(cfg: BridgeConfig) -> Result<String, String> {
     let target = dll_install_dir(&cfg);
     std::fs::create_dir_all(&target).map_err(|e| format!("mkdir {}: {e}", target))?;
     let target_dll = format!("{}\\driver_cardboardplusplus.dll", target);
-
-    // Backup existing DLL first (kept: rename below replaces atomically).
     if Path::new(&target_dll).exists() {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -587,37 +545,22 @@ fn install_driver(cfg: BridgeConfig) -> Result<String, String> {
         std::fs::copy(&target_dll, &backup).map_err(|e| format!("backup {}: {e}", backup))?;
         info!("backed up existing driver to {}", backup);
     }
-
-    // Atomic install: copy to a temp file in the same directory, then rename
-    // over the target. A failed copy never leaves a missing/half-written DLL.
     let tmp_dll = format!("{}.tmp-{}", target_dll, std::process::id());
     if let Err(e) = std::fs::copy(&src, &tmp_dll) {
         let _ = std::fs::remove_file(&tmp_dll);
         return Err(format!("copy to {}: {e}", tmp_dll));
     }
-    // Retry while SteamVR holds the loaded DLL open; the error names the
-    // lock so "access denied" becomes actionable.
     let installed =
         bridge_core::driver_deps::replace_locked(Path::new(&tmp_dll), Path::new(&target_dll));
     if let Some(tmp) = downloaded {
         let _ = std::fs::remove_file(tmp);
     }
     installed?;
-
-    // Runtime deps: the pinned FFmpeg set — vendored, or fetched from the
-    // pinned zip when there is no checkout (fails with the expected names
-    // when the pin itself is stale, never a silent dead driver).
     let ffmpeg_dlls = install_ffmpeg_standalone(Path::new(&target), false)?;
     info!("installed FFmpeg runtimes: {}", ffmpeg_dlls.join(", "));
-
-    // Ship the exe-baked manifest + bindings for a from-scratch install.
     install_resources(Path::new(&cfg.steamvr_drivers_dir))?;
-
-    // Force the driver on in steamvr.vrsettings (repairs a user-disabled or
-    // safe-mode-blocked state from an earlier crash).
     let root = paths::steamvr_root_from_drivers_dir(&cfg.steamvr_drivers_dir);
     let forced = force_driver_enabled(&root)?;
-
     Ok(format!(
         "installed driver into {} (+ {} FFmpeg {} DLLs{})",
         target,
@@ -626,7 +569,8 @@ fn install_driver(cfg: BridgeConfig) -> Result<String, String> {
         if forced { "; vrsettings forced on" } else { "" },
     ))
 }
-
+/// Installs the APK over ADB: validates adb/apk/endpoint, connects, then
+/// `adb -s <endpoint> install -r`. Returns the confirmation line.
 fn install_apk(cfg: BridgeConfig) -> Result<String, String> {
     if !Path::new(&cfg.adb_path).exists() {
         return Err(format!("adb not found at {}", cfg.adb_path));
@@ -641,10 +585,10 @@ fn install_apk(cfg: BridgeConfig) -> Result<String, String> {
     run_capture(&cfg.adb_path, &["-s", &cfg.phone_endpoint, "install", "-r", &cfg.apk_path])?;
     Ok(format!("APK installed on {}", cfg.phone_endpoint))
 }
-
+/// Spawns vrserver.exe directly (legacy path: no Steam client involvement)
+/// on a worker thread and posts the outcome to the status line.
 fn spawn_start_steamvr(ui: slint::Weak<MainWindow>, drivers_dir: String) {
     std::thread::spawn(move || {
-        // Derive the SteamVR root from the configured drivers dir.
         let root = paths::steamvr_root_from_drivers_dir(&drivers_dir);
         let vrserver = format!("{root}\\bin\\win64\\vrserver.exe");
         let msg = if Path::new(&vrserver).exists() {

@@ -1,8 +1,6 @@
-# ffmpeg-deps.ps1 — Shared reader for driver_cardboardplusplus/lib/ffmpeg/deps.json
-# (the single source of truth for the driver's FFmpeg runtime DLL versions).
-# Dot-source from compile-driver.ps1 / install-driver.ps1:
-#   . "$PSScriptRoot\ffmpeg-deps.ps1"
-
+# Shared reader for driver_cardboardplusplus/lib/ffmpeg/deps.json, the single
+# source of truth for the driver's FFmpeg runtime versions. Dot-source from
+# compile-driver.ps1 / install-driver.ps1: . "$PSScriptRoot\ffmpeg-deps.ps1"
 function Get-FfmpegDepsManifest([string]$FfmpegDir) {
     $manifest = Join-Path $FfmpegDir "deps.json"
     if (-not (Test-Path -LiteralPath $manifest)) {
@@ -14,24 +12,21 @@ function Get-FfmpegDepsManifest([string]$FfmpegDir) {
     }
     return $json
 }
-
-# Pinned runtime DLL file names, e.g. avcodec-62.dll
+# Pinned runtime DLL names from the manifest (e.g. avcodec-62.dll).
 function Get-FfmpegDepDlls([string]$FfmpegDir) {
     return @( (Get-FfmpegDepsManifest $FfmpegDir).dlls )
 }
-
-# Fail fast when the vendored tree doesn't match the pinned version:
-# each pinned DLL needs its link-time .lib + major-tied .def under lib/
-# and its runtime DLL under bin/. Runs after Ensure-FfmpegDeps (compile,
-# install) so a version skew is never a silent dead driver.
+# Fails fast when the vendored tree mismatches the pin: every pinned DLL
+# needs its link-time .lib + major-tied .def under lib/ and its runtime DLL
+# under bin/. Runs after Ensure (compile/install) so skew is never silent.
 function Assert-FfmpegDeps([string]$FfmpegDir) {
     $manifest = Get-FfmpegDepsManifest $FfmpegDir
     $libDir = Join-Path $FfmpegDir "lib"
     $binDir = Join-Path $FfmpegDir "bin"
     $bad = @()
     foreach ($dll in $manifest.dlls) {
-        $base = [System.IO.Path]::GetFileNameWithoutExtension($dll)  # avcodec-62
-        $libName = ($base -replace '-\d+$', '')                        # avcodec
+        $base = [System.IO.Path]::GetFileNameWithoutExtension($dll)
+        $libName = ($base -replace '-\d+$', '')
         if (-not (Test-Path -LiteralPath (Join-Path $libDir "$libName.lib"))) {
             $bad += "lib\$libName.lib"
         }
@@ -47,11 +42,11 @@ function Assert-FfmpegDeps([string]$FfmpegDir) {
     }
     Write-Host ("FFmpeg {0} deps OK: {1}" -f $manifest.ffmpeg_version, ($manifest.dlls -join ", "))
 }
-
-# Download the pinned shared build from GitHub and extract just the runtime
-# DLLs into bin/. No-op when all pinned DLLs are already present (bin/ is
-# git-ignored, so this runs once per fresh clone). Ends with Assert, so a
-# renamed/removed upstream asset fails loudly instead of half-installing.
+# Downloads the pinned shared build and extracts just the runtime DLLs into
+# bin/. No-op when all pinned DLLs are present (bin/ is git-ignored, so this
+# runs once per fresh clone). Ends with Assert: a renamed upstream asset
+# fails loudly instead of half-installing. curl resumes partials (-C -) with
+# retries; Invoke-WebRequest is the fallback (throws on HTTP errors).
 function Ensure-FfmpegDeps([string]$FfmpegDir) {
     $manifest = Get-FfmpegDepsManifest $FfmpegDir
     $binDir = Join-Path $FfmpegDir "bin"
@@ -68,16 +63,12 @@ function Ensure-FfmpegDeps([string]$FfmpegDir) {
     try {
         $zip = Join-Path $tmp "ffmpeg-shared.zip"
         Write-Host ("Fetching FFmpeg {0} runtime ({1}) ..." -f $manifest.ffmpeg_version, $manifest.bin_zip_url) -ForegroundColor Cyan
-        # curl resumes partial downloads (-C -) and retries drops; the GitHub
-        # CDN can be slow, and re-downloading ~90 MB from scratch each time
-        # is what made naive Invoke-WebRequest runs die here before.
         $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
         if ($curl) {
             & $curl.Source -fSL --retry 3 --retry-delay 5 -C - -o $zip $manifest.bin_zip_url
             if ($LASTEXITCODE -ne 0) { throw "curl download failed (exit $LASTEXITCODE)" }
         } else {
             $ProgressPreference = "SilentlyContinue"
-            # Throws on network/HTTP errors ($ErrorActionPreference = "Stop").
             Invoke-WebRequest -Uri $manifest.bin_zip_url -OutFile $zip -UseBasicParsing
         }
         Expand-Archive -LiteralPath $zip -DestinationPath (Join-Path $tmp "x") -Force

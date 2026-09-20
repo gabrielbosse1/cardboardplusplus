@@ -1,21 +1,11 @@
-# bake-driver-version.ps1 - Bake the git commit count into
-# driver_cardboardplusplus/include/DriverVersion.h so the running driver
-# reports which commit it was built from ("BRIDGE_ACK v1 <count>").
-#
-# Single source of truth for the bake: scripts/compile-driver.ps1 and CI
-# (.github/workflows/build-driver.yml, release.yml) all call this script,
-# so local and runner builds stamp the identical header. Never edit
-# DriverVersion.h by hand.
-#
-# An explicit count (e.g. the release workflow's version job) wins when
-# given; otherwise the count comes from `git rev-list --count HEAD`.
+# Bakes the git commit count into DriverVersion.h so the running driver
+# reports its build in "BRIDGE_ACK v1 <count>". Called by compile-driver.ps1
+# and CI, so local and runner builds stamp the identical header. An explicit
+# -Count wins (release workflow); otherwise git rev-list --count HEAD, or
+# "dev" when git is unavailable. Never edit DriverVersion.h by hand.
 param([string]$Count = "")
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
-
-# Falls back to "dev" when git is unavailable (e.g. source export).
-# NOTE: the local is $version on purpose - PowerShell variables are
-# case-insensitive, so $count would clobber the $Count parameter.
 $version = "dev"
 if ($Count) {
     $version = $Count.Trim()

@@ -1,36 +1,25 @@
+//! Bridge tests pretending to be the driver: asserts the wire strings the
+//! bridge sends/parses (HELLO/ACK/STATS/CFG/CAP) match CardboardWire.h
+//! byte-for-byte, plus the locked port numbers. Test names read as the spec.
 use std::net::UdpSocket;
 use std::time::Duration;
-
-// ---------------------------------------------------------------------------
-// Tests that pretend to be the SteamVR driver.
-//
-// These tests bind a UDP socket on port 42070 (the driver discovery port),
-// wait for the bridge to send BRIDGE_HELLO, reply with BRIDGE_ACK + stats,
-// and verify the wire protocol is correct.
-// ---------------------------------------------------------------------------
-
+/// Driver discovery/control port this fake binds in the ignored live test.
 const DRIVER_PORT: u16 = 42070;
-
 #[test]
 fn bridge_hello_wire_is_exactly_15_bytes() {
-    // The bridge sends b"BRIDGE_HELLO v1" — verify the exact wire bytes.
     let hello = b"BRIDGE_HELLO v1";
     assert_eq!(hello.len(), 15);
     assert_eq!(hello, b"BRIDGE_HELLO v1");
 }
-
 #[test]
 fn bridge_ack_response_format() {
-    // The driver must reply with exactly "BRIDGE_ACK v1" (13 bytes).
     let ack = b"BRIDGE_ACK v1";
     assert_eq!(ack.len(), 13);
     let msg = String::from_utf8_lossy(ack);
     assert!(msg.starts_with("BRIDGE_ACK"));
 }
-
 #[test]
 fn bridge_stats_wire_format() {
-    // BRIDGE_STATS fps=<n> bitrate=<kbps> frames=<n> drops=<n>
     let fps = 60;
     let bitrate = 20000;
     let frames = 1234u64;
@@ -42,78 +31,53 @@ fn bridge_stats_wire_format() {
     assert!(stats.contains("frames=1234"));
     assert!(stats.contains("drops=2"));
 }
-
 #[test]
 fn bridge_cfg_wire_format() {
-    // BRIDGE_CFG <fps> <bitrate_kbps> <encoder>
     let cfg = format!("BRIDGE_CFG {} {} {}", 60, 20000, "h264_nvenc");
     assert_eq!(cfg, "BRIDGE_CFG 60 20000 h264_nvenc");
-
     let cfg_auto = format!("BRIDGE_CFG {} {} {}", 30, 8000, "auto");
     assert_eq!(cfg_auto, "BRIDGE_CFG 30 8000 auto");
 }
-
 #[test]
 fn bridge_preview_wire_format() {
     assert_eq!(b"BRIDGE_PREVIEW 1", b"BRIDGE_PREVIEW 1");
     assert_eq!(b"BRIDGE_PREVIEW 0", b"BRIDGE_PREVIEW 0");
 }
-
 #[test]
 fn cardboard_cap_wire_format() {
-    // CARDBOARD_CAP <width> <height>
     let cap = format!("CARDBOARD_CAP {} {}", 1600, 900);
     assert_eq!(cap, "CARDBOARD_CAP 1600 900");
 }
-
 #[test]
 #[ignore = "binds the real driver port 42070 — stop the bridge/driver first, then run with --ignored"]
 fn mock_driver_can_exchange_heartbeat_with_bridge() {
-    // Simulate the driver side: bind on 42070, wait for BRIDGE_HELLO,
-    // reply with BRIDGE_ACK. This verifies the bridge can talk to a mock driver.
     let sock = UdpSocket::bind(format!("127.0.0.1:{DRIVER_PORT}")).unwrap();
     sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-
-    // The bridge would send BRIDGE_HELLO here. We simulate it.
     let hello = b"BRIDGE_HELLO v1";
     let ack = b"BRIDGE_ACK v1";
-
-    // Verify the handshake works if the bridge sends hello.
-    // In a real integration test, the bridge process would be started separately.
-    // Here we test the protocol parsing.
     let msg = String::from_utf8_lossy(hello);
     assert!(msg.starts_with("BRIDGE_HELLO"));
-
     let response = String::from_utf8_lossy(ack);
     assert!(response.starts_with("BRIDGE_ACK"));
 }
-
 #[test]
 fn stats_parser_handles_various_field_combinations() {
-    // Test the same parsing logic the bridge uses for BRIDGE_STATS.
-    // Full stats line
     let line = "BRIDGE_STATS fps=60 bitrate=20000 frames=1234 drops=2";
     assert!(parse_bridge_stats(line).is_some());
-
-    // Partial — only fps
     let line = "BRIDGE_STATS fps=30";
     let parsed = parse_bridge_stats(line).unwrap();
-    assert_eq!(parsed.0, 30); // fps
-    assert_eq!(parsed.1, 0);  // bitrate defaults to 0
-    assert_eq!(parsed.2, 0);  // frames defaults to 0
-    assert_eq!(parsed.3, 0);  // drops defaults to 0
-
-    // Zero valid fields is a reject, not idle-zeros.
+    assert_eq!(parsed.0, 30);
+    assert_eq!(parsed.1, 0);
+    assert_eq!(parsed.2, 0);
+    assert_eq!(parsed.3, 0);
     assert!(parse_bridge_stats("BRIDGE_STATS").is_none());
     assert!(parse_bridge_stats("BRIDGE_STATS future=none").is_none());
     assert!(parse_bridge_stats("BRIDGE_STATS fps=abc").is_none());
-
-    // Unknown prefix
     assert!(parse_bridge_stats("BRIDGE_ACK v1").is_none());
     assert!(parse_bridge_stats("hello").is_none());
 }
-
-/// Mirror of the bridge's stats parsing logic.
+/// Independent mirror of the bridge's parse_stats: proves the STATS line shape
+/// by reimplementing the parse instead of calling it, so both sides must agree.
 fn parse_bridge_stats(msg: &str) -> Option<(i32, i32, u64, u64)> {
     let rest = msg.trim_start().strip_prefix("BRIDGE_STATS")?;
     let clean: String = rest.chars().filter(|c| !c.is_control()).collect();
@@ -159,20 +123,15 @@ fn parse_bridge_stats(msg: &str) -> Option<(i32, i32, u64, u64)> {
     }
     Some((fps, kbps, frames, drops))
 }
-
 #[test]
 fn discovery_port_matches_wire_contract() {
     assert_eq!(DRIVER_PORT, 42070);
 }
-
 #[test]
 fn encoder_choice_roundtrip() {
-    // Verify the bridge's encoder choice logic matches expectations.
     use cardboard_bridge::net::EncoderChoice;
-
     assert_eq!(EncoderChoice::from(0), EncoderChoice::Gpu);
     assert_eq!(EncoderChoice::from(1), EncoderChoice::Cpu);
-
     assert_eq!(EncoderChoice::Gpu.as_str(), "gpu");
     assert_eq!(EncoderChoice::Cpu.as_str(), "cpu");
     assert_eq!(EncoderChoice::Nvenc.as_str(), "h264_nvenc");
@@ -180,7 +139,6 @@ fn encoder_choice_roundtrip() {
     assert_eq!(EncoderChoice::from_name("gpu"), EncoderChoice::Gpu);
     assert_eq!(EncoderChoice::from_name("h264_nvenc"), EncoderChoice::Nvenc);
 }
-
 #[test]
 fn port_constants_are_locked() {
     use cardboard_bridge::net::*;

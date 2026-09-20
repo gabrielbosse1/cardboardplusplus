@@ -1,5 +1,4 @@
 package com.google.cardboard.settings;
-
 import android.app.AlertDialog;
 import android.content.Context;
 import android.text.InputType;
@@ -13,24 +12,20 @@ import android.widget.Toast;
 import com.google.cardboard.NativeBridge;
 import com.google.cardboard.R;
 import com.google.cardboard.core.DebugLog;
-
-/**
- * Owns the settings popup menu (switch viewer / set PC IP).
- *
- * <p>Binds the inflated {@code settings_menu} items to their actions. This is deliberately detached
- * from {@code VrActivity} so adding a future menu item only touches this class plus the menu XML.
- */
+// Overflow-menu controller (viewer switch, PC IP, debug toggle): builds the
+// PopupMenu on an anchor view and routes each item. Owned by VrActivity.
 public class SettingsMenuController implements PopupMenu.OnMenuItemClickListener {
   private final View anchor;
   private final NativeBridge bridge;
   private final AppSettings appSettings;
-
+  // Captures the anchor view, native SDK handle, and prefs. Nothing shows
+  // until show() is called.
   public SettingsMenuController(View anchor, NativeBridge bridge, AppSettings appSettings) {
     this.anchor = anchor;
     this.bridge = bridge;
     this.appSettings = appSettings;
   }
-
+  // Inflates and shows the settings popup anchored to the view.
   public void show() {
     PopupMenu popup = new PopupMenu(anchor.getContext(), anchor);
     MenuInflater inflater = popup.getMenuInflater();
@@ -38,7 +33,8 @@ public class SettingsMenuController implements PopupMenu.OnMenuItemClickListener
     popup.setOnMenuItemClickListener(this);
     popup.show();
   }
-
+  // Routes the tapped item: viewer switch via native SDK, PC-IP dialog, or
+  // debug toggle. False for unknown ids (menu ignores them).
   @Override
   public boolean onMenuItemClick(MenuItem item) {
     if (item.getItemId() == R.id.switch_viewer) {
@@ -55,7 +51,8 @@ public class SettingsMenuController implements PopupMenu.OnMenuItemClickListener
     }
     return false;
   }
-
+  // Flips the persisted debug flag plus the runtime gate, then toasts the
+  // new state so the user sees it took effect.
   private void toggleDebugLogging() {
     boolean newState = !appSettings.isDebugLogging();
     appSettings.setDebugLogging(newState);
@@ -66,7 +63,8 @@ public class SettingsMenuController implements PopupMenu.OnMenuItemClickListener
         Toast.LENGTH_SHORT)
         .show();
   }
-
+  // PC-IP dialog: validates the entry (empty clears the override) and
+  // persists it; telemetry/camera pick it up without a restart.
   private void showPcIpDialog() {
     Context context = anchor.getContext();
     EditText ipInput = new EditText(context);
@@ -78,7 +76,6 @@ public class SettingsMenuController implements PopupMenu.OnMenuItemClickListener
     ipInput.setText(appSettings.getPcIp());
     ipInput.setSelectAllOnFocus(true);
     ipInput.setImeOptions(EditorInfo.IME_ACTION_DONE);
-
     new AlertDialog.Builder(context)
         .setTitle(R.string.pc_ip_dialog_title)
         .setView(ipInput)
@@ -86,8 +83,6 @@ public class SettingsMenuController implements PopupMenu.OnMenuItemClickListener
             R.string.pc_ip_ok,
             (dialog, which) -> {
               String ip = ipInput.getText().toString().trim();
-              // Empty clears back to auto-discovery; anything else must parse
-              // (never persist garbage that would black-hole discovery).
               if (!ip.isEmpty() && !isValidIp(ip)) {
                 Toast.makeText(context, R.string.pc_ip_invalid, Toast.LENGTH_LONG).show();
                 return;
@@ -97,8 +92,8 @@ public class SettingsMenuController implements PopupMenu.OnMenuItemClickListener
         .setNegativeButton(R.string.pc_ip_cancel, null)
         .show();
   }
-
-  /** True when the string resolves to an IP address (v4 preferred, v6 accepted). */
+  // Accepts anything InetAddress resolves (IPv4/IPv6/hostname). Static for
+  // the unit test; the dialog rejects failures with a toast.
   static boolean isValidIp(String ip) {
     try {
       java.net.InetAddress.getByName(ip);

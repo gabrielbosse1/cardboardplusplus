@@ -17,37 +17,28 @@
 #include <mutex>
 #include <condition_variable>
 #include <memory>
-
 #pragma comment(lib, "ws2_32.lib")
-
 using namespace vr;
-
-// A real triple-buffered swap texture set. Three distinct shared textures
-// so the app, compositor, and driver can each own a buffer simultaneously.
+// Triple-buffered eye textures shared with the SteamVR compositor; nextIndex rotates the write slot.
 struct SwapTextureSet {
     ID3D11Texture2D* pTextures[3];
     HANDLE hSharedHandles[3];
-    uint32_t nextIndex; // round-robin index handed out by GetNextSwapTextureSetIndex
+    uint32_t nextIndex;
 };
-
-// Per SubmitLayer call: both eyes + each eye's valid bounds.
-// SteamVR calls SubmitLayer once per layer; the driver must composite all of
-// them in submission order (see FLICKER_ISSUE_MAP.md §10 — H1 fix).
+// One queued compositor layer with per-eye texture handles and UV bounds; filled by SubmitLayer, drained by Present.
 struct SubmitLayerInfo {
     vr::SharedTextureHandle_t hTextureLeft;
     vr::SharedTextureHandle_t hTextureRight;
     vr::VRTextureBounds_t boundsLeft;
     vr::VRTextureBounds_t boundsRight;
 };
-
-// A frame queued for the background encoder thread.
+// Frame handed from the Present thread to the encoding thread; layers carry shared handles plus bounds.
+// Per-layer eye handles with bounds; the encoding thread opens these on its own D3D device.
 struct PendingFrame {
     ID3D11Texture2D* pLeft;
     ID3D11Texture2D* pRight;
     int64_t pts;
     bool valid;
-    // One entry per submitted layer, opened on the encoding thread's own D3D11
-    // device and composited in submission order (painter's algorithm).
     struct PendingLayer {
         HANDLE hLeft = nullptr;
         HANDLE hRight = nullptr;
@@ -56,26 +47,11 @@ struct PendingFrame {
     };
     std::vector<PendingLayer> layers;
 };
-
-/**
- * Virtual HMD device driver for SteamVR. Presents as a display to OpenVR.
- *
- * The implementation is deliberately split across one translation unit per
- * concern so each subsystem can be reviewed on its own:
- *   - HmdDriver.cpp      device lifecycle + SteamVR probe/pose/display methods
- *   - DirectMode.cpp     swap texture sets + Present/SubmitLayer compositing
- *   - EncoderSetup.cpp   encoder lifecycle + hardware-cap reconfiguration
- *   - EncodingThread.cpp the background GPU-readback + encode thread loop
- *   - UdpTransport.cpp   H264 framing + UDP fan-out to the phone + localhost preview
- *   - Discovery.cpp      phone broadcast discovery + cap negotiation
- *
- * Every subsystem touched below is owned by this class (raw pointers are the
- * pre-existing ownership model; they are released in Deactivate / Shutdown).
- */
+// Virtual HMD: serves SteamVR display/direct-mode interfaces, composites eye layers, encodes H.264, streams over UDP.
 class HmdDriver : public ITrackedDeviceServerDriver, public IVRDisplayComponent, public IVRDriverDirectModeComponent
 {
 public:
-    // ITrackedDeviceServerDriver
+// SteamVR device + display + direct-mode hooks; Activate/Deactivate bracket the session, RunFrame/GetPose publish tracking.
     EVRInitError Activate(uint32_t unObjectId);
     void Deactivate();
     void EnterStandby();
@@ -83,8 +59,6 @@ public:
     void DebugRequest(const char* pchRequest, char* pchResponseBuffer, uint32_t unResponseBufferSize);
     DriverPose_t GetPose();
     void RunFrame();
-
-    // IVRDisplayComponent
     void GetWindowBounds( int32_t *pnX, int32_t *pnY, uint32_t *pnWidth, uint32_t *pnHeight );
     bool IsDisplayOnDesktop();
     bool IsDisplayRealDisplay();
@@ -92,8 +66,6 @@ public:
     void GetEyeOutputViewport( EVREye eEye, uint32_t *pnX, uint32_t *pnY, uint32_t *pnWidth, uint32_t *pnHeight );
     void GetProjectionRaw( EVREye eEye, float *pfLeft, float *pfRight, float *pfTop, float *pfBottom );
     DistortionCoordinates_t ComputeDistortion( EVREye eEye, float fU, float fV );
-
-    // IVRDriverDirectModeComponent
     void CreateSwapTextureSet(uint32_t unPid, const SwapTextureSetDesc_t* pSwapTextureSetDesc, SwapTextureSet_t* pOutSwapTextureSet) override;
     void DestroySwapTextureSet(vr::SharedTextureHandle_t sharedTextureHandle) override;
     void DestroyAllSwapTextureSets(uint32_t unPid) override;
@@ -102,93 +74,62 @@ public:
     void Present(vr::SharedTextureHandle_t syncTexture) override;
     void PostPresent() override;
     void GetFrameTiming(DriverDirectMode_FrameTiming* pFrameTiming) override;
-
-    // Fan-out send: one framed packet to every active target (preview + phone).
+// Encoded-packet fan-out to preview + phone; GetVideoEncoder exposes the encoder, OnEncodedPacket receives each access unit.
     void SendFannedOut(const uint8_t* raw, int rawSize,
                        const uint8_t* framed, int framedSize);
-
-    // Encoder surface used by the encoder subsystem (callback into this class).
     VideoEncoder* GetVideoEncoder() { return m_pVideoEncoder; }
     void OnEncodedPacket(uint8_t* data, int size, int64_t pts, bool keyframe);
-
 private:
-    // ---- encoder lifecycle / configuration ----
+// Encoder + bridge + socket lifecycle helpers; each Initialize/Shutdown pair owns one subsystem thread or object.
     bool InitializeVideoEncoder();
     void ShutdownVideoEncoder();
     bool ApplyHardwareCap(int capW, int capH);
     void ClampEncoderToCap();
     bool ApplyBridgeCfg(int fps, int bitrateKbps, const char* codec);
     void ApplyStreamSettings(const cbpp::PayloadSettingsChange& settings);
-    // Single validated applier behind the SHM + UDP control planes (M5): every
-    // settings change funnels through here. Out-of-range fields are rejected
-    // and the old value kept; W/H are evened + 16-aligned, then clamped to cap.
     bool ApplyEncoderSettings(int w, int h, int fps, int bitrateBps, bool useGpu, const char* reason);
     static bool SanitizeEncoderDims(int& w, int& h);
-    // Wires both encoder callbacks (packet + telemetry); every encoder
-    // (re-)init site must use this so re-inits never drop telemetry (H4).
     void RegisterEncoderCallbacks(VideoEncoder* enc);
     void RunBridgeHeartbeat();
-
-    // Bridge telemetry
     bool InitializeBridge();
     void ShutdownBridge();
-
-    // ---- UDP transport (video streaming to the bridge) ----
     bool InitializeUDP();
     void ShutdownUDP();
-
-    // ---- phone discovery (broadcast + cap negotiation) ----
     bool InitializeDiscovery();
     void ShutdownDiscovery();
     void DiscoveryThreadFunc();
     void SwitchDataTarget(const char* phoneIp);
-    void SendBridgeStats(const sockaddr_in& addr); // periodic BRIDGE_STATS to the bridge
-
-    // ---- sensor data forwarding (bridge → driver via UDP 42074) ----
+    void SendBridgeStats(const sockaddr_in& addr);
     bool InitializeSensorSocket();
     void ShutdownSensorSocket();
     void SensorThreadFunc();
-
-    // ---- background encoding loop + compositor sync-texture handshake ----
+// Frame pipeline helpers; the encoding thread runs EncodingThreadFunc/EncodePendingFrame, Present uses the sync/copy helpers.
     void EncodingThreadFunc();
     void EncodePendingFrame(const PendingFrame& frame);
     bool AcquireSyncTexture(vr::SharedTextureHandle_t syncTexture);
     void ReleaseSyncTexture();
     void WaitEncoderIdle();
-
-    // ---- device identity / shared D3D11 device ----
+// Device, swap-set, and sync-texture state; maps connect compositor handles to D3D textures owned here.
     uint32_t m_driverId;
     ID3D11Device* m_pD3D11Device;
     ID3D11DeviceContext* m_pD3D11DeviceContext;
-
-    // ---- swap-texture-set bookkeeping (per process pid) ----
     std::map<uint32_t, std::vector<std::shared_ptr<SwapTextureSet>>> m_swapTextureSets;
-    // Map from SharedTextureHandle to the actual D3D11 texture.
     std::map<vr::SharedTextureHandle_t, ID3D11Texture2D*> m_textureHandleMap;
-    // Map from SharedTextureHandle to the owning swap texture set (for index rotation).
     std::map<vr::SharedTextureHandle_t, std::shared_ptr<SwapTextureSet>> m_setByHandle;
-
-    // ---- cached compositor sync texture (opened once, per Valve's recommendation) ----
     HANDLE m_cachedSyncHandle;
     ID3D11Texture2D* m_pSyncTexture;
     IDXGIKeyedMutex* m_pSyncMutex;
     bool m_syncAcquired = false;
-
-    // ---- background encoder thread handshake ----
+// Encode queue + encoder config; Present produces PendingFrame, the encoding thread consumes it under m_encoderMutex.
     std::thread m_encodingThread;
     std::atomic<bool> m_encodingRunning;
     std::mutex m_encodeMutex;
     std::condition_variable m_encodeCv;
     bool m_frameQueued;
     PendingFrame m_pendingFrame;
-    // Signaled by the encoder thread when it has finished ALL GPU/CPU work
-    // for the previous frame (including readback), so Present can safely
-    // queue new GPU work on the shared D3D11 context.
     std::mutex m_encodeDoneMutex;
     std::condition_variable m_encodeDoneCv;
     bool m_encodeDone;
-
-    // ---- encoder state (mutable so it can be clamped to the phone's cap) ----
     VideoEncoder* m_pVideoEncoder;
     bool m_encoderInitialized;
     int64_t m_encoderPts;
@@ -200,12 +141,7 @@ private:
     int m_pendingCapW = 0;
     int m_pendingCapH = 0;
     std::mutex m_encoderMutex;
-
-    // Private owned copies of eye textures so Present() can release the sync
-    // texture immediately after a fast GPU copy, instead of doing the full
-    // ComposeSBSGPU on the compositor thread.
-    // One (left,right) pair per submitted layer; shared with the encoding
-    // thread's second D3D11 device and composited in order there.
+// Private per-eye copies shared with the encoder thread; rebuilt when layer size or format changes.
     struct LayerCopy {
         ID3D11Texture2D* pLeft = nullptr;
         HANDLE hLeft = nullptr;
@@ -217,68 +153,47 @@ private:
     };
     std::vector<LayerCopy> m_layerCopies;
     bool EnsureLayerCopies(const std::vector<SubmitLayerInfo>& layers);
-    std::atomic<bool> m_sceneTearingDown{false};  // set during DestroyAllSwapTextureSets
-
-    // Present-rate pacing diagnostics.
-
-    // Stream on/off switch; the Bridge is the single owner of this.
+    std::atomic<bool> m_sceneTearingDown{false};
     std::atomic<int> m_streamEnabled{ 1 };
     long long m_lastHeartbeatNs = 0;
     int m_presentCount = 0;
     long long m_lastPresentLogNs = 0;
-
-    // Accumulated SubmitLayer calls since the last Present (composited together,
-    // in submission order, as one SBS frame). m_hasSubmit is atomic: SubmitLayer
-    // (compositor submit thread) writes it, Present (present thread) reads it.
+// Submit queue, UDP targets, discovery/sensor sockets, sensor cache, and bridge endpoint; guarded by the matching mutex/atomic.
     std::vector<SubmitLayerInfo> m_submitLayers;
     std::mutex m_submitLayersMutex;
     std::atomic<bool> m_hasSubmit{false};
-
-    // ---- UDP socket (video stream to the bridge) ----
     SOCKET m_udpSocket;
-    sockaddr_in m_serverAddr;    // phone target; set by SwitchDataTarget on discovery
-    sockaddr_in m_previewAddr;   // permanent localhost preview target (127.0.0.1:42069)
-    std::atomic<bool> m_hasPhoneTarget{false};  // m_serverAddr holds a real phone
-    std::atomic<bool> m_previewEnabled{true};   // localhost preview send (BRIDGE_PREVIEW)
+    sockaddr_in m_serverAddr;
+    sockaddr_in m_previewAddr;
+    std::atomic<bool> m_hasPhoneTarget{false};
+    std::atomic<bool> m_previewEnabled{true};
     bool m_udpInitialized;
-    uint32_t m_udpDroppedPreview; // preview-target drops (localhost:42069 full)
-    uint32_t m_udpDroppedPhone;   // phone-target drops (send buffer full)
-    std::atomic<uint64_t> m_udpFramesSent{0};   // framed packets handed to UDP (once per encoded frame)
-    // Scratch buffers reused across encoded frames so OnEncodedPacket never
-    // mallocs per frame (M9). Encoding-thread only.
+    uint32_t m_udpDroppedPreview;
+    uint32_t m_udpDroppedPhone;
+    std::atomic<uint64_t> m_udpFramesSent{0};
     std::vector<uint8_t> m_scratchFixed;
     std::vector<uint8_t> m_scratchFramed;
-
-    // ---- UDP discovery socket (phone broadcast) ----
     SOCKET m_discoverySocket;
     bool m_discoveryInitialized;
     std::atomic<bool> m_discoveryRunning;
     std::thread m_discoveryThread;
     std::mutex m_targetIpMutex;
-    std::atomic<long long> m_lastPhonePacketMs{0};  // last time a phone packet was received (GetTickCount64)
-
-    // ---- UDP sensor socket (bridge → driver, port 42074) ----
+    std::atomic<long long> m_lastPhonePacketMs{0};
     SOCKET m_sensorSocket;
     bool m_sensorInitialized;
     std::atomic<bool> m_sensorRunning;
     std::thread m_sensorThread;
-    // Latest sensor sample from the phone, written by the sensor thread, read by GetPose().
     std::mutex m_sensorMutex;
     float m_sensorGyro[3]{0, 0, 0};
     float m_sensorAccel[3]{0, 0, 0};
     float m_sensorMag[3]{0, 0, 0};
     uint64_t m_sensorTimestampMs{0};
     std::atomic<bool> m_hasSensorData{false};
-    // Fused rotation quaternion from tag 0x12 (TYPE_ROTATION_VECTOR).
-    // Already relative to the bridge's reference pose (bridge owns recenter).
-    float m_sensorQuat[4]{1, 0, 0, 0}; // [w, x, y, z] in OpenVR space
+    float m_sensorQuat[4]{1, 0, 0, 0};
     std::atomic<bool> m_hasQuaternion{false};
     std::atomic<int64_t> m_lastSensorRecvMs{0};
     std::atomic<int64_t> m_lastRotationRecvMs{0};
-    // Fake proximity sensor — always reports "wearing" so SteamVR never goes to standby.
     vr::VRInputComponentHandle_t m_proximityHandle{0};
-
-    // Shared-memory telemetry bridge (producer).
     cbpp::BridgeServer m_bridgeServer;
     std::atomic<bool> m_bridgeInitialized;
 };

@@ -1,18 +1,8 @@
-//! Shared-memory consumer service + settings channel.
-//!
-//! Wraps `bridge-shm` in a small ergonomic layer and logs telemetry about the
-//! traffic so the UI can show liveness without touching protocol internals.
-//!
-//! Two regions are involved:
-//! - the **status region** (driver → bridge): telemetry, frame submits, etc.,
-//!   consumed here via `ShmService`;
-//! - the **command region** (bridge → driver): stream settings, produced here
-//!   via `SettingsChannel`.
-
 use bridge_shm::{
     BridgeConsumer, BridgeMessage, CMD_REGION_SIZE, MemError, CmdProducer, payload,
 };
-
+/// Read side of the driver status ring with cumulative counters for the
+/// diagnostics tab. Opened once at bridge startup; drain() is polled.
 pub struct ShmService {
     consumer: BridgeConsumer,
     pub last_write_seq: u64,
@@ -20,8 +10,9 @@ pub struct ShmService {
     pub msgs_total: u64,
     dropped_seen: u64,
 }
-
 impl ShmService {
+    /// Opens the driver region of `size` bytes. Fails when SteamVR never
+    /// started the driver (no mapping yet) or the layout version mismatches.
     pub fn open(size: usize) -> Result<Self, MemError> {
         let consumer = BridgeConsumer::open(size)?;
         Ok(Self {
@@ -32,16 +23,17 @@ impl ShmService {
             dropped_seen: 0,
         })
     }
-
+    /// Messages the consumer skipped by falling behind. Feeds the dropped
+    /// counter in diagnostics.
     pub fn dropped(&self) -> u64 {
         self.consumer.dropped()
     }
-
+    /// Messages waiting unread. Polled to size each drain batch.
     pub fn pending(&self) -> u64 {
         self.consumer.pending()
     }
-
-    /// Drain everything currently available, returning each parsed message.
+    /// Pulls every queued message and refreshes the cumulative totals.
+    /// Called on each UI tick; returns the batch for the caller to apply.
     pub fn drain(&mut self) -> Vec<BridgeMessage> {
         let mut out = Vec::new();
         while let Some(msg) = self.consumer.try_consume() {
@@ -49,29 +41,28 @@ impl ShmService {
             out.push(msg);
         }
         self.last_write_seq = self.consumer.write_seq();
-        // `consumer.dropped()` is cumulative: only the delta since the last
-        // drain counts, or every drain double-counts the same drops.
         let cur = self.consumer.dropped();
         self.dropped_total += cur.saturating_sub(self.dropped_seen);
         self.dropped_seen = cur;
         out
     }
 }
-
-/// Bridge → driver settings push over the command region.
+/// Write side of the command ring: pushes Stream-tab settings to the driver.
+/// Latest-wins — the driver only honors the highest `seq` it has seen.
 pub struct SettingsChannel {
     producer: CmdProducer,
 }
-
 impl SettingsChannel {
-    /// Create or open the command region the driver polls for settings.
+    /// Creates (or attaches to) the command region. Called once at startup
+    /// alongside ShmService::open.
     pub fn open() -> Result<Self, MemError> {
         Ok(Self {
             producer: CmdProducer::open(CMD_REGION_SIZE)?,
         })
     }
-
-    /// Push the current stream settings as one latest-wins message.
+    /// Publishes one settings snapshot; `encoder` is the numeric EncoderChoice
+    /// id, `stream_enabled` gates the driver emit loop. Returns the sequence
+    /// number so callers can confirm the driver consumed it.
     pub fn push(
         &mut self,
         width: u32,
@@ -90,13 +81,12 @@ impl SettingsChannel {
             stream_enabled,
             seq: 0,
         };
-        // seq mirrors the ring turn so the driver can detect generations.
         s.seq = self.producer.write_seq() + 1;
         self.producer.publish_settings(&s)
     }
 }
-
-/// Short human-readable tag for the UI status pane / logging.
+/// Short log/DB tag for a message variant. Used when draining batches into
+/// the ring log and diagnostics counters.
 pub fn msg_tag(msg: &BridgeMessage) -> &'static str {
     match msg {
         BridgeMessage::TextureSetCreated(_) => "texture_set_created",

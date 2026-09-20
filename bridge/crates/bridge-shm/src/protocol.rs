@@ -1,121 +1,46 @@
-//! Wire protocol shared with the C++ driver.
-//!
-//! # Layout (authoritative copy: this file — `bridge/crates/bridge-shm/src/protocol.rs`,
-//! mirrored by `driver_cardboardplusplus/include/BridgeProtocol.h`;
-//! values here are the locked SHM contract, do not change them)
-//!
-//! Region layout:
-//!
-//! ```text
-//! +----------------------+  0
-//! | RegionHeader (128B)  |
-//! +----------------------+  128
-//! | Slot 0  (slot_size)  |
-//! +----------------------+  ...
-//! | Slot 1               |
-//! | ...                  |
-//! ```
-//!
-//! Every numeric field is little-endian. Producers may only bump `write_seq`
-//! after the whole slot is written (release). Consumers may only reuse a slot
-//! after they have advanced their own cursor (acquire happens on the same
-//! memory, no locking needed because a slot is either "in-flight" or "owned" by
-//! exactly one side between the seq bumps).
-//!
-//! ## Command region (settings push, Bridge → driver)
-//!
-//! Because the status region is single-producer (driver), settings are pushed
-//! over a **second named region** `Local\cardboard_pp_bridge_cmd` that reuses the
-//! exact same header + slot layout but **flips the roles**: the Rust bridge is
-//! the producer (its `CmdProducer` bumps `write_seq`) and the driver is the
-//! consumer (it polls from its own cursor, latest-wins, same rules). The bridge
-//! never reads from this region and the driver never writes to it, so the
-//! verified status path stays byte-for-byte untouched.
-//!
-//! - Message types on the command region: only `SETTINGS` (7) is used today;
-//!   the slot/msg_type rules are identical to the status ring.
-//! - Producer semantics (match the Rust `CmdProducer`): on a fresh region the
-//!   producer initializes the header (magic/version/layout, `write_seq = 0`) and
-//!   wipes the slots; on an existing region it keeps `write_seq` monotonic and
-//!   does not wipe anything.
-//!
-//! ## RegionHeader (offset 0, 128 bytes)
-//!
-//! | offset | type | name |
-//! |--------|------|------|
-//! | 0x00   | [u8;4] | magic `"CBPP"` |
-//! | 0x04   | u32  | version `1` |
-//! | 0x08   | u32  | header_size `128` |
-//! | 0x0C   | u32  | slot_size (bytes, >= 32) |
-//! | 0x10   | u32  | slot_count |
-//! | 0x14   | u32  | flags (reserved, 0) |
-//! | 0x18   | u64  | write_seq (producer publishes) |
-//! | 0x20   | u64  | read_seq (consumer consumes) |
-//! | 0x28   | u64  | dropped (consumer increments when skipped) |
-//! | 0x30..0x80 | padding, zeroed |
-//!
-//! Slot at `slot_index`: base = 128 + index * slot_size.
-//!
-//! | offset | type | name |
-//! |--------|------|------|
-//! | 0x00   | u64  | slot_seq (== index of the slot) |
-//! | 0x08   | u32  | msg_type |
-//! | 0x0C   | u32  | payload_len |
-//! | 0x10   | u8[] | payload (slot_size - 16) |
-//!
-//! A `slot_seq != write_seq % slot_count` means the slot belongs to an older
-//! turn; the next slot matching the current turn is the newest "one message per
-//! turn" — this is a **latest-wins** ring: the producer overwrites the oldest
-//! in-flight message when the consumer is slow. `msg_type == 0` means empty.
-
+// Shared-memory layout for the driver -> bridge channel (Local\cardboard_pp_bridge).
+// Source of truth for region/slot geometry and message payloads; the driver's
+// BridgeProtocol.h mirrors these structs byte-for-byte (natural C alignment).
 pub const MAGIC: [u8; 4] = *b"CBPP";
+// Bumped whenever the layout below changes; readers reject mismatched regions.
 pub const PROTOCOL_VERSION: u32 = 1;
+// Fixed-size region header; slot payloads start right after it.
 pub const HEADER_SIZE: usize = 128;
 pub const MIN_SLOT_SIZE: usize = 32;
+// OS object names for the status ring and the bridge -> driver command ring.
 pub const NAME_PREFIX: &str = "cardboard_pp_bridge";
-/// Command (Bridge → driver) region name.
 pub const CMD_NAME_PREFIX: &str = "cardboard_pp_bridge_cmd";
-/// Command region uses the same header/slot layout with roles flipped.
 pub const CMD_SLOT_SIZE: usize = 256;
 pub const CMD_SLOT_COUNT: usize = 8;
 pub const CMD_REGION_SIZE: usize = HEADER_SIZE + CMD_SLOT_SIZE * CMD_SLOT_COUNT;
-
-/// Message types. Must match `BridgeProtocol.h` in the driver.
+// Slot discriminant carried in each ring slot header (EMPTY = free slot).
 #[allow(non_snake_case)]
 pub mod MsgType {
     pub const EMPTY: u32 = 0;
-    /// `TextureSetCreated`: a swap texture set was created for a process.
     pub const TEXTURE_SET_CREATED: u32 = 1;
-    /// `FrameSubmitted`: a Present happened with per-eye textures.
     pub const FRAME_SUBMITTED: u32 = 2;
-    /// `CapReported`: phone reported its hardware decoder cap (forwarded).
     pub const CAP_REPORTED: u32 = 3;
-    /// `Pose`: HMD pose sample forwarded from the driver.
     pub const POSE: u32 = 4;
-    /// `ControllerInput`: controller axis/button sample forwarded.
     pub const CONTROLLER_INPUT: u32 = 5;
-    /// `Telemetry`: driver telemetry summary.
     pub const TELEMETRY: u32 = 6;
-    /// `Settings`: Bridge → driver settings change (command region only).
     pub const SETTINGS: u32 = 7;
 }
-
-/// Payloads. All `repr(C)`, little-endian, fixed size; extra bytes zero.
 pub mod payload {
-    /// Msg `TEXTURE_SET_CREATED`. 32 bytes.
+    /// Posted when the driver creates its shared-texture set; `shared_handle`
+    /// is the OS handle the bridge imports to observe frames.
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
     pub struct TextureSetCreated {
         pub pid: u32,
         pub width: u32,
         pub height: u32,
-        pub format: u32, // DXGI_FORMAT
+        pub format: u32,
         pub flags: u32,
         pub pad1: u32,
         pub shared_handle: u64,
     }
-
-    /// Msg `FRAME_SUBMITTED`. 40 bytes.
+    /// Posted per presented stereo frame; handles index into the texture set
+    /// from TextureSetCreated, `pts`/`frame_index` order the stream.
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
     pub struct FrameSubmitted {
@@ -126,8 +51,8 @@ pub mod payload {
         pub format: u32,
         pub pad1: u32,
     }
-
-    /// Msg `CAP_REPORTED`. 16 bytes.
+    /// Phone-reported decode capability forwarded by the driver so the bridge
+    /// can clamp the encode resolution before streaming starts.
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
     pub struct CapReported {
@@ -136,21 +61,20 @@ pub mod payload {
         pub pad1: u32,
         pub pad2: u32,
     }
-
-    /// Msg `POSE`. 84 bytes (DriverPose_t essentials).
+    /// Latest head pose: position/rotation plus linear/angular velocity for
+    /// prediction. `rot` is a [w, x, y, z] quaternion, timestamp in nanos.
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
     pub struct Pose {
         pub pos: [f32; 3],
         pub vel: [f32; 3],
         pub accel: [f32; 3],
-        pub rot: [f32; 4], // w x y z
+        pub rot: [f32; 4],
         pub ang_vel: [f32; 3],
         pub ang_accel: [f32; 3],
         pub timestamp_ns: i64,
     }
-
-    /// Msg `CONTROLLER_INPUT`. 40 bytes.
+    /// Hand/controller sample for one device: analog axes plus button bitmask.
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
     pub struct ControllerInput {
@@ -159,8 +83,8 @@ pub mod payload {
         pub buttons: u64,
         pub timestamp_ns: i64,
     }
-
-    /// Msg `TELEMETRY`. 64 bytes.
+    /// Encoder health snapshot powering the bridge diagnostics tab and the
+    /// adaptive-bitrate decision (encode latency, pacing, duplicate frames).
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
     pub struct Telemetry {
@@ -173,12 +97,8 @@ pub mod payload {
         pub summary_frames: u64,
         pub pad: [u64; 1],
     }
-
-    /// Msg `SETTINGS` (command region, Bridge → driver). 32 bytes.
-    ///
-    /// `encoder`: 0 = software (libx264), 1 = GPU (NVENC/AMF/QSV).
-    /// `stream_enabled`: 0/1 — the Bridge is the single on/off switch.
-    /// `seq`: monotonically increasing change id (for driver bookkeeping).
+    /// Bridge -> driver settings push over the command ring; `seq` lets the
+    /// driver drop stale writes (latest-wins) and `encoder` selects the codec.
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
     pub struct SettingsChange {
@@ -191,7 +111,6 @@ pub mod payload {
         pub seq: u64,
     }
 }
-
 impl payload::TextureSetCreated {
     pub const SIZE: usize = std::mem::size_of::<payload::TextureSetCreated>();
 }
@@ -214,19 +133,12 @@ impl payload::SettingsChange {
     pub const SIZE: usize = std::mem::size_of::<payload::SettingsChange>();
 }
 const _: () = assert!(std::mem::size_of::<payload::SettingsChange>() == 32);
-
-/// The maximum payload a slot can carry. We aim for slots that fit the largest
-/// fixed-size message (Telemetry = 64 bytes) plus the 16-byte slot header.
 pub const MAX_PAYLOAD: usize = 240;
-
-/// Size of a single slot (matches driver default).
 pub const DEFAULT_SLOT_SIZE: usize = 256;
-/// Number of slots in a default region.
 pub const DEFAULT_SLOT_COUNT: usize = 64;
-/// Total region size for the default config.
 pub const DEFAULT_REGION_SIZE: usize = HEADER_SIZE + DEFAULT_SLOT_SIZE * DEFAULT_SLOT_COUNT;
-
-/// A parsed message produced by the consumer.
+/// Decoded view of one ring slot; Unknown carries the raw discriminant so new
+/// message types fail visibly instead of mis-parsing.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BridgeMessage {
     TextureSetCreated(payload::TextureSetCreated),
@@ -235,11 +147,10 @@ pub enum BridgeMessage {
     Pose(payload::Pose),
     ControllerInput(payload::ControllerInput),
     Telemetry(payload::Telemetry),
-    /// An unknown or empty slot (slots with msg_type 0 are skipped before this).
     Unknown { msg_type: u32, len: u32 },
 }
-
-/// Cursor to the slot that holds message index `msg_index`.
+/// Byte offset of the slot holding `write_seq` in a ring of `slot_count`
+/// slots of `slot_size` bytes. Wraps modulo the count (latest-wins overwrite).
 pub fn slot_offset(write_seq: u64, slot_count: u32, slot_size: u32) -> usize {
     let idx = (write_seq % slot_count as u64) as usize;
     HEADER_SIZE + idx * slot_size as usize

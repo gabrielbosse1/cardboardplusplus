@@ -1,51 +1,38 @@
-//! End-to-end check against the REAL Python hand-landmark sidecar.
-//!
-//! Mock tests in `src/net/mediapipe.rs` pin the wire protocol against canned
-//! bytes; this test pins it against the actual `mediapipe_server.py`, so
-//! protocol drift (the silent "tracking shows 0 hands forever" failure) gets
-//! caught instead of shipped.
-//!
-//! Ignored by default: needs `python` + `mediapipe` + `opencv` + the model
-//! file, which CI builders don't have. Run explicitly:
-//!
-//! ```powershell
-//! cargo test -p cardboard-bridge --test hand_sidecar -- --ignored --nocapture
-//! ```
-//!
-//! The test is dependency-free on the Rust side: the "frame" is SOI-prefixed
-//! garbage that `cv2.imdecode` rejects, exercising framing + detect + config
-//! round-trips and expecting the server's zero-hands reply.
-
+//! Live sidecar tests (#[ignore] by default): spawn the real Python
+//! mediapipe_server.py + model and prove detect/config round-trips and the
+//! camera pipeline's lazy-connect. Skipped when python/model is missing;
+//! serialized by SIDECAR_LOCK since both bind TCP 42073. Run with --ignored.
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
-
+/// MediaPipe sidecar port (wire contract 42073).
 const PORT: u16 = 42073;
-
-/// Both tests spawn their own sidecar on the same fixed port, so they must
-/// not run in parallel inside one test binary (use an in-process lock rather
-/// than a new dependency).
+/// Serializes the two live tests: each spawns its own sidecar on PORT.
 static SIDECAR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// SOI marker + garbage: decodes to nothing, server must answer zero hands.
+/// Garbage JPEG (valid SOI, corrupt body): the model must answer zero hands,
+/// never an error.
 fn undecodable_jpeg() -> Vec<u8> {
     vec![0xFF, 0xD8, 0xFF, 0x00, 0x11, 0x22, 0x33, 0x44]
 }
-
+/// Locates mediapipe_server.py next to this crate. None when testing an
+/// installed layout without the script (callers SKIP).
 fn script_path() -> Option<PathBuf> {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("mediapipe_server.py");
     p.is_file().then_some(p)
 }
-
+/// True when the hand-landmarker model file is vendored. Without it the
+/// sidecar cannot start and both tests SKIP.
 fn model_present() -> bool {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("models")
         .join("hand_landmarker.task")
         .is_file()
 }
-
+/// Spawns the real sidecar (PYTHON env or PATH python) with output silenced.
+/// Returns None when the script/model/python is missing or spawn fails, in
+/// which case callers SKIP the test.
 fn spawn_server() -> Option<Child> {
     let script = script_path()?;
     if !model_present() {
@@ -59,15 +46,14 @@ fn spawn_server() -> Option<Child> {
         .spawn()
         .ok()
 }
-
-/// Poll until something answers on 42073 (TF import takes seconds).
+/// Waits up to `timeout` for the sidecar to accept TCP and ack a config
+/// probe frame. False when the child dies first or the deadline passes.
 fn wait_for_server(child: &mut Child, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if let Ok(mut s) = TcpStream::connect(format!("127.0.0.1:{PORT}")) {
             let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
             let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
-            // Health probe: the config frame must be acked with one zero byte.
             let mut buf = vec![0xFFu8, 0xFF, 0xFF, 0xFF, 0x01];
             for v in [0.5f32, 0.5, 0.5] {
                 buf.extend_from_slice(&v.to_le_bytes());
@@ -82,13 +68,12 @@ fn wait_for_server(child: &mut Child, timeout: Duration) -> bool {
             return false;
         }
         if child.try_wait().ok().flatten().is_some() {
-            return false; // server died during startup
+            return false;
         }
         std::thread::sleep(Duration::from_millis(500));
     }
     false
 }
-
 #[test]
 #[ignore]
 fn real_sidecar_detect_and_config_roundtrip() {
@@ -99,40 +84,25 @@ fn real_sidecar_detect_and_config_roundtrip() {
     };
     let alive = wait_for_server(&mut child, Duration::from_secs(60));
     assert!(alive, "sidecar never answered on 127.0.0.1:{PORT} (see server stderr)");
-
     let client = cardboard_bridge::net::mediapipe::MediapipeClient::connect(PORT)
         .expect("rust client connects to real sidecar");
-    // Undecodable frame -> zero-hands reply (not a hang, not an error).
     let hands = client.detect(&undecodable_jpeg());
     assert!(hands.is_empty(), "garbage frame must yield zero hands");
-    // Live tuning round-trip.
     assert!(
         client.set_config(0.8, 0.7, 0.6),
         "set_config must be acked by real sidecar"
     );
     let hands = client.detect(&undecodable_jpeg());
     assert!(hands.is_empty(), "detect still works after set_config");
-
     let _ = child.kill();
     let _ = child.wait();
 }
-
-/// Full camera pipeline with NO client at startup: `camera::spawn(None)`
-/// must still run its detect worker, lazy-connect to the sidecar on the
-/// first enabled frame, and update state. This is the regression test for
-/// "tracking never works after a slow sidecar startup".
-///
-/// Needs the phone's camera port (UDP 42072) free — i.e. the bridge itself
-/// must not be running.
 #[test]
 #[ignore]
 fn camera_pipeline_lazy_connects_without_startup_client() {
     use std::net::UdpSocket;
     use std::sync::{Arc, Mutex};
-
     let _guard = SIDECAR_LOCK.lock().unwrap();
-    // Valid 256x192 JPEG (blank -> zero hands, but the detect round-trip
-    // must still happen; the "lazy-connected" log line proves it did).
     let jpg_out = std::env::temp_dir().join("hand_sidecar_test.jpg");
     let gen = Command::new(std::env::var("PYTHON").unwrap_or_else(|_| "python".into()))
         .arg("-c")
@@ -143,7 +113,6 @@ fn camera_pipeline_lazy_connects_without_startup_client() {
         .status();
     assert!(gen.map(|s| s.success()).unwrap_or(false), "need cv2 to build test frame");
     let jpeg = std::fs::read(&jpg_out).expect("test frame written");
-
     let Some(mut child) = spawn_server() else {
         eprintln!("SKIP: mediapipe_server.py, model file, or python missing");
         return;
@@ -152,19 +121,13 @@ fn camera_pipeline_lazy_connects_without_startup_client() {
         wait_for_server(&mut child, Duration::from_secs(60)),
         "sidecar never answered on 127.0.0.1:{PORT}"
     );
-    // Drop our probe connection's slot: the server serves one connection at a
-    // time and the probe socket closes on drop here. (Subsequent connects
-    // from the camera worker take the slot.)
-
     let state: cardboard_bridge::app::SharedState =
         Arc::new(Mutex::new(cardboard_bridge::app::AppState::default()));
     {
         let mut s = state.lock().unwrap();
         s.hand_enabled = true;
     }
-    // NOTE: None client — the case that used to mean "no detect thread ever".
     cardboard_bridge::net::camera::spawn(state.clone(), None);
-
     let sock = UdpSocket::bind("0.0.0.0:0").expect("test udp socket");
     for seq in 0u16..5 {
         let mut dg = seq.to_be_bytes().to_vec();
@@ -172,7 +135,6 @@ fn camera_pipeline_lazy_connects_without_startup_client() {
         sock.send_to(&dg, "127.0.0.1:42072").expect("send frame");
         std::thread::sleep(Duration::from_millis(200));
     }
-
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut connected = false;
     let mut lazy = false;
@@ -192,7 +154,6 @@ fn camera_pipeline_lazy_connects_without_startup_client() {
         state.lock().unwrap().camera_detected_hands, 0,
         "blank frame must detect zero hands"
     );
-
     let _ = child.kill();
     let _ = child.wait();
 }

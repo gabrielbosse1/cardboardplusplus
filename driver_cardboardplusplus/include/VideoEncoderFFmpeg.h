@@ -1,7 +1,5 @@
+// FFmpeg/libav C API surface consumed by VideoEncoder (codec, bitstream filter, scale, D3D11VA interop).
 #pragma once
-// FFmpeg C headers shared by the VideoEncoder translation units. They MUST be
-// included inside `extern "C"` so MSVC generates correct C-linkage name
-// decoration for the FFmpeg symbols.
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavcodec/bsf.h>

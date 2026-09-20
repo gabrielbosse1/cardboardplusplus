@@ -1,7 +1,5 @@
-//! Human-readable index page served at / and /index -- the only
-//! documentation of the control-plane API. The harness fingerprints its exact
-//! bytes, so keep this text byte-for-byte stable.
-
+/// Plain-text endpoint guide served at GET /. Documents every REST route with
+/// shapes and a curl example; the single place external callers look first.
 pub const ENDPOINT_INDEX: &str = "\
 Cardboard++ Bridge — REST control plane
 ========================================

@@ -1,5 +1,8 @@
 import { ScrollView, Slider } from "std-widgets.slint";
-
+// Product UI: the setup WizardWindow plus the hub MainWindow (top bar, side
+// bar with Stream/Hand/Diagnostics/General pages). BridgeState is the shared
+// contract with main.rs — Rust pollers write properties, callbacks invoke
+// core actions. Compiled by build.rs via slint-build.
 export global Theme {
     in-out property <color> bg: #000000;
     in-out property <color> surface: #1C1C1E;
@@ -15,49 +18,48 @@ export global Theme {
     in-out property <color> warn: #FFD60A;
     in-out property <color> err: #FF453A;
 }
-
 export global BridgeState {
+    // Navigation + install flow state (written by the wizard watcher/hub).
     in-out property <int> current-tab: 0;
     in-out property <int> wizard-step: 0;
     in-out property <bool> install-busy: false;
     in-out property <string> install-note: "";
+    in-out property <float> install-progress: 0.0;
     in-out property <bool> driver-present: false;
     in-out property <string> steamvr-note: "";
-
+    in-out property <bool> steamvr-running: false;
+    // Connection pills + encoder state for the top bar.
     in-out property <bool> driver-connected: false;
     in-out property <bool> phone-connected: false;
     in-out property <bool> encoder-active: false;
     in-out property <string> encoder-name: "gpu";
-
     in-out property <int> stream-fps: 0;
     in-out property <int> latency-ms: 0;
     in-out property <int> packets-total: 0;
     in-out property <int> gyro-fps: 0;
     in-out property <int> hand-fps: 0;
+    // Hand-tracking tab state: toggles, thresholds, detection counts.
     in-out property <int> hands-detected: 0;
     in-out property <int> landmark-count: 21;
-
     in-out property <bool> hand-enabled: false;
     in-out property <bool> hand-overlay: true;
     in-out property <int> hand-det: 50;
     in-out property <int> hand-pres: 50;
     in-out property <int> hand-track: 50;
-
+    // Stream settings form (mirrored into apply-settings args).
     in-out property <int> video-width: 2880;
     in-out property <int> video-height: 1620;
     in-out property <int> fps: 60;
     in-out property <int> bitrate: 20;
     in-out property <int> encoder-index: 0;
-
     in-out property <float> net-decoded-fps: 0.0;
     in-out property <int> net-stalls: 0;
     in-out property <bool> link-test-active: false;
     in-out property <string> link-test-note: "";
-
     in-out property <string> phone-ip: "0.0.0.0";
     in-out property <string> log-text: "";
     in-out property <string> app-version: "0.1.0";
-
+    // Preview + camera frames and stream health (fast poller).
     in-out property <int> preview-driver-fps: 0;
     in-out property <int> preview-bitrate-kbps: 0;
     in-out property <int> preview-frames: 0;
@@ -66,7 +68,6 @@ export global BridgeState {
     in-out property <image> camera-frame: @image-url("icons/hand.svg");
     in-out property <int> camera-fps: 0;
     in-out property <bool> camera-connected: false;
-
     in-out property <string> gyro-x: "0.00";
     in-out property <string> gyro-y: "0.00";
     in-out property <string> gyro-z: "0.00";
@@ -76,28 +77,32 @@ export global BridgeState {
     in-out property <string> mag-x: "0.00";
     in-out property <string> mag-y: "0.00";
     in-out property <string> mag-z: "0.00";
-
+    // Hub actions, each wired in main.rs wire-callbacks to an AppCore method:
+    // apply-settings pushes Stream form (w,h,fps,Mbps,encoder-index),
+    // wizard-done finishes setup, install-driver runs the 6-stage install,
+    // open-steamvr launches via Steam, test-link starts the 10s link test,
+    // hand/overlay toggles flip detection vs skeleton paint, apply-hand-model
+    // retunes thresholds live (det,pres,track 1-100).
     callback apply-settings(int, int, int, int, int);
     callback wizard-done();
     callback install-driver();
     callback open-steamvr();
+    callback dismiss-steamvr-running();
     callback reopen-wizard(int);
     callback test-link();
     callback hand-toggled(bool);
     callback overlay-toggled(bool);
     callback apply-hand-model(int, int, int);
 }
-
+// Accent-filled action button; clicked fires only when enabled.
 component PrimaryButton inherits Rectangle {
     in property <string> text;
     in property <bool> enabled: true;
     callback clicked;
-
     height: 38px;
     border-radius: 9px;
     background: root.enabled ? Theme.accent : Theme.surface3;
     opacity: root.enabled ? 1 : 0.6;
-
     TouchArea {
         width: 100%;
         height: 100%;
@@ -108,7 +113,6 @@ component PrimaryButton inherits Rectangle {
             }
         }
     }
-
     Text {
         width: 100%;
         height: 100%;
@@ -120,18 +124,16 @@ component PrimaryButton inherits Rectangle {
         font-weight: 600;
     }
 }
-
+// Outlined secondary button, same clicked contract as PrimaryButton.
 component SecondaryButton inherits Rectangle {
     in property <string> text;
     in property <bool> enabled: true;
     callback clicked;
-
     height: 38px;
     border-radius: 9px;
     border-width: 1px;
     border-color: Theme.border;
     background: Theme.surface2;
-
     TouchArea {
         width: 100%;
         height: 100%;
@@ -142,7 +144,6 @@ component SecondaryButton inherits Rectangle {
             }
         }
     }
-
     Text {
         width: 100%;
         height: 100%;
@@ -154,7 +155,8 @@ component SecondaryButton inherits Rectangle {
         font-weight: 500;
     }
 }
-
+// Labeled number stepper bound two-way to value within min..max; used by
+// the Stream form (resolution/fps/bitrate rows).
 component Stepper inherits HorizontalLayout {
     in property <string> label;
     in-out property <int> value;
@@ -163,11 +165,9 @@ component Stepper inherits HorizontalLayout {
     in property <int> step: 1;
     in property <string> unit: "";
     callback changed(int);
-
     spacing: 10px;
     height: 36px;
     cross-axis-alignment: center;
-
     Text {
         text: root.label;
         color: Theme.text-mid;
@@ -176,7 +176,6 @@ component Stepper inherits HorizontalLayout {
         horizontal-stretch: 1;
         wrap: word-wrap;
     }
-
     Rectangle {
         width: 120px;
         height: 34px;
@@ -184,7 +183,6 @@ component Stepper inherits HorizontalLayout {
         border-width: 1px;
         border-color: Theme.border;
         background: Theme.surface;
-
         Text {
             width: 100%;
             height: 100%;
@@ -196,7 +194,6 @@ component Stepper inherits HorizontalLayout {
             font-weight: 600;
         }
     }
-
     Rectangle {
         width: 34px;
         height: 34px;
@@ -204,7 +201,6 @@ component Stepper inherits HorizontalLayout {
         border-width: 1px;
         border-color: Theme.border;
         background: Theme.surface2;
-
         TouchArea {
             width: 100%;
             height: 100%;
@@ -216,7 +212,6 @@ component Stepper inherits HorizontalLayout {
                 }
             }
         }
-
         Text {
             width: 100%;
             height: 100%;
@@ -227,7 +222,6 @@ component Stepper inherits HorizontalLayout {
             font-size: 15px;
         }
     }
-
     Rectangle {
         width: 34px;
         height: 34px;
@@ -235,7 +229,6 @@ component Stepper inherits HorizontalLayout {
         border-width: 1px;
         border-color: Theme.border;
         background: Theme.surface2;
-
         TouchArea {
             width: 100%;
             height: 100%;
@@ -247,7 +240,6 @@ component Stepper inherits HorizontalLayout {
                 }
             }
         }
-
         Text {
             width: 100%;
             height: 100%;
@@ -259,19 +251,16 @@ component Stepper inherits HorizontalLayout {
         }
     }
 }
-
+// Labeled on/off switch; changed(bool) drives the hand/overlay toggles.
 component Toggle inherits Rectangle {
     in property <string> label;
     in-out property <bool> checked;
     callback changed(bool);
-
     height: 30px;
     border-radius: 15px;
-
     HorizontalLayout {
         spacing: 12px;
         cross-axis-alignment: center;
-
         Text {
             text: root.label;
             color: Theme.text-mid;
@@ -279,7 +268,6 @@ component Toggle inherits Rectangle {
             vertical-alignment: center;
             horizontal-stretch: 1;
         }
-
         Rectangle {
             width: 46px;
             height: 26px;
@@ -287,7 +275,6 @@ component Toggle inherits Rectangle {
             border-width: 1px;
             border-color: Theme.border;
             background: root.checked ? Theme.accent : Theme.surface2;
-
             Rectangle {
                 width: 19px;
                 height: 19px;
@@ -295,12 +282,10 @@ component Toggle inherits Rectangle {
                 x: root.checked ? 24px : 2px;
                 border-radius: 9.5px;
                 background: #FFFFFF;
-
                 animate x {
                     duration: 150ms;
                 }
             }
-
             TouchArea {
                 width: 100%;
                 height: 100%;
@@ -313,18 +298,16 @@ component Toggle inherits Rectangle {
         }
     }
 }
-
+// Selectable chip (encoder picker); active highlights, clicked selects.
 component Pill inherits Rectangle {
     in property <string> text;
     in property <bool> active;
     callback clicked;
-
     height: 34px;
     border-radius: 9px;
     border-width: 1px;
     border-color: root.active ? Theme.accent : Theme.border;
     background: root.active ? Theme.accent-dim : Theme.surface2;
-
     TouchArea {
         width: 100%;
         height: 100%;
@@ -333,7 +316,6 @@ component Pill inherits Rectangle {
             root.clicked();
         }
     }
-
     Text {
         x: 14px;
         y: 0;
@@ -347,31 +329,28 @@ component Pill inherits Rectangle {
         font-weight: root.active ? 600 : 400;
     }
 }
-
+// Non-interactive status pill: label plus detail, green when ok. Used for
+// the connection indicators in the top bar.
 component StatusPill inherits Rectangle {
     in property <string> label;
     in property <string> detail: "";
     in property <bool> ok;
-
     height: 26px;
     border-radius: 13px;
     border-width: 1px;
     border-color: Theme.border;
     background: Theme.surface2;
-
     HorizontalLayout {
         padding-left: 10px;
         padding-right: 10px;
         spacing: 6px;
         cross-axis-alignment: center;
-
         Rectangle {
             width: 8px;
             height: 8px;
             border-radius: 4px;
             background: root.ok ? Theme.ok : Theme.text-dim;
         }
-
         Text {
             text: root.detail == "" ? root.label : root.label + " · " + root.detail;
             color: root.ok ? Theme.text-hi : Theme.text-dim;
@@ -380,54 +359,65 @@ component StatusPill inherits Rectangle {
         }
     }
 }
-
+// Thin progress fill for driver installs, driven by install-progress.
+component ProgressBar inherits Rectangle {
+    in property <float> progress: 0.0;
+    height: 6px;
+    border-radius: 3px;
+    background: Theme.surface3;
+    clip: true;
+    Rectangle {
+        x: 0;
+        y: 0;
+        height: 100%;
+        width: parent.width * Math.min(Math.max(root.progress, 0.0), 1.0);
+        border-radius: 3px;
+        background: Theme.accent;
+        animate width {
+            duration: 200ms;
+        }
+    }
+}
+// Titled settings card grouping one concern (stream, camera, install).
 component Card inherits Rectangle {
     in property <string> title;
     in property <string> hint: "";
-
     background: Theme.surface;
     border-width: 1px;
     border-color: Theme.border;
     border-radius: 14px;
-
     VerticalLayout {
         padding: 16px;
         spacing: 12px;
-
         Text {
             text: root.title;
             color: Theme.text-hi;
             font-size: 13px;
             font-weight: 600;
         }
-
         if root.hint != "" : Text {
             text: root.hint;
             color: Theme.text-dim;
             font-size: 11px;
             wrap: word-wrap;
         }
-
         @children
     }
 }
-
+// Large label/value tile for headline stats (fps, bitrate, hands).
 component Metric inherits Rectangle {
     in property <string> label;
     in property <string> value: "";
     in property <color> value-color: Theme.text-hi;
-
     height: 78px;
     border-radius: 12px;
     border-width: 1px;
     border-color: Theme.border;
     background: Theme.surface2;
-
     VerticalLayout {
         padding: 10px;
         spacing: 4px;
         alignment: center;
-
         Text {
             text: root.value;
             color: root.value-color;
@@ -435,7 +425,6 @@ component Metric inherits Rectangle {
             font-weight: 700;
             horizontal-alignment: center;
         }
-
         Text {
             text: root.label;
             color: Theme.text-dim;
@@ -444,23 +433,20 @@ component Metric inherits Rectangle {
         }
     }
 }
-
+// Compact label/value tile for dense grids (gyro axes, net stats).
 component MiniMetric inherits Rectangle {
     in property <string> label;
     in property <string> value: "";
     in property <color> value-color: Theme.text-hi;
-
     height: 52px;
     border-radius: 10px;
     border-width: 1px;
     border-color: Theme.border;
     background: Theme.surface2;
-
     VerticalLayout {
         padding: 6px;
         spacing: 0px;
         alignment: center;
-
         Text {
             text: root.value;
             color: root.value-color;
@@ -468,7 +454,6 @@ component MiniMetric inherits Rectangle {
             font-weight: 700;
             horizontal-alignment: center;
         }
-
         Text {
             text: root.label;
             color: Theme.text-dim;
@@ -477,17 +462,15 @@ component MiniMetric inherits Rectangle {
         }
     }
 }
-
+// Sidebar tab with icon; active highlights, clicked sets current-tab.
 component TabButton inherits Rectangle {
     in property <string> label;
     in property <image> icon;
     in property <bool> active;
     callback clicked;
-
     height: 44px;
     border-radius: 10px;
     background: root.active ? Theme.surface3 : transparent;
-
     Rectangle {
         x: 0;
         width: 3px;
@@ -496,13 +479,11 @@ component TabButton inherits Rectangle {
         border-radius: 2px;
         background: root.active ? Theme.accent : transparent;
     }
-
     HorizontalLayout {
         padding: 4px;
         padding-left: 16px;
         spacing: 12px;
         height: 100%;
-
         Image {
             width: 21px;
             height: 21px;
@@ -510,7 +491,6 @@ component TabButton inherits Rectangle {
             colorize: root.active ? Theme.text-hi : Theme.text-dim;
             vertical-alignment: center;
         }
-
         Text {
             text: root.label;
             color: root.active ? Theme.text-hi : Theme.text-dim;
@@ -519,7 +499,6 @@ component TabButton inherits Rectangle {
             vertical-alignment: center;
         }
     }
-
     TouchArea {
         width: 100%;
         height: 100%;
@@ -529,69 +508,58 @@ component TabButton inherits Rectangle {
         }
     }
 }
-
+// Hub header: title, version, and the driver/phone/encoder StatusPills.
 component TopBar inherits Rectangle {
     height: 62px;
     background: Theme.surface;
-
     Rectangle {
         width: 100%;
         height: 1px;
         y: parent.height - 1px;
         background: Theme.border;
     }
-
     HorizontalLayout {
         padding-left: 18px;
         padding-right: 18px;
         spacing: 13px;
         cross-axis-alignment: center;
-
         Image {
             source: @image-url("icons/logo.png");
             width: 32px;
             height: 32px;
         }
-
         VerticalLayout {
             spacing: 1px;
-
             Text {
                 text: "Cardboard++ Bridge";
                 color: Theme.text-hi;
                 font-size: 15px;
                 font-weight: 700;
             }
-
             Text {
                 text: "Control plane for the streaming driver";
                 color: Theme.text-dim;
                 font-size: 11px;
             }
         }
-
         Rectangle {
             horizontal-stretch: 1;
         }
-
         StatusPill {
             label: "Stream";
             detail: BridgeState.stream-fps + " fps";
             ok: BridgeState.driver-connected;
         }
-
         StatusPill {
             label: "Phone";
             detail: BridgeState.gyro-fps + "/s";
             ok: BridgeState.phone-connected;
         }
-
         StatusPill {
             label: "Hands";
             detail: BridgeState.hand-fps + " fps";
             ok: BridgeState.hand-enabled;
         }
-
         StatusPill {
             label: "Camera";
             detail: BridgeState.camera-fps + " fps";
@@ -599,28 +567,24 @@ component TopBar inherits Rectangle {
         }
     }
 }
-
+// Left tab rail switching current-tab between Stream/Hand/Diagnostics/General.
 component Sidebar inherits Rectangle {
     width: 216px;
     background: Theme.surface;
-
     Rectangle {
         width: 1px;
         x: parent.width - 1px;
         height: 100%;
         background: Theme.border;
     }
-
     VerticalLayout {
         padding: 14px;
         spacing: 6px;
-
         Text {
             text: "CONTROL PLANE";
             color: Theme.text-dim;
             font-size: 10px;
         }
-
         for t in [
             { index: 0, label: "Stream", icon: @image-url("icons/stream.svg") },
             { index: 1, label: "Hand Tracking", icon: @image-url("icons/hand.svg") },
@@ -634,13 +598,11 @@ component Sidebar inherits Rectangle {
                 BridgeState.current-tab = t.index;
             }
         }
-
         Rectangle {
             height: 1px;
             horizontal-stretch: 1;
             background: Theme.border;
         }
-
         Text {
             text: "Video stays direct:\nPC → phone (UDP 42069)";
             color: Theme.text-dim;
@@ -649,33 +611,28 @@ component Sidebar inherits Rectangle {
         }
     }
 }
-
+// Hub footer: install note plus progress bar during driver installs.
 component BottomBar inherits Rectangle {
     height: 28px;
     background: #000000;
-
     Rectangle {
         width: 100%;
         height: 1px;
         background: Theme.border;
     }
-
     HorizontalLayout {
         padding-left: 14px;
         padding-right: 14px;
         spacing: 8px;
-
         Text {
             text: "Cardboard++ Bridge  ·  v" + BridgeState.app-version;
             color: Theme.text-dim;
             font-size: 11px;
             vertical-alignment: center;
         }
-
         Rectangle {
             horizontal-stretch: 1;
         }
-
         Text {
             text: "GPL-3.0 · control plane for the SteamVR driver";
             color: Theme.text-dim;
@@ -684,34 +641,29 @@ component BottomBar inherits Rectangle {
         }
     }
 }
-
+// Stream tab: resolution/fps/bitrate steppers, encoder pills, Apply (calls
+// apply-settings), link test row, and the ffmpeg preview image.
 component StreamPage inherits HorizontalLayout {
     spacing: 14px;
     padding: 20px;
-
     VerticalLayout {
         horizontal-stretch: 1;
         spacing: 14px;
-
         Text {
             text: "STATS";
             color: Theme.text-dim;
             font-size: 10px;
         }
-
         Rectangle {
             background: Theme.surface;
             border-width: 1px;
             border-color: Theme.border;
             border-radius: 14px;
-
             VerticalLayout {
                 padding: 12px;
                 spacing: 10px;
-
                 HorizontalLayout {
                     spacing: 10px;
-
                     Rectangle {
                         horizontal-stretch: 1;
                         height: 46px;
@@ -719,12 +671,10 @@ component StreamPage inherits HorizontalLayout {
                         border-width: 1px;
                         border-color: Theme.border;
                         background: Theme.surface2;
-
                         VerticalLayout {
                             padding: 6px;
                             spacing: 0px;
                             alignment: center;
-
                             Text {
                                 text: "PC · SteamVR driver";
                                 color: BridgeState.driver-connected ? Theme.text-hi : Theme.text-dim;
@@ -732,7 +682,6 @@ component StreamPage inherits HorizontalLayout {
                                 font-weight: 600;
                                 horizontal-alignment: center;
                             }
-
                             Text {
                                 text: BridgeState.driver-connected ? "encoding & streaming" : "not connected";
                                 color: BridgeState.driver-connected ? Theme.ok : Theme.err;
@@ -741,14 +690,12 @@ component StreamPage inherits HorizontalLayout {
                             }
                         }
                     }
-
                     Text {
                         text: "→";
                         color: Theme.text-mid;
                         font-size: 18px;
                         vertical-alignment: center;
                     }
-
                     Rectangle {
                         horizontal-stretch: 1;
                         height: 46px;
@@ -756,12 +703,10 @@ component StreamPage inherits HorizontalLayout {
                         border-width: 1px;
                         border-color: Theme.border;
                         background: Theme.surface2;
-
                         VerticalLayout {
                             padding: 6px;
                             spacing: 0px;
                             alignment: center;
-
                             Text {
                                 text: "Phone · MediaCodec";
                                 color: BridgeState.phone-connected ? Theme.text-hi : Theme.text-dim;
@@ -769,7 +714,6 @@ component StreamPage inherits HorizontalLayout {
                                 font-weight: 600;
                                 horizontal-alignment: center;
                             }
-
                             Text {
                                 text: BridgeState.video-width + "×" + BridgeState.video-height + " @ " + BridgeState.fps + " fps";
                                 color: Theme.text-mid;
@@ -779,38 +723,32 @@ component StreamPage inherits HorizontalLayout {
                         }
                     }
                 }
-
                 Text {
                     text: "UDP 42069 · raw H.264 Annex-B (no length prefix)";
                     color: Theme.text-dim;
                     font-size: 10px;
                     wrap: word-wrap;
                 }
-
                 GridLayout {
                     spacing: 8px;
-
                     Row {
                         MiniMetric {
                             label: "Resolution (SBS)";
                             value: BridgeState.video-width + "×" + BridgeState.video-height;
                             horizontal-stretch: 1;
                         }
-
                         MiniMetric {
                             label: "Target FPS";
                             value: BridgeState.fps + " fps";
                             horizontal-stretch: 1;
                         }
                     }
-
                     Row {
                         MiniMetric {
                             label: "Bitrate";
                             value: BridgeState.bitrate + " Mbps";
                             horizontal-stretch: 1;
                         }
-
                         MiniMetric {
                             label: "Latency";
                             value: BridgeState.latency-ms + " ms";
@@ -818,14 +756,12 @@ component StreamPage inherits HorizontalLayout {
                             horizontal-stretch: 1;
                         }
                     }
-
                     Row {
                         MiniMetric {
                             label: "Phone Decode";
                             value: Math.round(BridgeState.net-decoded-fps) + " fps";
                             horizontal-stretch: 1;
                         }
-
                         MiniMetric {
                             label: "Link Stalls";
                             value: BridgeState.net-stalls + "";
@@ -836,13 +772,11 @@ component StreamPage inherits HorizontalLayout {
                 }
             }
         }
-
         Text {
             text: "VIEWER · STEAMVR";
             color: Theme.text-dim;
             font-size: 10px;
         }
-
         Rectangle {
             vertical-stretch: 1;
             min-height: 140px;
@@ -851,7 +785,6 @@ component StreamPage inherits HorizontalLayout {
             background: #000;
             border-width: 1px;
             border-color: Theme.border;
-
             Image {
                 source: BridgeState.preview-frame;
                 width: 100%;
@@ -860,7 +793,6 @@ component StreamPage inherits HorizontalLayout {
             }
         }
     }
-
     ScrollView {
         width: 380px;
         horizontal-scrollbar-policy: always-off;
@@ -868,17 +800,14 @@ component StreamPage inherits HorizontalLayout {
         right-col := VerticalLayout {
             spacing: 14px;
             width: parent.width;
-
     Text {
         text: "OPTIONS";
         color: Theme.text-dim;
         font-size: 10px;
     }
-
     Card {
         title: "Preview";
         hint: "The driver's localhost copy (UDP 127.0.0.1:42069), decoded live inside the bridge. The phone stream is unaffected.";
-
         Text {
             text: BridgeState.preview-frames > 0 ? "Local preview: streaming" : "Local preview: waiting for the driver…";
             color: BridgeState.preview-frames > 0 ? Theme.ok : Theme.text-dim;
@@ -886,31 +815,26 @@ component StreamPage inherits HorizontalLayout {
             font-weight: 600;
             wrap: word-wrap;
         }
-
         GridLayout {
             spacing: 12px;
-
             Row {
                 Metric {
                     label: "Driver FPS";
                     value: BridgeState.preview-driver-fps + "";
                     horizontal-stretch: 1;
                 }
-
                 Metric {
                     label: "Bitrate";
                     value: BridgeState.preview-bitrate-kbps + " kbps";
                     horizontal-stretch: 1;
                 }
             }
-
             Row {
                 Metric {
                     label: "Frames sent";
                     value: BridgeState.preview-frames + "";
                     horizontal-stretch: 1;
                 }
-
                 Metric {
                     label: "Dropped";
                     value: BridgeState.preview-drops + "";
@@ -920,14 +844,11 @@ component StreamPage inherits HorizontalLayout {
             }
         }
     }
-
     Card {
         title: "Encoder";
         hint: "GPU lets the driver pick the hardware backend for your card (AMF → NVENC → QSV, libx264 fallback). CPU forces software encoding.";
-
         HorizontalLayout {
             spacing: 10px;
-
             Pill {
                 text: "GPU";
                 active: BridgeState.encoder-index == 0;
@@ -936,7 +857,6 @@ component StreamPage inherits HorizontalLayout {
                     BridgeState.encoder-index = 0;
                 }
             }
-
             Pill {
                 text: "CPU";
                 active: BridgeState.encoder-index == 1;
@@ -947,14 +867,11 @@ component StreamPage inherits HorizontalLayout {
             }
         }
     }
-
     Card {
         title: "Picture";
         hint: "Resolution is clamped by the phone's hardware decoder cap. Settings push to the driver over UDP 42070 when you apply.";
-
         VerticalLayout {
             spacing: 12px;
-
             Stepper {
                 label: "Resolution width (SBS)";
                 value: BridgeState.video-width;
@@ -965,7 +882,6 @@ component StreamPage inherits HorizontalLayout {
                     BridgeState.video-width = v;
                 }
             }
-
             Stepper {
                 label: "Resolution height";
                 value: BridgeState.video-height;
@@ -976,7 +892,6 @@ component StreamPage inherits HorizontalLayout {
                     BridgeState.video-height = v;
                 }
             }
-
             Stepper {
                 label: "Target FPS";
                 value: BridgeState.fps;
@@ -987,12 +902,10 @@ component StreamPage inherits HorizontalLayout {
                     BridgeState.fps = v;
                 }
             }
-
             HorizontalLayout {
                 spacing: 10px;
                 height: 36px;
                 cross-axis-alignment: center;
-
                 Text {
                     text: "Bitrate (Mbps)";
                     color: Theme.text-mid;
@@ -1001,7 +914,6 @@ component StreamPage inherits HorizontalLayout {
                     horizontal-stretch: 1;
                     wrap: word-wrap;
                 }
-
                 Slider {
                     minimum: 2;
                     maximum: 40;
@@ -1011,7 +923,6 @@ component StreamPage inherits HorizontalLayout {
                         BridgeState.bitrate = Math.round(v);
                     }
                 }
-
                 Text {
                     text: BridgeState.bitrate + " Mbps";
                     color: Theme.text-hi;
@@ -1024,10 +935,8 @@ component StreamPage inherits HorizontalLayout {
             }
         }
     }
-
     HorizontalLayout {
         spacing: 10px;
-
         SecondaryButton {
             text: BridgeState.link-test-active ? "Testing Link… (≈10s)" : "Test Link";
             enabled: BridgeState.driver-connected && BridgeState.phone-connected && !BridgeState.link-test-active;
@@ -1036,7 +945,6 @@ component StreamPage inherits HorizontalLayout {
                 BridgeState.test-link();
             }
         }
-
         PrimaryButton {
             text: "Apply to Driver";
             enabled: BridgeState.driver-connected;
@@ -1046,7 +954,6 @@ component StreamPage inherits HorizontalLayout {
             }
         }
     }
-
     Text {
         text: BridgeState.link-test-note;
         color: Theme.text-mid;
@@ -1054,37 +961,32 @@ component StreamPage inherits HorizontalLayout {
         wrap: word-wrap;
         visible: BridgeState.link-test-note != "";
     }
-        } // right-col
-    } // right ScrollView
+        }
+    }
 }
-
+// Hand tab: detection/overlay toggles, threshold sliders (call
+// apply-hand-model), hand count metric, and the camera frame with skeleton.
 component HandPage inherits HorizontalLayout {
     spacing: 14px;
     padding: 20px;
-
     VerticalLayout {
         horizontal-stretch: 1;
         spacing: 14px;
-
         Text {
             text: "STATS";
             color: Theme.text-dim;
             font-size: 10px;
         }
-
         Rectangle {
             background: Theme.surface;
             border-width: 1px;
             border-color: Theme.border;
             border-radius: 14px;
-
             VerticalLayout {
                 padding: 12px;
                 spacing: 10px;
-
                 HorizontalLayout {
                     spacing: 10px;
-
                     Rectangle {
                         horizontal-stretch: 1;
                         height: 46px;
@@ -1092,12 +994,10 @@ component HandPage inherits HorizontalLayout {
                         border-width: 1px;
                         border-color: Theme.border;
                         background: Theme.surface2;
-
                         VerticalLayout {
                             padding: 6px;
                             spacing: 0px;
                             alignment: center;
-
                             Text {
                                 text: "Phone · Camera";
                                 color: BridgeState.camera-connected ? Theme.text-hi : Theme.text-dim;
@@ -1105,7 +1005,6 @@ component HandPage inherits HorizontalLayout {
                                 font-weight: 600;
                                 horizontal-alignment: center;
                             }
-
                             Text {
                                 text: BridgeState.camera-connected ? "sending JPEG frames" : "not connected";
                                 color: BridgeState.camera-connected ? Theme.ok : Theme.err;
@@ -1114,14 +1013,12 @@ component HandPage inherits HorizontalLayout {
                             }
                         }
                     }
-
                     Text {
                         text: "→";
                         color: Theme.text-mid;
                         font-size: 18px;
                         vertical-alignment: center;
                     }
-
                     Rectangle {
                         horizontal-stretch: 1;
                         height: 46px;
@@ -1129,12 +1026,10 @@ component HandPage inherits HorizontalLayout {
                         border-width: 1px;
                         border-color: Theme.border;
                         background: Theme.surface2;
-
                         VerticalLayout {
                             padding: 6px;
                             spacing: 0px;
                             alignment: center;
-
                             Text {
                                 text: "Bridge · MediaPipe";
                                 color: BridgeState.hand-enabled ? Theme.text-hi : Theme.text-dim;
@@ -1142,7 +1037,6 @@ component HandPage inherits HorizontalLayout {
                                 font-weight: 600;
                                 horizontal-alignment: center;
                             }
-
                             Text {
                                 text: BridgeState.hand-enabled ? "detecting hands" : "disabled";
                                 color: BridgeState.hand-enabled ? Theme.ok : Theme.err;
@@ -1152,52 +1046,44 @@ component HandPage inherits HorizontalLayout {
                         }
                     }
                 }
-
                 Text {
                     text: "Camera UDP 42072 · landmarks TCP 42073";
                     color: Theme.text-dim;
                     font-size: 10px;
                     wrap: word-wrap;
                 }
-
                 GridLayout {
                     spacing: 8px;
-
                     Row {
                         MiniMetric {
                             label: "Camera FPS";
                             value: BridgeState.camera-fps + " fps";
                             horizontal-stretch: 1;
                         }
-
                         MiniMetric {
                             label: "Hands Detected";
                             value: BridgeState.hands-detected + "";
                             horizontal-stretch: 1;
                         }
                     }
-
                     Row {
                         MiniMetric {
                             label: "Landmarks / Hand";
                             value: BridgeState.landmark-count + "";
                             horizontal-stretch: 1;
                         }
-
                         MiniMetric {
                             label: "Hand FPS";
                             value: BridgeState.hand-fps + " fps";
                             horizontal-stretch: 1;
                         }
                     }
-
                     Row {
                         MiniMetric {
                             label: "Detection Conf";
                             value: BridgeState.hand-det + "%";
                             horizontal-stretch: 1;
                         }
-
                         MiniMetric {
                             label: "Presence Conf";
                             value: BridgeState.hand-pres + "%";
@@ -1207,13 +1093,11 @@ component HandPage inherits HorizontalLayout {
                 }
             }
         }
-
         Text {
             text: "VIEWER · PHONE CAMERA";
             color: Theme.text-dim;
             font-size: 10px;
         }
-
         Rectangle {
             vertical-stretch: 1;
             min-height: 140px;
@@ -1222,7 +1106,6 @@ component HandPage inherits HorizontalLayout {
             background: #000;
             border-width: 1px;
             border-color: Theme.border;
-
             Image {
                 source: BridgeState.camera-frame;
                 width: 100%;
@@ -1231,7 +1114,6 @@ component HandPage inherits HorizontalLayout {
             }
         }
     }
-
     ScrollView {
         width: 380px;
         horizontal-scrollbar-policy: always-off;
@@ -1239,30 +1121,25 @@ component HandPage inherits HorizontalLayout {
         hand-right-col := VerticalLayout {
             spacing: 14px;
             width: parent.width;
-
             Text {
                 text: "OPTIONS";
                 color: Theme.text-dim;
                 font-size: 10px;
             }
-
             Card {
                 title: "Status";
-
                 if !BridgeState.hand-enabled : Text {
                     text: "Hand tracking is disabled. Frames are not being requested from the phone.";
                     color: Theme.text-dim;
                     font-size: 12px;
                     wrap: word-wrap;
                 }
-
                 if BridgeState.hand-enabled && BridgeState.hands-detected == 0 : Text {
                     text: "No hands detected yet. Keep your hands in the phone camera frustum.";
                     color: Theme.warn;
                     font-size: 12px;
                     wrap: word-wrap;
                 }
-
                 if BridgeState.hand-enabled && BridgeState.hands-detected > 0 : Text {
                     text: "Tracking active.";
                     color: Theme.ok;
@@ -1270,11 +1147,9 @@ component HandPage inherits HorizontalLayout {
                     wrap: word-wrap;
                 }
             }
-
             Card {
                 title: "Detection Model";
                 hint: "MediaPipe Hand Landmarker runs in a Python sidecar (TCP 42073). Applying pushes the new thresholds live — no restart, no dropped frames.";
-
                 Toggle {
                     label: "Enable hand tracking";
                     checked: BridgeState.hand-enabled;
@@ -1282,7 +1157,6 @@ component HandPage inherits HorizontalLayout {
                         BridgeState.hand-toggled(b);
                     }
                 }
-
                 Toggle {
                     label: "Draw skeleton overlay on the camera feed";
                     checked: BridgeState.hand-overlay;
@@ -1290,7 +1164,6 @@ component HandPage inherits HorizontalLayout {
                         BridgeState.overlay-toggled(b);
                     }
                 }
-
                 Stepper {
                     label: "Detection confidence";
                     value: BridgeState.hand-det;
@@ -1302,7 +1175,6 @@ component HandPage inherits HorizontalLayout {
                         BridgeState.hand-det = v;
                     }
                 }
-
                 Stepper {
                     label: "Presence confidence";
                     value: BridgeState.hand-pres;
@@ -1314,7 +1186,6 @@ component HandPage inherits HorizontalLayout {
                         BridgeState.hand-pres = v;
                     }
                 }
-
                 Stepper {
                     label: "Tracking confidence";
                     value: BridgeState.hand-track;
@@ -1326,22 +1197,18 @@ component HandPage inherits HorizontalLayout {
                         BridgeState.hand-track = v;
                     }
                 }
-
                 HorizontalLayout {
                     spacing: 12px;
-
                     Metric {
                         label: "Hands Detected";
                         value: BridgeState.hands-detected + "";
                         horizontal-stretch: 1;
                     }
-
                     Metric {
                         label: "Landmarks / Hand";
                         value: BridgeState.landmark-count + "";
                         horizontal-stretch: 1;
                     }
-
                     Metric {
                         label: "Hand FPS";
                         value: BridgeState.hand-fps + " fps";
@@ -1349,7 +1216,6 @@ component HandPage inherits HorizontalLayout {
                     }
                 }
             }
-
             PrimaryButton {
                 text: "Apply Model Settings";
                 clicked => {
@@ -1359,85 +1225,71 @@ component HandPage inherits HorizontalLayout {
         }
     }
 }
-
+// Diagnostics tab: live gyro/accel/mag grid, net stats, phone IP, and the
+// scrolling ring-log view (log-text, newest last).
 component DiagnosticsPage inherits VerticalLayout {
     spacing: 14px;
     padding: 20px;
-
     Text {
         text: "Diagnostics";
         color: Theme.text-hi;
         font-size: 22px;
         font-weight: 700;
     }
-
     HorizontalLayout {
         spacing: 12px;
-
         Metric {
             label: "Stream FPS";
             value: BridgeState.stream-fps + "";
             horizontal-stretch: 1;
         }
-
         Metric {
             label: "Encoder";
             value: BridgeState.encoder-name;
             horizontal-stretch: 1;
         }
-
         Metric {
             label: "Latency";
             value: BridgeState.latency-ms + " ms";
             horizontal-stretch: 1;
         }
-
         Metric {
             label: "Gyro Rate";
             value: BridgeState.gyro-fps + "/s";
             horizontal-stretch: 1;
         }
     }
-
     HorizontalLayout {
         spacing: 12px;
-
         Metric {
             label: "Hand FPS";
             value: BridgeState.hand-fps + " fps";
             horizontal-stretch: 1;
         }
-
         Metric {
             label: "Camera FPS";
             value: BridgeState.camera-fps + " fps";
             horizontal-stretch: 1;
         }
-
         Metric {
             label: "Telemetry Packets";
             value: BridgeState.packets-total + "";
             horizontal-stretch: 1;
         }
-
         Metric {
             label: "Phone Address";
             value: BridgeState.phone-ip;
             horizontal-stretch: 1;
         }
     }
-
     Card {
         title: "Installers";
         hint: "Re-install the SteamVR driver (pinned FFmpeg runtimes included) or revisit phone setup.";
-
         VerticalLayout {
             spacing: 8px;
-
             HorizontalLayout {
                 spacing: 10px;
                 cross-axis-alignment: center;
-
                 PrimaryButton {
                     width: 170px;
                     text: BridgeState.install-busy ? "Installing…" : "Re-install driver";
@@ -1446,7 +1298,6 @@ component DiagnosticsPage inherits VerticalLayout {
                         BridgeState.install-driver();
                     }
                 }
-
                 SecondaryButton {
                     width: 170px;
                     text: "Reinstall phone app";
@@ -1454,47 +1305,48 @@ component DiagnosticsPage inherits VerticalLayout {
                         BridgeState.reopen-wizard(2);
                     }
                 }
-
                 Rectangle {
                     horizontal-stretch: 1;
                 }
-
                 StatusPill {
                     label: "driver present";
                     ok: BridgeState.driver-present;
                 }
             }
-
             if BridgeState.install-note != "" : Text {
                 text: BridgeState.install-note;
                 color: Theme.text-mid;
                 font-size: 12px;
                 wrap: word-wrap;
             }
+            if BridgeState.install-busy || BridgeState.install-progress > 0.0 : ProgressBar {
+                progress: BridgeState.install-progress;
+            }
+            if BridgeState.steamvr-running : Text {
+                text: "SteamVR is still open — close it (status window → menu → Quit SteamVR) before installing or reopening.";
+                color: Theme.warn;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
         }
     }
-
     Card {
         title: "Sensors";
         hint: "Latest phone IMU sample from the telemetry uplink (UDP 42071).";
-
         VerticalLayout {
             spacing: 8px;
-
             Text {
                 text: "Gyro  " + BridgeState.gyro-x + "  " + BridgeState.gyro-y + "  " + BridgeState.gyro-z + " rad/s";
                 color: Theme.text-mid;
                 font-size: 12px;
                 font-family: "Consolas";
             }
-
             Text {
                 text: "Accel " + BridgeState.accel-x + "  " + BridgeState.accel-y + "  " + BridgeState.accel-z + " m/s²";
                 color: Theme.text-mid;
                 font-size: 12px;
                 font-family: "Consolas";
             }
-
             Text {
                 text: "Mag   " + BridgeState.mag-x + "  " + BridgeState.mag-y + "  " + BridgeState.mag-z + " µT";
                 color: Theme.text-mid;
@@ -1503,11 +1355,9 @@ component DiagnosticsPage inherits VerticalLayout {
             }
         }
     }
-
     Card {
         title: "Bridge log";
         hint: "Newest entries on top.";
-
         Rectangle {
             width: 100%;
             height: 240px;
@@ -1515,11 +1365,9 @@ component DiagnosticsPage inherits VerticalLayout {
             border-width: 1px;
             border-color: Theme.border;
             background: #000000;
-
             Flickable {
                 width: 100%;
                 height: 100%;
-
                 Text {
                     x: 12px;
                     y: 8px;
@@ -1534,32 +1382,28 @@ component DiagnosticsPage inherits VerticalLayout {
         }
     }
 }
-
+// General tab: driver install/update button, SteamVR open button, and the
+// setup-wizard reopen shortcut.
 component GeneralPage inherits VerticalLayout {
     spacing: 14px;
     padding: 20px;
-
     Text {
         text: "General";
         color: Theme.text-hi;
         font-size: 22px;
         font-weight: 700;
     }
-
     Card {
         title: "Phone Link";
-
         HorizontalLayout {
             spacing: 10px;
             cross-axis-alignment: center;
-
             Text {
                 text: "Telemetry uplink:";
                 color: Theme.text-mid;
                 font-size: 13px;
                 vertical-alignment: center;
             }
-
             Text {
                 text: BridgeState.phone-ip;
                 color: BridgeState.phone-connected ? Theme.text-hi : Theme.text-dim;
@@ -1567,17 +1411,14 @@ component GeneralPage inherits VerticalLayout {
                 font-weight: 600;
                 vertical-alignment: center;
             }
-
             Rectangle {
                 horizontal-stretch: 1;
             }
-
             StatusPill {
                 label: "reachable";
                 ok: BridgeState.phone-connected;
             }
         }
-
         Text {
             text: "Bridge listens on UDP 42071 for gyro, hand-tracking and ping frames. The video stream never enters the bridge.";
             color: Theme.text-dim;
@@ -1585,14 +1426,11 @@ component GeneralPage inherits VerticalLayout {
             wrap: word-wrap;
         }
     }
-
     Card {
         title: "Setup wizard";
-
         HorizontalLayout {
             spacing: 10px;
             cross-axis-alignment: center;
-
             Text {
                 text: "Re-run the guided setup (driver install, phone app, SteamVR).";
                 color: Theme.text-mid;
@@ -1601,7 +1439,6 @@ component GeneralPage inherits VerticalLayout {
                 horizontal-stretch: 1;
                 vertical-alignment: center;
             }
-
             SecondaryButton {
                 width: 190px;
                 text: "Back to setup wizard";
@@ -1611,10 +1448,8 @@ component GeneralPage inherits VerticalLayout {
             }
         }
     }
-
     Card {
         title: "About";
-
         Text {
             text: "Bridge v" + BridgeState.app-version + " · control plane for the SteamVR driver · GPL-3.0";
             color: Theme.text-mid;
@@ -1623,48 +1458,41 @@ component GeneralPage inherits VerticalLayout {
         }
     }
 }
-
+// First-run wizard: stepped driver/phone/SteamVR checklist ending in
+// wizard-done. Shown when setup.done is missing; reopen-wizard brings it back.
 export component WizardWindow inherits Window {
     title: "Cardboard++ setup";
     preferred-width: 560px;
     preferred-height: 600px;
     min-width: 480px;
     min-height: 540px;
-
     background: Theme.surface;
-
     VerticalLayout {
         padding: 28px;
         spacing: 14px;
-
                     HorizontalLayout {
                         spacing: 12px;
                         cross-axis-alignment: center;
-
                         Image {
                             source: @image-url("icons/logo.png");
                             width: 36px;
                             height: 36px;
                         }
-
                         VerticalLayout {
                             spacing: 2px;
                             horizontal-stretch: 1;
-
                             Text {
                                 text: "Cardboard++ setup";
                                 color: Theme.text-hi;
                                 font-size: 17px;
                                 font-weight: 700;
                             }
-
                             Text {
                                 text: "Step " + (BridgeState.wizard-step + 1) + " of 4 · skip anytime";
                                 color: Theme.text-dim;
                                 font-size: 11px;
                             }
                         }
-
                         SecondaryButton {
                             text: "Skip";
                             width: 72px;
@@ -1673,14 +1501,11 @@ export component WizardWindow inherits Window {
                             }
                         }
                     }
-
                     Rectangle {
                         min-height: 262px;
-
                     if BridgeState.wizard-step == 0 : VerticalLayout {
                         alignment: start;
                         spacing: 10px;
-
                         Text {
                             text: "Get started";
                             color: Theme.text-hi;
@@ -1688,7 +1513,6 @@ export component WizardWindow inherits Window {
                             font-weight: 600;
                             wrap: word-wrap;
                         }
-
                         Text {
                             text: "Cardboard++ turns a cheap Cardboard headset and an Android phone into a full SteamVR system — video and hand tracking together. You need a gaming PC with SteamVR, a Cardboard viewer, and an Android phone on the same Wi-Fi.";
                             color: Theme.text-mid;
@@ -1696,11 +1520,9 @@ export component WizardWindow inherits Window {
                             wrap: word-wrap;
                         }
                     }
-
                     if BridgeState.wizard-step == 1 : VerticalLayout {
                         alignment: start;
                         spacing: 10px;
-
                         Text {
                             text: "Install the SteamVR driver";
                             color: Theme.text-hi;
@@ -1708,14 +1530,12 @@ export component WizardWindow inherits Window {
                             font-weight: 600;
                             wrap: word-wrap;
                         }
-
                         Text {
                             text: BridgeState.driver-present ? "Driver detected inside SteamVR. You can re-install to update, then open SteamVR so it loads." : "One click copies the driver into SteamVR. Then open SteamVR so it loads, and allow the Cardboard++ addon under Settings → Startup/Shutdown → Add-ons.";
                             color: Theme.text-mid;
                             font-size: 13px;
                             wrap: word-wrap;
                         }
-
                         PrimaryButton {
                             text: BridgeState.install-busy ? "Installing…" : (BridgeState.driver-present ? "Re-install driver" : "Install driver");
                             enabled: !BridgeState.install-busy;
@@ -1723,21 +1543,43 @@ export component WizardWindow inherits Window {
                                 BridgeState.install-driver();
                             }
                         }
-
                         if BridgeState.install-note != "" : Text {
                             text: BridgeState.install-note;
                             color: Theme.text-mid;
                             font-size: 12px;
                             wrap: word-wrap;
                         }
-
+                        if BridgeState.install-busy || BridgeState.install-progress > 0.0 : ProgressBar {
+                            progress: BridgeState.install-progress;
+                        }
+                        if BridgeState.steamvr-running : Rectangle {
+                            border-width: 1px;
+                            border-color: Theme.warn;
+                            border-radius: 10px;
+                            background: #FFD60A1F;
+                            VerticalLayout {
+                                padding: 10px;
+                                spacing: 8px;
+                                Text {
+                                    text: "SteamVR is still open — close it first (status window → menu → Quit SteamVR), then click the button again.";
+                                    color: Theme.warn;
+                                    font-size: 12px;
+                                    wrap: word-wrap;
+                                }
+                                SecondaryButton {
+                                    text: "Dismiss";
+                                    clicked => {
+                                        BridgeState.dismiss-steamvr-running();
+                                    }
+                                }
+                            }
+                        }
                         SecondaryButton {
                             text: "Open SteamVR";
                             clicked => {
                                 BridgeState.open-steamvr();
                             }
                         }
-
                         if BridgeState.steamvr-note != "" : Text {
                             text: BridgeState.steamvr-note;
                             color: Theme.text-mid;
@@ -1745,11 +1587,9 @@ export component WizardWindow inherits Window {
                             wrap: word-wrap;
                         }
                     }
-
                     if BridgeState.wizard-step == 2 : VerticalLayout {
                         alignment: start;
                         spacing: 10px;
-
                         Text {
                             text: "Get the phone app";
                             color: Theme.text-hi;
@@ -1757,27 +1597,22 @@ export component WizardWindow inherits Window {
                             font-weight: 600;
                             wrap: word-wrap;
                         }
-
                         HorizontalLayout {
                             spacing: 14px;
-
                             Image {
                                 source: @image-url("icons/qr-releases.png");
                                 width: 150px;
                                 height: 150px;
                             }
-
                             VerticalLayout {
                                 spacing: 8px;
                                 horizontal-stretch: 1;
-
                                 Text {
                                     text: "1 · Scan the code — it opens the GitHub releases page. Download the APK from there.";
                                     color: Theme.text-mid;
                                     font-size: 13px;
                                     wrap: word-wrap;
                                 }
-
                                 Text {
                                     text: "2 · Android blocks installs at first: when asked, allow “Install unknown apps” for your browser, then open the APK to install it.";
                                     color: Theme.text-mid;
@@ -1787,11 +1622,9 @@ export component WizardWindow inherits Window {
                             }
                         }
                     }
-
                     if BridgeState.wizard-step == 3 : VerticalLayout {
                         alignment: start;
                         spacing: 10px;
-
                         Text {
                             text: "Connect your phone";
                             color: Theme.text-hi;
@@ -1799,14 +1632,12 @@ export component WizardWindow inherits Window {
                             font-weight: 600;
                             wrap: word-wrap;
                         }
-
                         Text {
                             text: "Open the Cardboard++ app on your phone now (same Wi-Fi as this PC). The hub opens by itself once the phone connects.";
                             color: Theme.text-mid;
                             font-size: 13px;
                             wrap: word-wrap;
                         }
-
                         Text {
                             text: BridgeState.phone-connected ? "Phone connected: " + BridgeState.phone-ip + " — opening hub…" : "Waiting for phone…";
                             color: BridgeState.phone-connected ? Theme.ok : Theme.text-dim;
@@ -1815,31 +1646,25 @@ export component WizardWindow inherits Window {
                             wrap: word-wrap;
                         }
                     }
-                    } // step container — fixed height so text can never reach the buttons
-
+                    }
                     Rectangle {
                         vertical-stretch: 1;
                     }
-
                     HorizontalLayout {
                         alignment: center;
                         spacing: 6px;
-
                         for i in [0, 1, 2, 3] : Rectangle {
                             width: i == BridgeState.wizard-step ? 22px : 8px;
                             height: 8px;
                             border-radius: 4px;
                             background: i == BridgeState.wizard-step ? Theme.accent : Theme.surface3;
-
                             animate width {
                                 duration: 150ms;
                             }
                         }
                     }
-
                     HorizontalLayout {
                         spacing: 10px;
-
                         SecondaryButton {
                             text: "Back";
                             enabled: BridgeState.wizard-step > 0;
@@ -1850,7 +1675,6 @@ export component WizardWindow inherits Window {
                                 }
                             }
                         }
-
                         PrimaryButton {
                             text: BridgeState.wizard-step < 3 ? "Next" : "Open hub";
                             horizontal-stretch: 1;
@@ -1865,30 +1689,25 @@ export component WizardWindow inherits Window {
                     }
     }
 }
-
+// Hub root: TopBar, Sidebar + tab pages, BottomBar. Fast/slow pollers in
+// main.rs keep every bound property fresh; see BridgeState above.
 export component MainWindow inherits Window {
     title: "Cardboard++ Bridge";
     preferred-width: 1160px;
     preferred-height: 720px;
     min-width: 940px;
     min-height: 560px;
-
     background: Theme.bg;
-
     VerticalLayout {
         TopBar {}
-
         HorizontalLayout {
             horizontal-stretch: 1;
             vertical-stretch: 1;
-
             Sidebar {}
-
             Rectangle {
                 horizontal-stretch: 1;
                 vertical-stretch: 1;
                 background: Theme.bg;
-
                 if BridgeState.current-tab == 0 : StreamPage {
                     x: 0; y: 0;
                     width: parent.width;
@@ -1917,7 +1736,6 @@ export component MainWindow inherits Window {
                 }
             }
         }
-
         BottomBar {}
     }
 }

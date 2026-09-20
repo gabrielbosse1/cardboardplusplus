@@ -3,7 +3,7 @@
 #include <cstdio>
 #include <cstring>
 #include "openvr_driver.h"
-
+// Formats a message and forwards it to SteamVR via VRDriverLog; called from every driver thread for diagnostics.
 void DriverLog(const char* pFormat, ...)
 {
     char buffer[1024];

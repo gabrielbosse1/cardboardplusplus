@@ -1,5 +1,4 @@
 package com.google.cardboard.camera;
-
 import android.annotation.SuppressLint;
 import android.content.Context;
 import android.graphics.ImageFormat;
@@ -21,28 +20,17 @@ import com.google.cardboard.NativeBridge;
 import com.google.cardboard.core.AppConstants;
 import com.google.cardboard.core.DebugLog;
 import java.util.ArrayList;
-
-/**
- * Encapsulates all Camera2 lifecycle: texture creation, device open, capture session and teardown.
- * Texture creation runs on the GL thread; camera open/capture run on their own {@link
- * HandlerThread}.
- */
+// Camera2 lifecycle owner in camera/; VrActivity drives open/pause/release and routes frames to CameraStreamer.
 public class CameraController {
   private static final String TAG = CameraController.class.getSimpleName();
   private static final DebugLog DBG = new DebugLog(TAG);
-
-  /**
-   * Callback interface for raw camera frames. Return true when taking
-   * ownership of {@code image} (the callback closes it); false means the
-   * controller closes it after the call returns.
-   */
+  // Receiver for YUV frames; CameraStreamer implements it and VrActivity wires it via setFrameCallback.
   public interface FrameCallback {
+    // Handles one camera image; returns true when ownership is taken, false when the caller closes it.
     boolean onFrame(Image image);
   }
-
   private final Context context;
   private final NativeBridge bridge;
-
   private CameraManager cameraManager;
   private CameraDevice cameraDevice;
   private CameraCaptureSession captureSession;
@@ -55,29 +43,24 @@ public class CameraController {
   private boolean cameraTexturePassed = false;
   private final Object cameraLock = new Object();
   private FrameCallback frameCallback;
-
   private int cameraWidth = AppConstants.DEFAULT_CAMERA_WIDTH;
   private int cameraHeight = AppConstants.DEFAULT_CAMERA_HEIGHT;
-  // ImageReader (streamer) capture size: small YUV output requested directly
-  // from the sensor so the streamer rarely has to downscale in Java.
   private int streamWidth = AppConstants.CAMERA_STREAM_WIDTH;
   private int streamHeight = AppConstants.CAMERA_STREAM_HEIGHT;
-
+  // Stores the activity context and native bridge; called from VrActivity.onCreate on the UI thread.
   public CameraController(Context context, NativeBridge bridge) {
     this.context = context;
     this.bridge = bridge;
   }
-
+  // Reports whether the OES texture reached native; called from VrActivity start and VrRenderer setup.
   public boolean isTexturePassed() {
     return cameraTexturePassed;
   }
-
-  /** Register a callback to receive raw camera frames. Must be called before {@link #openCamera()}. */
+  // Registers the frame consumer; called from VrActivity startSession with the CameraStreamer.
   public void setFrameCallback(FrameCallback callback) {
     this.frameCallback = callback;
   }
-
-  /** Creates the SurfaceTexture/Surface bound to the GL texture id and notifies native. */
+  // Creates the OES preview texture from the native id; called on the GL thread before openCamera.
   public void ensureCameraTexture(int textureId) {
     if (cameraSurfaceTexture == null) {
       cameraSurfaceTexture = new SurfaceTexture(textureId);
@@ -88,17 +71,16 @@ public class CameraController {
       DBG.i("Camera texture created: %d", textureId);
     }
   }
-
+  // Pushes the latest camera texel to the GL pipeline; called from VrRenderer.onDrawFrame on the GL thread.
   public void updateCameraTexture() {
     try {
       if (cameraSurfaceTexture != null) {
         cameraSurfaceTexture.updateTexImage();
       }
     } catch (Exception e) {
-      // Texture not ready or invalidated - skip frame, don't crash.
     }
   }
-
+  // Opens the back camera and its handler thread; called from VrActivity startSession and VrRenderer setup.
   @SuppressLint("MissingPermission")
   public void openCamera() {
     synchronized (cameraLock) {
@@ -106,20 +88,17 @@ public class CameraController {
         return;
       }
     }
-
     cameraManager = (CameraManager) context.getSystemService(Context.CAMERA_SERVICE);
     if (cameraManager == null) {
       Log.w(TAG, "CameraManager not available");
       return;
     }
-
     try {
       String backCameraId = CameraUtils.findBackCameraId(cameraManager);
       if (backCameraId == null) {
         Log.w(TAG, "No back camera found");
         return;
       }
-
       CameraCharacteristics characteristics =
           cameraManager.getCameraCharacteristics(backCameraId);
       android.hardware.camera2.params.StreamConfigurationMap map =
@@ -129,45 +108,35 @@ public class CameraController {
               map, AppConstants.MIN_CAMERA_WIDTH, AppConstants.MIN_CAMERA_HEIGHT);
       cameraWidth = chosen.getWidth();
       cameraHeight = chosen.getHeight();
-      // Streamer frames come from the YUV_420_888 ImageReader output, whose
-      // size list differs from SurfaceTexture's — query it separately and ask
-      // for stream size directly (falls back to 640x480, still cheap).
       Size yuvChosen =
           CameraUtils.chooseYuvOutputSize(
               map, AppConstants.CAMERA_STREAM_WIDTH, AppConstants.CAMERA_STREAM_HEIGHT);
       streamWidth = yuvChosen.getWidth();
       streamHeight = yuvChosen.getHeight();
-
       if (cameraSurfaceTexture != null) {
         cameraSurfaceTexture.setDefaultBufferSize(cameraWidth, cameraHeight);
       }
-
       synchronized (cameraLock) {
         cameraThread = new HandlerThread("CameraThread");
         cameraThread.start();
         cameraHandler = new Handler(cameraThread.getLooper());
       }
-
       cameraManager.openCamera(backCameraId, new CameraDeviceCallback(), cameraHandler);
-
       Log.i(TAG, "Camera opening, size: " + cameraWidth + "x" + cameraHeight
           + " stream: " + streamWidth + "x" + streamHeight);
     } catch (Exception e) {
       Log.w(TAG, "Could not open camera: " + e.getMessage());
     }
   }
-
+  // Builds the preview plus YUV capture session; called from CameraDeviceCallback.onOpened on the camera thread.
   private void createCaptureSession() {
     if (cameraDevice == null || cameraSurface == null) {
       return;
     }
     try {
-      // Create ImageReader for raw frame access at the small streamer size
-      // (YUV_420_888 gives NV21-like data). Requesting small directly keeps
-      // conversion + JPEG encode cheap; the preview Surface keeps full res.
       imageReader =
           ImageReader.newInstance(
-              streamWidth, streamHeight, ImageFormat.YUV_420_888, /*maxImages=*/ 2);
+              streamWidth, streamHeight, ImageFormat.YUV_420_888,  2);
       imageReader.setOnImageAvailableListener(
           reader -> {
             Image image = reader.acquireLatestImage();
@@ -184,21 +153,16 @@ public class CameraController {
             }
           },
           cameraHandler);
-
       final CaptureRequest.Builder captureRequestBuilder =
           cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
       captureRequestBuilder.addTarget(cameraSurface);
       captureRequestBuilder.addTarget(imageReader.getSurface());
-      // Pin the AE fps range so the sensor doesn't drop to ~8fps indoors.
-      // Prefer a range reaching 30fps; fall back to the fastest available.
       try {
         String camId = cameraDevice.getId();
         CameraCharacteristics chars = cameraManager.getCameraCharacteristics(camId);
         Range<Integer>[] ranges =
             chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES);
         if (ranges != null && ranges.length > 0) {
-          // Among ranges reaching 30fps, prefer the highest lower bound
-          // ([30,30] over [15,30]) so AE can't trade fps for exposure.
           Range<Integer> best = null;
           for (Range<Integer> r : ranges) {
             if (r.getUpper() >= 30
@@ -221,7 +185,6 @@ public class CameraController {
       } catch (Exception e) {
         Log.w(TAG, "FPS range not pinned: " + e.getMessage());
       }
-
       cameraDevice.createCaptureSession(
           new ArrayList<Surface>() {
             {
@@ -235,14 +198,9 @@ public class CameraController {
       Log.w(TAG, "Failed to create capture session: " + e.getMessage());
     }
   }
-
-  /**
-   * Pauses the camera: resets the native texture and releases all hardware resources. Must be
-   * called before the GL surface is paused.
-   */
+  // Tears down session, device, and GL textures; called from VrActivity.onPause on the UI thread.
   public void onPause() {
     bridge.resetCameraTexture();
-
     synchronized (cameraLock) {
       cameraInitialized = false;
       if (captureSession != null) {
@@ -265,7 +223,6 @@ public class CameraController {
       }
       cameraHandler = null;
     }
-
     if (imageReader != null) {
       try {
         imageReader.close();
@@ -289,8 +246,7 @@ public class CameraController {
     }
     cameraTexturePassed = false;
   }
-
-  /** Fully releases camera resources (used on activity destroy). */
+  // Releases all camera resources; called from VrActivity.onDestroy on the UI thread.
   public void release() {
     synchronized (cameraLock) {
       if (captureSession != null) {
@@ -322,15 +278,9 @@ public class CameraController {
     }
     cameraTexturePassed = false;
   }
-
-  /**
-   * Carries the {@code openCamera} result back into the controller.
-   *
-   * <p>All state transitions are guarded by {@link #cameraLock}: only the first session set-up
-   * wins (a second open is closed immediately), and any device closure clears {@link #cameraDevice}
-   * so a later {@link #openCamera()} can retry.
-   */
+  // Device state listener started by openCamera; runs on the camera handler thread.
   private final class CameraDeviceCallback extends CameraDevice.StateCallback {
+    // Stores the opened device and starts the session; invoked by Camera2 on the camera thread.
     @Override
     public void onOpened(CameraDevice camera) {
       synchronized (cameraLock) {
@@ -349,7 +299,7 @@ public class CameraController {
         }
       }
     }
-
+    // Clears the device reference on disconnect; invoked by Camera2 on the camera thread.
     @Override
     public void onDisconnected(CameraDevice camera) {
       synchronized (cameraLock) {
@@ -359,7 +309,7 @@ public class CameraController {
         }
       }
     }
-
+    // Clears the device reference on error; invoked by Camera2 on the camera thread.
     @Override
     public void onError(CameraDevice camera, int error) {
       synchronized (cameraLock) {
@@ -370,21 +320,14 @@ public class CameraController {
       }
     }
   }
-
-  /**
-   * Starts the repeating preview stream once the capture session is configured.
-   *
-   * <p>Holds the {@link CaptureRequest.Builder} created alongside the session so the auto-focus and
-   * auto-exposure settings the controller wants are applied when the stream starts. If the session
-   * is configured after the camera was already torn down, it is closed immediately instead.
-   */
+  // Session state listener that starts the repeating preview request; runs on the camera handler thread.
   private final class PreviewSessionCallback extends CameraCaptureSession.StateCallback {
     private final CaptureRequest.Builder captureRequestBuilder;
-
+    // Holds the preview request builder; called from createCaptureSession on the camera thread.
     PreviewSessionCallback(CaptureRequest.Builder captureRequestBuilder) {
       this.captureRequestBuilder = captureRequestBuilder;
     }
-
+    // Stores the session and starts repeating preview; invoked by Camera2 on the camera thread.
     @Override
     public void onConfigured(CameraCaptureSession session) {
       synchronized (cameraLock) {
@@ -403,7 +346,7 @@ public class CameraController {
         Log.w(TAG, "Failed to start preview: " + e.getMessage());
       }
     }
-
+    // Logs session configuration failure; invoked by Camera2 on the camera thread.
     @Override
     public void onConfigureFailed(CameraCaptureSession session) {
       Log.w(TAG, "Camera configuration failed");

@@ -18,3 +18,18 @@ jobs:
 
     - name: Run bridge tests
       run: cargo test --manifest-path bridge/Cargo.toml
+
+  installer:
+    # Web Setup.exe compiles offline (payload downloads at install time),
+    # so this validates bridge.iss on every PR without Rust or downloads.
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Inno Setup 6
+      run: winget install --id JRSoftware.InnoSetup -e --silent --accept-package-agreements --accept-source-agreements
+      shell: pwsh
+
+    - name: Build Setup.exe
+      run: ./scripts/compile-installer.ps1 -SkipBridge
+      shell: pwsh

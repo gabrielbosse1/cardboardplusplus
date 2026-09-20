@@ -1,8 +1,3 @@
-/**
- * Reserved for on-phone inference (e.g. MediaPipe hand tracking).
- *
- * <p>Intentionally empty: hand tracking currently runs in the bridge-side
- * Python sidecar (port 42073), not on the phone. New on-phone inference code
- * belongs here, one folder per responsibility.
- */
+// Reserved for on-phone inference (currently empty: hand tracking runs in
+// the bridge's MediaPipe sidecar; the phone only sends presence hints).
 package com.google.cardboard.tracking;

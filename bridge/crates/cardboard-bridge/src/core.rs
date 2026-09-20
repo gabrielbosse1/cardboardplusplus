@@ -1,38 +1,22 @@
-//! The UI-independent core of the bridge. Owns the shared `AppState`, starts
-//! the driver/phone worker threads, and exposes the operations the two user
-//! surfaces — the Slint window and the REST server — call. No Slint type ever
-//! reaches this module: `StatusSnapshot` is the raw, serializable view.
-
 use std::io::{Read, Write};
 use std::net::UdpSocket;
 use std::ops::Deref;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
-
 use crate::app::{AppState, SharedState};
 use crate::net::mediapipe::{MediapipeClient, Reclaim};
 use crate::net::{self, EncoderChoice, DRIVER_DISCOVERY_PORT, MEDIAPIPE_PORT, VIDEO_PORT};
-
 use bridge_core::paths;
-
-/// Version read from Cargo.toml at compile time.
+/// Crate version stamped into /health, the hub title, and release URLs.
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// Local preview size (driver localhost copy → ffmpeg → UI). Single source of
-/// truth for the ffmpeg scale filter and the RGBA frame buffer below.
+/// Preview frame size the ffmpeg decode scales to (keeps the hub cheap).
 pub const PREVIEW_W: u32 = 480;
 pub const PREVIEW_H: u32 = 270;
-
-/// Compiled boot defaults (mirror `AppState::default`); the link-test verdict
-/// starts relative to these. NOTE: not the POST /settings fallback — partial
-/// bodies keep the live session values via `AppCore::applied_settings`.
-/// Order: (width, height, fps, bitrate_mbps).
+/// Stream settings before the first apply: 2880x1620 @ 60fps, 20 Mbps.
 pub const APPLIED_DEFAULTS: (i32, i32, i32, i32) = (2880, 1620, 60, 20);
-
-/// A plain, serializable snapshot of the bridge's live state; what both the UI
-/// and the REST API render. Field *order is part of the wire contract* (the
-/// harness diffs the serialized JSON byte-for-byte) so do not reorder these.
+/// JSON-serializable copy of AppState for GET /status and the Slint pollers.
+/// Field order is covered by a stability test (hub bindings depend on it).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct StatusSnapshot {
     pub app_version: String,
@@ -63,7 +47,6 @@ pub struct StatusSnapshot {
     pub latest_mag_x: f32,
     pub latest_mag_y: f32,
     pub latest_mag_z: f32,
-    // -- appended (never reordered): phone video-path health + link test --
     pub net_frames_decoded: u32,
     pub net_stalls: u32,
     pub net_decoded_fps: f32,
@@ -71,29 +54,26 @@ pub struct StatusSnapshot {
     pub link_test_active: bool,
     pub link_test_result_mbps: i32,
     pub link_test_note: String,
-    // -- appended (never reordered): hand-tracking model state --
     pub hand_enabled: bool,
     pub hand_overlay: bool,
     pub hand_min_detection: i32,
     pub hand_min_presence: i32,
     pub hand_min_tracking: i32,
-    // -- appended (never reordered): setup wizard installer state --
     pub install_busy: bool,
     pub install_note: String,
     pub driver_present: bool,
     pub steamvr_note: String,
-    // -- appended (never reordered): full applied session (POST /settings
-    // partial bodies fall back to these, so they must be visible) --
     pub applied_width: i32,
     pub applied_height: i32,
     pub applied_fps: i32,
-    // -- appended (never reordered): component versions (commit counts
-    // reported by the driver / phone hello handshake) --
     pub driver_version: String,
     pub phone_version: String,
+    pub install_progress: f32,
+    pub steamvr_running: bool,
 }
-
 impl From<&AppState> for StatusSnapshot {
+    /// Snapshots live state for the UI/REST boundary. Copies every field so
+    /// readers never hold the state lock while rendering.
     fn from(s: &AppState) -> Self {
         Self {
             app_version: APP_VERSION.to_string(),
@@ -145,12 +125,12 @@ impl From<&AppState> for StatusSnapshot {
             applied_fps: s.applied_fps,
             driver_version: s.driver_version.clone(),
             phone_version: s.phone_version.clone(),
+            install_progress: s.install_progress,
+            steamvr_running: s.steamvr_running,
         }
     }
 }
-
-/// The settings that were just pushed to the driver, echoed back by the REST
-/// API so the client can confirm exactly what was applied.
+/// Stream settings echoed back by POST /settings after a successful push.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AppliedSettings {
     pub width: i32,
@@ -159,13 +139,12 @@ pub struct AppliedSettings {
     pub bitrate_mbps: i32,
     pub encoder: String,
 }
-
-/// Spawn the Python MediaPipe hand-landmark server as a child process and
-/// connect to it via TCP. Returns the client plus the child handle (if we
-/// spawned one, so the caller can kill it on shutdown). Returns `(None, None)`
-/// if the Python process can't be started or the TCP connection fails.
-/// The sidecar takes no arguments: port and model defaults are static, and
-/// tuning happens live over the TCP link (`MediapipeClient::set_config`).
+/// Starts the hand-tracking sidecar chain at bridge boot: reuses a healthy
+/// server when one already listens (dev restarts), reclaims the port from a
+/// stale python holder, else spawns mediapipe_server.py next to the binary
+/// and connects. Returns the client for the camera thread plus the child to
+/// kill at shutdown. Every outcome is logged; (None, None) means hands stay
+/// off but the rest of the bridge runs.
 fn spawn_mediapipe_server(state: &SharedState) -> (Option<MediapipeClient>, Option<Child>) {
     let (d, p, t) = match state.lock() {
         Ok(s) => (
@@ -175,18 +154,12 @@ fn spawn_mediapipe_server(state: &SharedState) -> (Option<MediapipeClient>, Opti
         ),
         Err(_) => (0.5, 0.5, 0.5),
     };
-    // First try connecting to an already-running server (e.g. started manually).
-    // The healthy probe also pushes the current thresholds, so an adopted
-    // server keeps the UI's tuning.
     if let Some(client) = MediapipeClient::connect_healthy(MEDIAPIPE_PORT, d, p, t) {
         if let Ok(mut s) = state.lock() {
             s.push_log("mediapipe: connected to existing server".into());
         }
         return (Some(client), None);
     }
-    // No healthy server, but something still answers TCP: a stale squatter
-    // (e.g. an older bridge's wedged sidecar). Kill it if it's ours, fail
-    // loudly otherwise — never silently adopt it.
     if MediapipeClient::try_once(MEDIAPIPE_PORT).is_ok() {
         match MediapipeClient::reclaim_port(MEDIAPIPE_PORT) {
             Reclaim::Freed(pid) => {
@@ -209,8 +182,6 @@ fn spawn_mediapipe_server(state: &SharedState) -> (Option<MediapipeClient>, Opti
             }
         }
     }
-
-    // Locate the Python script relative to the binary or cwd.
     let script_path = {
         let cwd_candidate = std::path::PathBuf::from("mediapipe_server.py");
         if cwd_candidate.is_file() {
@@ -220,20 +191,18 @@ fn spawn_mediapipe_server(state: &SharedState) -> (Option<MediapipeClient>, Opti
             if near.is_file() {
                 Some(near)
             } else {
-                // Try bridge/crates/cardboard-bridge/ (dev layout)
                 let dev_candidate = exe_dir
-                    .parent() // target/debug -> target
-                    .and_then(|p| p.parent()) // target -> bridge
-                    .and_then(|p| p.parent()) // bridge -> repo root
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .and_then(|p| p.parent())
                     .map(|p| p.join("bridge").join("crates").join("cardboard-bridge").join("mediapipe_server.py"))
                     .filter(|p| p.is_file());
                 if dev_candidate.is_some() {
                     dev_candidate
                 } else {
-                    // Try going up to bridge/ and looking in crates/cardboard-bridge/
                     exe_dir
-                        .parent() // target/debug -> target
-                        .and_then(|p| p.parent()) // target -> bridge
+                        .parent()
+                        .and_then(|p| p.parent())
                         .map(|p| p.join("crates").join("cardboard-bridge").join("mediapipe_server.py"))
                         .filter(|p| p.is_file())
                 }
@@ -248,11 +217,8 @@ fn spawn_mediapipe_server(state: &SharedState) -> (Option<MediapipeClient>, Opti
         }
         return (None, None);
     };
-
     let (python_prog, python_args) = python_command();
     {
-        // Log the exact interpreter (sidecar needs mediapipe/opencv/numpy —
-        // see requirements.txt next to mediapipe_server.py).
         let mut probe = Command::new(&python_prog);
         probe.args(&python_args).arg("--version");
         let ver = probe
@@ -272,8 +238,6 @@ fn spawn_mediapipe_server(state: &SharedState) -> (Option<MediapipeClient>, Opti
     let mut child = match Command::new(&python_prog)
         .args(&python_args)
         .arg(&script_path)
-        // Stdout is discarded (not piped): an undrained pipe would fill its
-        // 64KB buffer and wedge the child. Stderr is drained below.
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -286,10 +250,6 @@ fn spawn_mediapipe_server(state: &SharedState) -> (Option<MediapipeClient>, Opti
             return (None, None);
         }
     };
-
-    // Drain stderr in a background thread so the Python process doesn't block.
-    // Lines are mirrored into the ring log too: the bridge often runs as a GUI
-    // app where its own stderr is invisible, and a silent sidecar is undebuggable.
     if let Some(stderr) = child.stderr.take() {
         let log_state = state.clone();
         thread::spawn(move || {
@@ -303,14 +263,11 @@ fn spawn_mediapipe_server(state: &SharedState) -> (Option<MediapipeClient>, Opti
             }
         });
     }
-
     if let Ok(mut s) = state.lock() {
         s.push_log(format!(
             "mediapipe server started (pid {})", child.id()
         ));
     }
-
-    // Give the server a moment to bind, then connect.
     match MediapipeClient::connect(MEDIAPIPE_PORT) {
         Ok(client) => (Some(client), Some(child)),
         Err(e) => {
@@ -322,10 +279,13 @@ fn spawn_mediapipe_server(state: &SharedState) -> (Option<MediapipeClient>, Opti
         }
     }
 }
-
-/// Resolve the Python interpreter: `$PYTHON` first, then the Windows `py -3`
-/// launcher, then plain `python`. Returns (program, extra args).
+/// Picks the python for the sidecar: bundled python/ next to the exe first,
+/// then $PYTHON, then the py launcher, then PATH python. Last resort is the
+/// bare "python" name (spawn reports the failure to the log).
 fn python_command() -> (String, Vec<String>) {
+    if let Some(bundled) = bundled_python() {
+        return (bundled, vec![]);
+    }
     if let Ok(p) = std::env::var("PYTHON") {
         if !p.trim().is_empty() {
             return (p, vec![]);
@@ -347,10 +307,17 @@ fn python_command() -> (String, Vec<String>) {
     }
     ("python".to_string(), vec![])
 }
-
-/// Startup ffmpeg check (F42): the preview decoder shells out to ffmpeg, so
-/// a missing binary means a permanently dark preview pill. Log-only, with
-/// the install hint — no vendoring.
+/// Installer-bundled interpreter (python/python.exe next to the bridge exe).
+/// None in dev checkouts, which use system python instead.
+fn bundled_python() -> Option<String> {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|p| p.to_path_buf()))?;
+    let py = exe_dir.join("python").join("python.exe");
+    py.is_file().then(|| py.to_string_lossy().into_owned())
+}
+/// Logs the preview ffmpeg version at startup, or how to install it when
+/// missing (then the video preview stays dark but everything else works).
 fn log_ffmpeg_version(state: &SharedState) {
     match Command::new("ffmpeg").arg("-version").output() {
         Ok(out) if out.status.success() => {
@@ -373,33 +340,26 @@ fn log_ffmpeg_version(state: &SharedState) {
         }
     }
 }
-
-/// The bridge's brain, independent of any UI. `AppCore` is cheap to clone —
-/// each clone shares the same `Arc<Mutex<AppState>>`, so the UI, the REST
-/// server and the network threads all observe one consistent state.
+/// UI-independent bridge owner: holds shared state plus the preview frame
+/// slot, the ffmpeg decode child, and the MediaPipe client/child. All net
+/// loops and installers run from here; main.rs only renders snapshots.
 #[derive(Clone)]
 pub struct AppCore {
     state: SharedState,
-    /// The most recent decoded preview frame as raw RGBA pixels (width, height, data).
     preview_frame: Arc<Mutex<Option<(u32, u32, Vec<u8>)>>>,
-    /// Handle to the running preview decode thread (so we can stop it).
     preview_decode: Arc<Mutex<Option<PreviewDecodeHandle>>>,
-    /// The spawned Python MediaPipe server (if we started one). Killed by
-    /// `shutdown()` so it doesn't outlive the bridge.
     mediapipe_proc: Arc<Mutex<Option<Child>>>,
-    /// Live handle to the sidecar's TCP link. Cloned into the camera detect
-    /// thread; this copy serves `apply_hand_model` without a restart.
     mediapipe_client: Arc<Mutex<Option<MediapipeClient>>>,
 }
-
+/// ffmpeg preview decode child handle. Killed on shutdown/restart.
 struct PreviewDecodeHandle {
     child: Child,
 }
-
 impl AppCore {
-    /// Build the core, lay down the startup log banner (so an operator reading
-    /// the log immediately knows the topology), and kick off the driver +
-    /// phone control-plane loops.
+    /// Builds the core and starts every background loop: driver heartbeat,
+    /// phone telemetry, SHM drain (attaches when the driver mapping appears),
+    /// camera pipeline, sidecar spawn, and preview decode. Returns the Arc
+    /// that main, server, and the UI share.
     pub fn new() -> Arc<Self> {
         let state: SharedState = Arc::new(Mutex::new(AppState::default()));
         {
@@ -411,14 +371,8 @@ impl AppCore {
             s.push_log(format!("video stays direct: PC -> phone on udp {VIDEO_PORT}"));
             s.push_log(format!("camera receiver on udp {}", crate::net::CAMERA_PORT));
         }
-
         net::driver::spawn(state.clone());
         net::phone::spawn(state.clone());
-
-        // The shipped binary also drains the driver's SHM status ring (50 ms
-        // thread, same cadence as the bridge-ui worker): without this, nobody
-        // reads SHM in the product config — the bridge would be UDP-only and
-        // driver telemetry/pose frames would pile up unread.
         {
             let shm_state = state.clone();
             thread::spawn(move || {
@@ -435,7 +389,6 @@ impl AppCore {
                                 }
                             }
                             Err(_) => {
-                                // Driver not up yet; retry at 1 Hz, not 20 Hz.
                                 std::thread::sleep(std::time::Duration::from_secs(1));
                                 continue;
                             }
@@ -456,15 +409,9 @@ impl AppCore {
                 }
             });
         }
-
-        // Startup dependency checks (log-only, never fatal): preview needs
-        // ffmpeg on PATH, hand tracking needs the Python sidecar.
         log_ffmpeg_version(&state);
-
-        // Spawn the Python MediaPipe server and connect via TCP.
         let (mediapipe_client, mediapipe_proc) = spawn_mediapipe_server(&state);
         net::camera::spawn(state.clone(), mediapipe_client.clone());
-
         let core = Arc::new(Self {
             state,
             preview_frame: Arc::new(Mutex::new(None)),
@@ -472,22 +419,18 @@ impl AppCore {
             mediapipe_proc: Arc::new(Mutex::new(mediapipe_proc)),
             mediapipe_client: Arc::new(Mutex::new(mediapipe_client)),
         });
-        // The preview is always on: start decoding the driver's localhost
-        // copy right away (the driver sends it by default, no toggle needed).
         core.start_preview_decode();
         core
     }
-
-    /// Append a line to the shared ring log. Best-effort: a poisoned lock just
-    /// drops the line rather than killing the calling thread.
+    /// Thread-safe log append for background workers that only hold &self.
     pub fn push_log(&self, line: String) {
         if let Ok(mut s) = self.state.lock() {
             s.push_log(line);
         }
     }
-
-    /// Push stream settings to the driver (CARDBOARD_CAP + BRIDGE_CFG over
-    /// UDP), then record the applied encoder and the log line.
+    /// Applies Stream-tab settings: pushes CARDBOARD_CAP + BRIDGE_CFG to the
+    /// driver, records them for partial merges, and returns the echo for
+    /// POST /settings. Called from the hub callback and the REST handler.
     pub fn apply_settings(
         &self,
         width: i32,
@@ -498,12 +441,9 @@ impl AppCore {
     ) -> AppliedSettings {
         let choice = EncoderChoice::from_name(encoder);
         net::driver::send_config(width, height, fps, bitrate_mbps, choice);
-
         if let Ok(mut s) = self.state.lock() {
             s.encoder_name = choice.as_str().to_string();
             s.record_applied_settings(width, height, fps, bitrate_mbps);
-            // Encoding only makes sense while the driver is present; if it is,
-            // mark the encoder live again so a re-apply re-activates it.
             if s.driver_connected {
                 s.encoder_active = true;
             }
@@ -512,7 +452,6 @@ impl AppCore {
                 choice.as_str()
             ));
         }
-
         AppliedSettings {
             width,
             height,
@@ -521,14 +460,12 @@ impl AppCore {
             encoder: choice.as_str().to_string(),
         }
     }
-
-    /// How long the manual link test samples the phone's net stats.
+    /// Link-test observation window in seconds.
     pub const LINK_TEST_SECS: u64 = 10;
-
-    /// Start one manual link test (UI "Test link" button). Samples the
-    /// phone's stall counter for `LINK_TEST_SECS`, then stores a recommended
-    /// bitrate + note for the user to fine-tune and Apply. Never pushes to
-    /// the driver by itself. No-op unless phone and driver are both live.
+    /// Starts a 10s link test at the current bitrate: snapshots stall/fps
+    /// counters, and a background thread later writes the verdict from
+    /// link_test_verdict. No-op while a test runs or when driver/phone are
+    /// down. The hub polls link_test_* fields for progress.
     pub fn start_link_test(&self) {
         let baseline = if let Ok(mut s) = self.state.lock() {
             if s.link_test_active {
@@ -550,7 +487,6 @@ impl AppCore {
         } else {
             return;
         };
-
         let state = self.state.clone();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(Self::LINK_TEST_SECS));
@@ -569,10 +505,8 @@ impl AppCore {
             }
         });
     }
-
-    /// Master switch for bridge-side hand tracking. While off, the camera
-    /// detect worker skips the MediaPipe round-trip (the viewer still shows
-    /// the raw camera feed).
+    /// Toggles the MediaPipe detect path in the camera thread. The phone's
+    /// hand-presence hints keep flowing regardless.
     pub fn set_hand_enabled(&self, enabled: bool) {
         if let Ok(mut s) = self.state.lock() {
             s.hand_enabled = enabled;
@@ -582,17 +516,16 @@ impl AppCore {
             ));
         }
     }
-
-    /// Toggle the skeleton overlay drawn onto the camera viewer frame.
+    /// Toggles painting the skeleton onto the camera preview. Detection still
+    /// runs and counts hands when off — only the drawing stops.
     pub fn set_hand_overlay(&self, enabled: bool) {
         if let Ok(mut s) = self.state.lock() {
             s.hand_overlay = enabled;
         }
     }
-
-    /// Store new model confidences (0-100) and push them to the running
-    /// sidecar over TCP — the landmarker is recreated in place, so the camera
-    /// feed never drops a frame.
+    /// Retunes detection/presence/tracking thresholds (1-100 from the Camera
+    /// tab): stores them, then pushes to the live sidecar without a restart.
+    /// When the sidecar is down the values wait for the next bridge start.
     pub fn apply_hand_model(&self, det: i32, pres: i32, track: i32) {
         let (d, p, t) = {
             let mut s = self.state.lock().expect("state lock");
@@ -622,10 +555,8 @@ impl AppCore {
             "sidecar not running — model applies on next bridge start".into()
         });
     }
-
-    /// Re-check whether the driver DLL is present inside SteamVR. Cheap
-    /// local stat call — the UI poller runs it so the wizard step can show
-    /// "detected" without an install.
+    /// Refreshes whether the compiled driver DLL exists at the expected path.
+    /// Polled by the wizard watcher and hub slow loop for the install pill.
     pub fn refresh_driver_present(&self) -> bool {
         let present = std::path::Path::new(&driver_target_dll()).exists();
         if let Ok(mut s) = self.state.lock() {
@@ -633,10 +564,9 @@ impl AppCore {
         }
         present
     }
-
-    /// One-click SteamVR driver install (wizard step 2): standalone, no
-    /// checkout needed — release DLL, FFmpeg runtimes, baked resources,
-    /// plus vrsettings force-on. No-op while an install is already running.
+    /// Installs the driver on a worker thread with progress reports: refuses
+    /// while SteamVR runs (locked DLLs), then copies DLL + resources + FFmpeg
+    /// runtime into the SteamVR slot. Re-entrant calls while busy are ignored.
     pub fn install_driver(&self) {
         {
             let Ok(mut s) = self.state.lock() else {
@@ -645,17 +575,39 @@ impl AppCore {
             if s.install_busy {
                 return;
             }
+            let running = steamvr_running_now();
+            if !running.is_empty() {
+                s.steamvr_running = true;
+                s.install_note = format!(
+                    "SteamVR is running ({}) — close it first (status window → menu → Quit SteamVR), then install again",
+                    running.join(", ")
+                );
+                let note = s.install_note.clone();
+                s.push_log(format!("driver install blocked: {note}"));
+                return;
+            }
+            s.steamvr_running = false;
             s.install_busy = true;
+            s.install_progress = 0.0;
             s.install_note = "installing…".into();
             s.push_log("installing SteamVR driver…".into());
         }
         let state = self.state.clone();
         thread::spawn(move || {
-            let result = install_driver_files();
+            let report = |progress: f32, stage: &str| {
+                if let Ok(mut s) = state.lock() {
+                    s.install_progress = progress.clamp(0.0, 1.0);
+                    s.install_note = stage.into();
+                }
+            };
+            let result = install_driver_files(&report);
             if let Ok(mut s) = state.lock() {
                 s.install_busy = false;
                 s.install_note = match &result {
-                    Ok(out) => format!("done — {out}"),
+                    Ok(out) => {
+                        s.install_progress = 1.0;
+                        format!("done — {out}")
+                    }
                     Err(e) => format!("failed — {e}"),
                 };
                 s.driver_present = std::path::Path::new(&driver_target_dll()).exists();
@@ -664,20 +616,46 @@ impl AppCore {
             }
         });
     }
-
-    /// Launch SteamVR via vrserver.exe (wizard step 2, after install).
-    /// SteamVR picks up the installed driver on start.
+    /// Clears a stale "SteamVR running" banner after the user quits it.
+    /// Called from the wizard's dismiss button.
+    pub fn clear_steamvr_running(&self) {
+        if let Ok(mut s) = self.state.lock() {
+            s.steamvr_running = false;
+        }
+    }
+    /// Launches SteamVR via `steam -applaunch 250820` on a worker thread.
+    /// Reports "already running" immediately instead of double-launching, and
+    /// tells the user where Steam lives when it cannot be found.
     pub fn start_steamvr(&self) {
+        let running = steamvr_running_now();
+        if !running.is_empty() {
+            if let Ok(mut s) = self.state.lock() {
+                s.steamvr_running = true;
+                s.steamvr_note = format!(
+                    "SteamVR is already running ({}) — close it first (status window → menu → Quit SteamVR), then open again",
+                    running.join(", ")
+                );
+                let note = s.steamvr_note.clone();
+                s.push_log(format!("open SteamVR blocked: {note}"));
+            }
+            return;
+        }
+        if let Ok(mut s) = self.state.lock() {
+            s.steamvr_running = false;
+        }
         let state = self.state.clone();
         thread::spawn(move || {
-            let vrserver = format!("{}\\bin\\win64\\vrserver.exe", steamvr_root());
-            let note = if !std::path::Path::new(&vrserver).exists() {
-                format!("vrserver.exe not found at {vrserver}")
-            } else {
-                match Command::new(&vrserver).spawn() {
-                    Ok(_) => format!("started {vrserver}"),
-                    Err(e) => format!("failed to start SteamVR: {e}"),
+            let note = match find_steam_exe() {
+                Some(steam) => {
+                    match Command::new(&steam)
+                        .args(["-applaunch", &STEAMVR_APP_ID.to_string()])
+                        .spawn()
+                    {
+                        Ok(_) => format!("opening SteamVR via Steam ({steam})"),
+                        Err(e) => format!("failed to start SteamVR via {steam}: {e}"),
+                    }
                 }
+                None => "Steam not found (expected Steam\\steam.exe under Program Files) — open Steam and start SteamVR from Library → Tools".into(),
             };
             if let Ok(mut s) = state.lock() {
                 s.steamvr_note = note.clone();
@@ -685,9 +663,8 @@ impl AppCore {
             }
         });
     }
-
-    /// Kill the spawned MediaPipe server (if we started one) so the Python
-    /// process doesn't outlive the bridge. Called on shutdown.
+    /// Stops the sidecar child (if this bridge spawned it) at event-loop exit.
+    /// Net threads are daemon-style and end with the process.
     pub fn shutdown(&self) {
         if let Ok(mut proc) = self.mediapipe_proc.lock() {
             if let Some(mut child) = proc.take() {
@@ -697,18 +674,15 @@ impl AppCore {
         }
         self.push_log("bridge shutting down".into());
     }
-
-    /// Take the most recent decoded preview frame (consumed by the UI poller).
-    /// Creates a `slint::Image` from the raw RGBA data. Returns `None` if no
-    /// new frame is available.
+    /// Swaps the latest decoded preview frame out for the hub poller,
+    /// converting it to a Slint image. None when no frame arrived yet.
     pub fn take_preview_frame(&self) -> Option<slint::Image> {
         let (w, h, rgba) = self.preview_frame.lock().expect("preview frame lock").take()?;
         let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&rgba, w, h);
         Some(slint::Image::from_rgba8(buffer))
     }
-
-    /// Take the most recent camera frame for the viewer. Returns `None` if no
-    /// new frame is available or if the frame is stale (>1s old).
+    /// Swaps the latest camera frame out for the hub poller after a liveness
+    /// check: returns None (and clears the pill) when the camera went quiet.
     pub fn take_camera_frame(&self) -> Option<slint::Image> {
         let mut state = self.state.lock().expect("state lock");
         state.check_camera_liveness();
@@ -719,9 +693,12 @@ impl AppCore {
         let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&rgba, w, h);
         Some(slint::Image::from_rgba8(buffer))
     }
-
-    /// Start the embedded preview decoder: binds UDP 42069, spawns ffmpeg to
-    /// decode H.264 → RGBA, and stores the latest frame for the UI.
+    /// Starts the localhost preview pipeline: binds UDP 42069 (the driver's
+    /// Annex-B copy), pipes datagrams into ffmpeg stdin, and publishes each
+    /// decoded PREVIEW_W x PREVIEW_H RGBA frame to the slot the hub polls.
+    /// Restarts automatically when ffmpeg exits; a held port logs its PID.
+    /// Called once from new(); the pump threads never touch bridge memory
+    /// beyond the single latest-frame slot.
     fn start_preview_decode(&self) {
         {
             let mut decode = self.preview_decode.lock().expect("preview decode lock");
@@ -732,18 +709,13 @@ impl AppCore {
                         return;
                     }
                     _ => {
-                        // Stopped or errored — clean up and restart below.
                         let _ = handle.child.kill();
                         *decode = None;
                     }
                 }
             }
         }
-
         let frame_slot = self.preview_frame.clone();
-
-        // Bind the UDP socket that the driver sends the preview stream to,
-        // with backoff: a stale bridge/Python preview tap may still hold it.
         let socket = {
             let mut bound = None;
             for attempt in 0..6 {
@@ -769,8 +741,6 @@ impl AppCore {
             bound.expect("preview socket bound above")
         };
         socket.set_nonblocking(true).ok();
-
-        // Spawn ffmpeg: raw Annex-B H.264 in → scaled RGBA rawvideo out.
         let vf = format!("scale={PREVIEW_W}:{PREVIEW_H}");
         let mut child = match Command::new("ffmpeg")
             .args([
@@ -798,51 +768,37 @@ impl AppCore {
                 return;
             }
         };
-
         let mut stdin = child.stdin.take().expect("ffmpeg stdin");
         let mut stdout = child.stdout.take().expect("ffmpeg stdout");
-
         let frame_w: u32 = PREVIEW_W;
         let frame_h: u32 = PREVIEW_H;
         let frame_bytes = (frame_w * frame_h * 4) as usize;
-
-        // Thread 1: drain all available UDP datagrams into ffmpeg stdin (non-blocking).
         thread::spawn(move || {
             let mut buf = vec![0u8; 65536];
             loop {
-                // Drain every available datagram before sleeping.
                 loop {
                     match socket.recv(&mut buf) {
                         Ok(n) if n > 0 => {
                             if stdin.write_all(&buf[..n]).is_err() {
-                                return; // ffmpeg stdin closed.
+                                return;
                             }
                         }
-                        _ => break, // Would-block or error — done for this tick.
+                        _ => break,
                     }
                 }
-                // 2 ms backoff instead of a 1 ms busy spin: still ~500 drain
-                // chances/s, far less CPU while the driver is idle.
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
         });
-
-        // Thread 2: read complete RGBA frames from ffmpeg stdout (blocking is fine here).
         let preview_decode_cleanup = self.preview_decode.clone();
         thread::spawn(move || {
-            // Double-buffered: the full frame swaps into the UI slot while
-            // the evicted buffer becomes the next read target — steady-state
-            // zero allocation instead of one ~518 KB Vec per frame.
             let mut rgba = vec![0u8; frame_bytes];
             let mut off = 0usize;
             loop {
                 if rgba.len() < frame_bytes {
                     rgba.resize(frame_bytes, 0);
                 }
-                // Blocking read is safe here — ffmpeg produces output whenever it
-                // has decoded a frame, and the feeder thread keeps stdin full.
                 match stdout.read(&mut rgba[off..]) {
-                    Ok(0) => break, // ffmpeg exited.
+                    Ok(0) => break,
                     Ok(n) => {
                         off += n;
                         if off >= frame_bytes {
@@ -864,41 +820,28 @@ impl AppCore {
                     Err(_) => break,
                 }
             }
-            // ffmpeg exited (crash or stop). Clear the handle so the next
-            // start_preview_decode doesn't inherit a dead child.
             if let Ok(mut decode) = preview_decode_cleanup.lock() {
                 if decode.take().is_some() {
                     eprintln!("[preview] ffmpeg exited, handle cleared");
                 }
             }
         });
-
-        // Register the running decode session for the watcher below.
         {
             let mut decode = self.preview_decode.lock().expect("preview decode lock");
             *decode = Some(PreviewDecodeHandle { child });
         }
-
         self.push_log("embedded preview started (UDP 42069 → ffmpeg → UI)".into());
-
-        // Watcher thread: if ffmpeg exits unexpectedly, auto-restart after 2s backoff.
         let weak = Arc::downgrade(&{
-            // We need an Arc<Self> to call start_preview_decode again.
-            // Leaking an Arc is fine here — it lives for the process lifetime.
             let this = self.clone();
             Arc::new(this)
         });
         let preview_decode = self.preview_decode.clone();
         thread::spawn(move || {
-            // Wait for the child to finish.
             let child_exited = {
                 let decode = preview_decode.lock().expect("preview decode lock");
                 decode.as_ref().map(|h| h.child.id())
             };
             let Some(_pid) = child_exited else { return };
-
-            // Busy-wait until the decode handle is gone, then restart it:
-            // the preview is always on, so a dead ffmpeg is always revived.
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(500));
                 let decode = preview_decode.lock().expect("preview decode lock");
@@ -906,7 +849,6 @@ impl AppCore {
                     break;
                 }
             }
-            // Backoff before restart.
             std::thread::sleep(std::time::Duration::from_secs(2));
             if let Some(core) = weak.upgrade() {
                 core.push_log("preview auto-restarting...".into());
@@ -914,16 +856,13 @@ impl AppCore {
             }
         });
     }
-
-    /// Live status snapshot: a single read of the shared state.
+    /// Full state snapshot for GET /status and the hub pollers.
     pub fn status(&self) -> StatusSnapshot {
         let s = self.state.lock().expect("state lock");
         StatusSnapshot::from(s.deref())
     }
-
-    /// Live session values backing POST /settings partial bodies: missing
-    /// fields keep what the driver actually got, never the compiled
-    /// `APPLIED_DEFAULTS` (a `{}` body is a no-op, not a reset).
+    /// Live stream settings for partial merges (REST/UI). Falls back to
+    /// APPLIED_DEFAULTS when the lock is poisoned.
     pub fn applied_settings(&self) -> (i32, i32, i32, i32, String) {
         match self.state.lock() {
             Ok(s) => (
@@ -942,44 +881,93 @@ impl AppCore {
             ),
         }
     }
-
-    /// Newest-first log lines. The REST/UI consumers reverse the ring so the
-    /// most recent entry is always first.
+    /// Newest-first ring-log lines for GET /logs and the hub log view.
     pub fn logs(&self, n: usize) -> Vec<String> {
         let s = self.state.lock().expect("state lock");
         s.log.iter().rev().take(n).cloned().collect()
     }
 }
-
-/// SteamVR addon home for this driver (standard Steam location by default).
+/// Steam app id used to launch SteamVR, and the process names whose presence
+/// blocks driver installs (locked DLLs) and gates the "already running" path.
+const STEAMVR_APP_ID: u32 = 250820;
+const STEAMVR_PROCS: [&str; 2] = ["vrserver.exe", "vrmonitor.exe"];
+/// Finds steam.exe under Program Files. None on machines without Steam
+/// (start_steamvr then tells the user where to get it).
+fn find_steam_exe() -> Option<String> {
+    let dirs = [
+        std::env::var("ProgramFiles(x86)").ok(),
+        std::env::var("ProgramFiles").ok(),
+    ];
+    for dir in dirs.into_iter().flatten() {
+        let p = std::path::PathBuf::from(dir).join("Steam").join("steam.exe");
+        if p.exists() {
+            return Some(p.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+/// Matches tasklist CSV output against the SteamVR process names (first
+/// column, case-insensitive). Pure function so tests cover it without
+/// spawning tasklist.
+fn detect_steamvr_in_tasklist(output: &str) -> Vec<&'static str> {
+    STEAMVR_PROCS
+        .iter()
+        .filter(|proc_| {
+            output.lines().any(|line| {
+                line.split(',')
+                    .next()
+                    .unwrap_or(line)
+                    .trim()
+                    .trim_matches('"')
+                    .eq_ignore_ascii_case(proc_)
+            })
+        })
+        .copied()
+        .collect()
+}
+/// Live check: which SteamVR processes run right now. Empty when tasklist
+/// itself fails (then installs proceed — the locked-file retry reports it).
+fn steamvr_running_now() -> Vec<&'static str> {
+    match std::process::Command::new("tasklist")
+        .args(["/NH", "/FO", "CSV"])
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            detect_steamvr_in_tasklist(&String::from_utf8_lossy(&o.stdout))
+        }
+        _ => Vec::new(),
+    }
+}
+/// SteamVR driver slot, its root, and the installed DLL path. Thin wrappers
+/// over bridge_core::paths used across install/presence checks.
 fn steamvr_drivers_dir() -> String {
     paths::default_steamvr_drivers_dir()
 }
-/// SteamVR root (drivers dir minus the last two segments).
+/// SteamVR root derived from the driver slot (for vrsettings + steam exe).
 fn steamvr_root() -> String {
     paths::steamvr_root_from_drivers_dir(&steamvr_drivers_dir())
 }
-
-/// Target path of the driver DLL inside SteamVR.
+/// Installed driver DLL: <slot>/bin/win64/driver_cardboardplusplus.dll.
+/// Presence of this file drives the install pill.
 fn driver_target_dll() -> String {
     format!("{}\\bin\\win64\\driver_cardboardplusplus.dll", steamvr_drivers_dir())
 }
-
-/// Copy the driver DLL into SteamVR with backup + manifest (same steps
-/// as the legacy bridge-ui installer). Standalone: the DLL comes from a
-/// local checkout build when present, otherwise the version-matched GitHub
-/// release; FFmpeg + resources are fetched/baked, no checkout needed.
-/// Runs on the install thread.
-fn install_driver_files() -> Result<String, String> {
+/// Six-stage install with progress reports: prepare folders, back up the
+/// current DLL (timestamped .bak), resolve the new DLL (local compile or
+/// release download), atomic swap-in, FFmpeg runtime, resources + vrsettings
+/// force-on. Returns the one-line summary shown in the hub. Called on the
+/// install_driver worker thread.
+fn install_driver_files(report: &dyn Fn(f32, &str)) -> Result<String, String> {
     use bridge_core::driver_install::{
         DriverDllSource, download_to, driver_dll_source, force_driver_enabled,
         install_ffmpeg_standalone, install_resources,
     };
     use std::path::Path;
+    report(0.05, "preparing folders… (1/6)");
     let target_dir = format!("{}\\bin\\win64", steamvr_drivers_dir());
     std::fs::create_dir_all(&target_dir).map_err(|e| format!("mkdir {target_dir}: {e}"))?;
     let target_dll = driver_target_dll();
-
+    report(0.15, "backing up current driver… (2/6)");
     if Path::new(&target_dll).exists() {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -988,28 +976,29 @@ fn install_driver_files() -> Result<String, String> {
         let backup = format!("{target_dll}.bak-{stamp}");
         std::fs::copy(&target_dll, &backup).map_err(|e| format!("backup {backup}: {e}"))?;
     }
-
-    // Local checkout build wins (dev); otherwise download the release DLL
-    // matching this exe's baked commit count into a temp file.
+    report(0.30, "resolving driver… (3/6)");
     let mut downloaded: Option<std::path::PathBuf> = None;
     let src = match driver_dll_source()? {
-        DriverDllSource::Local(p) => p,
+        DriverDllSource::Local(p) => {
+            report(0.40, "copying local driver… (3/6)");
+            p
+        }
         DriverDllSource::Download(url) => {
+            report(0.40, "downloading driver… (3/6)");
             let tmp = std::env::temp_dir()
                 .join(format!("cb-driver-{}.dll", std::process::id()));
             download_to(&url, &tmp)?;
             downloaded = Some(tmp.clone());
+            report(0.50, "driver downloaded… (3/6)");
             tmp
         }
     };
-
+    report(0.55, "installing driver… (4/6)");
     let tmp_dll = format!("{target_dll}.tmp-{}", std::process::id());
     if let Err(e) = std::fs::copy(&src, &tmp_dll) {
         let _ = std::fs::remove_file(&tmp_dll);
         return Err(format!("copy to {tmp_dll}: {e}"));
     }
-    // Retry while SteamVR holds the loaded DLL open; the error names the
-    // lock so "access denied" becomes actionable.
     let installed = bridge_core::driver_deps::replace_locked(
         std::path::Path::new(&tmp_dll),
         std::path::Path::new(&target_dll),
@@ -1018,20 +1007,14 @@ fn install_driver_files() -> Result<String, String> {
         let _ = std::fs::remove_file(tmp);
     }
     installed?;
-
-    // Runtime deps: the pinned FFmpeg set — vendored, or fetched from the
-    // pinned zip when there is no checkout (fails with the expected names
-    // when the pin itself is stale, never a silent dead driver).
+    report(0.65, "installing FFmpeg runtimes… (5/6)");
     let ffmpeg_dlls = install_ffmpeg_standalone(Path::new(&target_dir), false)?;
-
-    // Ship the exe-baked manifest + bindings for a from-scratch install.
+    report(0.80, "FFmpeg runtimes ready… (5/6)");
+    report(0.88, "installing resources… (6/6)");
     let drivers_dir = steamvr_drivers_dir();
     install_resources(Path::new(&drivers_dir))?;
-
-    // Force the driver on in steamvr.vrsettings (repairs a user-disabled or
-    // safe-mode-blocked state from an earlier crash).
+    report(0.95, "enabling driver… (6/6)");
     let forced = force_driver_enabled(&steamvr_root())?;
-
     Ok(format!(
         "installed driver into {target_dir} (+ {} FFmpeg {} DLLs: {}{})",
         ffmpeg_dlls.len(),
@@ -1040,11 +1023,13 @@ fn install_driver_files() -> Result<String, String> {
         if forced { "; vrsettings forced on" } else { "" },
     ))
 }
-
 #[cfg(test)]
 mod tests {
+    // Core contract tests: snapshot mirrors state 1:1 with stable JSON field
+    // order (hub bindings depend on it), tasklist parsing finds SteamVR
+    // processes case-insensitively, defaults merge, logs read newest-first,
+    // and preview stats flow through. Test names read as the spec.
     use super::*;
-
     #[test]
     fn status_snapshot_reflects_state() {
         let state: SharedState = Arc::new(Mutex::new(AppState::default()));
@@ -1065,16 +1050,11 @@ mod tests {
         assert_eq!(snapshot.gyro_fps, 1000);
         assert_eq!(snapshot.hands_detected, 2);
     }
-
     #[test]
     fn status_snapshot_field_order_is_stable() {
-        // The REST API contract requires a specific JSON field order.
-        // This test verifies the serialization produces the expected keys
-        // in the expected order by checking the serialized string.
         let state: SharedState = Arc::new(Mutex::new(AppState::default()));
         let snapshot = StatusSnapshot::from(state.lock().unwrap().deref());
         let json = serde_json::to_string(&snapshot).unwrap();
-        // Check that key fields appear in the correct order.
         let app_ver_pos = json.find("app_version").unwrap();
         let driver_pos = json.find("driver_connected").unwrap();
         let encoder_pos = json.find("encoder_active").unwrap();
@@ -1086,35 +1066,55 @@ mod tests {
         assert!(encoder_pos < phone_pos);
         assert!(phone_pos < preview_pos);
         assert!(preview_pos < camera_pos);
-        // Phone health + link-test fields are appended (never reordered).
         let net_pos = json.find("net_frames_decoded").unwrap();
         let test_pos = json.find("link_test_active").unwrap();
         assert!(camera_pos < net_pos);
         assert!(net_pos < test_pos);
-        // Wizard installer fields are appended last (never reordered).
         let hand_pos = json.find("hand_min_tracking").unwrap();
         let install_pos = json.find("install_busy").unwrap();
         let present_pos = json.find("driver_present").unwrap();
         assert!(test_pos < hand_pos);
         assert!(hand_pos < install_pos);
         assert!(install_pos < present_pos);
-        // Full applied session is appended after the wizard state.
         let applied_w = json.find("applied_width").unwrap();
         let applied_h = json.find("applied_height").unwrap();
         let applied_fps = json.find("applied_fps").unwrap();
         assert!(present_pos < applied_w);
         assert!(applied_w < applied_h);
         assert!(applied_h < applied_fps);
-        // Component versions are appended last (never reordered).
         let driver_ver = json.find("driver_version").unwrap();
         let phone_ver = json.find("phone_version").unwrap();
         assert!(applied_fps < driver_ver);
         assert!(driver_ver < phone_ver);
+        let progress_pos = json.find("install_progress").unwrap();
+        assert!(phone_ver < progress_pos);
+        let running_pos = json.find("steamvr_running").unwrap();
+        assert!(progress_pos < running_pos);
     }
-
+    #[test]
+    fn steamvr_app_id_matches_store_page() {
+        assert_eq!(STEAMVR_APP_ID, 250820);
+    }
+    #[test]
+    fn tasklist_csv_detects_steamvr_procs() {
+        let out = "\"steam.exe\",\"1234\",\"Console\",\"1\",\"10,000 K\"\r\n\
+                   \"vrserver.exe\",\"5678\",\"Console\",\"1\",\"50,000 K\"\r\n\
+                   \"vrmonitor.exe\",\"9012\",\"Console\",\"1\",\"20,000 K\"\r\n";
+        assert_eq!(detect_steamvr_in_tasklist(out), vec!["vrserver.exe", "vrmonitor.exe"]);
+    }
+    #[test]
+    fn tasklist_output_without_steamvr_is_empty() {
+        let out = "\"steam.exe\",\"1234\",\"Console\",\"1\",\"10,000 K\"\r\n\
+                   \"explorer.exe\",\"42\",\"Console\",\"1\",\"30,000 K\"\r\n";
+        assert!(detect_steamvr_in_tasklist(out).is_empty());
+        assert!(detect_steamvr_in_tasklist("").is_empty());
+    }
+    #[test]
+    fn tasklist_match_is_case_insensitive() {
+        assert_eq!(detect_steamvr_in_tasklist("\"VRSERVER.EXE\",\"1\",\"X\",\"1\",\"1 K\""), vec!["vrserver.exe"]);
+    }
     #[test]
     fn applied_settings_defaults_merge_correctly() {
-        // When all fields are None, APPLIED_DEFAULTS should be used.
         let width = APPLIED_DEFAULTS.0;
         let height = APPLIED_DEFAULTS.1;
         let fps = APPLIED_DEFAULTS.2;
@@ -1124,7 +1124,6 @@ mod tests {
         assert_eq!(fps, 60);
         assert_eq!(bitrate, 20);
     }
-
     #[test]
     fn logs_returns_newest_first() {
         let state: SharedState = Arc::new(Mutex::new(AppState::default()));
@@ -1134,7 +1133,6 @@ mod tests {
             s.push_log("second".into());
             s.push_log("third".into());
         }
-        // Build an AppCore manually (without spawning threads).
         let core = AppCore {
             state,
             preview_frame: Arc::new(Mutex::new(None)),
@@ -1147,7 +1145,6 @@ mod tests {
         assert_eq!(logs[1], "second");
         assert_eq!(logs[2], "first");
     }
-
     #[test]
     fn preview_payload_reflects_driver_stats() {
         let state: SharedState = Arc::new(Mutex::new(AppState::default()));

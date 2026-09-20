@@ -5,24 +5,8 @@
 #include <chrono>
 #include <cstring>
 #include <fstream>
-
 using namespace vr;
-
-// ---------------------------------------------------------------------------
-// Device lifecycle + the SteamVR-facing probe/pose/display methods.
-//
-// Everything that touches real rendering, encoding, or networking lives in its
-// own translation unit (see the header for the full map); this file only
-// answers "who is this device" questions and drives its activate/teardown.
-// ---------------------------------------------------------------------------
-
-// iGPU test (Intel IntelArc/UHD): stop handing SteamVR the direct-display-mode
-// present handshake by not exposing IVRDriverDirectModeComponent and advertising
-// Prop_HasDriverDirectModeComponent=false. Nothing will be streamed in this mode;
-// the encoder is fed exclusively through the Present path. Comment the line out
-// to restore direct mode.
-// #define DRIVER_NO_DIRECT_MODE
-
+// Called by SteamVR to register the HMD; creates D3D, encoder, UDP/discovery/sensor sockets, encoding thread, bridge SHM, and device properties.
 EVRInitError HmdDriver::Activate(uint32_t unObjectId)
 {
     m_driverId = unObjectId;
@@ -44,18 +28,12 @@ EVRInitError HmdDriver::Activate(uint32_t unObjectId)
     m_frameQueued = false;
     m_encodeDone = true;
     m_pendingFrame = { nullptr, nullptr, 0, false };
-    // Session-state reset (L14 + R3): a stream-OFF from the bridge must not
-    // stick across SteamVR reloads, and stale submit/present counters must not
-    // leak from a previous session. No settings received yet means ON.
     m_streamEnabled.store(1, std::memory_order_relaxed);
     m_presentCount = 0;
     m_lastPresentLogNs = 0;
     m_lastHeartbeatNs = 0;
     m_submitLayers.clear();
-
     DriverLog("HmdDriver::Activate called");
-
-    // Create a D3D11 device for rendering.
     D3D_FEATURE_LEVEL featureLevel;
     HRESULT hr = D3D11CreateDevice(
         nullptr,
@@ -69,64 +47,45 @@ EVRInitError HmdDriver::Activate(uint32_t unObjectId)
         &featureLevel,
         &m_pD3D11DeviceContext
     );
-
     if (FAILED(hr)) {
         DriverLog("D3D11 device creation failed! HRESULT: 0x%x", hr);
         return VRInitError_Init_Internal;
     }
-
     DriverLog("D3D11 device initialized successfully");
-
     if (!InitializeVideoEncoder()) {
         DriverLog("WARNING: Video encoder initialization failed. Encoding will be disabled.");
     }
-
     if (!InitializeUDP()) {
         DriverLog("WARNING: UDP initialization failed. Frame transmission will be disabled.");
     }
-
     if (!InitializeDiscovery()) {
         DriverLog("WARNING: Discovery initialization failed. Phone auto-detection will be disabled.");
     }
-
     if (!InitializeSensorSocket()) {
         DriverLog("WARNING: Sensor socket initialization failed. Head tracking will use synthetic data.");
     }
-
-    // Start background encoding thread. All slow work (GPU readback, pixel
-    // conversion, encode, UDP send) happens here so Present() returns quickly
-    // and the SteamVR compositor keeps its vsync pacing.
     m_encodingRunning = true;
     m_encodingThread = std::thread(&HmdDriver::EncodingThreadFunc, this);
     DriverLog("Background encoding thread started");
-
     if (!InitializeBridge()) {
         DriverLog("WARNING: Bridge shared-memory initialization failed. Telemetry disabled.");
     }
-
-    // Set HMD properties
     PropertyContainerHandle_t props = VRProperties()->TrackedDeviceToPropertyContainer(m_driverId);
-
     VRProperties()->SetStringProperty(props, Prop_ModelNumber_String, "CardboardPlusPlus");
     VRProperties()->SetStringProperty(props, Prop_RenderModelName_String, "CardboardPlusPlus");
     VRProperties()->SetStringProperty(props, Prop_SerialNumber_String, "CBPP_VIRTUAL_HMD_001");
     VRProperties()->SetInt32Property(props, Prop_DeviceClass_Int32, TrackedDeviceClass_HMD);
     VRProperties()->SetStringProperty(props, Prop_ManufacturerName_String, "CardboardPlusPlus");
-
     VRProperties()->SetStringProperty(props, Prop_TrackingSystemName_String, "cardboardplusplus");
     VRProperties()->SetFloatProperty(props, Prop_UserIpdMeters_Float, 0.064f);
     VRProperties()->SetFloatProperty(props, Prop_DisplayFrequency_Float, 60.0f);
     VRProperties()->SetFloatProperty(props, Prop_SecondsFromVsyncToPhotons_Float, 0.011f);
     VRProperties()->SetBoolProperty(props, Prop_ReportsTimeSinceVSync_Bool, true);
-
     VRProperties()->SetUint64Property(props, Prop_CurrentUniverseId_Uint64, 2);
     VRProperties()->SetFloatProperty(props, Prop_UserHeadToEyeDepthMeters_Float, 0.f);
     VRProperties()->SetBoolProperty(props, Prop_IsOnDesktop_Bool, false);
     VRProperties()->SetBoolProperty(props, Prop_DisplayDebugMode_Bool, false);
     VRProperties()->SetBoolProperty(props, Prop_DeviceProvidesBatteryStatus_Bool, false);
-
-    // Fake proximity sensor: create boolean component "/proximity" and set it true.
-    // A device never goes to sleep while this is true, regardless of inactivity.
     VRDriverInput()->CreateBooleanComponent(props, "/proximity", &m_proximityHandle);
     VRDriverInput()->UpdateBooleanComponent(m_proximityHandle, true, 0);
 #ifdef DRIVER_NO_DIRECT_MODE
@@ -136,38 +95,29 @@ EVRInitError HmdDriver::Activate(uint32_t unObjectId)
     VRProperties()->SetBoolProperty(props, Prop_HasDriverDirectModeComponent_Bool, true);
     DriverLog("HMD properties set: HasDriverDirectModeComponent=true, IsDisplayOnDesktop=false, DebugMode=false");
 #endif
-
-    // Eye-to-head transforms
     HmdMatrix34_t eyeToHeadLeft = { 0 };
     eyeToHeadLeft.m[0][0] = 1.0f;
     eyeToHeadLeft.m[1][1] = 1.0f;
     eyeToHeadLeft.m[2][2] = 1.0f;
-    eyeToHeadLeft.m[0][3] = -0.032f; // left eye offset
-
+    eyeToHeadLeft.m[0][3] = -0.032f;
     HmdMatrix34_t eyeToHeadRight = { 0 };
     eyeToHeadRight.m[0][0] = 1.0f;
     eyeToHeadRight.m[1][1] = 1.0f;
     eyeToHeadRight.m[2][2] = 1.0f;
-    eyeToHeadRight.m[0][3] = 0.032f; // right eye offset
-
+    eyeToHeadRight.m[0][3] = 0.032f;
     VRServerDriverHost()->SetDisplayEyeToHead(m_driverId, eyeToHeadLeft, eyeToHeadRight);
-
     return VRInitError_None;
 }
-
+// Called by SteamVR at unload; joins threads, releases textures/sockets/encoder/bridge, then drops the D3D device.
 void HmdDriver::Deactivate()
 {
-	// Clean up resources and reset state.
     DriverLog("HmdDriver::Deactivate called");
-
-    // Stop background encoding thread and wait for any in-flight frame.
     m_encodingRunning = false;
     m_encodeCv.notify_all();
     if (m_encodingThread.joinable()) {
         m_encodingThread.join();
     }
     DriverLog("Background encoding thread stopped");
-
     ReleaseSyncTexture();
     if (m_pSyncMutex) {
         m_pSyncMutex->Release();
@@ -179,8 +129,6 @@ void HmdDriver::Deactivate()
     }
     m_cachedSyncHandle = nullptr;
     m_syncAcquired = false;
-
-    // Release per-layer private eye copies (and their shared handles)
     for (auto& c : m_layerCopies) {
         if (c.pLeft) { c.pLeft->Release(); c.pLeft = nullptr; }
         if (c.pRight) { c.pRight->Release(); c.pRight = nullptr; }
@@ -188,15 +136,11 @@ void HmdDriver::Deactivate()
         if (c.hRight) { CloseHandle(c.hRight); c.hRight = nullptr; }
     }
     m_layerCopies.clear();
-
     ShutdownDiscovery();
     ShutdownSensorSocket();
     ShutdownUDP();
     ShutdownVideoEncoder();
     ShutdownBridge();
-    // DestroyAllSwapTextureSets is keyed by pid — pid 0 alone leaks every
-    // other process's sets, so free all known pids. Collect keys first: each
-    // call erases its entry from m_swapTextureSets.
     std::vector<uint32_t> pids;
     pids.reserve(m_swapTextureSets.size());
     for (const auto& kv : m_swapTextureSets) {
@@ -205,7 +149,6 @@ void HmdDriver::Deactivate()
     for (uint32_t pid : pids) {
         DestroyAllSwapTextureSets(pid);
     }
-
     if (m_pD3D11DeviceContext) {
         m_pD3D11DeviceContext->Release();
         m_pD3D11DeviceContext = nullptr;
@@ -216,12 +159,12 @@ void HmdDriver::Deactivate()
     }
     m_driverId = k_unTrackedDeviceIndexInvalid;
 }
-
+// Standby hook (no-op); SteamVR calls it when the HMD would sleep.
+// Exposes IVRDisplayComponent and IVRDriverDirectModeComponent to the compositor; null for other interfaces.
 void HmdDriver::EnterStandby() {}
-
+// Exposes IVRDisplayComponent and IVRDriverDirectModeComponent to the compositor; null for other interfaces.
 void* HmdDriver::GetComponent(const char* pchComponentNameAndVersion)
 {
-	// Return to SteamVR which interfaces we support. This is how SteamVR knows we have display and direct mode components.
     DriverLog("GetComponent called with: %s", pchComponentNameAndVersion);
     if (strcmp(pchComponentNameAndVersion, IVRDisplayComponent_Version) == 0)
     {
@@ -235,7 +178,8 @@ void* HmdDriver::GetComponent(const char* pchComponentNameAndVersion)
 #endif
     return NULL;
 }
-
+// Answers SteamVR debug console queries with an empty string; pchRequest selects the query.
+// Called by SteamVR each frame; reports the phone quaternion when fresh, otherwise an out-of-range pose.
 void HmdDriver::DebugRequest(const char* pchRequest, char* pchResponseBuffer, uint32_t unResponseBufferSize)
 {
     if (unResponseBufferSize >= 1)
@@ -243,25 +187,17 @@ void HmdDriver::DebugRequest(const char* pchRequest, char* pchResponseBuffer, ui
         pchResponseBuffer[0] = 0;
     }
 }
-
+// Called by SteamVR each frame; reports the phone quaternion when fresh, otherwise an out-of-range pose.
 DriverPose_t HmdDriver::GetPose()
 {
     DriverPose_t pose = { 0 };
     pose.poseIsValid = true;
     pose.result = TrackingResult_Running_OK;
     pose.deviceIsConnected = true;
-
-    // World-from-driver is always identity (driver origin = world origin).
     pose.qWorldFromDriverRotation.w = 1.0;
     pose.qWorldFromDriverRotation.x = 0.0;
     pose.qWorldFromDriverRotation.y = 0.0;
     pose.qWorldFromDriverRotation.z = 0.0;
-
-    // Staleness watchdog: if no sensor packet (gyro 0x10 or rotation 0x12) has
-    // arrived for kSensorStaleMs, the phone/bridge link is gone. Report the
-    // pose as invalid rather than freezing on the last sample (which previously
-    // made SteamVR show a "tracking" but dead headset).
-    // ponytail: 0x10/0x12 are continuous sensors, so a 2s gap means the link truly died.
     static constexpr int64_t kSensorStaleMs = 2000;
     const int64_t lastRecv = m_lastSensorRecvMs.load(std::memory_order_relaxed);
     const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -269,9 +205,7 @@ DriverPose_t HmdDriver::GetPose()
     const bool fresh = lastRecv != 0 && (nowMs - lastRecv) < kSensorStaleMs;
     const int64_t lastRot = m_lastRotationRecvMs.load(std::memory_order_relaxed);
     const bool rotFresh = lastRot != 0 && (nowMs - lastRot) < kSensorStaleMs;
-
     bool hasQ = rotFresh && m_hasQuaternion.load(std::memory_order_relaxed);
-
     if (!fresh) {
         pose.poseIsValid = false;
         pose.result = TrackingResult_Running_OutOfRange;
@@ -282,14 +216,11 @@ DriverPose_t HmdDriver::GetPose()
         pose.qRotation = pose.qDriverFromHeadRotation;
         return pose;
     }
-
-    // Read the current quaternion (if available) for pose.
     HmdQuaternion_t quat;
     quat.w = 1.0;
     quat.x = 0.0;
     quat.y = 0.0;
     quat.z = 0.0;
-
     if (hasQ) {
         std::lock_guard<std::mutex> lock(m_sensorMutex);
         quat.w = m_sensorQuat[0];
@@ -297,29 +228,18 @@ DriverPose_t HmdDriver::GetPose()
         quat.y = m_sensorQuat[2];
         quat.z = m_sensorQuat[3];
     }
-    // No quaternion yet: keep identity rotation (a valid gyro-gated pose).
-    // Never synthesize motion here — the old sine-wave bob made the HMD drift
-    // on top of real tracking (H8).
-
-    // qRotation carries the live head orientation. qDriverFromHeadRotation is
-    // the fixed body-to-head offset (identity here) — the runtime composes
-    // all three transforms, so putting quat in both would apply head rotation
-    // twice. (Valve's simplehmd sample likewise keeps it identity.)
     pose.qDriverFromHeadRotation.w = 1.0;
     pose.qDriverFromHeadRotation.x = 0.0;
     pose.qDriverFromHeadRotation.y = 0.0;
     pose.qDriverFromHeadRotation.z = 0.0;
     pose.qRotation = quat;
-
     return pose;
 }
-
+// Called by DeviceProvider each frame; publishes the pose, drains bridge settings, and emits the 1 Hz status publish.
 void HmdDriver::RunFrame()
 {
-    // Update the server with our current pose each frame so compositor knows this HMD is present.
     DriverPose_t pose = GetPose();
     VRServerDriverHost()->TrackedDevicePoseUpdated(m_driverId, pose, sizeof(DriverPose_t));
-
     {
         static int rfCount = 0;
         rfCount++;
@@ -328,7 +248,6 @@ void HmdDriver::RunFrame()
                       m_hasQuaternion.load(std::memory_order_relaxed) ? 1 : 0);
         }
     }
-
     if (m_bridgeInitialized.load(std::memory_order_relaxed)) {
         cbpp::PayloadSettingsChange s;
         if (m_bridgeServer.PollSettings(s)) {
@@ -337,8 +256,7 @@ void HmdDriver::RunFrame()
         RunBridgeHeartbeat();
     }
 }
-
-// IVRDisplayComponent implementations
+// Reports the virtual window origin/size to SteamVR; pnX/pnY/pnWidth/pnHeight receive 0,0,1920,1080.
 void HmdDriver::GetWindowBounds( int32_t *pnX, int32_t *pnY, uint32_t *pnWidth, uint32_t *pnHeight )
 {
     if (pnX) *pnX = 0;
@@ -346,29 +264,30 @@ void HmdDriver::GetWindowBounds( int32_t *pnX, int32_t *pnY, uint32_t *pnWidth, 
     if (pnWidth) *pnWidth = 1920;
     if (pnHeight) *pnHeight = 1080;
 }
-
+// Reports that the display is a direct-mode panel rather than a desktop mirror.
+// Reports that the display is virtual rather than a physical monitor.
 bool HmdDriver::IsDisplayOnDesktop()
 {
     return false;
 }
-
+// Reports that the display is virtual rather than a physical monitor.
 bool HmdDriver::IsDisplayRealDisplay()
 {
     return false;
 }
-
+// Provides the per-eye render size (960x1080 half-SBS) the VR app should render into.
+// Provides the left/right viewport rectangles tiling the 1920x1080 SBS frame; eEye selects the half.
 void HmdDriver::GetRecommendedRenderTargetSize( uint32_t *pnWidth, uint32_t *pnHeight )
 {
-    if (pnWidth) *pnWidth = 1920 / 2; // single-eye recommended width
-    if (pnHeight) *pnHeight = 1080; // single-eye recommended height
+    if (pnWidth) *pnWidth = 1920 / 2;
+    if (pnHeight) *pnHeight = 1080;
 }
-
+// Provides the left/right viewport rectangles tiling the 1920x1080 SBS frame; eEye selects the half.
 void HmdDriver::GetEyeOutputViewport( EVREye eEye, uint32_t *pnX, uint32_t *pnY, uint32_t *pnWidth, uint32_t *pnHeight )
 {
     *pnY = 0;
     *pnWidth = 1920 / 2;
     *pnHeight = 1080;
-
     if (eEye == Eye_Left) {
         *pnX = 0;
     }
@@ -376,22 +295,18 @@ void HmdDriver::GetEyeOutputViewport( EVREye eEye, uint32_t *pnX, uint32_t *pnY,
         *pnX = 1920 / 2;
     }
 }
-
+// Provides a symmetric 90-degree frustum per eye; eEye is ignored because both eyes share it.
+// Passes UVs through unchanged; the phone performs lens correction in its renderer.
 void HmdDriver::GetProjectionRaw( EVREye eEye, float *pfLeft, float *pfRight, float *pfTop, float *pfBottom )
 {
-	// Simple symmetric projection. NOTE (M2_audit): top/bottom sign convention
-	// is UNVERIFIED — openvr_driver.h documents no convention, and swapping
-	// blindly risks an upside-down image. Verify with a SteamVR test pattern
-	// (top marker must appear up) before touching these values.
     *pfLeft = -1.0;
     *pfRight = 1.0;
     *pfTop = -1.0;
     *pfBottom = 1.0;
 }
-
+// Passes UVs through unchanged; the phone performs lens correction in its renderer.
 DistortionCoordinates_t HmdDriver::ComputeDistortion( EVREye eEye, float fU, float fV )
 {
-	// No distortion at all, Cardboard SDK should handle this.
     DistortionCoordinates_t coordinates;
     coordinates.rfBlue[0] = fU;
     coordinates.rfBlue[1] = fV;
@@ -401,7 +316,7 @@ DistortionCoordinates_t HmdDriver::ComputeDistortion( EVREye eEye, float fU, flo
     coordinates.rfRed[1] = fV;
     return coordinates;
 }
-
+// Republishes the cached telemetry once per second; called from RunFrame when the bridge region is live.
 void HmdDriver::RunBridgeHeartbeat()
 {
     long long nowNs = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -416,10 +331,9 @@ void HmdDriver::RunBridgeHeartbeat()
         }
     }
 }
-
+// Applies a bridge settings slot: toggles streaming and forwards geometry/bitrate/encoder choice to ApplyEncoderSettings.
 void HmdDriver::ApplyStreamSettings(const cbpp::PayloadSettingsChange& settings)
 {
-    // Bridge is the single on/off switch: log every transition (H2).
     int newStream = settings.stream_enabled ? 1 : 0;
     int oldStream = m_streamEnabled.exchange(newStream, std::memory_order_relaxed);
     if (newStream != oldStream) {
@@ -430,15 +344,12 @@ void HmdDriver::ApplyStreamSettings(const cbpp::PayloadSettingsChange& settings)
               (unsigned long long)settings.seq, settings.width, settings.height, settings.fps,
               settings.bitrate_kbps, settings.encoder,
               settings.stream_enabled ? "ON" : "OFF");
-
-    // bitrate_kbps is u32: clamp before *1000 so the int multiply can't overflow
-    // (H5). Out-of-range fps/bitrate are rejected inside ApplyEncoderSettings.
     int bps = (settings.bitrate_kbps >= 1 && settings.bitrate_kbps <= 100000)
         ? (int)settings.bitrate_kbps * 1000 : -1;
     ApplyEncoderSettings((int)settings.width, (int)settings.height, (int)settings.fps,
                          bps, settings.encoder != 0, "bridge-settings");
 }
-
+// Creates the telemetry SHM region and emits an initial status; called from Activate.
 bool HmdDriver::InitializeBridge()
 {
     if (m_bridgeServer.Start()) {
@@ -450,7 +361,7 @@ bool HmdDriver::InitializeBridge()
     m_bridgeInitialized.store(false, std::memory_order_relaxed);
     return false;
 }
-
+// Detaches the command consumer and destroys the telemetry region; called from Deactivate.
 void HmdDriver::ShutdownBridge()
 {
     m_bridgeInitialized.store(false, std::memory_order_relaxed);
@@ -458,55 +369,39 @@ void HmdDriver::ShutdownBridge()
     m_bridgeServer.Stop();
     DriverLog("Bridge shared-memory regions released");
 }
-
-// ---------------------------------------------------------------------------
-// Sensor data forwarding: the bridge forwards phone telemetry (gyro/accel/mag)
-// to the driver on UDP port 42074. The packet format is identical to the
-// phone→bridge format (tag 0x10, 45 bytes LE) so the driver reuses the same
-// wire constants. GetPose() reads the latest sample under m_sensorMutex.
-// ---------------------------------------------------------------------------
-
+// Binds the sensor UDP socket and starts the sensor thread; called from Activate.
 bool HmdDriver::InitializeSensorSocket()
 {
     DriverLog("Initializing sensor socket...");
-
     m_sensorSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (m_sensorSocket == INVALID_SOCKET) {
         DriverLog("sensor socket() failed! WSAError: %d", WSAGetLastError());
         return false;
     }
-
     BOOL reuseAddr = TRUE;
     setsockopt(m_sensorSocket, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuseAddr, sizeof(reuseAddr));
-
     sockaddr_in addr;
     addr.sin_family = AF_INET;
     addr.sin_port = htons(wire::kSensorPort);
     addr.sin_addr.s_addr = INADDR_ANY;
-
     if (bind(m_sensorSocket, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
         DriverLog("sensor bind() failed on port %d! WSAError: %d", wire::kSensorPort, WSAGetLastError());
         closesocket(m_sensorSocket);
         m_sensorSocket = INVALID_SOCKET;
         return false;
     }
-
     m_sensorInitialized = true;
     m_sensorRunning = true;
     m_sensorThread = std::thread(&HmdDriver::SensorThreadFunc, this);
-
     DriverLog("Sensor socket initialized. Listening on port %d", wire::kSensorPort);
     return true;
 }
-
+// Stops the sensor thread via a loopback wake packet, then closes the socket; called from Deactivate.
 void HmdDriver::ShutdownSensorSocket()
 {
     DriverLog("Shutting down sensor socket...");
-
     if (m_sensorInitialized) {
         m_sensorRunning = false;
-
-        // Send a dummy packet to unblock recvfrom.
         SOCKET wakeSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (wakeSocket != INVALID_SOCKET) {
             sockaddr_in localAddr;
@@ -517,44 +412,33 @@ void HmdDriver::ShutdownSensorSocket()
             sendto(wakeSocket, wake, 1, 0, (sockaddr*)&localAddr, sizeof(localAddr));
             closesocket(wakeSocket);
         }
-
         if (m_sensorThread.joinable()) {
             m_sensorThread.join();
         }
-
         if (m_sensorSocket != INVALID_SOCKET) {
             closesocket(m_sensorSocket);
             m_sensorSocket = INVALID_SOCKET;
         }
-
         m_sensorInitialized = false;
     }
-
     DriverLog("Sensor socket shutdown complete.");
 }
-
+// Reads bridge-forwarded 0x10 gyro and 0x12 quaternion packets on the sensor thread; GetPose consumes the cached sample.
 void HmdDriver::SensorThreadFunc()
 {
     DriverLog("Sensor thread started on port %d", wire::kSensorPort);
-
-    // Wire format: tag 0x10, u64 timestamp LE, 3x f32 gyro, 3x f32 accel, 3x f32 mag = 45 bytes.
     static constexpr int kSensorPacketLen = 45;
     uint8_t buffer[64];
     sockaddr_in senderAddr;
     int senderAddrLen = sizeof(senderAddr);
-
-    // Set a 2-second receive timeout so we can log periodic status.
     DWORD recvTimeout = 2000;
     setsockopt(m_sensorSocket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&recvTimeout, sizeof(recvTimeout));
-
     int logCounter = 0;
     int recvCount = 0;
-
     while (m_sensorRunning) {
         senderAddrLen = sizeof(senderAddr);
         int bytesReceived = recvfrom(m_sensorSocket, (char*)buffer, sizeof(buffer), 0,
                                      (sockaddr*)&senderAddr, &senderAddrLen);
-
         if (!m_sensorRunning) break;
         if (bytesReceived == SOCKET_ERROR) {
             int err = WSAGetLastError();
@@ -568,20 +452,14 @@ void HmdDriver::SensorThreadFunc()
             }
             continue;
         }
-
         DebugLogThrottle(50, "Sensor recv: %d bytes, tag=0x%02x", bytesReceived, buffer[0]);
-
         if (bytesReceived >= kSensorPacketLen && buffer[0] == 0x10) {
-            // Parse the sensor packet (little-endian).
             uint64_t timestamp = 0;
             std::memcpy(&timestamp, &buffer[1], 8);
-
             float gyro[3], accel[3], mag[3];
             std::memcpy(gyro,  &buffer[9],  12);
             std::memcpy(accel, &buffer[21], 12);
             std::memcpy(mag,   &buffer[33], 12);
-
-            // Store the latest sample under the mutex so GetPose() can read it.
             {
                 std::lock_guard<std::mutex> lock(m_sensorMutex);
                 std::memcpy(m_sensorGyro, gyro, 12);
@@ -595,16 +473,13 @@ void HmdDriver::SensorThreadFunc()
                     std::chrono::steady_clock::now().time_since_epoch()).count(),
                 std::memory_order_relaxed);
             recvCount++;
-
             DebugLog("Sensor pkt #%d: gyro=(%.3f,%.3f,%.3f) accel=(%.1f,%.1f,%.1f) ts=%llu",
                 recvCount, gyro[0], gyro[1], gyro[2], accel[0], accel[1], accel[2], (unsigned long long)timestamp);
         } else if (bytesReceived >= 25 && buffer[0] == 0x12) {
-            // Fused rotation quaternion from Android TYPE_ROTATION_VECTOR.
             uint64_t timestamp = 0;
             std::memcpy(&timestamp, &buffer[1], 8);
             float quat[4];
             std::memcpy(quat, &buffer[9], 16);
-
             {
                 std::lock_guard<std::mutex> lock(m_sensorMutex);
                 std::memcpy(m_sensorQuat, quat, 16);
@@ -621,13 +496,11 @@ void HmdDriver::SensorThreadFunc()
                     std::chrono::steady_clock::now().time_since_epoch()).count(),
                 std::memory_order_relaxed);
             recvCount++;
-
             DebugLog("Rotation pkt #%d: quat=(%.3f,%.3f,%.3f,%.3f) ts=%llu",
                 recvCount, quat[0], quat[1], quat[2], quat[3], (unsigned long long)timestamp);
         } else {
             DriverLog("Sensor: got %d bytes, tag=0x%02x (not 0x10/0x12)", bytesReceived, buffer[0]);
         }
     }
-
     DriverLog("Sensor thread exiting (received %d packets total)", recvCount);
 }

@@ -1,42 +1,22 @@
-//! Fast camera frame receiver from the phone.
-//!
-//! Wire (UDP 42072): `[u16 seq BE][JPEG 256x192]` per datagram, one frame per
-//! datagram, 30 fps. Latest-wins: the recv thread keeps only the newest
-//! datagram; a slow MediaPipe worker can never stall the display path.
-//!
-//! Threads (stdlib only):
-//! - recv: non-blocking drain-to-latest, JPEG decode, immediate
-//!   `note_camera_frame` for the UI, forward JPEG to the detect channel
-//!   (dropped when the worker is busy).
-//! - detect: blocking TCP `MediapipeClient::detect` on the latest JPEG only,
-//!   draws the skeleton overlay, stores the annotated frame.
-
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
-
 use crate::app::SharedState;
 use crate::net::mediapipe::MediapipeClient;
 use crate::net::{CAMERA_PORT, MEDIAPIPE_PORT};
-
-/// u16 seq header in front of every JPEG datagram (big-endian).
+/// Length of the big-endian u16 sequence prefix on each camera datagram.
 pub const SEQ_HEADER_LEN: usize = 2;
-
-/// Idle sleep when no datagrams are available.
 const POLL_INTERVAL: Duration = Duration::from_millis(1);
-
-/// Depth of the detect channel. 2 slots: one in flight, one newest-waiting.
 const DETECT_QUEUE: usize = 2;
-
-/// After this many consecutive stale frames the phone presumably restarted
-/// (seq reset to 0) and the tracker re-anchors instead of dropping forever.
 const STALE_RESYNC_AFTER: u32 = 30;
-
-type DetectJob = (u16, u32, u32, Vec<u8>, Arc<Vec<u8>>); // seq, w, h, rgba, jpeg (shared)
-
-/// Bind the camera socket and start the receive + detect threads.
-/// Called by `AppCore::new`.
+/// Work item for the detect thread: sequence id, decoded size, RGBA pixels
+/// (empty when only the JPEG is needed), and the shared JPEG for MediaPipe.
+type DetectJob = (u16, u32, u32, Vec<u8>, Arc<Vec<u8>>);
+/// Starts the camera pipeline (UDP 42072): a non-blocking receive thread plus
+/// a detect thread connected by a 2-deep latest-wins channel. `client` is the
+/// optional pre-connected MediaPipe sidecar; when None the detect thread
+/// lazy-connects on first use. Logs-and-returns when the socket cannot bind.
 pub fn spawn(state: SharedState, client: Option<MediapipeClient>) {
     let sock = match UdpSocket::bind(format!("0.0.0.0:{CAMERA_PORT}")) {
         Ok(sock) => sock,
@@ -47,40 +27,28 @@ pub fn spawn(state: SharedState, client: Option<MediapipeClient>) {
             return;
         }
     };
-    // Non-blocking so the drain loop below actually drains.
     if sock.set_nonblocking(true).is_err() {
         if let Ok(mut s) = state.lock() {
             s.push_log("camera socket non-blocking failed".into());
         }
         return;
     }
-
     if let Ok(mut s) = state.lock() {
         s.push_log(format!("camera listener on udp {CAMERA_PORT}"));
     }
-
-    // Latest-wins channel to the detect worker.
     let (tx, rx) = mpsc::sync_channel::<DetectJob>(DETECT_QUEUE);
-    // True once the sidecar has answered (startup or lazy-connect): lets the
-    // recv thread skip decodes nobody will use (see `process_frame`).
     let sidecar_ok = Arc::new(AtomicBool::new(client.is_some()));
-
-    // Always run the detect worker, even when the sidecar wasn't reachable
-    // at startup: it lazy-connects (and retries) so a slow Python import
-    // or a manually-started server still heals without a bridge restart.
     {
         let detect_state = state.clone();
         let ok = sidecar_ok.clone();
         std::thread::spawn(move || detect_loop(rx, detect_state, client, ok));
     }
-
     std::thread::spawn(move || camera_loop(sock, state, tx, sidecar_ok));
 }
-
-/// Wrapping-aware frame ordering for the u16 BE seq header (endianness
-/// untouched). Accepts only frames newer than anything seen: duplicates and
-/// reordered (stale) frames are rejected, forward jumps count the skipped
-/// frames as gaps.
+/// Reorders the u16 phone sequence numbers: accepts in-order frames, counts
+/// gaps (dropped UDP), drops duplicates and stale retransmits, and resyncs
+/// after STALE_RESYNC_AFTER stale frames in a row (phone app restarted and
+/// the counter wrapped back to 0).
 #[derive(Default)]
 struct SeqTracker {
     last: Option<u16>,
@@ -88,8 +56,10 @@ struct SeqTracker {
     gaps: u64,
     stale_dropped: u64,
 }
-
 impl SeqTracker {
+    /// Returns true when `seq` is newer than the last accepted frame.
+    /// Wrapping subtraction handles the u16 rollover; a delta in the top
+    /// half of the range means the frame is older (stale/duplicate).
     fn accept(&mut self, seq: u16) -> bool {
         match self.last {
             None => {
@@ -99,11 +69,9 @@ impl SeqTracker {
             Some(last) => {
                 let delta = seq.wrapping_sub(last);
                 if delta == 0 {
-                    return false; // duplicate
+                    return false;
                 }
                 if delta > 0x8000 {
-                    // Older than `last`: reorder. But a phone restart resets
-                    // seq to 0, which also looks stale — re-anchor after a run.
                     self.stale_dropped += 1;
                     self.stale_run += 1;
                     if self.stale_run > STALE_RESYNC_AFTER {
@@ -123,9 +91,9 @@ impl SeqTracker {
         }
     }
 }
-
-/// Recv thread: drain to the newest datagram, decode, display immediately,
-/// forward the JPEG to the detect worker when it has room.
+/// Non-blocking receive loop. Drains every queued datagram per tick and keeps
+/// only the newest (latest-wins: no point decoding a stale frame when a newer
+/// one is already here). After 10s of silence logs a one-time firewall hint.
 fn camera_loop(
     sock: UdpSocket,
     state: SharedState,
@@ -139,9 +107,7 @@ fn camera_loop(
     let started = Instant::now();
     let mut silence_hinted = false;
     let mut got_one_ever = false;
-
     loop {
-        // Drain every available datagram; only the newest survives.
         let mut got_one = false;
         loop {
             match sock.recv(&mut buf) {
@@ -150,8 +116,8 @@ fn camera_loop(
                     latest.extend_from_slice(&buf[..n]);
                     got_one = true;
                 }
-                Ok(_) => {} // too short for seq + JPEG — ignore
-                _ => break, // Would-block — done for this tick
+                Ok(_) => {}
+                _ => break,
             }
         }
         if !got_one {
@@ -171,8 +137,10 @@ fn camera_loop(
         process_frame(&latest, &state, frame_count, &tx, &mut tracker, &sidecar_ok);
     }
 }
-
-/// Decode one datagram: strip seq, JPEG decode, store for UI, offer to detect.
+/// Validates one camera datagram and routes it: drops stale/duplicate
+/// sequences and non-JPEG payloads, stores the decoded RGBA for the preview,
+/// and queues a DetectJob (try_send: the queue holder drops rather than
+/// blocks when the detector is busy). Every 60th frame logs to the ring log.
 fn process_frame(
     datagram: &[u8],
     state: &SharedState,
@@ -187,28 +155,17 @@ fn process_frame(
         return;
     }
     let jpeg_data = &datagram[SEQ_HEADER_LEN..];
-    // Quick SOI sanity check before paying for a full decode.
     if jpeg_data.len() < 2 || jpeg_data[0] != 0xFF || jpeg_data[1] != 0xD8 {
         return;
     }
     crate::debug_log!(state, "[camera] frame #{frame_count} seq={seq}, {} bytes jpeg", jpeg_data.len());
-    // Shared payload: the detect job clones the Arc, not the bytes.
     let jpeg_shared: Arc<Vec<u8>> = Arc::new(jpeg_data.to_vec());
-
-    // When the overlay is on, only the detect thread should store display
-    // frames — it annotates them with the skeleton. Storing raw frames here
-    // would cause a visible raw↔overlay flicker as the two threads race to
-    // overwrite the same slot.
     let (overlay_on, enabled, pending) = state
         .lock()
         .map(|s| (s.hand_overlay, s.hand_enabled, s.camera_frame.is_some()))
         .unwrap_or((true, false, false));
     if !overlay_on {
         if !enabled && !sidecar_ok.load(Ordering::Relaxed) && pending {
-            // Nobody watches (last frame unconsumed), nothing to detect
-            // with, overlay off: skip the decode, but still offer the JPEG
-            // to the worker so a late sidecar lazy-connects and the hand
-            // count stays live.
             let _ = tx.try_send((seq, 0, 0, Vec::new(), jpeg_shared));
             return;
         }
@@ -216,9 +173,6 @@ fn process_frame(
             Some(v) => v,
             None => return,
         };
-        // Display path: never waits for MediaPipe. `rgba` moves in (no
-        // clone); the worker gets an empty frame — the raw display store
-        // above is already the annotated-free output it would have stored.
         if let Ok(mut s) = state.lock() {
             s.note_camera_frame(w, h, rgba);
             if frame_count % 60 == 1 {
@@ -228,24 +182,19 @@ fn process_frame(
         let _ = tx.try_send((seq, w, h, Vec::new(), jpeg_shared));
         return;
     }
-
     let (w, h, rgba) = match decode_jpeg(jpeg_data) {
         Some(v) => v,
         None => return,
     };
     if frame_count % 60 == 1 {
-        // Still log even when skipping the display write, for diagnostics.
         crate::debug_log!(state, "[camera] frame #{frame_count} seq={seq}, {w}x{h} (overlay on, skipping raw store)");
     }
-
-    // Detect path: latest-wins. Channel full = worker busy → drop this one
-    // (the display path above already stored the frame).
     let _ = tx.try_send((seq, w, h, rgba, jpeg_shared));
 }
-
-/// Detect thread: blocking TCP detect on the latest job only. Holds an
-/// optional client: `None` (sidecar unreachable at startup) lazy-connects
-/// on the first enabled frame and retries, so the pipeline self-heals.
+/// Detect thread: takes the newest queued job (skipping backlog), lazy-
+/// connects the MediaPipe sidecar when hand tracking is enabled, runs
+/// detection on the JPEG, draws the hand overlay into the RGBA when enabled,
+/// and publishes the frame plus hand count to shared state.
 fn detect_loop(
     rx: mpsc::Receiver<DetectJob>,
     state: SharedState,
@@ -253,26 +202,18 @@ fn detect_loop(
     sidecar_ok: Arc<AtomicBool>,
 ) {
     loop {
-        // Drain to the newest job; intermediate frames are superseded.
         let mut job = match rx.recv() {
             Ok(j) => j,
-            Err(_) => break, // sender gone
+            Err(_) => break,
         };
         while let Ok(newer) = rx.try_recv() {
             job = newer;
         }
         let (seq, w, h, mut rgba, jpeg) = job;
-        // Master switch lives in shared state so the UI toggle takes effect
-        // on the very next frame without touching the thread layout.
         let (enabled, overlay) = match state.lock() {
             Ok(s) => (s.hand_enabled, s.hand_overlay),
             Err(_) => (false, true),
         };
-        // Lazy (re)connect: first enabled frame after a failed startup, or
-        // a manually-started sidecar, picks up the server without a restart.
-        // Healthy probe (not a bare accept): a wedged squatter must not be
-        // adopted — startup reclaims those; here we just retry next frame.
-        // Thresholds come from state so the probe never clobbers tuning.
         if enabled && client.is_none() {
             let (d, p, t) = match state.lock() {
                 Ok(s) => (
@@ -305,76 +246,67 @@ fn detect_loop(
             s.camera_detected_hands = count;
             if !rgba.is_empty() {
                 if overlay {
-                    // When overlay is on, this is the sole display writer.
-                    // Count the frame for fps so the pill doesn't read zero.
                     s.note_camera_frame(w, h, rgba);
                 } else {
                     s.store_camera_frame(w, h, rgba);
                 }
             }
         }
-        // debug_log! re-locks the state — emit after the guard above drops.
         if count > 0 {
             crate::debug_log!(&state, "[camera] seq={seq} {count} hand(s)");
         }
     }
 }
-
-/// JPEG → (w, h, RGBA). Pure-Rust decode of a ~256x192 frame (~50 kpx).
-/// Decodes straight to RGBA (no RGB→RGBA repack pass).
+/// Decodes a phone JPEG (256x192 q38) straight to RGBA via zune-jpeg.
+/// Returns None on corrupt data (dropped UDP tail); callers skip the frame.
 fn decode_jpeg(jpeg_data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     use zune_core::bytestream::ZCursor;
     use zune_core::colorspace::ColorSpace;
     use zune_core::options::DecoderOptions;
-
     let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGBA);
     let mut decoder = zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(jpeg_data), options);
     let rgba = decoder.decode().ok()?;
     let info = decoder.info()?;
     Some((info.width as u32, info.height as u32, rgba))
 }
-
 #[cfg(test)]
 mod tests {
+    // SeqTracker contract tests: in-order accept with gap counting, u16
+    // wraparound, duplicate/stale rejection, and resync after a phone-side
+    // sequence restart. Test names read as the spec.
     use super::*;
-
     #[test]
     fn seq_tracker_accepts_in_order_and_counts_gaps() {
         let mut t = SeqTracker::default();
         assert!(t.accept(0));
         assert!(t.accept(1));
-        assert!(t.accept(5)); // skipped 2..4
+        assert!(t.accept(5));
         assert_eq!(t.gaps, 3);
     }
-
     #[test]
     fn seq_tracker_wraps_around_u16() {
         let mut t = SeqTracker::default();
         assert!(t.accept(0xFFFF));
-        assert!(t.accept(0)); // wrapping +1, not stale
+        assert!(t.accept(0));
         assert!(t.accept(1));
         assert_eq!(t.gaps, 0);
     }
-
     #[test]
     fn seq_tracker_rejects_duplicates_and_stale() {
         let mut t = SeqTracker::default();
         assert!(t.accept(100));
-        assert!(!t.accept(100)); // duplicate
-        assert!(!t.accept(50)); // reordered
+        assert!(!t.accept(100));
+        assert!(!t.accept(50));
         assert_eq!(t.stale_dropped, 1);
-        assert!(t.accept(101)); // stream continues
+        assert!(t.accept(101));
     }
-
     #[test]
     fn seq_tracker_resyncs_after_phone_restart() {
         let mut t = SeqTracker::default();
         assert!(t.accept(5000));
-        // Phone restarted: seq back at 0. First frames look stale...
         for seq in 0..STALE_RESYNC_AFTER {
             assert!(!t.accept(seq as u16), "seq={seq} should still look stale");
         }
-        // ...then the tracker re-anchors and the stream resumes.
         assert!(t.accept(STALE_RESYNC_AFTER as u16));
         assert!(t.accept(STALE_RESYNC_AFTER as u16 + 1));
     }

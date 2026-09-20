@@ -8,110 +8,74 @@
 #include <functional>
 #include <mutex>
 #include "BridgeProtocol.h"
-
 struct AVCodecContext;
 struct AVFrame;
 struct AVPacket;
 struct AVBSFContext;
 struct SwsContext;
 struct AVBufferRef;
-
+// SBS H.264 encoder: composites eye textures with shaders on D3D11, converts to NV12, encodes via FFmpeg.
 class VideoEncoder
 {
 public:
+// Packet/telemetry callbacks delivered to HmdDriver; LayerBounds carries per-eye UV rects from SubmitLayer.
     using EncodedPacketCallback = std::function<void(uint8_t* data, int size, int64_t pts, bool keyframe)>;
     using TelemetryCallback = std::function<void(const cbpp::PayloadTelemetry&)>;
-
-    // Per-layer valid sub-rectangle of the eye texture (VRTextureBounds_t equivalent).
     struct LayerBounds {
         float uMin = 0.0f, vMin = 0.0f, uMax = 1.0f, vMax = 1.0f;
     };
-
+// Main pipeline stages driven by the encoding thread: init, open eyes, compose, read back, convert, encode.
     VideoEncoder();
     ~VideoEncoder();
-
     bool Initialize(ID3D11Device* pDevice, ID3D11DeviceContext* pContext,
                     int width, int height, int fps, int bitrate, bool useGpuEncoding);
-
-    // Open shared private eye copies on the encoder's own D3D11 device.
-    // Must be called before ComposeSBSGPU/ReadbackToBuffer on the encoding thread.
     bool OpenSharedEyeTextures(const std::vector<std::pair<HANDLE, HANDLE>>& handles,
                                std::vector<ID3D11Texture2D*>& outLeft,
                                std::vector<ID3D11Texture2D*>& outRight);
     void ReleaseEyeTextures();
-    
     void Shutdown();
-
-    // Split-frame API for the async encode pipeline (all on the encoding thread:
-    // ComposeSBSGPU composites submitted layers to the conversion RT,
-    // ReadbackToBuffer copies it to the CPU buffer, SwsConvert does BGRA->NV12,
-    // FinishEncode hashes + sends to the encoder + drains packets + telemetry).
     bool ComposeSBSGPU(const std::vector<ID3D11Texture2D*>& lefts,
                        const std::vector<ID3D11Texture2D*>& rights,
                        const std::vector<LayerBounds>& leftBounds,
                        const std::vector<LayerBounds>& rightBounds);
-    bool SwsConvert();                   // sws_scale BGRA→NV12 from the readback buffer
-    bool FinishEncode(int64_t pts);      // hash + send + receive + telemetry (no D3D11)
-    bool ReadbackToBuffer();  // D3D11: CopySubresourceRegion + Map + memcpy + Unmap (all in one)
-
+    bool SwsConvert();
+    bool FinishEncode(int64_t pts);
+    bool ReadbackToBuffer();
     void SetEncodedPacketCallback(EncodedPacketCallback callback);
-    // Periodic encode stats summary (called ~1/s from the encode thread).
     void SetTelemetryCallback(TelemetryCallback callback);
-
-    // Loss recovery: the discovery thread calls this when the phone sends
-    // KEYFRAME_REQ (it lost video data). Sets an atomic flag consumed by
-    // SendFrameToEncoder on the encode thread, which forces the next frame
-    // to IDR. Atomic so no encoder mutex is needed across threads.
     void RequestKeyframe();
-
+// Trivial state queries; read by Present/heartbeat paths to check encoder readiness and geometry.
+// Internal FFmpeg/shader/compose stages plus error and version logging helpers.
     bool IsInitialized() const { return m_initialized; }
     int GetWidth() const { return m_width; }
     int GetHeight() const { return m_height; }
-
 private:
     bool InitializeFFmpeg();
     void CleanupFFmpeg();
-
     bool InitializeShaderConversion();
     void CleanupShaderConversion();
-
-    // Draws one layer's eyes into the SBS conversion RT (left eye → left half,
-    // right eye → right half) using the layer blend state. Caller clears the RT
-    // once and sets the viewport; this is invoked once per submitted layer.
     bool ComposeSBSLayer(ID3D11Texture2D* pLeft, ID3D11Texture2D* pRight,
                          const LayerBounds& leftBounds, const LayerBounds& rightBounds,
                          ID3D11BlendState* blendState);
-
     bool SendFrameToEncoder();
     bool ReceiveEncodedPackets();
-
     void LogFFmpegError(const char* context, int errorCode);
     void LogFFmpegVersion();
-
+// D3D devices, FFmpeg contexts, shader objects, frame buffers, and encode timing counters for telemetry.
     ID3D11Device* m_pDevice;
     ID3D11DeviceContext* m_pContext;
-
-    // Second D3D11 device for encoding thread (separate from compositor's device).
-    // ComposeSBSGPU + ReadbackToBuffer run on this device to avoid contention.
     ID3D11Device* m_pEncDevice = nullptr;
     ID3D11DeviceContext* m_pEncContext = nullptr;
-
-    // Shared eye textures opened on the encoding device (one pair per layer).
-    // Cached across frames while the handles are unchanged (M9); released on
-    // handle change, error, or Shutdown.
     std::vector<ID3D11Texture2D*> m_encEyeLefts;
     std::vector<ID3D11Texture2D*> m_encEyeRights;
     std::vector<std::pair<HANDLE, HANDLE>> m_openedHandles;
-
     AVCodecContext* m_pCodecContext;
     AVBufferRef* m_pHwDeviceCtx;
     AVFrame* m_pFrame;
     AVPacket* m_pPacket;
     AVBSFContext* m_pBsfCtx;
     SwsContext* m_pConvertContext;
-
     ID3D11Texture2D* m_pStagingTexture;
-
     bool m_initialized;
     bool m_useGpuEncoding;
     int m_width;
@@ -119,27 +83,21 @@ private:
     int m_fps;
     int m_bitrate;
     int64_t m_frameCount;
-
     EncodedPacketCallback m_encodedPacketCallback;
     TelemetryCallback m_telemetryCallback;
-
     uint8_t* m_pSoftwareFrameBuffer;
     bool m_hasValidFrame;
-
-    // Shader-based SBS compositing (handles any eye format, e.g. R10G10B10A2).
     ID3D11Texture2D* m_pConversionRT;
     ID3D11RenderTargetView* m_pConversionRTV;
     ID3D11VertexShader* m_pBlitVS;
     ID3D11PixelShader* m_pSBSPS;
     ID3D11SamplerState* m_pBlitSampler;
     ID3D11BlendState* m_pBlitBlend;
-    ID3D11BlendState* m_pLayerBlend;   // alpha blend for stacking multiple layers
-    ID3D11Buffer* m_pBoundsCB;         // per-layer VRTextureBounds for the SBS shader
+    ID3D11BlendState* m_pLayerBlend;
+    ID3D11Buffer* m_pBoundsCB;
     ID3D11InputLayout* m_pBlitInputLayout;
     ID3D11Buffer* m_pBlitVertexBuffer;
     bool m_shaderConversionReady;
-
-    // Telemetry for diagnosing capture/encode stalls (image-in-image artifact)
     LARGE_INTEGER m_perfFreq;
     int64_t m_encSumUs;
     int64_t m_encMaxUs;
@@ -152,25 +110,12 @@ private:
     int m_dupCount;
     int64_t m_summaryFrames;
     int m_summaryInterval;
-
     uint32_t ComputeFrameHash();
     void LogTelemetrySummary();
-
-    // CPU readback buffer (Populate in ReadbackToBuffer, consumed by SwsConvert)
     uint8_t* m_pReadbackBuffer = nullptr;
-
-    // Annex-B formatted SPS+PPS NALs extracted from codec extradata at init.
-    // Prepended to every keyframe that doesn't already start with SPS, so
-    // decoders can configure even when the BSF skips the prepend.
     std::vector<uint8_t> m_spsPpsAnnexB;
-    // Forced-IDR flag for phone loss recovery (see RequestKeyframe). Set by
-    // the discovery thread, consumed once via exchange() in
-    // SendFrameToEncoder, so NACK bursts collapse into a single keyframe.
     std::atomic<bool> m_forceKeyframe{false};
     int m_readbackBufferSize = 0;
-
-    // DIAG (Test A): remember the eye texture formats of the last SBS compose so a
-    // black-frame detection in ReadbackToBuffer can report them (H6 format check).
     uint32_t m_lastLeftFmt = 0;
     uint32_t m_lastRightFmt = 0;
 };
