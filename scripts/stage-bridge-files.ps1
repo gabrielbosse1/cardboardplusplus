@@ -45,5 +45,5 @@ if (-not $SkipPython) {
 New-Item -ItemType Directory -Path $outDir -Force | Out-Null
 $outZip = Join-Path $outDir "bridge-files.zip"
 if (Test-Path -LiteralPath $outZip) { Remove-Item -LiteralPath $outZip -Force }
-Compress-Archive -LiteralPath (Join-Path $stage "*") -DestinationPath $outZip -Force
+Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $outZip -Force
 Write-Host "Payload staged: $outZip" -ForegroundColor Green
