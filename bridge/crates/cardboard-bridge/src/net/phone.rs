@@ -131,6 +131,7 @@ fn apply_packet(state: &SharedState, packet: TelemetryPacket, src: SocketAddr) {
                     s.push_log(format!("phone IP updated to {src} (rotation)"));
                 }
                 s.phone_connected = true;
+                s.note_rotation(sample.quat);
                 debug_msg = Some(format!(
                     "[phone] rotation quat=({:.4},{:.4},{:.4},{:.4}) ts={}",
                     sample.quat[0], sample.quat[1], sample.quat[2], sample.quat[3],
@@ -186,7 +187,7 @@ mod tests {
     // check clears the pill exactly once. Test names read as the spec.
     use super::*;
     use crate::app::AppState;
-    use crate::net::telemetry::{GyroSample, HandFrame, TelemetryPacket};
+    use crate::net::telemetry::{GyroSample, HandFrame, RotationSample, TelemetryPacket};
     use std::sync::{Arc, Mutex};
     fn fresh_state() -> SharedState {
         Arc::new(Mutex::new(AppState::default()))
@@ -243,6 +244,17 @@ mod tests {
         apply_packet(&state, TelemetryPacket::Gyro(sample), fake_src());
         let s = state.lock().unwrap();
         assert!(s.phone_connected);
+    }
+        #[test]
+    fn rotation_caches_head_quat_for_hand_pipeline() {
+        let state = fresh_state();
+        assert_eq!(state.lock().unwrap().head_quat, [1.0, 0.0, 0.0, 0.0]);
+        let sample = RotationSample {
+            timestamp_ms: 7,
+            quat: [0.5, 0.5, 0.5, 0.5],
+        };
+        apply_packet(&state, TelemetryPacket::Rotation(sample), fake_src());
+        assert_eq!(state.lock().unwrap().head_quat, [0.5, 0.5, 0.5, 0.5]);
     }
     #[test]
     fn gyro_increments_packets_total() {

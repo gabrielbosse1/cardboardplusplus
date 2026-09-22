@@ -1,0 +1,15 @@
+{
+    "jsonid": "input_profile",
+    "controller_type": "handtracking",
+    "input_profile_path": "{cardboardplusplus}/input/cardboard_hand_profile.json",
+    "input_source": {
+        "/input/skeleton/left": {
+            "type": "skeleton",
+            "skeleton": "/skeleton/hand/left"
+        },
+        "/input/skeleton/right": {
+            "type": "skeleton",
+            "skeleton": "/skeleton/hand/right"
+        }
+    }
+}

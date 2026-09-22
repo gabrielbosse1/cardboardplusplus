@@ -9,11 +9,13 @@ pub struct Landmark {
     pub y: f32,
     pub z: f32,
 }
-/// One tracked hand: 21 MediaPipe landmarks plus which hand it is and the
-/// model confidence score. Produced per camera frame by detect().
+/// One tracked hand: 21 MediaPipe landmarks (image space) plus 21 world
+/// landmarks (meters, camera-relative) and the hand identity / confidence.
+/// Produced per camera frame by detect().
 #[derive(Debug, Clone)]
 pub struct DetectedHand {
     pub landmarks: [Landmark; 21],
+    pub world_landmarks: [Landmark; 21],
     pub handedness: String,
     pub score: f32,
 }
@@ -172,7 +174,7 @@ impl MediapipeClient {
         stream.read_exact(&mut ack).is_ok()
     }
     /// One request-response round: sends [u32 len][jpeg], reads the hand
-    /// count, then that many [u8 handedness][f32 score][21 x 3xf32] records.
+    /// count, then that many [u8 handedness][f32 score][21 x 3xf32 image][21 x 3xf32 world] records.
     /// Returns None on any short read/write so detect() can reconnect.
     fn detect_once(stream: &mut TcpStream, jpeg: &[u8]) -> Option<Vec<DetectedHand>> {
         let len_bytes = (jpeg.len() as u32).to_le_bytes();
@@ -190,7 +192,8 @@ impl MediapipeClient {
         }
         let mut hands = Vec::with_capacity(n);
         for _ in 0..n {
-            let mut hand_buf = [0u8; 1 + 4 + 21 * 3 * 4];
+            // handedness(1) + score(4) + 21 image landmarks(252) + 21 world landmarks(252) = 509
+            let mut hand_buf = [0u8; 1 + 4 + 21 * 3 * 4 + 21 * 3 * 4];
             if stream.read_exact(&mut hand_buf).is_err() {
                 return None;
             }
@@ -206,8 +209,19 @@ impl MediapipeClient {
                     z: f32::from_le_bytes(hand_buf[off + 8..off + 12].try_into().unwrap()),
                 };
             }
+            let mut world_landmarks = [Landmark::default(); 21];
+            let world_base = 5 + 21 * 3 * 4;
+            for i in 0..21 {
+                let off = world_base + i * 12;
+                world_landmarks[i] = Landmark {
+                    x: f32::from_le_bytes(hand_buf[off..off + 4].try_into().unwrap()),
+                    y: f32::from_le_bytes(hand_buf[off + 4..off + 8].try_into().unwrap()),
+                    z: f32::from_le_bytes(hand_buf[off + 8..off + 12].try_into().unwrap()),
+                };
+            }
             hands.push(DetectedHand {
                 landmarks,
+                world_landmarks,
                 handedness: handedness.to_string(),
                 score,
             });
@@ -371,6 +385,15 @@ mod tests {
         });
         port
     }
+    /// Appends 21 world landmarks (zeros) to a per-hand record so the mock
+    /// matches the new wire format that includes world coordinates.
+    fn append_world_zeros(buf: &mut Vec<u8>) {
+        for _ in 0..21 {
+            buf.extend_from_slice(&0.0f32.to_le_bytes());
+            buf.extend_from_slice(&0.0f32.to_le_bytes());
+            buf.extend_from_slice(&0.0f32.to_le_bytes());
+        }
+    }
     #[test]
     fn detect_returns_empty_when_no_hands() {
         let port = start_mock_server(vec![0x00]);
@@ -388,6 +411,7 @@ mod tests {
             resp.extend_from_slice(&0.2f32.to_le_bytes());
             resp.extend_from_slice(&0.3f32.to_le_bytes());
         }
+        append_world_zeros(&mut resp);
         let port = start_mock_server(resp);
         let client = MediapipeClient::connect(port).unwrap();
         let hands = client.detect(b"\xFF\xD8");
@@ -409,6 +433,7 @@ mod tests {
                 resp.extend_from_slice(&0.0f32.to_le_bytes());
                 resp.extend_from_slice(&0.0f32.to_le_bytes());
             }
+            append_world_zeros(&mut resp);
         }
         let port = start_mock_server(resp);
         let client = MediapipeClient::connect(port).unwrap();
@@ -436,6 +461,7 @@ mod tests {
                     resp.extend_from_slice(&0.00f32.to_le_bytes());
                     resp.extend_from_slice(&0.00f32.to_le_bytes());
                 }
+                append_world_zeros(&mut resp);
                 let _ = stream.write_all(&resp);
                 let _ = stream.flush();
             }
@@ -494,6 +520,7 @@ mod tests {
                     resp.extend_from_slice(&0.0f32.to_le_bytes());
                     resp.extend_from_slice(&0.0f32.to_le_bytes());
                 }
+                append_world_zeros(&mut resp);
                 let _ = stream.write_all(&resp);
                 let _ = stream.flush();
             }

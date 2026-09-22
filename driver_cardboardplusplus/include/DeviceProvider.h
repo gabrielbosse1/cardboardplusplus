@@ -1,20 +1,24 @@
 #pragma once
 #include "HmdDriver.h"
+#include "HandDriver.h"
 #include "openvr_driver.h"
 #include <windows.h>
 using namespace vr;
-// SteamVR device provider; owns the single HmdDriver and forwards Init/RunFrame/Cleanup.
+// SteamVR device provider; owns the HmdDriver and dynamically spawns/removes
+// hand-tracker devices when the bridge reports hand tracking data.
 class DeviceProvider : public IServerTrackedDeviceProvider
 {
 public:
-// SteamVR provider hooks; Init/Cleanup manage the HMD lifetime, RunFrame drives the per-frame pose publish.
-	EVRInitError Init(IVRDriverContext* pDriverContext);
-	void Cleanup();
-	const char* const* GetInterfaceVersions();
-	void RunFrame();
-	bool ShouldBlockStandbyMode();
-	void EnterStandby();
-	void LeaveStandby();
+    EVRInitError Init(IVRDriverContext* pDriverContext);
+    void Cleanup();
+    const char* const* GetInterfaceVersions();
+    void RunFrame();
+    bool ShouldBlockStandbyMode();
+    void EnterStandby();
+    void LeaveStandby();
 private:
-	HmdDriver* m_hmdDriver;
+    HmdDriver* m_hmdDriver = nullptr;
+    HandDriver* m_handDevices[2] = {}; // 0=left, 1=right
+    bool m_handRegistered[2] = {};
+    void EnsureHandDevices();
 };

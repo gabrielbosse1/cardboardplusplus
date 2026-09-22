@@ -256,6 +256,22 @@ void HmdDriver::RunFrame()
         RunBridgeHeartbeat();
     }
 }
+// Returns a snapshot of the skeleton hand data for the given hand (0=left, 1=right).
+// Returns false when no data ever arrived or the last packet is older than
+// the staleness gate; callers publish poseIsValid=false while this is false.
+bool HmdDriver::GetSkeletonHand(int handId, SkeletonHand& out)
+{
+    if (handId < 0 || handId >= 2) return false;
+    std::lock_guard<std::mutex> lock(m_skeletonMutex);
+    auto& hand = m_skeletonHands[handId];
+    if (!hand.connected) return false;
+    static constexpr int64_t kSkeletonStaleMs = 1500;
+    const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (nowMs - hand.timestamp_ms > kSkeletonStaleMs) return false;
+    out = hand;
+    return true;
+}
 // Reports the virtual window origin/size to SteamVR; pnX/pnY/pnWidth/pnHeight receive 0,0,1920,1080.
 void HmdDriver::GetWindowBounds( int32_t *pnX, int32_t *pnY, uint32_t *pnWidth, uint32_t *pnHeight )
 {
@@ -428,7 +444,7 @@ void HmdDriver::SensorThreadFunc()
 {
     DriverLog("Sensor thread started on port %d", wire::kSensorPort);
     static constexpr int kSensorPacketLen = 45;
-    uint8_t buffer[64];
+    uint8_t buffer[1024]; // large enough for skeleton packets (31 bones × 28 + header ≈ 871)
     sockaddr_in senderAddr;
     int senderAddrLen = sizeof(senderAddr);
     DWORD recvTimeout = 2000;
@@ -498,6 +514,42 @@ void HmdDriver::SensorThreadFunc()
             recvCount++;
             DebugLog("Rotation pkt #%d: quat=(%.3f,%.3f,%.3f,%.3f) ts=%llu",
                 recvCount, quat[0], quat[1], quat[2], quat[3], (unsigned long long)timestamp);
+        } else if (bytesReceived >= 4 && buffer[0] == 0x13) {
+            // Skeleton packet: [tag=0x13][timestamp_ms u64 LE][hand_id u8][num_bones u8][bone0..boneN as 7×f32 LE]
+            // Convention (parent-relative, like Valve's sample driver):
+            // bone 0 (root) = absolute wrist position (device pose anchor,
+            // identity rotation); bones 1..30 = parent-relative offsets and
+            // orientations. See ovr_bones.rs.
+            static constexpr int kSkeletonPacketLen = 11 + SKELETON_BONE_COUNT * 7 * 4;
+            if (bytesReceived < kSkeletonPacketLen) {
+                DriverLog("Sensor: short skeleton packet (%d bytes, need %d)", bytesReceived, kSkeletonPacketLen);
+                continue;
+            }
+            uint64_t pktTs = 0;
+            std::memcpy(&pktTs, &buffer[1], 8);
+            uint8_t handId = buffer[9];
+            uint8_t numBones = buffer[10];
+            if (handId < 2 && numBones == SKELETON_BONE_COUNT) {
+                std::lock_guard<std::mutex> lock(m_skeletonMutex);
+                auto& hand = m_skeletonHands[handId];
+                // Out-of-order UDP arrivals carry older sender timestamps;
+                // they lose to the newest accepted packet.
+                if (hand.connected && pktTs < hand.packet_ts) {
+                    DebugLogThrottle(100, "Skeleton pkt: dropped stale hand=%d ts=%llu (current=%llu)",
+                        handId, (unsigned long long)pktTs, (unsigned long long)hand.packet_ts);
+                    continue;
+                }
+                const uint8_t* p = &buffer[11];
+                for (int i = 0; i < SKELETON_BONE_COUNT; i++) {
+                    std::memcpy(hand.bones[i].pos, p, 12); p += 12;
+                    std::memcpy(hand.bones[i].rot, p, 16); p += 16;
+                }
+                hand.connected = true;
+                hand.packet_ts = pktTs;
+                hand.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                DebugLogThrottle(100, "Skeleton pkt: hand=%d bones=%d", handId, numBones);
+            }
         } else {
             DriverLog("Sensor: got %d bytes, tag=0x%02x (not 0x10/0x12)", bytesReceived, buffer[0]);
         }

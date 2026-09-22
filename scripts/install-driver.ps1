@@ -70,8 +70,16 @@ New-Item -ItemType Directory -Path $dstRoot -Force | Out-Null
 Copy-WithRetry $manifestSrc $dstRoot
 $dstRes = Join-Path $dstRoot "resources"
 New-Item -ItemType Directory -Path $dstRes -Force | Out-Null
-$resFiles = Get-ChildItem (Join-Path $srcResources "*")
-foreach ($f in $resFiles) { Copy-WithRetry $f.FullName $dstRes }
+# Copy every file under resources/ (including input/, icons/, ...) — a flat
+# Copy-Item of top-level entries only creates empty subdirectories.
+$resFiles = Get-ChildItem $srcResources -Recurse -File
+foreach ($f in $resFiles) {
+    $rel = $f.FullName.Substring($srcResources.Length).TrimStart('\')
+    $target = Join-Path $dstRes $rel
+    $targetDir = Split-Path $target -Parent
+    New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+    Copy-WithRetry $f.FullName $target
+}
 Write-Host ("Copied {0} resource file(s) to {1}" -f $resFiles.Count, $dstRes)
 Write-Host "Driver installed to $dstDir" -ForegroundColor Green
 Write-Host "Restart SteamVR to load the driver." -ForegroundColor Yellow

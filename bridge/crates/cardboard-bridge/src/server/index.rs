@@ -1,8 +1,8 @@
 /// Plain-text endpoint guide served at GET /. Documents every REST route with
 /// shapes and a curl example; the single place external callers look first.
 pub const ENDPOINT_INDEX: &str = "\
-Cardboard++ Bridge — REST control plane
-========================================
+Cardboard++ — REST control plane
+================================
 
 The bridge runs its control logic (driver heartbeat, phone telemetry, config
 push) in a UI-independent core. This server exposes that core over plain

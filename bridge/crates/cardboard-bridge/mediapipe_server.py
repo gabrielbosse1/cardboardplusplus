@@ -11,7 +11,8 @@ Wire protocol (little-endian), one TCP connection, sequential requests:
     Per hand:
       [1 byte: handedness (0=left, 1=right)]
       [4 bytes f32 LE: score]
-      [21 * 3 * 4 = 252 bytes: 21 landmarks as (x,y,z) f32 LE each]
+      [21 * 3 * 4 = 252 bytes: 21 image landmarks as (x,y,z) f32 LE each]
+      [21 * 3 * 4 = 252 bytes: 21 world landmarks as (x,y,z) f32 LE each, meters]
     If num_hands == 0: just the 1 zero byte.
 
   Live config (no restart needed):
@@ -126,14 +127,17 @@ def handle_connection(conn):
             mp_image = __import__("mediapipe").Image(image_format=__import__("mediapipe").ImageFormat.SRGB, data=rgb)
 
             result = landmarker.detect_for_video(mp_image, timestamp_ms)
+            frame_idx += 1
 
             # Build binary response
             hands = result.hand_landmarks or []
+            world_hands = result.hand_world_landmarks or []
             handednesses = result.handedness or []
             n = min(len(hands), MAX_HANDS)
             buf = bytearray([n])
             for i in range(n):
                 lm = hands[i]
+                wh = world_hands[i] if i < len(world_hands) else None
                 hh = handednesses[i][0].category_name if handednesses[i] else "Right"
                 h_code = 0 if hh == "Left" else 1
                 score = handednesses[i][0].score if handednesses[i] else 0.0
@@ -141,6 +145,12 @@ def handle_connection(conn):
                 buf.extend(struct.pack("<f", score))
                 for pt in lm:
                     buf.extend(struct.pack("<fff", pt.x, pt.y, pt.z))
+                if wh:
+                    for pt in wh:
+                        buf.extend(struct.pack("<fff", pt.x, pt.y, pt.z))
+                else:
+                    for _ in range(21):
+                        buf.extend(struct.pack("<fff", 0.0, 0.0, 0.0))
 
             conn.sendall(bytes(buf))
             frame_idx += 1

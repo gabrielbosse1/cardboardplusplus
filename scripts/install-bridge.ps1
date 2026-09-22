@@ -24,7 +24,7 @@ foreach ($f in @((Join-Path $dest "cardboard-bridge-svc.exe"), (Join-Path $dest 
 }
 $group = Join-Path ([Environment]::GetFolderPath("CommonStartMenu")) "Programs\Cardboard++"
 New-Item -ItemType Directory -Path $group -Force | Out-Null
-$sc = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $group "Cardboard++ Bridge.lnk"))
+$sc = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $group "Cardboard++.lnk"))
 $sc.TargetPath = Join-Path $dest "cardboard-bridge-svc.exe"
 $sc.WorkingDirectory = $dest
 $sc.Save()
@@ -37,7 +37,7 @@ foreach ($c in @(@{p="py";a=@("-3")}, @{p="python";a=@()})) {
 if (-not $py) { Write-Warning "no Python found -- hand tracking disabled. Then: py -3 -m pip install -r $crate\requirements.txt" }
 else { Write-Host ("python: " + ((& $py.p @($py.a) --version 2>&1) | Select-Object -First 1)) }
 foreach ($port in @(42071, 42072)) {
-  $name = "Cardboard++ Bridge UDP $port"
+  $name = "Cardboard++ UDP $port"
   if (-not (Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue)) {
     New-NetFirewallRule -DisplayName $name -Direction Inbound -Protocol UDP -LocalPort $port -Action Allow | Out-Null
     Write-Host "firewall: allowed inbound UDP $port"

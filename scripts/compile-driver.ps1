@@ -10,9 +10,21 @@ Ensure-FfmpegDeps "$root\driver_cardboardplusplus\lib\ffmpeg"
 & "$PSScriptRoot\bake-driver-version.ps1"
 $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 if (-not (Test-Path $vsWhere)) { throw "vswhere.exe not found - install Visual Studio" }
+# Native stderr must not be fatal under Stop (external tools always write
+# there); the exit code after each call is the real failure signal.
+$nativePref = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+$LASTEXITCODE = 0
 $msbuild = & $vsWhere -latest -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\amd64\MSBuild.exe" | Select-Object -First 1
+$vsWhereExit = $LASTEXITCODE
+$ErrorActionPreference = $nativePref
+if ($vsWhereExit -ne 0) { throw "vswhere failed" }
 if (-not $msbuild) { throw "MSBuild not found - install the C++ build tools in Visual Studio" }
 Write-Host "Building driver ($Configuration|x64)..." -ForegroundColor Cyan
+$ErrorActionPreference = "Continue"
+$LASTEXITCODE = 0
 & $msbuild $sln /p:Configuration=$Configuration /p:Platform=x64 /v:minimal
-if ($LASTEXITCODE -ne 0) { throw "driver build failed" }
+$nativeExit = $LASTEXITCODE
+$ErrorActionPreference = $nativePref
+if ($nativeExit -ne 0) { throw "driver build failed" }
 Write-Host "Driver built: driver_cardboardplusplus\x64\$Configuration\driver_cardboardplusplus.dll" -ForegroundColor Green

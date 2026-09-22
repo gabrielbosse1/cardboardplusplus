@@ -1,18 +1,20 @@
 use std::net::UdpSocket;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 use crate::app::SharedState;
 use crate::net::mediapipe::MediapipeClient;
-use crate::net::{CAMERA_PORT, MEDIAPIPE_PORT};
+use crate::net::{CAMERA_PORT, MEDIAPIPE_PORT, SENSOR_PORT};
 /// Length of the big-endian u16 sequence prefix on each camera datagram.
 pub const SEQ_HEADER_LEN: usize = 2;
 const POLL_INTERVAL: Duration = Duration::from_millis(1);
 const DETECT_QUEUE: usize = 2;
 const STALE_RESYNC_AFTER: u32 = 30;
-/// Work item for the detect thread: sequence id, decoded size, RGBA pixels
-/// (empty when only the JPEG is needed), and the shared JPEG for MediaPipe.
-type DetectJob = (u16, u32, u32, Vec<u8>, Arc<Vec<u8>>);
+/// Detections below this MediaPipe score never reach slot tracking or the driver send.
+const MIN_HAND_SCORE: f32 = 0.3;
+/// Work item for the detect thread: sequence id and the shared JPEG for
+/// MediaPipe + preview decode. The receive thread never decodes; the detect
+/// thread decodes on demand so the UDP drain is never blocked by CPU work.
+type DetectJob = (u16, Arc<Vec<u8>>);
 /// Starts the camera pipeline (UDP 42072): a non-blocking receive thread plus
 /// a detect thread connected by a 2-deep latest-wins channel. `client` is the
 /// optional pre-connected MediaPipe sidecar; when None the detect thread
@@ -37,13 +39,11 @@ pub fn spawn(state: SharedState, client: Option<MediapipeClient>) {
         s.push_log(format!("camera listener on udp {CAMERA_PORT}"));
     }
     let (tx, rx) = mpsc::sync_channel::<DetectJob>(DETECT_QUEUE);
-    let sidecar_ok = Arc::new(AtomicBool::new(client.is_some()));
     {
         let detect_state = state.clone();
-        let ok = sidecar_ok.clone();
-        std::thread::spawn(move || detect_loop(rx, detect_state, client, ok));
+        std::thread::spawn(move || detect_loop(rx, detect_state, client));
     }
-    std::thread::spawn(move || camera_loop(sock, state, tx, sidecar_ok));
+    std::thread::spawn(move || camera_loop(sock, state, tx));
 }
 /// Reorders the u16 phone sequence numbers: accepts in-order frames, counts
 /// gaps (dropped UDP), drops duplicates and stale retransmits, and resyncs
@@ -98,7 +98,6 @@ fn camera_loop(
     sock: UdpSocket,
     state: SharedState,
     tx: mpsc::SyncSender<DetectJob>,
-    sidecar_ok: Arc<AtomicBool>,
 ) {
     let mut buf = [0u8; 65535];
     let mut frame_count: u64 = 0;
@@ -134,20 +133,20 @@ fn camera_loop(
         }
         got_one_ever = true;
         frame_count += 1;
-        process_frame(&latest, &state, frame_count, &tx, &mut tracker, &sidecar_ok);
+        process_frame(&latest, &state, frame_count, &tx, &mut tracker);
     }
 }
 /// Validates one camera datagram and routes it: drops stale/duplicate
-/// sequences and non-JPEG payloads, stores the decoded RGBA for the preview,
-/// and queues a DetectJob (try_send: the queue holder drops rather than
-/// blocks when the detector is busy). Every 60th frame logs to the ring log.
+/// sequences and non-JPEG payloads, and queues a DetectJob (try_send: the
+/// queue holder drops rather than blocks when the detector is busy). The JPEG
+/// decode is deferred to the detect thread so the UDP recv loop is never
+/// blocked by CPU work. Every 60th frame logs to the ring log.
 fn process_frame(
     datagram: &[u8],
     state: &SharedState,
     frame_count: u64,
     tx: &mpsc::SyncSender<DetectJob>,
     tracker: &mut SeqTracker,
-    sidecar_ok: &Arc<AtomicBool>,
 ) {
     let seq = u16::from_be_bytes([datagram[0], datagram[1]]);
     if !tracker.accept(seq) {
@@ -158,49 +157,27 @@ fn process_frame(
     if jpeg_data.len() < 2 || jpeg_data[0] != 0xFF || jpeg_data[1] != 0xD8 {
         return;
     }
-    crate::debug_log!(state, "[camera] frame #{frame_count} seq={seq}, {} bytes jpeg", jpeg_data.len());
-    let jpeg_shared: Arc<Vec<u8>> = Arc::new(jpeg_data.to_vec());
-    let (overlay_on, enabled, pending) = state
-        .lock()
-        .map(|s| (s.hand_overlay, s.hand_enabled, s.camera_frame.is_some()))
-        .unwrap_or((true, false, false));
-    if !overlay_on {
-        if !enabled && !sidecar_ok.load(Ordering::Relaxed) && pending {
-            let _ = tx.try_send((seq, 0, 0, Vec::new(), jpeg_shared));
-            return;
-        }
-        let (w, h, rgba) = match decode_jpeg(jpeg_data) {
-            Some(v) => v,
-            None => return,
-        };
-        if let Ok(mut s) = state.lock() {
-            s.note_camera_frame(w, h, rgba);
-            if frame_count % 60 == 1 {
-                s.push_log(format!("camera frame #{frame_count} seq={seq}, {w}x{h}"));
-            }
-        }
-        let _ = tx.try_send((seq, w, h, Vec::new(), jpeg_shared));
-        return;
-    }
-    let (w, h, rgba) = match decode_jpeg(jpeg_data) {
-        Some(v) => v,
-        None => return,
-    };
     if frame_count % 60 == 1 {
-        crate::debug_log!(state, "[camera] frame #{frame_count} seq={seq}, {w}x{h} (overlay on, skipping raw store)");
+        crate::debug_log!(state, "[camera] frame #{frame_count} seq={seq}, {} bytes jpeg", jpeg_data.len());
     }
-    let _ = tx.try_send((seq, w, h, rgba, jpeg_shared));
+    let _ = tx.try_send((seq, Arc::new(jpeg_data.to_vec())));
 }
 /// Detect thread: takes the newest queued job (skipping backlog), lazy-
-/// connects the MediaPipe sidecar when hand tracking is enabled, runs
-/// detection on the JPEG, draws the hand overlay into the RGBA when enabled,
-/// and publishes the frame plus hand count to shared state.
+/// connects the MediaPipe sidecar when hand tracking is enabled, decodes
+/// JPEG on demand, runs detection on the JPEG, draws the hand overlay into
+/// the RGBA when enabled, and publishes the frame plus hand count to shared
+/// state. JPEG decode happens here instead of on the receive thread so the
+/// UDP drain is never blocked by CPU work.
 fn detect_loop(
     rx: mpsc::Receiver<DetectJob>,
     state: SharedState,
     mut client: Option<MediapipeClient>,
-    sidecar_ok: Arc<AtomicBool>,
 ) {
+    // UDP socket for sending skeleton data to the driver's sensor port
+    let skeleton_sock = UdpSocket::bind("127.0.0.1:0").ok();
+    let skeleton_addr = format!("127.0.0.1:{SENSOR_PORT}");
+    // Stable hand slots: sides never flicker, labels only vote on swaps.
+    let mut slots = crate::hand_slots::HandSlots::new();
     loop {
         let mut job = match rx.recv() {
             Ok(j) => j,
@@ -209,10 +186,10 @@ fn detect_loop(
         while let Ok(newer) = rx.try_recv() {
             job = newer;
         }
-        let (seq, w, h, mut rgba, jpeg) = job;
-        let (enabled, overlay) = match state.lock() {
-            Ok(s) => (s.hand_enabled, s.hand_overlay),
-            Err(_) => (false, true),
+        let (seq, jpeg) = job;
+        let (enabled, overlay, head_quat) = match state.lock() {
+            Ok(s) => (s.hand_enabled, s.hand_overlay, s.head_quat),
+            Err(_) => (false, true, [1.0, 0.0, 0.0, 0.0]),
         };
         if enabled && client.is_none() {
             let (d, p, t) = match state.lock() {
@@ -225,35 +202,106 @@ fn detect_loop(
             };
             if let Some(cli) = MediapipeClient::connect_healthy(MEDIAPIPE_PORT, d, p, t) {
                 client = Some(cli);
-                sidecar_ok.store(true, Ordering::Relaxed);
                 if let Ok(mut s) = state.lock() {
                     s.push_log("mediapipe: lazy-connected to sidecar".into());
                 }
             }
         }
-        if client.is_some() {
-            sidecar_ok.store(true, Ordering::Relaxed);
-        }
         let hands = match (&client, enabled) {
             (Some(cli), true) => cli.detect(&jpeg),
             _ => vec![],
         };
-        let count = hands.len();
-        if overlay && count > 0 && !rgba.is_empty() {
-            crate::hand_overlay::draw_hands(&mut rgba, w, h, &hands);
-        }
-        if let Ok(mut s) = state.lock() {
-            s.camera_detected_hands = count;
-            if !rgba.is_empty() {
-                if overlay {
-                    s.note_camera_frame(w, h, rgba);
-                } else {
-                    s.store_camera_frame(w, h, rgba);
+        let hands: Vec<_> = hands
+            .into_iter()
+            .filter(|h| h.score >= MIN_HAND_SCORE)
+            .collect();
+        // Debug dump for offline orientation analysis: raw frame plus both
+        // landmark sets, throttled to one shot per 5s while hands are up.
+        if !hands.is_empty() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static LAST_DUMP_MS: AtomicU64 = AtomicU64::new(0);
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            if now_ms - LAST_DUMP_MS.load(Ordering::Relaxed) > 5000 {
+                LAST_DUMP_MS.store(now_ms, Ordering::Relaxed);
+                let dir = std::env::temp_dir().join("cbpp");
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = std::fs::write(dir.join("hand_frame.jpg"), &jpeg[..]);
+                let mut txt = format!("seq={seq} count={}\n", hands.len());
+                for (hi, h) in hands.iter().enumerate() {
+                    txt += &format!("hand{hi} label={} score={:.3}\n", h.handedness, h.score);
+                    for (i, l) in h.landmarks.iter().enumerate() {
+                        txt += &format!(" img[{i}] {:.4} {:.4} {:.4}\n", l.x, l.y, l.z);
+                    }
+                    for (i, l) in h.world_landmarks.iter().enumerate() {
+                        txt += &format!(" world[{i}] {:.4} {:.4} {:.4}\n", l.x, l.y, l.z);
+                    }
                 }
+                let _ = std::fs::write(dir.join("hand_frame.txt"), txt);
+            }
+        }
+        // Stable sides + smoothing + swap detection. hand_id comes from the
+        // slot (never the flickering per-frame label).
+        let (tracked, slot_warnings) = slots.update(&hands);
+        for w in slot_warnings {
+            if let Ok(mut s) = state.lock() {
+                s.push_log(w);
+            }
+        }
+        let count = tracked.len();
+        // Send skeleton bone data to driver via UDP (tag 0x13)
+        if count > 0 {
+            let timestamp_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            if let Some(ref sock) = skeleton_sock {
+                for hand in &tracked {
+                    let hand_id = hand.hand_id;
+                    let mut bones = crate::ovr_bones::compute_world_bones(&hand.landmarks, &hand.world_landmarks, hand_id == 1);
+                    // Tracking-space device pose is composed here (bridge
+                    // owns all rotation math); the driver copies bone 0
+                    // verbatim into the SteamVR pose.
+                    crate::ovr_bones::apply_head_pose(&mut bones, head_quat);
+                    {
+                        use std::sync::atomic::{AtomicU64, Ordering};
+                        static LOG_CNT: AtomicU64 = AtomicU64::new(0);
+                        let n = LOG_CNT.fetch_add(1, Ordering::Relaxed);
+                        if n % 30 == 0 {
+                            let w = &hand.world_landmarks;
+                            let wr = w[0];
+                            let tip = w[12];
+                            let span = ((tip.x - wr.x).powi(2) + (tip.y - wr.y).powi(2) + (tip.z - wr.z).powi(2)).sqrt();
+                            let root = bones[0].position;
+                            crate::debug_log!(&state, "[camera] world_lm wrist=({:.3},{:.3},{:.3}) tip=({:.3},{:.3},{:.3}) span={:.4}m bone_root=({:.3},{:.3},{:.3})",
+                                wr.x, wr.y, wr.z, tip.x, tip.y, tip.z, span, root[0], root[1], root[2]);
+                        }
+                    }
+                    let pkt = crate::ovr_bones::serialize_bones_udp(hand_id, timestamp_ms, &bones);
+                    let _ = sock.send_to(&pkt, &skeleton_addr);
+                }
+            }
+        }
+        // Decode JPEG only when we need the RGBA for overlay or preview
+        if overlay && count > 0 {
+            if let Some((w, h, mut rgba)) = decode_jpeg(&jpeg) {
+                crate::hand_overlay::draw_hands(&mut rgba, w, h, &hands);
+                if let Ok(mut s) = state.lock() {
+                    s.note_camera_frame(w, h, rgba);
+                }
+            }
+        } else if let Some((w, h, rgba)) = decode_jpeg(&jpeg) {
+            if let Ok(mut s) = state.lock() {
+                s.note_camera_frame(w, h, rgba);
             }
         }
         if count > 0 {
             crate::debug_log!(&state, "[camera] seq={seq} {count} hand(s)");
+        }
+        if let Ok(mut s) = state.lock() {
+            s.camera_detected_hands = count;
         }
     }
 }

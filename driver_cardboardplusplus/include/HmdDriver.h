@@ -196,4 +196,25 @@ private:
     vr::VRInputComponentHandle_t m_proximityHandle{0};
     cbpp::BridgeServer m_bridgeServer;
     std::atomic<bool> m_bridgeInitialized;
+
+public:
+    // Skeleton data from bridge (tag 0x13 on sensor port 42074).
+    static constexpr int SKELETON_BONE_COUNT = 31;
+    struct SkeletonBone { float pos[3]; float rot[4]; };
+    struct SkeletonHand {
+        SkeletonBone bones[SKELETON_BONE_COUNT];
+        int64_t timestamp_ms{0};
+        // Sender timestamp of the last accepted packet (bridge clock); only
+        // compared against newer arrivals, never against timestamp_ms above.
+        uint64_t packet_ts{0};
+        bool connected{false};
+    };
+
+private:
+    std::mutex m_skeletonMutex;
+    SkeletonHand m_skeletonHands[2]{}; // 0=left, 1=right
+
+public:
+    /// Returns a snapshot of the skeleton hand data; called by HandDriver.
+    bool GetSkeletonHand(int handId, SkeletonHand& out);
 };

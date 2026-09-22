@@ -50,6 +50,7 @@ pub struct AppState {
     pub latest_accel: [f32; 3],
     pub latest_mag: [f32; 3],
     pub latest_timestamp_ms: u64,
+    pub head_quat: [f32; 4],
     pub net_frames_decoded: u32,
     pub net_stalls: u32,
     pub net_decoded_fps: f32,
@@ -106,6 +107,7 @@ impl Default for AppState {
             latest_accel: [0.0; 3],
             latest_mag: [0.0; 3],
             latest_timestamp_ms: 0,
+            head_quat: [1.0, 0.0, 0.0, 0.0],
             net_frames_decoded: 0,
             net_stalls: 0,
             net_decoded_fps: 0.0,
@@ -177,6 +179,13 @@ impl AppState {
         self.hand_pulse_count += 1;
         self.hands_detected = hands as i32;
         self.packets_total += 1;
+    }
+    /// Caches the latest phone head-orientation quat [w,x,y,z] for the hand
+    /// pipeline: camera.rs composes it into the skeleton device pose so the
+    /// driver can copy the 0x13 packet verbatim. Identity until the first
+    /// rotation sample arrives. Called from phone.rs.
+    pub fn note_rotation(&mut self, quat: [f32; 4]) {
+        self.head_quat = quat;
     }
     /// Adaptive-bitrate ladder (Mbps) the link test walks one step at a time.
     pub const BITRATE_TIERS_MBPS: [i32; 4] = [4, 8, 12, 20];

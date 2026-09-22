@@ -3,4 +3,6 @@
 pub mod app;
 pub mod net;
 pub mod hand_overlay;
+pub mod hand_slots;
+pub mod ovr_bones;
 pub(crate) use app::debug_log;

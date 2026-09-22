@@ -531,7 +531,7 @@ component TopBar inherits Rectangle {
         VerticalLayout {
             spacing: 1px;
             Text {
-                text: "Cardboard++ Bridge";
+                text: "Cardboard++";
                 color: Theme.text-hi;
                 font-size: 15px;
                 font-weight: 700;
@@ -625,7 +625,7 @@ component BottomBar inherits Rectangle {
         padding-right: 14px;
         spacing: 8px;
         Text {
-            text: "Cardboard++ Bridge  ·  v" + BridgeState.app-version;
+            text: "Cardboard++  ·  v" + BridgeState.app-version;
             color: Theme.text-dim;
             font-size: 11px;
             vertical-alignment: center;
@@ -1692,7 +1692,7 @@ export component WizardWindow inherits Window {
 // Hub root: TopBar, Sidebar + tab pages, BottomBar. Fast/slow pollers in
 // main.rs keep every bound property fresh; see BridgeState above.
 export component MainWindow inherits Window {
-    title: "Cardboard++ Bridge";
+    title: "Cardboard++";
     preferred-width: 1160px;
     preferred-height: 720px;
     min-width: 940px;

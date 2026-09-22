@@ -1,4 +1,5 @@
 use crate::net::mediapipe::DetectedHand;
+use crate::ovr_bones;
 /// MediaPipe finger/toplogy edges over the 21 landmarks: four per finger plus
 /// the wrist-to-pinky-base span. Indices reference DetectedHand.landmarks.
 const CONNECTIONS: &[[usize; 2]] = &[
@@ -10,11 +11,12 @@ const CONNECTIONS: &[[usize; 2]] = &[
     [0, 17],
 ];
 /// Paints every detected hand onto the camera RGBA preview: green bones along
-/// CONNECTIONS plus white joint dots. Coordinates are normalized [0,1], so
-/// they scale by the frame size `w`/`h`. Called from the camera detect_loop
-/// when the hand overlay is enabled.
+/// CONNECTIONS plus white joint dots (MediaPipe landmarks), and blue extra
+/// bones computed from the OpenVR converter (metacarpals, extended tips, aux).
+/// Coordinates are normalized [0,1], so they scale by the frame size `w`/`h`.
 pub fn draw_hands(rgba: &mut [u8], w: u32, h: u32, hands: &[DetectedHand]) {
     for hand in hands {
+        // Green: original 21 MediaPipe landmarks
         for &[a, b] in CONNECTIONS {
             let ax = (hand.landmarks[a].x * w as f32) as i32;
             let ay = (hand.landmarks[a].y * h as f32) as i32;
@@ -26,6 +28,22 @@ pub fn draw_hands(rgba: &mut [u8], w: u32, h: u32, hands: &[DetectedHand]) {
             let x = (lm.x * w as f32) as i32;
             let y = (lm.y * h as f32) as i32;
             draw_dot(rgba, w, h, x, y, 3, [255, 255, 255, 240]);
+        }
+        // Blue: extra OpenVR bones (computed from the 21 landmarks)
+        let bones = ovr_bones::compute_bones(&hand.landmarks);
+        // Connections between extra bones only
+        for &[a, b] in ovr_bones::EXTRA_CONNECTIONS {
+            let ax = (bones[a].x * w as f32) as i32;
+            let ay = (bones[a].y * h as f32) as i32;
+            let bx = (bones[b].x * w as f32) as i32;
+            let by = (bones[b].y * h as f32) as i32;
+            draw_line(rgba, w, h, ax, ay, bx, by, [255, 180, 0, 200]);
+        }
+        // Extra bone dots (smaller than the main ones)
+        for &idx in ovr_bones::EXTRA_BONE_INDEXES {
+            let x = (bones[idx].x * w as f32) as i32;
+            let y = (bones[idx].y * h as f32) as i32;
+            draw_dot(rgba, w, h, x, y, 2, [255, 180, 0, 200]);
         }
     }
 }
