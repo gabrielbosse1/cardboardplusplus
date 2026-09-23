@@ -12,7 +12,7 @@ const CONNECTIONS: &[[usize; 2]] = &[
 ];
 /// Paints every detected hand onto the camera RGBA preview: green bones along
 /// CONNECTIONS plus white joint dots (MediaPipe landmarks), and blue extra
-/// bones computed from the OpenVR converter (metacarpals, extended tips, aux).
+/// bones computed from the OpenVR converter (metacarpal stubs, aux).
 /// Coordinates are normalized [0,1], so they scale by the frame size `w`/`h`.
 pub fn draw_hands(rgba: &mut [u8], w: u32, h: u32, hands: &[DetectedHand]) {
     for hand in hands {

@@ -24,18 +24,6 @@ BONE_PINKY0=21; BONE_PINKY1=22; BONE_PINKY2=23; BONE_PINKY3=24; BONE_PINKY4=25
 BONE_AUX_THUMB=26; BONE_AUX_INDEX=27; BONE_AUX_MIDDLE=28; BONE_AUX_RING=29; BONE_AUX_PINKY=30
 PARENT=[-1,0,1,2,3,4,1,6,7,8,9,1,11,12,13,14,1,16,17,18,19,1,21,22,23,24,0,0,0,0,0]
 
-# Tip-extension lengths (fingertip past the last knuckle), in meters, measured
-# from Valve's vr_glove GLB as |end node - tip node|: index 22.8, middle
-# 25.9, ring 22.4, pinky 18.0mm. Same slots as finger_joint_lengths[*][4]
-# in Valve's handskeletonsimulation sample driver (0.02/0.02/0.03/0.02).
-TIP_LEN = {9: 0.0228, 14: 0.0259, 19: 0.0224, 24: 0.0180}  # keyed by BONE_*3
-
-def _extrapolate(tip, dip, L):
-    """Fingertip: extend past the last knuckle along DIP->TIP by L."""
-    d = tip - dip
-    l = float(np.linalg.norm(d))
-    return tip + d * (L / l)
-
 # Colors BGR
 C=[(180,180,180),(255,255,255),(0,160,255),(0,160,255),(0,160,255),(0,160,255),
    (0,255,100),(0,255,100),(0,255,100),(0,255,100),(0,255,100),
@@ -129,13 +117,13 @@ class Converter:
         rmc0=_short_meta(rmc, 0.0176); pmc0=_short_meta(pmc, 0.0245)
         # Thumb: 4 MediaPipe points -> 4 bones, direct map.
         b[BONE_THUMB0]=tc.copy(); b[BONE_THUMB1]=tm.copy(); b[BONE_THUMB2]=ti.copy(); b[BONE_THUMB3]=tt.copy(); b[BONE_AUX_THUMB]=tt.copy()
-        # Fingers: Finger0 (meta) sits AT the MCP (17-26mm from wrist per Valve's
-        # GLB + sample driver). Finger4 (tip) extends past the last knuckle by
-        # TIP_LEN, like Valve's tip-extension bone. AUX tracks the fingertip.
-        b[BONE_INDEX0]=imc0; b[BONE_INDEX1]=ip.copy(); b[BONE_INDEX2]=idp.copy(); b[BONE_INDEX3]=it.copy(); b[BONE_INDEX4]=_extrapolate(it,idp,TIP_LEN[BONE_INDEX3]); b[BONE_AUX_INDEX]=b[BONE_INDEX4].copy()
-        b[BONE_MIDDLE0]=mmc0; b[BONE_MIDDLE1]=mp_.copy(); b[BONE_MIDDLE2]=mdp.copy(); b[BONE_MIDDLE3]=mtt.copy(); b[BONE_MIDDLE4]=_extrapolate(mtt,mdp,TIP_LEN[BONE_MIDDLE3]); b[BONE_AUX_MIDDLE]=b[BONE_MIDDLE4].copy()
-        b[BONE_RING0]=rmc0; b[BONE_RING1]=rp.copy(); b[BONE_RING2]=rdp.copy(); b[BONE_RING3]=rt.copy(); b[BONE_RING4]=_extrapolate(rt,rdp,TIP_LEN[BONE_RING3]); b[BONE_AUX_RING]=b[BONE_RING4].copy()
-        b[BONE_PINKY0]=pmc0; b[BONE_PINKY1]=pp.copy(); b[BONE_PINKY2]=pdp.copy(); b[BONE_PINKY3]=pt.copy(); b[BONE_PINKY4]=_extrapolate(pt,pdp,TIP_LEN[BONE_PINKY3]); b[BONE_AUX_PINKY]=b[BONE_PINKY4].copy()
+        # Fingers: Finger0 (meta) is the metacarpal stub at Valve's GLB length
+        # (17-26mm from wrist). Finger1..4 = MCP, PIP, DIP, TIP direct.
+        # AUX tracks the fingertip.
+        b[BONE_INDEX0]=imc0; b[BONE_INDEX1]=imc.copy(); b[BONE_INDEX2]=ip.copy(); b[BONE_INDEX3]=idp.copy(); b[BONE_INDEX4]=it.copy(); b[BONE_AUX_INDEX]=it.copy()
+        b[BONE_MIDDLE0]=mmc0; b[BONE_MIDDLE1]=mmc.copy(); b[BONE_MIDDLE2]=mp_.copy(); b[BONE_MIDDLE3]=mdp.copy(); b[BONE_MIDDLE4]=mtt.copy(); b[BONE_AUX_MIDDLE]=mtt.copy()
+        b[BONE_RING0]=rmc0; b[BONE_RING1]=rmc.copy(); b[BONE_RING2]=rp.copy(); b[BONE_RING3]=rdp.copy(); b[BONE_RING4]=rt.copy(); b[BONE_AUX_RING]=rt.copy()
+        b[BONE_PINKY0]=pmc0; b[BONE_PINKY1]=pmc.copy(); b[BONE_PINKY2]=pp.copy(); b[BONE_PINKY3]=pdp.copy(); b[BONE_PINKY4]=pt.copy(); b[BONE_AUX_PINKY]=pt.copy()
         return b
 
 GLOVE_LEFT_PATH = "C:/Program Files (x86)/Steam/steamapps/common/SteamVR/resources/rendermodels/vr_glove/vr_glove_left_model_slim.glb"
@@ -165,7 +153,7 @@ class GloveMesh:
         (22,23),(23,24),(24,25),(25,26),(26,None),
         (27,None),(28,None),(29,None),(30,None),(31,None)]
     # live-bone direction for each skin joint: (from bone, to bone or None)
-    # Finger0 (meta) sits AT the MCP: pos bone is the *0 bone (= MCP).
+    # Finger0 (meta) = metacarpal stub, Finger1 (bone) sits AT the MCP.
     JDIR = [(BONE_ROOT,None),(BONE_WRIST,BONE_MIDDLE0),
         (BONE_THUMB0,BONE_THUMB1),(BONE_THUMB1,BONE_THUMB2),(BONE_THUMB2,BONE_THUMB3),(BONE_THUMB3,None),
         (BONE_INDEX0,BONE_INDEX1),(BONE_INDEX1,BONE_INDEX2),(BONE_INDEX2,BONE_INDEX3),(BONE_INDEX3,BONE_INDEX4),(BONE_INDEX4,None),

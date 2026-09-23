@@ -62,15 +62,6 @@ const PINKY_TIP: usize = 20;
 /// Index 25.8mm, Middle 17.9mm, Ring 17.6mm, Pinky 24.5mm.
 const META_LEN: [f32; 4] = [0.0258, 0.0179, 0.0176, 0.0245];
 
-/// Tip extension lengths past the last knuckle, same as hand_tracker.py.
-/// Keyed by BONE_*3 index: Index(9)=22.8mm, Middle(14)=25.9mm, Ring(19)=22.4mm, Pinky(24)=18.0mm.
-const TIP_LEN: [(usize, f32); 4] = [
-    (BONE_INDEX3, 0.0228),
-    (BONE_MIDDLE3, 0.0259),
-    (BONE_RING3, 0.0224),
-    (BONE_PINKY3, 0.0180),
-];
-
 /// Vector ops on Landmark (used as 3D points in normalized image space).
 fn sub(a: Landmark, b: Landmark) -> Landmark {
     Landmark { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z }
@@ -98,25 +89,16 @@ fn short_meta(wrist: Landmark, mcp: Landmark, target_len: f32) -> Landmark {
     add(wrist, scale(d, target_len / l))
 }
 
-/// Fingertip: extend past the last knuckle along DIP→TIP by length.
-fn extrapolate_tip(tip: Landmark, dip: Landmark, ext_len: f32) -> Landmark {
-    let d = sub(tip, dip);
-    let l = norm(d);
-    if l < 1e-9 {
-        return tip;
-    }
-    add(tip, scale(d, ext_len / l))
-}
-
 /// Compute OpenVR bones from 21 MediaPipe landmarks.
 ///
 /// The algorithm does NOT modify the original landmarks. It adds 10 new bones:
 /// - BONE_ROOT(0), BONE_WRIST(1): both at wrist position
 /// - 4 metacarpals (INDEX0=6, MIDDLE0=11, RING0=16, PINKY0=21): wrist→MCP at Valve length
-/// - 4 extended tips (INDEX4=10, MIDDLE4=15, RING4=20, PINKY4=25): extrapolated past DIP→TIP
 /// - 5 aux bones (26-30): track their respective tips
 ///
-/// All 21 original landmarks are copied directly into the corresponding bone slots.
+/// Finger chain matches Valve's GLB node layout (meta, _0, _1, _2, _end):
+/// bone1←MCP, bone2←PIP, bone3←DIP, bone4←TIP. All 21 original landmarks
+/// are copied directly into the corresponding bone slots.
 pub fn compute_bones(landmarks: &[Landmark; 21]) -> [Landmark; NUM_BONES] {
     let w = landmarks[WRIST];
     let mut bones = [Landmark::default(); NUM_BONES];
@@ -133,31 +115,31 @@ pub fn compute_bones(landmarks: &[Landmark; 21]) -> [Landmark; NUM_BONES] {
 
     // Index finger
     bones[BONE_INDEX0] = short_meta(w, landmarks[INDEX_MCP], META_LEN[0]);
-    bones[BONE_INDEX1] = landmarks[INDEX_PIP];
-    bones[BONE_INDEX2] = landmarks[INDEX_DIP];
-    bones[BONE_INDEX3] = landmarks[INDEX_TIP];
-    bones[BONE_INDEX4] = extrapolate_tip(landmarks[INDEX_TIP], landmarks[INDEX_DIP], TIP_LEN[0].1);
+    bones[BONE_INDEX1] = landmarks[INDEX_MCP];
+    bones[BONE_INDEX2] = landmarks[INDEX_PIP];
+    bones[BONE_INDEX3] = landmarks[INDEX_DIP];
+    bones[BONE_INDEX4] = landmarks[INDEX_TIP];
 
     // Middle finger
     bones[BONE_MIDDLE0] = short_meta(w, landmarks[MIDDLE_MCP], META_LEN[1]);
-    bones[BONE_MIDDLE1] = landmarks[MIDDLE_PIP];
-    bones[BONE_MIDDLE2] = landmarks[MIDDLE_DIP];
-    bones[BONE_MIDDLE3] = landmarks[MIDDLE_TIP];
-    bones[BONE_MIDDLE4] = extrapolate_tip(landmarks[MIDDLE_TIP], landmarks[MIDDLE_DIP], TIP_LEN[1].1);
+    bones[BONE_MIDDLE1] = landmarks[MIDDLE_MCP];
+    bones[BONE_MIDDLE2] = landmarks[MIDDLE_PIP];
+    bones[BONE_MIDDLE3] = landmarks[MIDDLE_DIP];
+    bones[BONE_MIDDLE4] = landmarks[MIDDLE_TIP];
 
     // Ring finger
     bones[BONE_RING0] = short_meta(w, landmarks[RING_MCP], META_LEN[2]);
-    bones[BONE_RING1] = landmarks[RING_PIP];
-    bones[BONE_RING2] = landmarks[RING_DIP];
-    bones[BONE_RING3] = landmarks[RING_TIP];
-    bones[BONE_RING4] = extrapolate_tip(landmarks[RING_TIP], landmarks[RING_DIP], TIP_LEN[2].1);
+    bones[BONE_RING1] = landmarks[RING_MCP];
+    bones[BONE_RING2] = landmarks[RING_PIP];
+    bones[BONE_RING3] = landmarks[RING_DIP];
+    bones[BONE_RING4] = landmarks[RING_TIP];
 
     // Pinky finger
     bones[BONE_PINKY0] = short_meta(w, landmarks[PINKY_MCP], META_LEN[3]);
-    bones[BONE_PINKY1] = landmarks[PINKY_PIP];
-    bones[BONE_PINKY2] = landmarks[PINKY_DIP];
-    bones[BONE_PINKY3] = landmarks[PINKY_TIP];
-    bones[BONE_PINKY4] = extrapolate_tip(landmarks[PINKY_TIP], landmarks[PINKY_DIP], TIP_LEN[3].1);
+    bones[BONE_PINKY1] = landmarks[PINKY_MCP];
+    bones[BONE_PINKY2] = landmarks[PINKY_PIP];
+    bones[BONE_PINKY3] = landmarks[PINKY_DIP];
+    bones[BONE_PINKY4] = landmarks[PINKY_TIP];
 
     // Aux bones track their respective tips
     bones[BONE_AUX_THUMB] = bones[BONE_THUMB3];
@@ -172,10 +154,7 @@ pub fn compute_bones(landmarks: &[Landmark; 21]) -> [Landmark; NUM_BONES] {
 /// Indexes of the extra bones (not original MediaPipe landmarks) for overlay drawing.
 pub const EXTRA_BONE_INDEXES: &[usize] = &[
     BONE_ROOT, BONE_WRIST,
-    BONE_INDEX0, BONE_INDEX4,
-    BONE_MIDDLE0, BONE_MIDDLE4,
-    BONE_RING0, BONE_RING4,
-    BONE_PINKY0, BONE_PINKY4,
+    BONE_INDEX0, BONE_MIDDLE0, BONE_RING0, BONE_PINKY0,
     BONE_AUX_THUMB, BONE_AUX_INDEX, BONE_AUX_MIDDLE, BONE_AUX_RING, BONE_AUX_PINKY,
 ];
 
@@ -534,8 +513,7 @@ const BIND_QUAT_RIGHT: [[f32; 4]; NUM_BONES] = [
 ///   the whole glove rotates as a unit when the palm rolls.
 /// - bones 2..30 are PARENT-relative (position offset + orientation, both
 ///   in the parent bone's frame) at MediaPipe's metric scale, with
-///   metacarpal stubs and tip extensions snapped to Valve's vr_glove
-///   lengths. Positions are never mirrored: true side is preserved.
+///   metacarpal stubs at Valve's lengths. Positions are never mirrored: true side is preserved.
 ///   Parent-relative transforms stay in the device frame — SteamVR composes
 ///   them under the device pose itself.
 pub fn compute_world_bones(image_landmarks: &[Landmark; 21], world_landmarks: &[Landmark; 21], is_right_hand: bool) -> [BoneTransform; NUM_BONES] {
@@ -582,7 +560,7 @@ pub fn compute_world_bones(image_landmarks: &[Landmark; 21], world_landmarks: &[
     positions[BONE_THUMB2] = lm[THUMB_IP];
     positions[BONE_THUMB3] = lm[THUMB_TIP];
 
-    // Fingers: metacarpals at Valve GLB length, PIP/DIP/TIP direct, tips extrapolated
+    // Fingers: metacarpal stubs at Valve GLB length, MCP/PIP/DIP/TIP direct
     let meta = [
         (BONE_INDEX0, lm[INDEX_MCP], META_LEN_WORLD[0].1),
         (BONE_MIDDLE0, lm[MIDDLE_MCP], META_LEN_WORLD[1].1),
@@ -595,41 +573,25 @@ pub fn compute_world_bones(image_landmarks: &[Landmark; 21], world_landmarks: &[
         positions[*bone] = if l < 1e-9 { *mcp } else { vadd(w, vscale(d, len / l)) };
     }
 
-    positions[BONE_INDEX1] = lm[INDEX_PIP];
-    positions[BONE_INDEX2] = lm[INDEX_DIP];
-    positions[BONE_INDEX3] = lm[INDEX_TIP];
-    positions[BONE_INDEX4] = {
-        let d = vsub(lm[INDEX_TIP], lm[INDEX_DIP]);
-        let l = vnorm(d);
-        if l < 1e-9 { lm[INDEX_TIP] } else { vadd(lm[INDEX_TIP], vscale(d, TIP_LEN[0].1 / l)) }
-    };
+    positions[BONE_INDEX1] = lm[INDEX_MCP];
+    positions[BONE_INDEX2] = lm[INDEX_PIP];
+    positions[BONE_INDEX3] = lm[INDEX_DIP];
+    positions[BONE_INDEX4] = lm[INDEX_TIP];
 
-    positions[BONE_MIDDLE1] = lm[MIDDLE_PIP];
-    positions[BONE_MIDDLE2] = lm[MIDDLE_DIP];
-    positions[BONE_MIDDLE3] = lm[MIDDLE_TIP];
-    positions[BONE_MIDDLE4] = {
-        let d = vsub(lm[MIDDLE_TIP], lm[MIDDLE_DIP]);
-        let l = vnorm(d);
-        if l < 1e-9 { lm[MIDDLE_TIP] } else { vadd(lm[MIDDLE_TIP], vscale(d, TIP_LEN[1].1 / l)) }
-    };
+    positions[BONE_MIDDLE1] = lm[MIDDLE_MCP];
+    positions[BONE_MIDDLE2] = lm[MIDDLE_PIP];
+    positions[BONE_MIDDLE3] = lm[MIDDLE_DIP];
+    positions[BONE_MIDDLE4] = lm[MIDDLE_TIP];
 
-    positions[BONE_RING1] = lm[RING_PIP];
-    positions[BONE_RING2] = lm[RING_DIP];
-    positions[BONE_RING3] = lm[RING_TIP];
-    positions[BONE_RING4] = {
-        let d = vsub(lm[RING_TIP], lm[RING_DIP]);
-        let l = vnorm(d);
-        if l < 1e-9 { lm[RING_TIP] } else { vadd(lm[RING_TIP], vscale(d, TIP_LEN[2].1 / l)) }
-    };
+    positions[BONE_RING1] = lm[RING_MCP];
+    positions[BONE_RING2] = lm[RING_PIP];
+    positions[BONE_RING3] = lm[RING_DIP];
+    positions[BONE_RING4] = lm[RING_TIP];
 
-    positions[BONE_PINKY1] = lm[PINKY_PIP];
-    positions[BONE_PINKY2] = lm[PINKY_DIP];
-    positions[BONE_PINKY3] = lm[PINKY_TIP];
-    positions[BONE_PINKY4] = {
-        let d = vsub(lm[PINKY_TIP], lm[PINKY_DIP]);
-        let l = vnorm(d);
-        if l < 1e-9 { lm[PINKY_TIP] } else { vadd(lm[PINKY_TIP], vscale(d, TIP_LEN[3].1 / l)) }
-    };
+    positions[BONE_PINKY1] = lm[PINKY_MCP];
+    positions[BONE_PINKY2] = lm[PINKY_PIP];
+    positions[BONE_PINKY3] = lm[PINKY_DIP];
+    positions[BONE_PINKY4] = lm[PINKY_TIP];
 
     // Aux bones = their tips
     positions[BONE_AUX_THUMB] = positions[BONE_THUMB3];
@@ -686,7 +648,21 @@ pub fn compute_world_bones(image_landmarks: &[Landmark; 21], world_landmarks: &[
                 let bd = vnormalize(vsub(bind_pos[b], bind_pos[a]));
                 let ld = vnormalize(vsub(positions[b], positions[a]));
                 let delta = if vnorm(bd) > 1e-9 && vnorm(ld) > 1e-9 {
-                    quat_from_to(bd, ld)
+                    // Two-vector frame: the segment aligns the bone axis and
+                    // the palm normal carries the roll (projected palm normal
+                    // equals the nail direction for a finger curling in the
+                    // palm plane). A single arc never adds twist about the
+                    // segment axis, so a spin about the finger axis would
+                    // leave the skin unrotated.
+                    // ponytail: palm reference dies past ~72° flexion
+                    // (|proj| = cosθ < 0.3) — roll freezes at a deep fist.
+                    let pb = vsub(palm_bind, vscale(bd, vdot(palm_bind, bd)));
+                    let pl = vsub(palm_live, vscale(ld, vdot(palm_live, ld)));
+                    if vnorm(pb) > 0.3 && vnorm(pl) > 0.3 {
+                        quat_from_basis(bd, palm_bind, ld, palm_live)
+                    } else {
+                        quat_from_to(bd, ld)
+                    }
                 } else {
                     prev_delta
                 };
@@ -701,6 +677,22 @@ pub fn compute_world_bones(image_landmarks: &[Landmark; 21], world_landmarks: &[
                 };
             }
         }
+    }
+
+    // Aux bones (26-30) sit after the pinky chain in the loop, so the
+    // None-branch prev_delta above would give every one of them the pinky's
+    // last-segment delta. Each aux tracks its own finger's tip instead;
+    // bind quats for aux/tip pairs are identical in the GLB, so sharing the
+    // tip's model-space frame keeps orientation and position in sync.
+    const AUX_TIP: [(usize, usize); 5] = [
+        (BONE_AUX_THUMB, BONE_THUMB3),
+        (BONE_AUX_INDEX, BONE_INDEX4),
+        (BONE_AUX_MIDDLE, BONE_MIDDLE4),
+        (BONE_AUX_RING, BONE_RING4),
+        (BONE_AUX_PINKY, BONE_PINKY4),
+    ];
+    for (aux, tip) in AUX_TIP {
+        frames[aux] = frames[tip];
     }
 
     // Parent-relative transforms. Root carries the absolute wrist anchor
@@ -869,25 +861,29 @@ mod tests {
     }
 
     #[test]
-    fn pip_dip_tip_are_direct_copies() {
+    fn mcp_pip_dip_tip_are_direct_copies() {
         let lm = standard_hand();
         let bones = compute_bones(&lm);
-        // Index PIP, DIP, TIP
-        assert_eq!(bones[BONE_INDEX1].x, lm[INDEX_PIP].x);
-        assert_eq!(bones[BONE_INDEX2].x, lm[INDEX_DIP].x);
-        assert_eq!(bones[BONE_INDEX3].x, lm[INDEX_TIP].x);
+        // Index MCP, PIP, DIP, TIP
+        assert_eq!(bones[BONE_INDEX1].x, lm[INDEX_MCP].x);
+        assert_eq!(bones[BONE_INDEX2].x, lm[INDEX_PIP].x);
+        assert_eq!(bones[BONE_INDEX3].x, lm[INDEX_DIP].x);
+        assert_eq!(bones[BONE_INDEX4].x, lm[INDEX_TIP].x);
         // Middle
-        assert_eq!(bones[BONE_MIDDLE1].x, lm[MIDDLE_PIP].x);
-        assert_eq!(bones[BONE_MIDDLE2].x, lm[MIDDLE_DIP].x);
-        assert_eq!(bones[BONE_MIDDLE3].x, lm[MIDDLE_TIP].x);
+        assert_eq!(bones[BONE_MIDDLE1].x, lm[MIDDLE_MCP].x);
+        assert_eq!(bones[BONE_MIDDLE2].x, lm[MIDDLE_PIP].x);
+        assert_eq!(bones[BONE_MIDDLE3].x, lm[MIDDLE_DIP].x);
+        assert_eq!(bones[BONE_MIDDLE4].x, lm[MIDDLE_TIP].x);
         // Ring
-        assert_eq!(bones[BONE_RING1].x, lm[RING_PIP].x);
-        assert_eq!(bones[BONE_RING2].x, lm[RING_DIP].x);
-        assert_eq!(bones[BONE_RING3].x, lm[RING_TIP].x);
+        assert_eq!(bones[BONE_RING1].x, lm[RING_MCP].x);
+        assert_eq!(bones[BONE_RING2].x, lm[RING_PIP].x);
+        assert_eq!(bones[BONE_RING3].x, lm[RING_DIP].x);
+        assert_eq!(bones[BONE_RING4].x, lm[RING_TIP].x);
         // Pinky
-        assert_eq!(bones[BONE_PINKY1].x, lm[PINKY_PIP].x);
-        assert_eq!(bones[BONE_PINKY2].x, lm[PINKY_DIP].x);
-        assert_eq!(bones[BONE_PINKY3].x, lm[PINKY_TIP].x);
+        assert_eq!(bones[BONE_PINKY1].x, lm[PINKY_MCP].x);
+        assert_eq!(bones[BONE_PINKY2].x, lm[PINKY_PIP].x);
+        assert_eq!(bones[BONE_PINKY3].x, lm[PINKY_DIP].x);
+        assert_eq!(bones[BONE_PINKY4].x, lm[PINKY_TIP].x);
     }
 
     #[test]
@@ -906,17 +902,12 @@ mod tests {
     }
 
     #[test]
-    fn extended_tip_is_beyond_dip() {
+    fn tip_is_beyond_dip() {
         let lm = standard_hand();
         let bones = compute_bones(&lm);
-        let ext_tip = bones[BONE_INDEX4];
-        let orig_tip = lm[INDEX_TIP];
-        let dip = lm[INDEX_DIP];
-        // Extended tip should be further from DIP than original tip
-        let ext_dist = norm(sub(ext_tip, dip));
-        let orig_dist = norm(sub(orig_tip, dip));
-        assert!(ext_dist > orig_dist,
-            "extended tip should be further from DIP than original tip");
+        assert!(norm(sub(bones[BONE_INDEX4], bones[BONE_INDEX3]))
+            > norm(sub(lm[INDEX_TIP], lm[INDEX_DIP])) * 0.9,
+            "index TIP bone should sit ~at the TIP landmark past the DIP");
     }
 
     #[test]
@@ -944,7 +935,7 @@ mod tests {
 
     #[test]
     fn extra_bone_count_matches_constant() {
-        assert_eq!(EXTRA_BONE_INDEXES.len(), 15);
+        assert_eq!(EXTRA_BONE_INDEXES.len(), 11);
     }
 
     /// Synthetic metric hand: wrist at origin, fingers along +Y (MediaPipe
@@ -1022,6 +1013,61 @@ mod tests {
         }
     }
 
+    /// Isolates quat_from_basis: rotating only the live pair by R must
+    /// left-multiply the resulting delta by exactly R (bind side untouched).
+    #[test]
+    fn basis_delta_follows_live_rotation() {
+        // Exact vectors printed from the wrist branch (metric_hand +60° spin).
+        let fb = [0.002177f32, 0.0071199997, 0.016319];
+        let pb = [0.9469149f32, 0.2285864, -0.22605363];
+        let fl = [0.0f32, -0.017826488, -0.0016205898];
+        let pl = [-0.022628153f32, 0.09051256, -0.9956382];
+        let half = 30.0f32.to_radians();
+        let q_r = [half.cos(), 0.0, -half.sin(), 0.0]; // -60° about Y
+        let d0 = quat_from_basis(fb, pb, fl, pl);
+        let fl1 = quat_rot_vec(q_r, fl);
+        let pl1 = quat_rot_vec(q_r, pl);
+        let d1 = quat_from_basis(fb, pb, fl1, pl1);
+        let want = quat_mul(q_r, d0);
+        let dot = (want[0] * d1[0] + want[1] * d1[1] + want[2] * d1[2] + want[3] * d1[3]).abs();
+        assert!(dot > 0.999, "basis delta not equivariant, dot={dot}");
+    }
+
+    /// Rigid spin of the whole hand about the finger axis must rotate every
+    /// bone's skin frame (model frame ∘ conj(bind)) by exactly that spin.
+    /// A single-vector arc delta is blind to roll about the segment axis.
+    #[test]
+    fn rigid_spin_rotates_every_skin_frame_with_the_hand() {
+        let base = metric_hand();
+        let (s, c) = (60.0f32.to_radians().sin(), 60.0f32.to_radians().cos());
+        let spun = base.map(|l| fake_landmark(c * l.x + s * l.z, l.y, -s * l.x + c * l.z));
+        let img = image_hand();
+        let (_, rot_base) = compose_chain(&world_bones(&img, &base));
+        let (_, rot_spun) = compose_chain(&world_bones(&img, &spun));
+        // Landmarks spin +60° about MediaPipe +Y; the [x,-y,-z] axis flip
+        // conjugates that to -60° about OpenVR +Y.
+        let half = 30.0f32.to_radians();
+        let q_spin = [half.cos(), 0.0, -half.sin(), 0.0];
+        let chain = [
+            BONE_WRIST, BONE_INDEX0, BONE_INDEX1, BONE_INDEX2, BONE_INDEX3, BONE_INDEX4,
+        ];
+        let mut dots = Vec::new();
+        for &i in &chain {
+            let bind = BIND_QUAT_LEFT[i];
+            let skin_base = quat_mul(rot_base[i], quat_conj(bind));
+            let skin_spun = quat_mul(rot_spun[i], quat_conj(bind));
+            let want = quat_mul(q_spin, skin_base);
+            let dot = (want[0] * skin_spun[0] + want[1] * skin_spun[1]
+                + want[2] * skin_spun[2] + want[3] * skin_spun[3])
+                .abs();
+            dots.push((i, dot));
+        }
+        eprintln!("skin-follow dots: {dots:?}");
+        for (i, dot) in dots {
+            assert!(dot > 0.99, "bone {i} skin does not follow a rigid spin, dot={dot}");
+        }
+    }
+
     #[test]
     fn world_orientations_are_unit_quats() {
         let bones = world_bones(&image_hand(), &metric_hand());
@@ -1056,7 +1102,7 @@ mod tests {
         .sqrt();
         assert!(dw < 1e-5, "wrist should reconstruct to origin, got {dw}");
         // Middle fingertip reconstructs to ~the MediaPipe span (~0.24 m).
-        let tip = wpos[BONE_MIDDLE3];
+        let tip = wpos[BONE_MIDDLE4];
         let dt = (tip[0]*tip[0] + tip[1]*tip[1] + tip[2]*tip[2]).sqrt();
         assert!((dt - 0.24).abs() < 0.05, "middle tip span {dt}, expected ~0.24");
         // Composed orientations stay unit quaternions.
@@ -1110,7 +1156,7 @@ mod tests {
             assert!(dot > 0.9, "right bone {bone} +X should point at parent, dot={dot}");
         }
         // Chain still reconstructs the true model joints (no mirror).
-        let tip = wpos[BONE_MIDDLE3];
+        let tip = wpos[BONE_MIDDLE4];
         let dt = (tip[0]*tip[0] + tip[1]*tip[1] + tip[2]*tip[2]).sqrt();
         assert!((dt - 0.24).abs() < 0.05, "right middle tip span {dt}");
     }
@@ -1150,9 +1196,9 @@ mod tests {
         let (pos_straight, rot_straight) = compose_chain(&straight_bones);
         let (pos_curled, _) = compose_chain(&curled_bones);
         assert!(
-            pos_curled[BONE_INDEX3][2] > pos_straight[BONE_INDEX3][2],
+            pos_curled[BONE_INDEX4][2] > pos_straight[BONE_INDEX4][2],
             "curled tip z {} should be palm-side of straight tip z {}",
-            pos_curled[BONE_INDEX3][2], pos_straight[BONE_INDEX3][2]
+            pos_curled[BONE_INDEX4][2], pos_straight[BONE_INDEX4][2]
         );
         assert_bind_delta_maps_segments(&straight_bones, false, "straight");
         assert_bind_delta_maps_segments(&curled_bones, false, "curled");
@@ -1167,7 +1213,7 @@ mod tests {
         wlm[INDEX_TIP] = fake_landmark(0.0, 0.1, 0.05);
         let bones = world_bones(&image_hand(), &wlm);
         let (wpos, _) = compose_chain(&bones);
-        let z = wpos[BONE_INDEX3][2];
+        let z = wpos[BONE_INDEX4][2];
         assert!((z + 0.05).abs() < 1e-5, "tip depth {z}, expected ~-0.05");
     }
 
@@ -1238,6 +1284,33 @@ mod tests {
         let bones_r = compute_world_bones(&image_hand(), &metric_hand(), true);
         assert_bind_delta_maps_segments(&bones_l, false, "metric");
         assert_bind_delta_maps_segments(&bones_r, true, "metric");
+    }
+
+    /// Each aux bone's composed orientation must equal its finger's tip —
+    /// aux sits after the pinky chain, so a stale prev_delta would give all
+    /// five the pinky's last-segment delta and twist the fingertip mesh.
+    #[test]
+    fn aux_frames_match_their_tips() {
+        let pairs = [
+            (BONE_AUX_THUMB, BONE_THUMB3),
+            (BONE_AUX_INDEX, BONE_INDEX4),
+            (BONE_AUX_MIDDLE, BONE_MIDDLE4),
+            (BONE_AUX_RING, BONE_RING4),
+            (BONE_AUX_PINKY, BONE_PINKY4),
+        ];
+        for is_right in [false, true] {
+            let bones = compute_world_bones(&image_hand(), &metric_hand(), is_right);
+            let (_, wrot) = compose_chain(&bones);
+            for (aux, tip) in pairs {
+                for k in 0..4 {
+                    let d = (wrot[aux][k] - wrot[tip][k]).abs();
+                    assert!(
+                        d < 1e-4,
+                        "right={is_right} aux {aux} vs tip {tip} quat[{k}] diff {d}"
+                    );
+                }
+            }
+        }
     }
 
     /// apply_head_pose with identity head quat applies only the pitch
