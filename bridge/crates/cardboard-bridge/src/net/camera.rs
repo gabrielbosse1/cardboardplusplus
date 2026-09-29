@@ -257,10 +257,18 @@ fn detect_loop(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
+            // Drained every frame so the accumulators stay bounded; logged
+            // rate-limited below.
+            let jitter = slots.take_jitter();
             if let Some(ref sock) = skeleton_sock {
                 for hand in &tracked {
                     let hand_id = hand.hand_id;
-                    let mut bones = crate::ovr_bones::compute_world_bones(&hand.landmarks, &hand.world_landmarks, hand_id == 1);
+                    let mut bones = crate::ovr_bones::compute_world_bones_with_palm(
+                        &hand.landmarks,
+                        &hand.world_landmarks,
+                        hand_id == 1,
+                        Some(hand.palm),
+                    );
                     // Tracking-space device pose is composed here (bridge
                     // owns all rotation math); the driver copies bone 0
                     // verbatim into the SteamVR pose.
@@ -277,6 +285,11 @@ fn detect_loop(
                             let root = bones[0].position;
                             crate::debug_log!(&state, "[camera] world_lm wrist=({:.3},{:.3},{:.3}) tip=({:.3},{:.3},{:.3}) span={:.4}m bone_root=({:.3},{:.3},{:.3})",
                                 wr.x, wr.y, wr.z, tip.x, tip.y, tip.z, span, root[0], root[1], root[2]);
+                            for (hid, raw, sm, palm, sm_palm, cnt) in &jitter {
+                                crate::debug_log!(&state, "[hands] jitter hand={hid} n={cnt} raw_dz_mm=[{:.2},{:.2},{:.2},{:.2},{:.2}] sm_dz_mm=[{:.2},{:.2},{:.2},{:.2},{:.2}] palm={:.2}deg sm_palm={:.2}deg",
+                                    raw[0] * 1000.0, raw[1] * 1000.0, raw[2] * 1000.0, raw[3] * 1000.0, raw[4] * 1000.0,
+                                    sm[0] * 1000.0, sm[1] * 1000.0, sm[2] * 1000.0, sm[3] * 1000.0, sm[4] * 1000.0, palm, sm_palm);
+                            }
                         }
                     }
                     let pkt = crate::ovr_bones::serialize_bones_udp(hand_id, timestamp_ms, &bones);
