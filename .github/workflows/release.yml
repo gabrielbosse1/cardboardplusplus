@@ -83,7 +83,8 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: setup
-        path: installer/dist/CardboardBridge-Setup-*.exe
+        path: installer/dist/*Setup-*.exe
+        if-no-files-found: error
 
   driver:
     needs: version
@@ -152,7 +153,7 @@ jobs:
         mv "dist/app-r$COUNT/app-debug.apk" "dist/cardboardplusplus-r$COUNT.apk"
         # Stable names: the web installer fetches these from latest/download.
         mv dist/bridge-files/bridge-files.zip dist/bridge-files.zip
-        mv dist/setup/CardboardBridge-Setup-*.exe dist/CardboardBridge-Setup.exe
+        mv dist/setup/*Setup-*.exe dist/CardboardBridge-Setup.exe
         NOTES="$(git log -1 --format='%h %s')"
         if gh release view "$TAG" >/dev/null 2>&1; then
           # Re-run on the same commit: just refresh the files.
