@@ -715,33 +715,36 @@ pub fn compute_world_bones_with_palm(
             Some((a, b)) => {
                 let bd = vnormalize(vsub(bind_pos[b], bind_pos[a]));
                 let ld = vnormalize(vsub(positions[b], positions[a]));
-                let delta = if vnorm(bd) > 1e-9 && vnorm(ld) > 1e-9 {
-                    // Two-vector frame: the segment aligns the bone axis and
-                    // the palm normal carries the roll (projected palm normal
-                    // equals the nail direction for a finger curling in the
-                    // palm plane). A single arc never adds twist about the
-                    // segment axis, so a spin about the finger axis would
-                    // leave the skin unrotated.
-                    // ponytail: palm reference dies past ~72° flexion
-                    // (|proj| = cosθ < 0.3) — roll freezes at a deep fist.
-                    let pb = vsub(palm_bind, vscale(bd, vdot(palm_bind, bd)));
-                    let pl = vsub(palm_live, vscale(ld, vdot(palm_live, ld)));
-                    if vnorm(pb) > 0.3 && vnorm(pl) > 0.3 {
-                        quat_from_basis(bd, palm_bind, ld, palm_live)
-                    } else {
-                        quat_from_to(bd, ld)
-                    }
+                // Compose each bone's live frame on top of its parent's live
+                // frame instead of rotating the whole hand in model space.
+                // The parent already carries the hand's roll, so this bone only
+                // has to add its own flexion: the shortest arc between the bind
+                // and live segment directions expressed in the parent frame.
+                // That is a hinge, so it adds no twist about the bone axis.
+                let parent = PARENT[i] as usize;
+                let bp = quat_conj(bind_q[parent]);
+                let flex = if vnorm(bd) > 1e-9 && vnorm(ld) > 1e-9 {
+                    quat_from_to(
+                        vnormalize(quat_rot_vec(bp, bd)),
+                        vnormalize(quat_rot_vec(quat_conj(frames[parent]), ld)),
+                    )
                 } else {
                     prev_delta
                 };
-                prev_delta = delta;
-                frames[i] = quat_mul(delta, bind_q[i]);
+                prev_delta = flex;
+                frames[i] = quat_mul(quat_mul(frames[parent], flex), quat_mul(bp, bind_q[i]));
             }
             None => {
+                // Tips and root carry no segment of their own: rigid with the
+                // parent, so they inherit the parent's frame.
                 frames[i] = if i == BONE_ROOT {
                     [1.0, 0.0, 0.0, 0.0]
                 } else {
-                    quat_mul(prev_delta, bind_q[i])
+                    let parent = PARENT[i] as usize;
+                    quat_mul(
+                        frames[parent],
+                        quat_mul(quat_conj(bind_q[parent]), bind_q[i]),
+                    )
                 };
             }
         }
@@ -1841,6 +1844,112 @@ mod tests {
                 angle_deg(seg3(&lm, mcp, pip), seg3(&lm, pip, dip)),
                 angle_deg(seg3(&lm, pip, dip), seg3(&lm, dip, tip)),
             );
+        }
+    }
+
+    /// Landmarks rebuilt from Valve's bind pose, so every bone frame equals
+    /// its bind orientation until a joint is deliberately curled. Inverts the
+    /// [x, -y, -z] world conversion the pipeline applies.
+    fn bind_pose_landmarks() -> [Landmark; 21] {
+        let bp = &BIND_POS_LEFT;
+        let un = |p: [f32; 3]| fake_landmark(p[0], -p[1], -p[2]);
+        let mut lm = [fake_landmark(0.0, 0.0, 0.0); 21];
+        lm[WRIST] = un(bp[BONE_WRIST]);
+        for (l, b) in [
+            (THUMB_CMC, BONE_THUMB0),
+            (THUMB_MCP, BONE_THUMB1),
+            (THUMB_IP, BONE_THUMB2),
+            (THUMB_TIP, BONE_THUMB3),
+            (INDEX_MCP, BONE_INDEX1),
+            (INDEX_PIP, BONE_INDEX2),
+            (INDEX_DIP, BONE_INDEX3),
+            (INDEX_TIP, BONE_INDEX4),
+            (MIDDLE_MCP, BONE_MIDDLE1),
+            (MIDDLE_PIP, BONE_MIDDLE2),
+            (MIDDLE_DIP, BONE_MIDDLE3),
+            (MIDDLE_TIP, BONE_MIDDLE4),
+            (RING_MCP, BONE_RING1),
+            (RING_PIP, BONE_RING2),
+            (RING_DIP, BONE_RING3),
+            (RING_TIP, BONE_RING4),
+            (PINKY_MCP, BONE_PINKY1),
+            (PINKY_PIP, BONE_PINKY2),
+            (PINKY_DIP, BONE_PINKY3),
+            (PINKY_TIP, BONE_PINKY4),
+        ] {
+            lm[l] = un(bp[b]);
+        }
+        lm
+    }
+
+    /// Rodrigues rotation of `p` about the unit axis `palm` through `c`.
+    fn rotate_about_palm(p: [f32; 3], c: [f32; 3], palm: [f32; 3], ang: f32) -> [f32; 3] {
+        let v = sub3(p, c);
+        let cr = vcross(palm, v);
+        let dt = vdot(palm, v);
+        let (s, co) = (ang.sin(), ang.cos());
+        [
+            c[0] + v[0] * co + cr[0] * s + palm[0] * dt * (1.0 - co),
+            c[1] + v[1] * co + cr[1] * s + palm[1] * dt * (1.0 - co),
+            c[2] + v[2] * co + cr[2] * s + palm[2] * dt * (1.0 - co),
+        ]
+    }
+
+    /// Axis-angle of a unit quaternion, returning (axis, angle).
+    fn quat_axis_angle(q: [f32; 4]) -> ([f32; 3], f32) {
+        let w = q[0].clamp(-1.0, 1.0);
+        let s = (q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+        if s < 1e-9 {
+            ([1.0, 0.0, 0.0], 0.0)
+        } else {
+            ([q[1] / s, q[2] / s, q[3] / s], 2.0 * s.atan2(w))
+        }
+    }
+
+    /// A curled finger must not spin the skin around the bone. Each phalange
+    /// frame is the rotation taking its bind segment onto its live segment;
+    /// any residual twist about the live bone axis rotates the skinned
+    /// geometry, which is what folds the rendered fingers forward instead of
+    /// into the palm. Roll comes from the parent frame, so this has to hold at
+    /// every curl depth, and the rendered flexion has to grow monotonically.
+    #[test]
+    fn finger_curl_adds_no_twist_about_the_bone_axis() {
+        let bp = &BIND_POS_LEFT;
+        let img = [fake_landmark(0.5, 0.55, 0.0); 21];
+        let base = bind_pose_landmarks();
+        let w = [base[WRIST].x, base[WRIST].y, base[WRIST].z];
+        let palm = norm3(vcross(
+            sub3([base[INDEX_MCP].x, base[INDEX_MCP].y, base[INDEX_MCP].z], w),
+            sub3([base[MIDDLE_MCP].x, base[MIDDLE_MCP].y, base[MIDDLE_MCP].z], w),
+        ));
+        let (a, b) = ORIENT_SEG[BONE_INDEX3].unwrap();
+
+        let mut prev_flexion = 0.0f32;
+        for deg in [15.0f32, 30.0, 50.0, 70.0, 90.0] {
+            let mut lm = base;
+            let c = [lm[INDEX_DIP].x, lm[INDEX_DIP].y, lm[INDEX_DIP].z];
+            let p = [lm[INDEX_TIP].x, lm[INDEX_TIP].y, lm[INDEX_TIP].z];
+            let r = rotate_about_palm(p, c, palm, deg.to_radians());
+            lm[INDEX_TIP] = fake_landmark(r[0], r[1], r[2]);
+
+            let (wp, wr) = compose_chain(&compute_world_bones(&img, &lm, false));
+            let bd = norm3(sub3(bp[b], bp[a]));
+            let ld = norm3(sub3(wp[b], wp[a]));
+            let applied = quat_mul(wr[BONE_INDEX3], quat_conj(BIND_QUAT_LEFT[BONE_INDEX3]));
+            let (_, twist) = quat_axis_angle(quat_mul(applied, quat_conj(quat_from_to(bd, ld))));
+            let twist = twist.to_degrees();
+            assert!(
+                twist < 5.0,
+                "curl {deg} deg: {twist:.1} deg twist about the bone axis"
+            );
+
+            let flexion = angle_deg(bd, ld);
+            assert!(
+                flexion > prev_flexion,
+                "curl {deg} deg: flexion {flexion:.1} deg did not grow past \
+                 {prev_flexion:.1} deg"
+            );
+            prev_flexion = flexion;
         }
     }
 }
