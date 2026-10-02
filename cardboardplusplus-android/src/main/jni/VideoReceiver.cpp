@@ -19,6 +19,14 @@
 
 namespace ndk_cardboardplusplus {
 
+namespace {
+// Reports whether a frame payload opens with a 3- or 4-byte Annex-B start code.
+bool HasStartCode(const uint8_t* p) {
+  return p[0] == 0x00 && p[1] == 0x00 &&
+         (p[2] == 0x01 || (p[2] == 0x00 && p[3] == 0x01));
+}
+}  // namespace
+
 VideoReceiver::VideoReceiver()
     : socket_fd_(-1), running_(false) {
 }
@@ -226,13 +234,25 @@ void VideoReceiver::ReceiveLoop() {
         break;
       }
 
+      // Every payload on this port is Annex-B (h264_mp4toannexb output), so a
+      // frame head that is not a start code can only mean the offset drifted.
+      // Rejecting it here stops the loop from slicing plausible-looking garbage
+      // out of the bitstream and handing it to the decoder as real frames.
+      if (buffer.size() - buf_head_ >= 9 && !HasStartCode(base + 4)) {
+        LOGE("Frame head is not Annex-B at offset %zu, resyncing", buf_head_);
+        buffer.clear();
+        buf_head_ = 0;
+        MaybeSendKeyframeNack();
+        break;
+      }
+
       if (buffer.size() - buf_head_ < 4 + frame_len) {
         // Frame not fully arrived yet; if the backlog already exceeds the
         // largest plausible frame, we missed its length prefix long ago —
-        // desync now instead of buffering megabytes. Otherwise wait for more
+        // desync now instead of buffering dead air. Otherwise wait for more
         // datagrams.
-        if (buffer.size() - buf_head_ > (size_t)kMaxFrameSize) {
-          LOGE("Reassembly backlog %zu exceeds max frame, resyncing",
+        if (buffer.size() - buf_head_ > (size_t)kMaxPartialFrameBytes) {
+          LOGE("Reassembly backlog %zu exceeds max partial frame, resyncing",
                buffer.size() - buf_head_);
           buffer.clear();
           buf_head_ = 0;

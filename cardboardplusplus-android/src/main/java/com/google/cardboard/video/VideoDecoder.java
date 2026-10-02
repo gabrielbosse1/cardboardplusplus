@@ -15,6 +15,9 @@ import java.util.Arrays;
 public class VideoDecoder {
   private static final String TAG = "VideoDecoder";
   private static final DebugLog DBG = new DebugLog(TAG);
+  // Upper bound accepted when parsing a keyframe's SPS; the driver clamps its
+  // encoder to 320x180-7680x7680, so anything outside that is malformed.
+  private static final int MAX_STREAM_DIM = 7680;
   private final NativeBridge bridge;
   private final int textureId;
   private final int width;
@@ -135,7 +138,15 @@ public class VideoDecoder {
     int[] dims = null;
     if (newSps != null) {
       dims = parseSpsDimensions(newSps);
-      if (!Arrays.equals(newSps, sps)) {
+      // A keyframe that survived a desynced reassembly can carry a garbage SPS.
+      // Only trust one that parses into a plausible frame size, otherwise it
+      // would be cached and reconfigure the codec into a broken state.
+      if (dims == null || dims[0] <= 0 || dims[0] > MAX_STREAM_DIM || dims[1] <= 0
+          || dims[1] > MAX_STREAM_DIM) {
+        newSps = null;
+        dims = null;
+      }
+      if (newSps != null && !Arrays.equals(newSps, sps)) {
         newPps = extractNal(data, 8);
       }
     }
@@ -186,6 +197,18 @@ public class VideoDecoder {
       } catch (Exception e) {
         Log.e(TAG, "feedFrame error: " + e.getMessage());
       }
+    }
+  }
+  // Rebuilds the codec from the cached SPS/PPS; called from VideoWatchdog when
+  // frames keep arriving but nothing decodes. Leaves sps/pps cached so the next
+  // keyframe still refreshes them if the driver re-emits different ones.
+  public void reconfigure() {
+    synchronized (codecLock) {
+      if (!configured || decoder == null) {
+        return;
+      }
+      DBG.w("Frames arriving but none decoded; reconfiguring decoder");
+      reconfigureDecoderLocked();
     }
   }
   // Tears down and rebuilds MediaCodec on SPS change; called from feedFrame under the codec lock.

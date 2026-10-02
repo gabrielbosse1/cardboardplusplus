@@ -14,6 +14,7 @@ public class VideoManager {
   private VideoDecoder decoder;
   private boolean surfaceCreated = false;
   private Runnable reconnectAction;
+  private Runnable reconfigureAction;
   private VideoWatchdog watchdog;
   private NetStatsReporter netStats;
   private TelemetrySender telemetrySender;
@@ -33,6 +34,18 @@ public class VideoManager {
   // Registers the stall-recovery hook; called from VrActivity.onCreate with DiscoveryManager.pokeNow.
   public void setReconnectAction(Runnable reconnectAction) {
     this.reconnectAction = reconnectAction;
+  }
+  // Registers the codec-reset hook; called from VrActivity.onCreate with a keyframe request.
+  public void setReconfigureAction(Runnable reconfigureAction) {
+    this.reconfigureAction = reconfigureAction;
+  }
+  // Rebuilds the live decoder; called from VideoWatchdog's poll thread when frames
+  // arrive but nothing is decoded.
+  public void reconfigureDecoder() {
+    VideoDecoder d = decoder;
+    if (d != null) {
+      d.reconfigure();
+    }
   }
   // Creates the decoder on a fresh video texture; called from VrActivity start and VrRenderer setup on the GL thread.
   public void onSurfaceCreated() {
@@ -62,7 +75,7 @@ public class VideoManager {
   // Lazily starts the stall watchdog; called from start on the GL thread.
   private void startWatchdog() {
     if (watchdog == null) {
-      watchdog = new VideoWatchdog(TAG, reconnectAction, () -> decoder);
+      watchdog = new VideoWatchdog(TAG, reconnectAction, reconfigureAction, () -> decoder);
     }
     watchdog.start();
   }

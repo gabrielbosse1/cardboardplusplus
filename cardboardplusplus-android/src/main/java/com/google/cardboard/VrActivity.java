@@ -112,6 +112,13 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
         "decoder-cap-query")
         .start();
     videoManager.setReconnectAction(() -> discoveryManager.pokeNow());
+    // A wedged decoder cannot fix itself: rebuild it and pull a fresh IDR so the
+    // SPS cache is refreshed from the driver's next keyframe.
+    videoManager.setReconfigureAction(
+        () -> {
+          videoManager.reconfigureDecoder();
+          discoveryManager.requestKeyframe();
+        });
     setContentView(R.layout.activity_vr);
     glView = findViewById(R.id.surface_view);
     glView.setEGLContextClientVersion(2);

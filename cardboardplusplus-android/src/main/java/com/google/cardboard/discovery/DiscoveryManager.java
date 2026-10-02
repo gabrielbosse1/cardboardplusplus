@@ -16,7 +16,11 @@ public class DiscoveryManager {
   private static final String CAP_PREFIX = AppConstants.CAP_PREFIX;
   private static final int CAP_SEND_ATTEMPTS = 3;
   private static final long CAP_SEND_GAP_MS = 500;
-  static final long HEARTBEAT_INTERVAL_MS = 5000;
+  // Post-ACK cadence. Must stay well under the driver's phone timeout
+  // (kPhoneTimeoutMs = 5000 ms in the driver's Discovery.cpp): the driver drops
+  // the video data target once no packet arrives from the phone for that long,
+  // which would cut video until the next heartbeat.
+  static final long HEARTBEAT_INTERVAL_MS = 2000;
   private final AppSettings appSettings;
   private static final int FALLBACK_AFTER_FAILURES = 5;
   private volatile boolean broadcasting = false;
@@ -79,6 +83,24 @@ public class DiscoveryManager {
       sendCapBurst(socket, capTarget);
     } catch (Exception e) {
       Log.w(TAG, "Discovery poke failed: " + e.getMessage());
+    }
+  }
+  // Demands an IDR from the driver; consumed by its discovery path, which arms
+  // a one-shot forced keyframe. Used after decoder-side loss, where the wire is
+  // intact but the decoder has lost its reference frames.
+  public void requestKeyframe() {
+    DatagramSocket socket = liveSocket;
+    InetAddress driverAddr = lastDriverAddr;
+    if (socket == null || socket.isClosed() || driverAddr == null) {
+      return;
+    }
+    try {
+      byte[] req = AppConstants.KEYFRAME_REQ.getBytes();
+      socket.send(new DatagramPacket(req, req.length, driverAddr,
+          AppConstants.UDP_DISCOVERY_PORT));
+      DBG.i("Sent KEYFRAME_REQ to %s", driverAddr.getHostAddress());
+    } catch (Exception e) {
+      Log.w(TAG, "KEYFRAME_REQ failed: " + e.getMessage());
     }
   }
   // Halts broadcasting and joins the worker; called from VrActivity.onPause on the UI thread.

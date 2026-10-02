@@ -9,7 +9,10 @@ using namespace vr;
 namespace {
 static constexpr int kUdpChunkBytes = 1400;
 // Chunk size for non-blocking UDP sends; keeps each datagram inside a safe MTU.
-// Fragments one buffer into 1400-byte datagrams on socket; counts a drop when the send buffer is full.
+// Fragments one buffer into 1400-byte datagrams on socket. A full send buffer
+// abandons the whole buffer rather than its tail: the phone parses the stream as
+// 4-byte length-prefixed frames, so a partial frame would leave its declared
+// length unfulfilled and desync the reassembler for the rest of the stream.
 static void SendFramedUdp(SOCKET socket, const sockaddr_in* addr,
                           const uint8_t* framed, int framedSize,
                           uint32_t* droppedCounter)
@@ -26,6 +29,7 @@ static void SendFramedUdp(SOCKET socket, const sockaddr_in* addr,
                 if (*droppedCounter % 30 == 1) {
                     DriverLog("[UDP] Send buffer full, dropping frame (dropped=%d)", (int)*droppedCounter);
                 }
+                return;
             } else {
                 char targetIp[INET_ADDRSTRLEN];
                 inet_ntop(AF_INET, &addr->sin_addr, targetIp, sizeof(targetIp));

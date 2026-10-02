@@ -62,6 +62,11 @@ class VideoReceiver {
   // be mistaken for stream desync and dropped. Tied loosely to a 4K-class SBS
   // stream; raise if you increase resolution/bitrate.
   static const int kMaxFrameSize = 16 * 1024 * 1024;
+  // Largest *incomplete* frame we keep waiting for before declaring the stream
+  // desynced. A partial frame past this means its 4-byte length prefix was
+  // misread, and the next datagram is a better place to resync than growing the
+  // backlog toward kMaxFrameSize (megabytes of dead air at any bitrate).
+  static const size_t kMaxPartialFrameBytes = 1024 * 1024;
 
   // Max queued decoded-ready frames. The receiver runs far ahead of the
   // decoder/render thread; once the backlog exceeds this depth we drop the
