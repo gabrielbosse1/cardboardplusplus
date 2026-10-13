@@ -31,5 +31,12 @@ jobs:
     - name: Driver unit tests
       shell: pwsh
       run: |
-        cl /nologo /EHsc /std:c++14 /I driver_cardboardplusplus\include /Fe:driver_tests.exe /Fo:driver_tests_ driver_cardboardplusplus\tests\test_wire_protocol.cpp
+        # cl is not on PATH in a bare pwsh shell; enter the VS dev environment first,
+        # same as scripts/compile-driver.ps1 does locally.
+        $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+        $vsRoot = & $vswhere -latest -property installationPath
+        $devCmd = Join-Path $vsRoot "Common7\Tools\VsDevCmd.bat"
+        cmd /c "`"$devCmd`" -arch=x64 >nul && cl /nologo /EHsc /std:c++14 /I driver_cardboardplusplus\include /Fe:driver_tests.exe /Fo:driver_tests_ driver_cardboardplusplus\tests\test_wire_protocol.cpp"
+        if ($LASTEXITCODE -ne 0) { throw "driver test compile failed (cl exit $LASTEXITCODE)" }
         .\driver_tests.exe
+        if ($LASTEXITCODE -ne 0) { throw "driver tests failed" }
