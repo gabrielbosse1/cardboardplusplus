@@ -25,18 +25,15 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class CameraStreamer implements CameraController.FrameCallback {
   private static final String TAG = CameraStreamer.class.getSimpleName();
   private static final DebugLog DBG = new DebugLog(TAG);
-  // Target stream shape/quality/cadence from AppConstants (256x192 q38).
-  private static final int TARGET_WIDTH = AppConstants.CAMERA_STREAM_WIDTH;
-  private static final int TARGET_HEIGHT = AppConstants.CAMERA_STREAM_HEIGHT;
+  // JPEG quality from AppConstants; frames are encoded at native capture
+  // size (bridge decodes any size, MediaPipe resizes internally).
   private static final int JPEG_QUALITY = AppConstants.CAMERA_JPEG_QUALITY;
-  private static final long FRAME_INTERVAL_MS = AppConstants.CAMERA_FRAME_INTERVAL_MS;
   // Set while the socket loop runs; false during reconnect gaps (frames are
   // refused then). Distinct from shouldStream, the stop flag.
   private volatile boolean streaming = false;
   private volatile boolean shouldStream = false;
   private volatile DatagramSocket socket;
   private volatile InetAddress pcAddress;
-  private long lastFrameTimeMs;
   private int frameCount;
   private int seq;
   private int droppedFrames;
@@ -47,12 +44,10 @@ public class CameraStreamer implements CameraController.FrameCallback {
   // Guards the single in-flight encode: onFrame drops when the sender thread
   // is still busy, so a slow JPEG never builds a backlog.
   private final AtomicBoolean senderBusy = new AtomicBoolean(false);
-  // Reused NV21 conversion buffers (no per-frame allocation).
+  // Reused NV21 conversion buffer (no per-frame allocation).
   private byte[] nv21Scratch;
-  private byte[] smallScratch;
   public CameraStreamer(AppSettings appSettings) {
     this.appSettings = appSettings;
-    lastFrameTimeMs = 0;
     frameCount = 0;
   }
   // Opens the sender thread plus a daemon socket loop (bind, resolve PC,
@@ -117,16 +112,13 @@ public class CameraStreamer implements CameraController.FrameCallback {
     Log.i(TAG, "Camera streamer stopped, sent " + frameCount + " frames, dropped "
         + droppedFrames + " oversize, " + droppedBusy + " busy");
   }
-  // FrameCallback entry (camera thread): rate-limits to FRAME_INTERVAL_MS,
-  // drops when the sender is busy, else hands the Image to the sender thread
-  // (which closes it). True means accepted for send.
+  // FrameCallback entry (camera thread): uncapped, drops when the sender
+  // is busy, else hands the Image to the sender thread (which closes it).
+  // True means accepted for send.
   public boolean isStreaming() { return streaming; }
   @Override
   public boolean onFrame(Image image) {
     if (!streaming || socket == null || pcAddress == null || senderHandler == null) return false;
-    long now = System.currentTimeMillis();
-    if (now - lastFrameTimeMs < FRAME_INTERVAL_MS) return false;
-    lastFrameTimeMs = now;
     if (!senderBusy.compareAndSet(false, true)) {
       droppedBusy++;
       return false;
@@ -144,9 +136,9 @@ public class CameraStreamer implements CameraController.FrameCallback {
     });
     return true;
   }
-  // Converts one frame to NV21, downscales to the stream shape, JPEGs it,
-  // and sends [seq][jpeg] as a single datagram. Oversize JPEGs (past the
-  // 60KB datagram cap) are counted and dropped — UDP cannot fragment them.
+  // Converts one frame to NV21, JPEGs it at native capture size, and sends
+  // [seq][jpeg] as a single datagram. Oversize JPEGs (past the 60KB
+  // datagram cap) are counted and dropped — UDP cannot fragment them.
   private void sendFrame(Image image) {
     DatagramSocket sock = socket;
     InetAddress addr = pcAddress;
@@ -155,18 +147,15 @@ public class CameraStreamer implements CameraController.FrameCallback {
       int w = image.getWidth();
       int h = image.getHeight();
       if (w <= 0 || h <= 0) return;
+      long t0 = System.nanoTime();
       byte[] nv21 = imageToNv21(image, w, h);
       if (nv21 == null) return;
-      byte[] small;
-      if (w == TARGET_WIDTH && h == TARGET_HEIGHT) {
-        small = nv21;
-      } else {
-        small = downscaleNv21(nv21, w, h, TARGET_WIDTH, TARGET_HEIGHT);
-      }
-      YuvImage yuvImage = new YuvImage(small, ImageFormat.NV21, TARGET_WIDTH, TARGET_HEIGHT, null);
+      long t1 = System.nanoTime();
+      YuvImage yuvImage = new YuvImage(nv21, ImageFormat.NV21, w, h, null);
       ByteArrayOutputStream jpegStream = new ByteArrayOutputStream();
-      yuvImage.compressToJpeg(new Rect(0, 0, TARGET_WIDTH, TARGET_HEIGHT), JPEG_QUALITY, jpegStream);
+      yuvImage.compressToJpeg(new Rect(0, 0, w, h), JPEG_QUALITY, jpegStream);
       byte[] jpegData = jpegStream.toByteArray();
+      long t2 = System.nanoTime();
       if (jpegData.length + AppConstants.CAMERA_SEQ_HEADER_LEN > AppConstants.CAMERA_MAX_DATAGRAM) {
         droppedFrames++;
         return;
@@ -178,42 +167,16 @@ public class CameraStreamer implements CameraController.FrameCallback {
       seq++;
       DatagramPacket packet = new DatagramPacket(payload, payload.length, addr, AppConstants.CAMERA_PORT);
       sock.send(packet);
+      long t3 = System.nanoTime();
       frameCount++;
       if (frameCount % 60 == 1) {
-        DBG.i("Sent %d frames, dropped %d oversize %d busy, last size: %d bytes",
-            frameCount, droppedFrames, droppedBusy, payload.length);
+        DBG.i("Sent %d frames %dx%d, dropped %d oversize %d busy, last size: %d bytes, nv21=%dms jpeg=%dms send=%dms",
+            frameCount, w, h, droppedFrames, droppedBusy, payload.length,
+            (t1 - t0) / 1000000, (t2 - t1) / 1000000, (t3 - t2) / 1000000);
       }
     } catch (Exception e) {
       Log.w(TAG, "Frame send failed: " + e.getMessage());
     }
-  }
-  // Nearest-neighbor NV21 downscale into the reused small buffer. Keeps the
-  // Y and interleaved VU planes consistent; called when the camera runs
-  // larger than the 256x192 stream shape.
-  private byte[] downscaleNv21(byte[] src, int srcW, int srcH, int dstW, int dstH) {
-    byte[] dst = ensureSmall(dstW * dstH * 3 / 2);
-    for (int y = 0; y < dstH; y++) {
-      int srcY = y * srcH / dstH;
-      for (int x = 0; x < dstW; x++) {
-        dst[y * dstW + x] = src[srcY * srcW + x * srcW / dstW];
-      }
-    }
-    int srcUvStart = srcW * srcH;
-    int dstUvStart = dstW * dstH;
-    int srcUvW = srcW / 2;
-    int dstUvW = dstW / 2;
-    int dstUvH = dstH / 2;
-    for (int y = 0; y < dstUvH; y++) {
-      int srcY = y * (srcH / 2) / dstUvH;
-      for (int x = 0; x < dstUvW; x++) {
-        int srcX = x * srcUvW / dstUvW;
-        int srcOff = srcUvStart + (srcY * srcUvW + srcX) * 2;
-        int dstOff = dstUvStart + (y * dstUvW + x) * 2;
-        dst[dstOff] = src[srcOff];
-        dst[dstOff + 1] = src[srcOff + 1];
-      }
-    }
-    return dst;
   }
   // Repacks a YUV_420_888 Image (arbitrary row/pixel strides) into packed
   // NV21 (V/U interleaved) in the reused scratch buffer.
@@ -255,12 +218,5 @@ public class CameraStreamer implements CameraController.FrameCallback {
       nv21Scratch = new byte[need];
     }
     return nv21Scratch;
-  }
-  // Small-frame scratch, same reuse contract as ensureNv21.
-  private byte[] ensureSmall(int need) {
-    if (smallScratch == null || smallScratch.length < need) {
-      smallScratch = new byte[need];
-    }
-    return smallScratch;
   }
 }

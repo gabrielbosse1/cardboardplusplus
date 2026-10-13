@@ -11,6 +11,34 @@
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 using namespace vr;
+
+namespace {
+// Compositor-facing driver calls run on SteamVR's render thread, so a slow one
+// can trip the compositor watchdog and abort it. The compositor log then only
+// says "Render thread in CRenderThread::Update", naming no driver call; this
+// reports which callback stalled and for how long.
+class StallScope {
+ public:
+    explicit StallScope(const char* name)
+        : name_(name), start_(std::chrono::steady_clock::now()) {}
+    ~StallScope() {
+        long long us = std::chrono::duration_cast<std::chrono::microseconds>(
+                           std::chrono::steady_clock::now() - start_).count();
+        if (us < kStallLogUs) return;
+        static unsigned s_count = 0;
+        if (++s_count <= 5 || s_count % 20 == 0) {
+            DriverLog("[STALL] %s took %lld ms (stalls=%u)", name_, us / 1000, s_count);
+        }
+    }
+ private:
+    // A stall long enough to reach SteamVR's ~6 s watchdog budget; anything
+    // under this is normal jitter on a busy compositor.
+    static constexpr long long kStallLogUs = 200000;
+    const char* name_;
+    std::chrono::steady_clock::time_point start_;
+};
+}  // namespace
+
 #ifdef _DEBUG
 #define DRIVER_DIAG
 #endif
@@ -24,6 +52,7 @@ void HmdDriver::CreateSwapTextureSet(uint32_t unPid, const SwapTextureSetDesc_t*
     if (pOutSwapTextureSet) {
         std::memset(pOutSwapTextureSet, 0, sizeof(*pOutSwapTextureSet));
     }
+    StallScope stall("CreateSwapTextureSet");
     DriverLog("CreateSwapTextureSet called: width=%d, height=%d, format=%d, samples=%d",
         pSwapTextureSetDesc->nWidth, pSwapTextureSetDesc->nHeight, pSwapTextureSetDesc->nFormat, pSwapTextureSetDesc->nSampleCount);
     WaitEncoderIdle();
@@ -93,6 +122,7 @@ void HmdDriver::CreateSwapTextureSet(uint32_t unPid, const SwapTextureSetDesc_t*
 // Called by the compositor to release one triple-set; waits for the encoder to idle, then erases its handle entries.
 void HmdDriver::DestroySwapTextureSet(vr::SharedTextureHandle_t sharedTextureHandle)
 {
+    StallScope stall("DestroySwapTextureSet");
     DriverLog("DestroySwapTextureSet called: handle=%llu", (uint64_t)sharedTextureHandle);
     WaitEncoderIdle();
     auto it = m_setByHandle.find(sharedTextureHandle);
@@ -120,6 +150,7 @@ void HmdDriver::DestroySwapTextureSet(vr::SharedTextureHandle_t sharedTextureHan
 // Called when a VR app exits; drops every swap-set for unPid and clears any queued frame.
 void HmdDriver::DestroyAllSwapTextureSets(uint32_t unPid)
 {
+    StallScope stall("DestroyAllSwapTextureSets");
     DriverLog("DestroyAllSwapTextureSets called for pid=%d", unPid);
     m_sceneTearingDown = true;
     WaitEncoderIdle();
@@ -190,6 +221,7 @@ void HmdDriver::SubmitLayer(const SubmitLayerPerEye_t(&perEye)[2])
 // Called by the compositor at vsync with the sync texture; resolves queued layers into private copies and wakes the encoding thread.
 void HmdDriver::Present(vr::SharedTextureHandle_t syncTexture)
 {
+    StallScope stall("Present");
     if (!m_streamEnabled.load(std::memory_order_relaxed)) {
         return;
     }
@@ -332,6 +364,7 @@ void HmdDriver::PostPresent()
 // Opens and acquires the compositor keyed-mutex sync texture; caches the handle while it stays valid.
 bool HmdDriver::AcquireSyncTexture(vr::SharedTextureHandle_t syncTexture)
 {
+    StallScope stall("AcquireSyncTexture");
     if (!syncTexture) return false;
     HANDLE hSync = (HANDLE)syncTexture;
     if (hSync == INVALID_HANDLE_VALUE) return false;
@@ -373,6 +406,7 @@ void HmdDriver::ReleaseSyncTexture()
 // Creates or resizes private per-eye copies matching each submitted layer; lets the encoder hold textures past compositor reuse.
 bool HmdDriver::EnsureLayerCopies(const std::vector<SubmitLayerInfo>& layers)
 {
+    StallScope stall("EnsureLayerCopies");
     if (m_layerCopies.size() < layers.size()) {
         m_layerCopies.resize(layers.size());
     }
@@ -434,12 +468,13 @@ bool HmdDriver::EnsureLayerCopies(const std::vector<SubmitLayerInfo>& layers)
     }
     return true;
 }
-// Blocks texture teardown/re-init paths up to 2 s until the encoding thread signals completion.
-// Frame-timing hook (timing output intentionally left empty); the compositor calls it per frame.
+// Blocks texture teardown/re-init paths until the encoding thread signals
+// completion. Kept short because the compositor calls this on its own threads:
+// a long wait here shows up as a stalled compositor render thread.
 void HmdDriver::WaitEncoderIdle()
 {
     std::unique_lock<std::mutex> lock(m_encodeDoneMutex);
-    m_encodeDoneCv.wait_for(lock, std::chrono::seconds(2), [this] { return m_encodeDone; });
+    m_encodeDoneCv.wait_for(lock, std::chrono::milliseconds(250), [this] { return m_encodeDone; });
 }
 // Frame-timing hook (timing output intentionally left empty); the compositor calls it per frame.
 void HmdDriver::GetFrameTiming(DriverDirectMode_FrameTiming* pFrameTiming)

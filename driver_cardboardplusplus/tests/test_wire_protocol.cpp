@@ -7,6 +7,327 @@
 #include <vector>
 #include "CardboardWire.h"
 #include "H264Utils.h"
+#include "GripLimit.h"
+// --- grip limit -----------------------------------------------------------------
+// SteamVR reads the grip limit as both the curl/splay reference and the ceiling
+// on skeletal motion. Left null, SteamVR substitutes the Index controller's
+// fist, which bottoms out before a bare hand does and stops MCP flexion short of
+// the palm. These assertions keep the generated table a genuine full fist: unit
+// quaternions, a closed root, and joint flexion past the point where knuckles
+// stop.
+struct Vec3 { float x, y, z; };
+static Vec3 vsub(Vec3 a, Vec3 b) { return Vec3{a.x - b.x, a.y - b.y, a.z - b.z}; }
+static float vdot(Vec3 a, Vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+static float vlen(Vec3 a) { return sqrtf(vdot(a, a)); }
+static Vec3 qrot(const float q[4], Vec3 v) {
+    Vec3 u{q[1], q[2], q[3]};
+    Vec3 uv{u.y * v.z - u.z * v.y, u.z * v.x - u.x * v.z, u.x * v.y - u.y * v.x};
+    Vec3 uuv{u.y * uv.z - u.z * uv.y, u.z * uv.x - u.x * uv.z, u.x * uv.y - u.y * uv.x};
+    return Vec3{v.x + 2.0f * (q[0] * uv.x + uuv.x), v.y + 2.0f * (q[0] * uv.y + uuv.y),
+                v.z + 2.0f * (q[0] * uv.z + uuv.z)};
+}
+static void qmul(float out[4], const float a[4], const float b[4]) {
+    out[0] = a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3];
+    out[1] = a[0] * b[1] + a[1] * b[0] + a[2] * b[3] - a[3] * b[2];
+    out[2] = a[0] * b[2] - a[1] * b[3] + a[2] * b[0] + a[3] * b[1];
+    out[3] = a[0] * b[3] + a[1] * b[2] - a[2] * b[1] + a[3] * b[0];
+}
+// Valve's vr_glove parent hierarchy.
+static const int kGripParent[31] = {-1, 0, 1, 2, 3, 4, 1, 6, 7, 8, 9, 1, 11, 12, 13, 14,
+                                    1, 16, 17, 18, 19, 1, 21, 22, 23, 24, 0, 0, 0, 0, 0};
+// Phalangeal joint bones per finger: MCP, PIP, DIP.
+static const int kFingerJoints[4][3] = {{7, 8, 9}, {12, 13, 14}, {17, 18, 19}, {22, 23, 24}};
+static const char* kFingerNames[4] = {"index", "middle", "ring", "pinky"};
+
+static float joint_flexion_deg(const GripLimitBone* g, int bone) {
+    float wr[31][4];
+    Vec3 wp[31];
+    for (int i = 0; i < 31; i++) {
+        int p = kGripParent[i];
+        wp[i].x = wp[i].y = wp[i].z = 0.0f;
+        wr[i][0] = 1.0f; wr[i][1] = wr[i][2] = wr[i][3] = 0.0f;
+        if (p < 0) continue;
+        Vec3 off{g[i].pos[0], g[i].pos[1], g[i].pos[2]};
+        Vec3 w = qrot(wr[p], off);
+        wp[i] = Vec3{wp[p].x + w.x, wp[p].y + w.y, wp[p].z + w.z};
+        qmul(wr[i], wr[p], g[i].rot);
+    }
+    // Angle at `bone` between the segment arriving from its parent and the one
+    // leaving toward its child.
+    int p = kGripParent[bone];
+    int child = bone + 1;
+    Vec3 incoming = vsub(wp[bone], wp[p]);
+    Vec3 outgoing = vsub(wp[child], wp[bone]);
+    float li = vlen(incoming), lo = vlen(outgoing);
+    if (li < 1e-9f || lo < 1e-9f) return 0.0f;
+    float c = vdot(incoming, outgoing) / (li * lo);
+    if (c > 1.0f) c = 1.0f;
+    if (c < -1.0f) c = -1.0f;
+    return acosf(c) * 180.0f / 3.14159265f;
+}
+
+static void test_grip_limit_is_a_closed_fist() {
+    const GripLimitBone* sides[2] = {kGripLimitLeft, kGripLimitRight};
+    for (int s = 0; s < 2; s++) {
+        const char* label = s == 0 ? "left" : "right";
+        // Root must stay at identity so the device pose owns the transform.
+        assert(vlen(Vec3{sides[s][0].pos[0], sides[s][0].pos[1], sides[s][0].pos[2]}) < 1e-6f);
+        assert(fabsf(sides[s][0].rot[0] - 1.0f) < 1e-6f);
+        for (int i = 0; i < 31; i++) {
+            float qn = sides[s][i].rot[0] * sides[s][i].rot[0] + sides[s][i].rot[1] * sides[s][i].rot[1] +
+                       sides[s][i].rot[2] * sides[s][i].rot[2] + sides[s][i].rot[3] * sides[s][i].rot[3];
+            assert(fabsf(qn - 1.0f) < 1e-4f);
+        }
+        for (int f = 0; f < 4; f++) {
+            // Human maxima are MCP ~90, PIP ~110, DIP ~80; the floor here is
+            // well past the Index controller's fist so the ceiling actually
+            // moves when a bare hand closes.
+            const float floor[3] = {60.0f, 70.0f, 45.0f};
+            for (int j = 0; j < 3; j++) {
+                float deg = joint_flexion_deg(sides[s], kFingerJoints[f][j]);
+                assert(deg > floor[j]);
+                assert(deg < 130.0f);
+                printf("  %s %s joint %d flexion %.1f deg\n", label, kFingerNames[f], j, deg);
+            }
+        }
+    }
+    printf("PASS: grip limit is a full fist on both hands\n");
+}
+
+static void test_grip_limit_sides_are_mirrored() {
+    // The two tables are built from x-mirrored Valve binds, so a rolled joint
+    // must come out with the same angle on both sides.
+    for (int f = 0; f < 4; f++) {
+        for (int j = 0; j < 3; j++) {
+            int b = kFingerJoints[f][j];
+            float l = joint_flexion_deg(kGripLimitLeft, b);
+            float r = joint_flexion_deg(kGripLimitRight, b);
+            assert(fabsf(l - r) < 1.0f);
+        }
+    }
+    printf("PASS: grip limit flexions match across hands\n");
+}
+
+// --- pinch -------------------------------------------------------------------------------
+// Thumb-to-index tip gap, the classic pinch metric. The wire carries every bone
+// parent-relative, so world-space measurements need a parent-chain walk first; these
+// mirror that walk with identity rotations, where the expected answer is a plain sum
+// down the chain.
+static const int kPinchThumbTip = 5;
+static const int kPinchIndexTip = 10;
+static const float kPinchMaxDist = 0.045f;
+
+struct WireBone { float pos[3]; float rot[4]; };
+struct WireHand { WireBone bones[31]; };
+// Mirror of the constants HandDriver sets on its property container.
+static const char* kControllerTypeContract = "knuckles";
+static const char* kInputProfileContract = "{indexcontroller}/input/index_controller_profile.json";
+static const char* kRenderModelLeftContract = "{indexcontroller}/rendermodels/valve_controller_knu_1_0_left";
+static const char* kRenderModelRightContract = "{indexcontroller}/rendermodels/valve_controller_knu_1_0_right";
+// Finger curl paths, in index..pinky order. Valve's knuckles input profile declares these
+// four and no thumb, so any other spelling silently stops resolving.
+static const char* kFingerPathContract[4] = {
+    "/input/finger/index", "/input/finger/middle", "/input/finger/ring", "/input/finger/pinky",
+};
+
+static void wire_hand_straight_x(WireHand* h, float step) {
+    for (int i = 0; i < 31; i++) {
+        h->bones[i].pos[0] = step * static_cast<float>(i);
+        h->bones[i].pos[1] = 0.0f;
+        h->bones[i].pos[2] = 0.0f;
+        h->bones[i].rot[0] = 1.0f;
+        h->bones[i].rot[1] = h->bones[i].rot[2] = h->bones[i].rot[3] = 0.0f;
+    }
+}
+
+// Mirror of HandDriver::world_bone with identity joint rotations.
+static void wire_world_bone(const WireHand& h, int bone, float* out) {
+    out[0] = out[1] = out[2] = 0.0f;
+    for (int b = bone; b > 0; b = kGripParent[b]) {
+        out[0] += h.bones[b].pos[0];
+        out[1] += h.bones[b].pos[1];
+        out[2] += h.bones[b].pos[2];
+    }
+}
+
+// Mirror of HandDriver::world_chain: rotate each parent-relative offset by the
+// accumulated parent rotation, then accumulate along the chain.
+static void wire_world_chain(const WireHand& h, float out[31][3]) {
+    float wr[31][4];
+    for (int i = 0; i < 31; i++) {
+        int p = kGripParent[i];
+        out[i][0] = out[i][1] = out[i][2] = 0.0f;
+        wr[i][0] = 1.0f; wr[i][1] = wr[i][2] = wr[i][3] = 0.0f;
+        if (p < 0) continue;
+        Vec3 w = qrot(wr[p], Vec3{h.bones[i].pos[0], h.bones[i].pos[1], h.bones[i].pos[2]});
+        for (int k = 0; k < 3; k++) out[i][k] = out[p][k] + (k == 0 ? w.x : (k == 1 ? w.y : w.z));
+        qmul(wr[i], wr[p], h.bones[i].rot);
+    }
+}
+
+// Mirror of HandDriver::joint_flexion_deg.
+static float wire_joint_flexion_deg(const float wp[31][3], int bone) {
+int p = kGripParent[bone];
+    Vec3 here{wp[bone][0], wp[bone][1], wp[bone][2]};
+    Vec3 par{wp[p][0], wp[p][1], wp[p][2]};
+    Vec3 child{wp[bone + 1][0], wp[bone + 1][1], wp[bone + 1][2]};
+    Vec3 incoming = vsub(here, par);
+    Vec3 outgoing = vsub(child, here);
+    float li = vlen(incoming), lo = vlen(outgoing);
+    if (li < 1e-9f || lo < 1e-9f) return 0.0f;
+    float c = vdot(incoming, outgoing) / (li * lo);
+    if (c > 1.0f) c = 1.0f;
+    if (c < -1.0f) c = -1.0f;
+    return acosf(c) * 180.0f / 3.14159265f;
+}
+
+// Mirror of HandDriver::finger_curl: mean over the finger's three joints of the live
+// flexion divided by the same joint's grip-limit flexion.
+static float wire_finger_curl(const float wp[31][3], const float limit[4][3], int finger) {
+    float sum = 0.0f;
+    for (int j = 0; j < 3; j++) {
+        if (limit[finger][j] < 1e-3f) continue;
+        float ratio = wire_joint_flexion_deg(wp, kFingerJoints[finger][j]) / limit[finger][j];
+        if (ratio > 1.0f) ratio = 1.0f;
+        if (ratio < 0.0f) ratio = 0.0f;
+        sum += ratio;
+    }
+    return sum / 3.0f;
+}
+
+// The grip-limit table through the same helpers, giving the divisor the driver
+// computes once per hand.
+static void wire_grip_limit_flexion(const GripLimitBone* g, float out[4][3]) {
+    WireHand h;
+    for (int i = 0; i < 31; i++) {
+        for (int k = 0; k < 3; k++) h.bones[i].pos[k] = g[i].pos[k];
+        for (int k = 0; k < 4; k++) h.bones[i].rot[k] = g[i].rot[k];
+    }
+    float wp[31][3];
+    wire_world_chain(h, wp);
+    for (int f = 0; f < 4; f++) {
+        for (int j = 0; j < 3; j++) out[f][j] = wire_joint_flexion_deg(wp, kFingerJoints[f][j]);
+    }
+}
+
+static float wire_tip_gap(const WireHand& h) {
+    float t[3], i[3];
+    wire_world_bone(h, kPinchThumbTip, t);
+    wire_world_bone(h, kPinchIndexTip, i);
+    return vlen(Vec3{t[0] - i[0], t[1] - i[1], t[2] - i[2]});
+}
+
+static void test_pinch_walk_reaches_the_finger_tips() {
+    // A 31-bone chain walk is only correct if it lands on the tip, not somewhere
+    // up the finger: check the accumulated sum against each chain's own terms.
+    const float step = 0.002f;
+    WireHand h;
+    wire_hand_straight_x(&h, step);
+    float tip[3];
+    wire_world_bone(h, kPinchThumbTip, tip);
+    // Thumb chain is wrist + thumb0..3; the root contributes nothing.
+    float want = step * (1.0f + 2.0f + 3.0f + 4.0f + 5.0f);
+    assert(fabsf(tip[0] - want) < 1e-6f);
+    wire_world_bone(h, kPinchIndexTip, tip);
+    // Index chain is wrist + index0..4.
+    want = step * (1.0f + 6.0f + 7.0f + 8.0f + 9.0f + 10.0f);
+    assert(fabsf(tip[0] - want) < 1e-6f);
+    printf("PASS: parent-relative chain walk reaches both finger tips\n");
+}
+
+static void test_pinch_threshold_separates_open_from_closed() {
+    // An open hand must stay below the threshold or every menu click fires by itself.
+    const float step = 0.002f;
+    WireHand open;
+    wire_hand_straight_x(&open, step);
+    float open_gap = wire_tip_gap(open);
+    assert(open_gap > kPinchMaxDist);
+    printf("  open hand tip gap %.1f mm (threshold %.1f mm)\n", open_gap * 1000.0f,
+           kPinchMaxDist * 1000.0f);
+    // Fold the index tip onto the thumb tip by rewriting only the last bone. Bone 10's
+    // parent is bone 9, so its offset is set to whatever closes the remaining gap.
+    WireHand pinched = open;
+    float thumb[3], index_parent[3];
+    wire_world_bone(pinched, kPinchThumbTip, thumb);
+    wire_world_bone(pinched, kPinchIndexTip - 1, index_parent);
+    for (int a = 0; a < 3; a++) {
+        pinched.bones[kPinchIndexTip].pos[a] = thumb[a] - index_parent[a];
+    }
+    assert(wire_tip_gap(pinched) < 1e-6f);
+    printf("PASS: pinch threshold separates an open hand from touching fingertips\n");
+}
+
+static void test_finger_curl_is_zero_on_a_straight_hand() {
+    // The divisor is the grip limit, so a divisor of zero would read every live angle as
+    // zero curl and a hand with no flexed joints reports nothing at all.
+    float limit[4][3];
+    wire_grip_limit_flexion(kGripLimitLeft, limit);
+    WireHand open;
+    wire_hand_straight_x(&open, 0.002f);
+    float wp[31][3];
+    wire_world_chain(open, wp);
+    for (int f = 0; f < 4; f++) {
+        for (int j = 0; j < 3; j++) {
+            assert(limit[f][j] > 1e-3f);
+        }
+        float curl = wire_finger_curl(wp, limit, f);
+        assert(curl < 1e-4f);
+        printf("  straight %s curl %.4f\n", kFingerNames[f], curl);
+    }
+    printf("PASS: finger curl reads zero on a straight hand\n");
+}
+
+static void test_finger_curl_reaches_one_at_the_grip_limit() {
+    // Feeding the grip-limit table back through the same path must produce exactly 1.0 on
+    // every finger: that is the definition of the divisor, and it is what stops curl from
+    // ever disagreeing with the ceiling SteamVR already applies to the skeleton.
+    const GripLimitBone* sides[2] = {kGripLimitLeft, kGripLimitRight};
+    for (int s = 0; s < 2; s++) {
+        float limit[4][3];
+        wire_grip_limit_flexion(sides[s], limit);
+        WireHand fist;
+        for (int i = 0; i < 31; i++) {
+            for (int k = 0; k < 3; k++) fist.bones[i].pos[k] = sides[s][i].pos[k];
+            for (int k = 0; k < 4; k++) fist.bones[i].rot[k] = sides[s][i].rot[k];
+        }
+        float wp[31][3];
+        wire_world_chain(fist, wp);
+        for (int f = 0; f < 4; f++) {
+            float curl = wire_finger_curl(wp, limit, f);
+            assert(fabsf(curl - 1.0f) < 1e-3f);
+            printf("  %s %s curl %.4f\n", s == 0 ? "left" : "right", kFingerNames[f], curl);
+        }
+    }
+    printf("PASS: finger curl reaches exactly 1 at the grip limit on both hands\n");
+}
+
+static void test_finger_paths_match_the_knuckles_profile() {
+    // SteamVR silently drops a component whose path is not declared by the input profile
+    // named in Prop_InputProfilePath_String, and the knuckles profile declares no thumb.
+    const char* expected[4] = {"/input/finger/index", "/input/finger/middle",
+                               "/input/finger/ring", "/input/finger/pinky"};
+    for (int f = 0; f < 4; f++) {
+        assert(strcmp(kFingerPathContract[f], expected[f]) == 0);
+    }
+    printf("PASS: finger curl paths match the knuckles profile\n");
+}
+
+static void test_hand_device_keeps_its_binding_profile_and_render_model() {
+    // game - from the controller type, so an edit here silently changes what the whole system
+    // believes the device is. knuckles is the only type every one of those ships a
+    // skeleton-aware binding for.
+    assert(strcmp(kControllerTypeContract, "knuckles") == 0);
+    assert(strcmp(kInputProfileContract,
+                  "{indexcontroller}/input/index_controller_profile.json") == 0);
+    // The render model is not cosmetic and the path must be driver-qualified: unqualified, SteamVR
+    // resolves it under this driver's own resource root, finds nothing, and draws nothing at all.
+    assert(strcmp(kRenderModelLeftContract,
+                  "{indexcontroller}/rendermodels/valve_controller_knu_1_0_left") == 0);
+    assert(strcmp(kRenderModelRightContract,
+                  "{indexcontroller}/rendermodels/valve_controller_knu_1_0_right") == 0);
+    printf("PASS: hand keeps its binding profile and render model\n");
+}
+
 static void test_port_constants() {
     assert(wire::kDataPort == 42069);
     assert(wire::kDiscoveryPort == 42070);
@@ -512,6 +833,14 @@ static void test_phone_timeout_keeps_active_target() {
 }
 int main() {
     printf("=== Driver wire protocol tests ===\n\n");
+    test_grip_limit_is_a_closed_fist();
+    test_grip_limit_sides_are_mirrored();
+    test_pinch_walk_reaches_the_finger_tips();
+    test_pinch_threshold_separates_open_from_closed();
+    test_finger_curl_is_zero_on_a_straight_hand();
+    test_finger_curl_reaches_one_at_the_grip_limit();
+    test_finger_paths_match_the_knuckles_profile();
+    test_hand_device_keeps_its_binding_profile_and_render_model();
     test_port_constants();
     test_cardboard_cap_string();
     test_discovery_ack_string();

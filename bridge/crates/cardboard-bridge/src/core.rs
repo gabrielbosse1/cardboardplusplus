@@ -94,7 +94,7 @@ impl From<&AppState> for StatusSnapshot {
             preview_drops: s.preview_drops,
             camera_connected: s.camera_connected,
             camera_fps: s.camera_fps,
-            camera_detected_hands: s.camera_detected_hands,
+            camera_detected_hands: s.hands_detected as usize,
             latest_gyro_x: s.latest_gyro[0],
             latest_gyro_y: s.latest_gyro[1],
             latest_gyro_z: s.latest_gyro[2],
@@ -145,7 +145,9 @@ pub struct AppliedSettings {
 /// and connects. Returns the client for the camera thread plus the child to
 /// kill at shutdown. Every outcome is logged; (None, None) means hands stay
 /// off but the rest of the bridge runs.
-fn spawn_mediapipe_server(state: &SharedState) -> (Option<MediapipeClient>, Option<Child>) {
+/// pub(crate) so the camera detect loop can respawn a sidecar that died
+/// mid-session; returns (None, None) when hands stay off but the bridge runs.
+pub(crate) fn spawn_mediapipe_server(state: &SharedState) -> (Option<MediapipeClient>, Option<Child>) {
     let (d, p, t) = match state.lock() {
         Ok(s) => (
             s.hand_min_detection as f32 / 100.0,
@@ -411,12 +413,19 @@ impl AppCore {
         }
         log_ffmpeg_version(&state);
         let (mediapipe_client, mediapipe_proc) = spawn_mediapipe_server(&state);
-        net::camera::spawn(state.clone(), mediapipe_client.clone());
+        // Shared with the camera detect loop so it can replace a sidecar that
+        // died mid-session; the old handle is reaped before a new one lands.
+        let mediapipe_proc = Arc::new(Mutex::new(mediapipe_proc));
+        net::camera::spawn(
+            state.clone(),
+            mediapipe_client.clone(),
+            mediapipe_proc.clone(),
+        );
         let core = Arc::new(Self {
             state,
             preview_frame: Arc::new(Mutex::new(None)),
             preview_decode: Arc::new(Mutex::new(None)),
-            mediapipe_proc: Arc::new(Mutex::new(mediapipe_proc)),
+            mediapipe_proc,
             mediapipe_client: Arc::new(Mutex::new(mediapipe_client)),
         });
         core.start_preview_decode();
@@ -1049,6 +1058,7 @@ mod tests {
         assert_eq!(snapshot.phone_ip, "10.0.0.1");
         assert_eq!(snapshot.gyro_fps, 1000);
         assert_eq!(snapshot.hands_detected, 2);
+        assert_eq!(snapshot.hands_detected as usize, snapshot.camera_detected_hands);
     }
     #[test]
     fn status_snapshot_field_order_is_stable() {

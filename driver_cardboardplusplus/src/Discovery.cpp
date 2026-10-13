@@ -175,7 +175,23 @@ void HmdDriver::DiscoveryThreadFunc()
                 responseAddr.sin_addr.s_addr = senderAddr.sin_addr.s_addr;
                 sendto(m_discoverySocket, wire::kDiscoveryAck, (int)wire::kDiscoveryAckLen, 0,
                        (sockaddr*)&responseAddr, sizeof(responseAddr));
-                DebugLog("Discovery ACK sent to %s", senderIpStr);
+                // Echo the applied encode size back to the beacon sender so the
+                // bridge can report what the driver actually runs (the phone
+                // only ever reads the 3-byte ACK and ignores this line).
+                {
+                    char echo[64];
+                    int echoLen;
+                    {
+                        std::lock_guard<std::mutex> lock(m_encoderMutex);
+                        echoLen = snprintf(echo, sizeof(echo), "%s %d %d",
+                                           wire::kCardboardCap, m_encoderW, m_encoderH);
+                    }
+                    if (echoLen > 0 && echoLen < (int)sizeof(echo)) {
+                        sendto(m_discoverySocket, echo, echoLen, 0,
+                               (sockaddr*)&responseAddr, sizeof(responseAddr));
+                    }
+                }
+                DebugLog("Discovery ACK + CAP echo sent to %s", senderIpStr);
             } else {
                 static uint64_t unknownCount = 0;
                 if (++unknownCount <= 3 || unknownCount % 50 == 1) {

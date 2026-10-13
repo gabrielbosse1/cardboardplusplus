@@ -31,7 +31,9 @@ public final class AppConstants {
   public static final byte TELEMETRY_TAG_ROTATION = 0x12;
   public static final byte TELEMETRY_TAG_NETSTATS = 0x13;
   public static final byte TELEMETRY_TAG_PING = 0x20;
-  // Camera capture floors and the downscaled stream shape sent to the bridge.
+  // Camera capture floors for CameraController size choice and the JPEG
+  // quality for the bridge uplink; frames are sent uncapped at native
+  // capture size (bridge decodes any size).
   public static final int DEFAULT_CAMERA_WIDTH = 640;
   public static final int DEFAULT_CAMERA_HEIGHT = 480;
   public static final int MIN_CAMERA_WIDTH = 640;
@@ -39,7 +41,6 @@ public final class AppConstants {
   public static final int CAMERA_STREAM_WIDTH = 256;
   public static final int CAMERA_STREAM_HEIGHT = 192;
   public static final int CAMERA_JPEG_QUALITY = 38;
-  public static final long CAMERA_FRAME_INTERVAL_MS = 1000 / 30;
   // Camera datagram framing: 2-byte big-endian seq header, single-datagram size cap.
   public static final int CAMERA_SEQ_HEADER_LEN = 2;
   public static final int CAMERA_MAX_DATAGRAM = 60000;

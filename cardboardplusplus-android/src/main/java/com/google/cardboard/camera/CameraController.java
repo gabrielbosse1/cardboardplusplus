@@ -165,16 +165,10 @@ public class CameraController {
         if (ranges != null && ranges.length > 0) {
           Range<Integer> best = null;
           for (Range<Integer> r : ranges) {
-            if (r.getUpper() >= 30
-                && (best == null || r.getLower() > best.getLower())) {
+            if (best == null
+                || r.getUpper() > best.getUpper()
+                || (r.getUpper().equals(best.getUpper()) && r.getLower() > best.getLower())) {
               best = r;
-            }
-          }
-          if (best == null) {
-            for (Range<Integer> r : ranges) {
-              if (best == null || r.getUpper() > best.getUpper()) {
-                best = r;
-              }
             }
           }
           if (best != null) {

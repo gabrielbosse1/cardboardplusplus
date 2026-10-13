@@ -1,9 +1,15 @@
 #include "HmdDriver.h"
 #include "DriverLog.h"
+#include <chrono>
 #include <mutex>
 #include <utility>
 #include <vector>
 using namespace vr;
+namespace {
+// Any encode stage slower than this is reported with its name; the compositor
+// log can only say the render thread stalled, not which stage held it up.
+constexpr long long kSlowStageUs = 200000;
+}  // namespace
 // Encoding thread loop started from Activate; waits for Present to queue a frame, encodes it, then signals idle.
 void HmdDriver::EncodingThreadFunc()
 {
@@ -28,6 +34,18 @@ void HmdDriver::EncodePendingFrame(const PendingFrame& frame)
     std::lock_guard<std::mutex> lock(m_encoderMutex);
     if (!m_encoderInitialized || !m_pVideoEncoder) return;
     if (frame.layers.empty()) return;
+    auto stageStart = std::chrono::steady_clock::now();
+    auto noteStage = [&](const char* name) {
+        long long us = std::chrono::duration_cast<std::chrono::microseconds>(
+                           std::chrono::steady_clock::now() - stageStart).count();
+        if (us >= kSlowStageUs) {
+            static unsigned s_count = 0;
+            if (++s_count <= 5 || s_count % 20 == 0) {
+                DriverLog("[STALL] encode %s took %lld ms (stalls=%u)", name, us / 1000, s_count);
+            }
+        }
+        stageStart = std::chrono::steady_clock::now();
+    };
     std::vector<std::pair<HANDLE, HANDLE>> handles;
     handles.reserve(frame.layers.size());
     for (const auto& l : frame.layers)
@@ -37,10 +55,12 @@ void HmdDriver::EncodePendingFrame(const PendingFrame& frame)
         DriverLog("OpenSharedEyeTextures failed for pts=%lld", (long long)frame.pts);
         return;
     }
+    noteStage("OpenSharedEyeTextures");
     if (pLefts.empty()) {
         m_pVideoEncoder->ReleaseEyeTextures();
         return;
     }
+    noteStage("OpenSharedEyeTextures");
     std::vector<VideoEncoder::LayerBounds> lbL, lbR;
     lbL.reserve(frame.layers.size());
     lbR.reserve(frame.layers.size());
@@ -53,16 +73,27 @@ void HmdDriver::EncodePendingFrame(const PendingFrame& frame)
         m_pVideoEncoder->ReleaseEyeTextures();
         return;
     }
+    noteStage("ComposeSBSGPU");
     if (!m_pVideoEncoder->ReadbackToBuffer()) {
-        DriverLog("ReadbackToBuffer failed for pts=%lld", (long long)frame.pts);
+        // Rate-limited: at frame rate this floods the SteamVR log, and the log
+        // write takes a SteamVR-internal lock on the encode thread.
+        static unsigned s_readbackFailCount = 0;
+        if (++s_readbackFailCount <= 5 || s_readbackFailCount % 60 == 0) {
+            DriverLog("ReadbackToBuffer failed for pts=%lld (drop=%u)",
+                      (long long)frame.pts, s_readbackFailCount);
+        }
+        noteStage("ReadbackToBuffer");
         m_pVideoEncoder->ReleaseEyeTextures();
         return;
     }
+    noteStage("ReadbackToBuffer");
     if (!m_pVideoEncoder->SwsConvert()) {
         DriverLog("SwsConvert failed for pts=%lld", (long long)frame.pts);
         return;
     }
+    noteStage("SwsConvert");
     if (!m_pVideoEncoder->FinishEncode(frame.pts)) {
         DriverLog("FinishEncode failed for pts=%lld", (long long)frame.pts);
     }
+    noteStage("FinishEncode");
 }

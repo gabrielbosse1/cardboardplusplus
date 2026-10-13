@@ -124,6 +124,9 @@ fn app_state_tracks_telemetry_metrics() {
     state.note_gyro(&cardboard_bridge::net::telemetry::GyroSample::default());
     state.note_hand(2);
     assert_eq!(state.packets_total, 2);
+    // The phone sends no landmarks; the detect loop owns the hand count.
+    assert_eq!(state.hands_detected, 0);
+    state.note_hand_tracked(2);
     assert_eq!(state.hands_detected, 2);
 }
 #[test]

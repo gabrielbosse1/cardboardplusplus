@@ -1,8 +1,9 @@
 use std::net::UdpSocket;
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use crate::app::SharedState;
 use crate::net::mediapipe::MediapipeClient;
+use crate::ovr_bones::NUM_BONES;
 use crate::net::{CAMERA_PORT, MEDIAPIPE_PORT, SENSOR_PORT};
 /// Length of the big-endian u16 sequence prefix on each camera datagram.
 pub const SEQ_HEADER_LEN: usize = 2;
@@ -11,6 +12,9 @@ const DETECT_QUEUE: usize = 2;
 const STALE_RESYNC_AFTER: u32 = 30;
 /// Detections below this MediaPipe score never reach slot tracking or the driver send.
 const MIN_HAND_SCORE: f32 = 0.3;
+/// Floor between sidecar respawn attempts. The sidecar can die mid-session
+/// (native crash), and respawning is far too heavy to retry per camera frame.
+const RESPAWN_INTERVAL: Duration = Duration::from_secs(5);
 /// Work item for the detect thread: sequence id and the shared JPEG for
 /// MediaPipe + preview decode. The receive thread never decodes; the detect
 /// thread decodes on demand so the UDP drain is never blocked by CPU work.
@@ -18,8 +22,13 @@ type DetectJob = (u16, Arc<Vec<u8>>);
 /// Starts the camera pipeline (UDP 42072): a non-blocking receive thread plus
 /// a detect thread connected by a 2-deep latest-wins channel. `client` is the
 /// optional pre-connected MediaPipe sidecar; when None the detect thread
-/// lazy-connects on first use. Logs-and-returns when the socket cannot bind.
-pub fn spawn(state: SharedState, client: Option<MediapipeClient>) {
+/// lazy-connects on first use and respawns a sidecar that died. Logs-and-returns
+/// when the socket cannot bind.
+pub fn spawn(
+    state: SharedState,
+    client: Option<MediapipeClient>,
+    mediapipe_proc: Arc<Mutex<Option<std::process::Child>>>,
+) {
     let sock = match UdpSocket::bind(format!("0.0.0.0:{CAMERA_PORT}")) {
         Ok(sock) => sock,
         Err(err) => {
@@ -41,7 +50,9 @@ pub fn spawn(state: SharedState, client: Option<MediapipeClient>) {
     let (tx, rx) = mpsc::sync_channel::<DetectJob>(DETECT_QUEUE);
     {
         let detect_state = state.clone();
-        std::thread::spawn(move || detect_loop(rx, detect_state, client));
+        std::thread::spawn(move || {
+            detect_loop(rx, detect_state, client, mediapipe_proc)
+        });
     }
     std::thread::spawn(move || camera_loop(sock, state, tx));
 }
@@ -172,12 +183,16 @@ fn detect_loop(
     rx: mpsc::Receiver<DetectJob>,
     state: SharedState,
     mut client: Option<MediapipeClient>,
+    mediapipe_proc: Arc<Mutex<Option<std::process::Child>>>,
 ) {
     // UDP socket for sending skeleton data to the driver's sensor port
     let skeleton_sock = UdpSocket::bind("127.0.0.1:0").ok();
     let skeleton_addr = format!("127.0.0.1:{SENSOR_PORT}");
     // Stable hand slots: sides never flicker, labels only vote on swaps.
     let mut slots = crate::hand_slots::HandSlots::new();
+    let mut last_respawn: Option<Instant> = None;
+    // Last frame's bone orientations per hand, for quaternion sign continuity.
+    let mut prev_orientations: [Option<[[f32; 4]; NUM_BONES]>; 2] = [None, None];
     loop {
         let mut job = match rx.recv() {
             Ok(j) => j,
@@ -191,6 +206,23 @@ fn detect_loop(
             Ok(s) => (s.hand_enabled, s.hand_overlay, s.head_quat),
             Err(_) => (false, true, [1.0, 0.0, 0.0, 0.0]),
         };
+        // A sidecar that died leaves `client` holding a dead TCP stream, so the
+        // lazy-connect branch below would never run again. try_wait() is the
+        // death signal: it costs nothing and only means anything for a sidecar
+        // this bridge spawned.
+        if enabled {
+            let exited = mediapipe_proc
+                .lock()
+                .ok()
+                .and_then(|mut slot| slot.as_mut().and_then(|c| c.try_wait().ok().flatten()))
+                .is_some();
+            if exited {
+                if let Ok(mut s) = state.lock() {
+                    s.push_log("mediapipe: sidecar exited, dropping client".into());
+                }
+                client = None;
+            }
+        }
         if enabled && client.is_none() {
             let (d, p, t) = match state.lock() {
                 Ok(s) => (
@@ -204,6 +236,28 @@ fn detect_loop(
                 client = Some(cli);
                 if let Ok(mut s) = state.lock() {
                     s.push_log("mediapipe: lazy-connected to sidecar".into());
+                }
+            } else {
+                // Sidecar is gone (died mid-session). Respawn it instead of
+                // retrying the TCP connect every frame, so hand tracking
+                // recovers on its own without a bridge restart.
+                let due = last_respawn.map(|t| t.elapsed() >= RESPAWN_INTERVAL).unwrap_or(true);
+                if due {
+                    last_respawn = Some(Instant::now());
+                    let (fresh, child) = crate::core::spawn_mediapipe_server(&state);
+                    if let Ok(mut slot) = mediapipe_proc.lock() {
+                        if let Some(mut old) = slot.take() {
+                            let _ = old.kill();
+                            let _ = old.wait();
+                        }
+                        *slot = child;
+                    }
+                    if fresh.is_some() {
+                        if let Ok(mut s) = state.lock() {
+                            s.push_log("mediapipe: respawned dead sidecar".into());
+                        }
+                    }
+                    client = fresh;
                 }
             }
         }
@@ -262,13 +316,22 @@ fn detect_loop(
             let jitter = slots.take_jitter();
             if let Some(ref sock) = skeleton_sock {
                 for hand in &tracked {
-                    let hand_id = hand.hand_id;
-                    let mut bones = crate::ovr_bones::compute_world_bones_with_palm(
+                    let hand_id = hand.hand_id as usize;
+                    // Previous frame's orientations, so the quaternion signs
+                    // stay continuous: SteamVR interpolates the skeleton between
+                    // the frames it is handed, and q -> -q is a 360 deg slerp.
+                    // A hand that has just been acquired starts from identity.
+                    let prev = prev_orientations[hand_id].get_or_insert_with(|| {
+                        std::array::from_fn(|_| [1.0f32, 0.0, 0.0, 0.0])
+                    });
+                    let mut bones = crate::ovr_bones::compute_world_bones_tracked(
                         &hand.landmarks,
                         &hand.world_landmarks,
                         hand_id == 1,
                         Some(hand.palm),
+                        prev,
                     );
+                    *prev = bones.map(|b| b.orientation);
                     // Tracking-space device pose is composed here (bridge
                     // owns all rotation math); the driver copies bone 0
                     // verbatim into the SteamVR pose.
@@ -292,8 +355,28 @@ fn detect_loop(
                             }
                         }
                     }
-                    let pkt = crate::ovr_bones::serialize_bones_udp(hand_id, timestamp_ms, &bones);
+                    let pkt = crate::ovr_bones::serialize_bones_udp(
+                        hand_id as u8,
+                        timestamp_ms,
+                        &bones,
+                    );
                     let _ = sock.send_to(&pkt, &skeleton_addr);
+                    {
+                        use std::sync::atomic::{AtomicU64, Ordering};
+                        static SKEL_LOG_CNT: AtomicU64 = AtomicU64::new(0);
+                        let n = SKEL_LOG_CNT.fetch_add(1, Ordering::Relaxed);
+                        if n % 30 == 0 {
+                            let root = bones[0].position;
+                            crate::debug_log!(
+                                &state,
+                                "[camera] skeleton -> driver udp {SENSOR_PORT}: hand={hand_id} {} bytes root=({:.3},{:.3},{:.3})",
+                                pkt.len(),
+                                root[0],
+                                root[1],
+                                root[2]
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -314,7 +397,11 @@ fn detect_loop(
             crate::debug_log!(&state, "[camera] seq={seq} {count} hand(s)");
         }
         if let Ok(mut s) = state.lock() {
-            s.camera_detected_hands = count;
+            s.note_hand_tracked(count);
+            // Rolls the fps window here too: the phone telemetry loop is a
+            // different thread, so leaving this to phone.rs would stall the
+            // camera and hand meters whenever telemetry stops.
+            s.recompute_fps();
         }
     }
 }

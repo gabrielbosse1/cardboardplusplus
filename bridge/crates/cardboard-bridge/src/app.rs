@@ -1,16 +1,21 @@
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
+
 /// Handle shared by every thread (net loops, UI pollers, REST): a mutex
 /// around the single AppState. Threads lock briefly per update.
 pub type SharedState = Arc<Mutex<AppState>>;
 /// Ring-log cap: keeps memory flat no matter how chatty the net threads get.
 const MAX_LOG_LINES: usize = 200;
-static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
-/// Verbose logging switch: always on in debug builds, runtime-toggled in
-/// release via --debug, CARDBOARD_DEBUG=1, or POST /debug.
+/// Rotation telemetry arrives at ~50-100Hz; logging 1-in-N keeps a few seconds
+/// of context in the ring log instead of one second of it.
+const ROTATION_LOG_EVERY: u32 = 50;
+/// Verbose logging switch: verbose by default in debug builds, silent in
+/// release; --debug, CARDBOARD_DEBUG=1 or POST /debug flip it in either
+/// direction at runtime.
+static DEBUG_ENABLED: AtomicBool = AtomicBool::new(cfg!(debug_assertions));
 pub fn debug_enabled() -> bool {
-    cfg!(debug_assertions) || DEBUG_ENABLED.load(Ordering::Relaxed)
+    DEBUG_ENABLED.load(Ordering::Relaxed)
 }
 /// Flips verbose logging at runtime. Called from main's flag parsing and the
 /// REST /debug endpoint.
@@ -45,7 +50,6 @@ pub struct AppState {
     pub camera_frame: Option<(u32, u32, Vec<u8>)>,
     pub camera_frame_time: Instant,
     pub camera_fps: i32,
-    pub camera_detected_hands: usize,
     pub latest_gyro: [f32; 3],
     pub latest_accel: [f32; 3],
     pub latest_mag: [f32; 3],
@@ -75,6 +79,7 @@ pub struct AppState {
     gyro_pulse_count: u64,
     hand_pulse_count: u64,
     camera_pulse_count: u64,
+    rotation_tick: u32,
     fps_window_started: Instant,
 }
 impl Default for AppState {
@@ -102,7 +107,6 @@ impl Default for AppState {
             camera_frame: None,
             camera_frame_time: Instant::now(),
             camera_fps: 0,
-            camera_detected_hands: 0,
             latest_gyro: [0.0; 3],
             latest_accel: [0.0; 3],
             latest_mag: [0.0; 3],
@@ -132,6 +136,7 @@ impl Default for AppState {
             gyro_pulse_count: 0,
             hand_pulse_count: 0,
             camera_pulse_count: 0,
+            rotation_tick: 0,
             fps_window_started: Instant::now(),
         }
     }
@@ -145,6 +150,13 @@ impl AppState {
             let excess = self.log.len() - MAX_LOG_LINES;
             self.log.drain(0..excess);
         }
+    }
+    /// True on every ROTATION_LOG_EVERY-th rotation sample. Sampled instead of
+    /// logged per sample because rotation runs at ~50-100Hz and would evict the
+    /// entire ring log within seconds.
+    pub fn log_rotation_tick(&mut self) -> bool {
+        self.rotation_tick = self.rotation_tick.wrapping_add(1);
+        self.rotation_tick % ROTATION_LOG_EVERY == 0
     }
     /// Rolls the 1-second FPS window: converts pulse counts (gyro/hand/camera)
     /// into per-second rates and restarts the window. Called on every sample;
@@ -173,12 +185,19 @@ impl AppState {
         self.latest_mag = sample.magnetic_field;
         self.latest_timestamp_ms = sample.timestamp_ms;
     }
-    /// Folds one hand hint in: visible-hand count plus counters. Called from
-    /// phone.rs for trusted senders only.
-    pub fn note_hand(&mut self, hands: u8) {
+    /// Folds one phone hand hint in: packet tally only. The phone runs no
+    /// inference, so this count is a hint and never drives hand_fps or
+    /// hands_detected — those come from the bridge detect loop via
+    /// note_hand_tracked. Called from phone.rs for trusted senders only.
+    pub fn note_hand(&mut self, _hands: u8) {
+        self.packets_total += 1;
+    }
+    /// Folds one completed detect pass in: tracked-hand count plus the
+    /// hand_fps pulse. MediaPipe inference happens on the detect loop, so this
+    /// is where the real hand-tracking rate is known. Called from camera.rs.
+    pub fn note_hand_tracked(&mut self, hands: usize) {
         self.hand_pulse_count += 1;
         self.hands_detected = hands as i32;
-        self.packets_total += 1;
     }
     /// Caches the latest phone head-orientation quat [w,x,y,z] for the hand
     /// pipeline: camera.rs composes it into the skeleton device pose so the
@@ -289,6 +308,7 @@ impl AppState {
 /// Gated log helper for net threads: pushes the formatted line only when
 /// verbose logging is on. Locks the state briefly; drops the line on
 /// contention instead of blocking the hot path.
+#[macro_export]
 macro_rules! debug_log {
     ($state:expr, $($arg:tt)*) => {
         if $crate::app::debug_enabled() {
@@ -298,7 +318,6 @@ macro_rules! debug_log {
         }
     };
 }
-pub(crate) use debug_log;
 #[cfg(test)]
 mod tests {
     // State-method tests: ring-log cap, FPS window roll, per-packet tallies,
@@ -342,7 +361,23 @@ mod tests {
         s.note_gyro(&crate::net::telemetry::GyroSample::default());
         s.note_hand(2);
         assert_eq!(s.packets_total, 2);
-        assert_eq!(s.hands_detected, 2);
+    }
+    #[test]
+    fn phone_hand_hint_does_not_drive_the_hand_meters() {
+        // The phone runs no inference, so its hint is a packet tally only.
+        // hands_detected and hand_fps belong to the bridge detect loop.
+        let mut s = AppState::default();
+        s.note_hand(2);
+        assert_eq!(s.hands_detected, 0);
+        assert_eq!(s.hand_pulse_count, 0);
+    }
+    #[test]
+    fn detect_loop_sets_hand_count_and_pulses_the_fps_meter() {
+        let mut s = AppState::default();
+        s.note_hand_tracked(2);
+        s.note_hand_tracked(1);
+        assert_eq!(s.hands_detected, 1);
+        assert_eq!(s.hand_pulse_count, 2);
     }
     #[test]
     fn hand_tracking_is_on_by_default() {

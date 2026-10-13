@@ -132,11 +132,16 @@ fn apply_packet(state: &SharedState, packet: TelemetryPacket, src: SocketAddr) {
                 }
                 s.phone_connected = true;
                 s.note_rotation(sample.quat);
-                debug_msg = Some(format!(
-                    "[phone] rotation quat=({:.4},{:.4},{:.4},{:.4}) ts={}",
-                    sample.quat[0], sample.quat[1], sample.quat[2], sample.quat[3],
-                    sample.timestamp_ms
-                ));
+                // Rotation arrives at ~50-100Hz. Logging every sample evicts
+                // the whole ring log within seconds, so sample it — the live
+                // values are already on /status and in the phone telemetry.
+                if s.log_rotation_tick() {
+                    debug_msg = Some(format!(
+                        "[phone] rotation quat=({:.4},{:.4},{:.4},{:.4}) ts={}",
+                        sample.quat[0], sample.quat[1], sample.quat[2], sample.quat[3],
+                        sample.timestamp_ms
+                    ));
+                }
             }
             TelemetryPacket::NetStats(stats) => {
                 if s.phone_connected && s.phone_ip == src.ip().to_string() {
@@ -266,7 +271,7 @@ mod tests {
         assert_eq!(s.packets_total, 2);
     }
     #[test]
-    fn hand_sets_phone_connected_and_records_hands() {
+    fn hand_hint_marks_the_phone_connected_without_setting_hand_count() {
         let state = fresh_state();
         apply_packet(&state, TelemetryPacket::Hello("1".into()), fake_src());
         let frame = HandFrame {
@@ -278,7 +283,7 @@ mod tests {
         apply_packet(&state, TelemetryPacket::Hand(frame), fake_src());
         let s = state.lock().unwrap();
         assert!(s.phone_connected);
-        assert_eq!(s.hands_detected, 2);
+        assert_eq!(s.hands_detected, 0);
     }
     #[test]
     fn hand_from_unknown_phone_is_ignored() {

@@ -27,3 +27,9 @@ jobs:
 
     - name: Build Driver
       run: msbuild driver_cardboardplusplus\driver_cardboardplusplus.sln /p:Configuration=${{ matrix.configuration }} /p:Platform=x64 /p:PlatformToolset=v143
+
+    - name: Driver unit tests
+      shell: pwsh
+      run: |
+        cl /nologo /EHsc /std:c++14 /I driver_cardboardplusplus\include /Fe:driver_tests.exe /Fo:driver_tests_ driver_cardboardplusplus\tests\test_wire_protocol.cpp
+        .\driver_tests.exe

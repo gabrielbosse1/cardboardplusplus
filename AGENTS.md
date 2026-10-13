@@ -57,7 +57,7 @@ cardboardplusplus/
 │   ├── crates/bridge-core/              # Shared core lib
 │   └── Cargo.toml                       # Workspace manifest (`cargo test` runs from here)
 ├── driver_cardboardplusplus/        # C++ — SteamVR driver DLL
-│   ├── src/                         # Discovery, HmdDriver, ControllerDriver, etc.
+│   ├── src/                         # Discovery, HmdDriver, HandDriver, etc.
 │   ├── include/                     # Headers (CardboardWire.h = locked contract)
 │   ├── tests/                       # Driver tests (mock SteamVR, mock bridge)
 │   └── driver_cardboardplusplus.vcxproj
@@ -386,6 +386,8 @@ Bad: `// Fixed: driver stayed connected after disconnect (user asked to clear fl
 - Phone → Driver: `"CARDBOARD_DISCOVERY"` (every 500ms until ACK)
 - Phone → Driver: `"CARDBOARD_CAP <W> <H>"` (no ACK, triggers resolution clamp)
 - Driver → Phone: `"ACK"` (3 bytes)
+- Driver → Phone: `"CARDBOARD_CAP <W> <H>"` (echoes the applied encoder size
+  alongside the ACK; the phone ignores anything that is not `"ACK"`)
 - Bridge → Driver: `"BRIDGE_HELLO v1"` (every 500ms)
 - Driver → Bridge: `"BRIDGE_ACK v1"` + `"BRIDGE_STATS fps=<n> bitrate=<kbps> frames=<n> drops=<n>"`
 - Bridge → Driver: `"BRIDGE_CFG <fps> <bitrate_kbps> <encoder>"`

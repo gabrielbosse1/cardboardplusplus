@@ -11,6 +11,7 @@ final class VideoWatchdog {
   private static final long STALL_MS = 3000;
   private static final long POLL_MS = 500;
   private static final long OUTPUT_STALL_MS = 1500;
+  private static final long RECONFIGURE_INTERVAL_MS = 2000;
   private static final long REANNOUNCE_INTERVAL_MS = 5000;
   private final String tag;
   private final Runnable reconnectAction;
@@ -59,6 +60,7 @@ final class VideoWatchdog {
     long lastAnnounceMs = 0;
     long lastFrameSeenAt = 0;
     long lastOutputAtMs = 0;
+    long lastReconfigureMs = 0;
     int lastDecodedFrames = -1;
     boolean wasStalled = false;
     boolean wasMuted = false;
@@ -107,7 +109,10 @@ final class VideoWatchdog {
         if (!wasMuted) {
           DBG.w("Frames arriving but none decoded for >" + OUTPUT_STALL_MS + "ms");
         }
-        if (reconfigureAction != null) {
+        // Throttled: a rebuild tears the codec down and forces an IDR, so one
+        // per poll would hammer both the codec and the driver.
+        if (reconfigureAction != null && now - lastReconfigureMs >= RECONFIGURE_INTERVAL_MS) {
+          lastReconfigureMs = now;
           reconfigureAction.run();
         }
       }

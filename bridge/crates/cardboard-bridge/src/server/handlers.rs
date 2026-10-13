@@ -14,6 +14,9 @@ pub fn handle(mut request: Request, core: &AppCore) {
         Some((p, q)) => (p.to_string(), Some(q.to_string())),
         None => (request.url().to_string(), None),
     };
+    if crate::app::debug_enabled() {
+        core.push_log(format!("REST {} {}{}", method.as_str(), path, query.as_deref().map(|q| format!("?{q}")).unwrap_or_default()));
+    }
     let response = match (method, path.as_str()) {
         (_, "/") | (_, "/index") => text(StatusCode(200), ENDPOINT_INDEX),
         (Method::Get, "/health") => ok_json(&health_payload()),

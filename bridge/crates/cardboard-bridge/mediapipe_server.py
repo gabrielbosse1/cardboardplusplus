@@ -27,6 +27,7 @@ Usage:
     python mediapipe_server.py
 """
 
+import os
 import socket
 import struct
 import sys
@@ -49,8 +50,23 @@ CONFIG_BODY_LEN = 1 + 3 * 4  # kind + 3× f32 LE
 # only one connection is served at a time, so no locking is needed.
 landmarker = None
 
+# VIDEO mode requires strictly increasing timestamps, and `landmarker` outlives
+# the connection that created it. A per-connection counter restarts at 0 and
+# hands the model a timestamp it has already consumed, which makes every
+# detect_for_video raise for the rest of the process's life.
+#
+# Advances exactly once per frame that reaches the model, so the 33 ms step
+# below is the real capture interval the motion model is told about. Frames
+# rejected before inference (undecodable JPEG, wrong channel count) consume no
+# timestamp and must not advance it.
+frame_idx = 0
+
 
 def create_landmarker(min_detection=0.5, min_presence=0.5, min_tracking=0.5):
+    # Inference is CPU-only: MediaPipe's GPU delegate is built for Linux
+    # ("GPU support is currently limited to Ubuntu platforms"), and the Windows
+    # wheels disable it in build flags. Cost is ~30ms/frame with no hand and
+    # ~50ms with one, which is what caps hand tracking near 20fps.
     opts = HandLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=MODEL_PATH),
         running_mode=RunningMode.VIDEO,
@@ -94,8 +110,7 @@ def handle_config(conn):
 
 
 def handle_connection(conn):
-    global landmarker
-    frame_idx = 0
+    global landmarker, frame_idx
     try:
         while True:
             # Read length-prefixed JPEG frame
@@ -120,13 +135,29 @@ def handle_connection(conn):
                 conn.sendall(b"\x00")
                 continue
 
+            if bgr.ndim != 3 or bgr.shape[2] != 3:
+                # Landmarks need 3 channels; a non-color decode would make
+                # cvtColor raise and kill the connection.
+                conn.sendall(b"\x00")
+                continue
+
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             # Monotonic per-frame timestamp (VIDEO mode requires non-decreasing
-            # timestamps; wall-clock can jump on NTP/sleep adjustments).
+            # timestamps; wall-clock can jump on NTP/sleep adjustments). 33 ms
+            # is the bridge camera loop's cadence, and the model's motion
+            # estimation reads the step, so it has to advance once per frame.
             timestamp_ms = frame_idx * 33
             mp_image = __import__("mediapipe").Image(image_format=__import__("mediapipe").ImageFormat.SRGB, data=rgb)
 
-            result = landmarker.detect_for_video(mp_image, timestamp_ms)
+            try:
+                result = landmarker.detect_for_video(mp_image, timestamp_ms)
+            except Exception as exc:
+                # Drop this frame only; report zero hands and keep serving.
+                print(f"[mediapipe] frame {frame_idx} failed: {exc!r}", file=sys.stderr)
+                sys.stderr.flush()
+                conn.sendall(b"\x00")
+                frame_idx += 1
+                continue
             frame_idx += 1
 
             # Build binary response
@@ -153,9 +184,14 @@ def handle_connection(conn):
                         buf.extend(struct.pack("<fff", 0.0, 0.0, 0.0))
 
             conn.sendall(bytes(buf))
-            frame_idx += 1
     except (ConnectionResetError, BrokenPipeError, OSError):
         pass
+    except Exception as exc:
+        # A per-frame failure (bad JPEG, model error) must not take the whole
+        # sidecar down: the bridge holds no other recovery path, and a dead
+        # sidecar means hand tracking is gone until the bridge restarts.
+        print(f"[mediapipe] fatal in connection handler: {exc!r}", file=sys.stderr)
+        sys.stderr.flush()
 
 
 def main():
@@ -171,19 +207,23 @@ def main():
     srv.listen(1)
     srv.settimeout(1.0)
 
+    # Serves exactly one bridge: when that connection ends the sidecar has
+    # no purpose, so it exits. os._exit discards the socket without an
+    # active close, so port 42073 is immediately free for the next bridge
+    # (no TIME_WAIT) and a killed bridge never orphans this process.
     while True:
         try:
             conn, addr = srv.accept()
             print(f"[mediapipe] bridge connected from {addr}", file=sys.stderr)
             sys.stderr.flush()
             handle_connection(conn)
-            print("[mediapipe] bridge disconnected", file=sys.stderr)
+            print("[mediapipe] bridge disconnected, exiting", file=sys.stderr)
             sys.stderr.flush()
-            conn.close()
         except socket.timeout:
             continue
         except KeyboardInterrupt:
             break
+        os._exit(0)
 
 
 if __name__ == "__main__":

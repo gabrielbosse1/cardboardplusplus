@@ -73,7 +73,7 @@ cardboardplusplus/
 │       └── bridge-ui/                  # New Slint product UI (status/stream/camera/install/diagnostics)
 ├── driver_cardboardplusplus/           # SteamVR driver (C++ DLL)
 │   ├── src/                            # HmdDriver, VideoEncoder*, EncodingThread, UdpTransport,
-│   │                                   # Discovery, BridgeServer (SHM producer), ControllerDriver, DeviceProvider
+│   │                                   # Discovery, BridgeServer (SHM producer), HandDriver, DeviceProvider
 │   ├── include/                        # CardboardWire.h (locked UDP contract), BridgeProtocol.h (SHM mirror)
 │   └── tests/                          # Driver tests (mock SteamVR, mock bridge)
 ├── cardboardplusplus-android/          # Android VR app (Java + JNI/C++)

@@ -80,7 +80,7 @@ public:
     VideoEncoder* GetVideoEncoder() { return m_pVideoEncoder; }
     void OnEncodedPacket(uint8_t* data, int size, int64_t pts, bool keyframe);
 private:
-// Encoder + bridge + socket lifecycle helpers; each Initialize/Shutdown pair owns one subsystem thread or object.
+    // Encoder + bridge + socket lifecycle helpers; each Initialize/Shutdown pair owns one subsystem thread or object.
     bool InitializeVideoEncoder();
     void ShutdownVideoEncoder();
     bool ApplyHardwareCap(int capW, int capH);

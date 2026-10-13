@@ -5,13 +5,15 @@ use crate::net::mediapipe::{DetectedHand, Landmark};
 /// MediaPipe's per-frame handedness label flickers (especially on dorsal
 /// views), which used to teleport skeletons between SteamVR devices and
 /// flip the frame chirality mid-track (inside-out fingers, inverted
-/// curls). Slots fix the side once and track by wrist-position continuity;
-/// the label only feeds a debounce streak that detects a persistently
-/// swapped assignment using both hands' histories.
+/// curls). Slots track each hand by wrist-position continuity, but the label
+/// — not image position — decides which side a hand belongs to: a hand that
+/// has crossed the midline sits in the opposite half of the image, and
+/// reading its position there spawns the wrong device. A sustained
+/// disagreement between a slot's side and the hand's label corrects the
+/// assignment, latched so it cannot oscillate.
 ///
-/// Slot index == SteamVR device id (0 = left, 1 = right) and never changes
-/// while tracked. A hand keeps its slot (and side) across crossings, brief
-/// losses, and label flicker.
+/// Slot index == SteamVR device id (0 = left, 1 = right). A hand keeps its
+/// slot (and side) across crossings, brief losses, and label flicker.
 pub struct TrackedHand {
     pub hand_id: u8,
     pub landmarks: [Landmark; 21],
@@ -33,7 +35,7 @@ const SAMPLE_DT: f32 = 1.0 / 30.0;
 /// how far the gain opens per m/s of joint speed, so it must be large: 2 mm
 /// of landmark noise already looks like 0.085 m/s of motion, and a relaxed
 /// finger closes at ~0.02 m/s, so the two only separate if BETA is in the
-/// hundreds. `DERIV_CUTOFF_HZ` is deliberately far below `MIN_CUTOFF_HZ` —
+/// hundreds. `DERIV_CUTOFF_HZ` is deliberately far below `MIN_CUTOFF_HZ` â€”
 /// the speed estimate is averaged hard so noise does not read as motion and
 /// hold the gain open. Fingertips run ~0.01 m/s (relaxed curl) to ~0.25 m/s
 /// (fast gesture); across that whole band these values cost at most 0.3 mm
@@ -41,9 +43,14 @@ const SAMPLE_DT: f32 = 1.0 / 30.0;
 const MIN_CUTOFF_HZ: f32 = 0.7;
 const DERIV_CUTOFF_HZ: f32 = 0.15;
 const BETA: f32 = 100.0;
-/// Palm-normal follow rate: the metacarpal fan is narrow, so the raw normal
-/// wanders degrees per frame; orientations use the smoothed copy instead.
-const PALM_ALPHA: f32 = 0.35;
+/// Floor and gain for the palm-normal follow rate. The normal is a direction
+/// in radians, so the speed term is rad/s rather than m/s; a brisk wrist roll
+/// runs 5-15 rad/s, which needs a gain far smaller than `BETA` or the filter
+/// never filters at all. The normal is the only input to the 3-DOF wrist
+/// orientation, so its lag lands directly on wrist roll while finger curl,
+/// which is computed inside the parent frame, is unaffected.
+const PALM_MIN_CUTOFF_HZ: f32 = 0.7;
+const PALM_BETA: f32 = 0.35;
 /// Consecutive disagreeing labels on BOTH slots before correcting a swap.
 const SWAP_AFTER: u32 = 90;
 /// Consecutive disagreeing labels before warning about a single slot.
@@ -67,7 +74,7 @@ fn cutoff_alpha(cutoff_hz: f32) -> f32 {
 /// `1 - sqrt(a/(2-a))` of the jitter: the old `a = 0.65` removed 31% while
 /// still lagging half a frame. The distal phalanges are only ~16 mm long, so
 /// a couple of millimetres of per-joint noise swings their direction by tens
-/// of degrees — the fingertip visibly flaps. Because most landmark noise is
+/// of degrees â€” the fingertip visibly flaps. Because most landmark noise is
 /// common-mode across the hand, no per-joint filter can remove it; only
 /// adaptivity can, by filtering hardest exactly when the hand is at rest.
 ///
@@ -102,13 +109,31 @@ fn smooth_normal(current: [f32; 3], target: [f32; 3], alpha: f32) -> [f32; 3] {
         + current[1] * target[1]
         + current[2] * target[2])
         .clamp(-1.0, 1.0);
-    let angle = dot.acos();
-    if angle < 1e-4 {
+    // Near-parallel: nothing to do.
+    if dot > 1.0 - 1e-6 {
         return current;
     }
-    if angle > std::f32::consts::PI - 1e-4 {
-        return target;
+    // Antipodal. slerp has no defined axis here, and taking the target outright
+    // jumps the normal 180 deg in a single frame, which reads as the wrist
+    // teleporting. Nudge just past the antipode instead: the sign of the tiny
+    // component left over picks a stable axis and the normal keeps moving.
+    if dot < -1.0 + 1e-6 {
+        let axis = normal_axis(current, target);
+        let t = alpha * std::f32::consts::PI;
+        let (s, c) = t.sin_cos();
+        let moved = [
+            axis[0] * s + current[0] * c,
+            axis[1] * s + current[1] * c,
+            axis[2] * s + current[2] * c,
+        ];
+        let l = (moved[0] * moved[0] + moved[1] * moved[1] + moved[2] * moved[2]).sqrt();
+        return if l < 1e-9 {
+            target
+        } else {
+            [moved[0] / l, moved[1] / l, moved[2] / l]
+        };
     }
+    let angle = dot.acos();
     let sin_angle = angle.sin();
     let current_weight = ((1.0 - alpha) * angle).sin() / sin_angle;
     let target_weight = (alpha * angle).sin() / sin_angle;
@@ -125,23 +150,99 @@ fn smooth_normal(current: [f32; 3], target: [f32; 3], alpha: f32) -> [f32; 3] {
     }
 }
 
-/// Palm normal from raw world landmarks (index/middle metacarpal fan).
-fn raw_palm_normal(det: &DetectedHand) -> Option<[f32; 3]> {
-    let w = det.world_landmarks[0];
-    let ix = det.world_landmarks[5];
-    let md = det.world_landmarks[9];
-    let a = [ix.x - w.x, ix.y - w.y, ix.z - w.z];
-    let b = [md.x - w.x, md.y - w.y, md.z - w.z];
+/// Any unit vector perpendicular to both `a` and `b`, for the degenerate
+/// antipodal case where the slerp axis is undefined.
+fn normal_axis(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     let c = [
         a[1] * b[2] - a[2] * b[1],
         a[2] * b[0] - a[0] * b[2],
         a[0] * b[1] - a[1] * b[0],
     ];
     let l = (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt();
-    if l < 1e-9 {
-        None
+    if l > 1e-6 {
+        [c[0] / l, c[1] / l, c[2] / l]
     } else {
-        Some([c[0] / l, c[1] / l, c[2] / l])
+        // Exactly antipodal has no unique axis; pick one from any component.
+        let a = if a[0].abs() < 0.9 { a } else { [a[1], a[2], a[0]] };
+        let c = [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ];
+        let l = (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt();
+        if l < 1e-9 {
+            [1.0, 0.0, 0.0]
+        } else {
+            [c[0] / l, c[1] / l, c[2] / l]
+        }
+    }
+}
+
+/// Landmark ids forming the palm plane: wrist plus the four MCP joints.
+const PALM_RING: [usize; 5] = [0, 5, 9, 13, 17];
+
+/// Best-fit palm-plane normal by Newell's method over wrist + all four MCPs,
+/// oriented so it points out of the palm.
+///
+/// A two-point cross product (wrist x index MCP) reads less code but the two
+/// vectors are only ~17.6 deg apart, so landmark noise is amplified ~3.3x and
+/// the wrist roll jitters by several degrees. Five points across the palm also
+/// survive foreshortening, where the cross product degenerates to nothing.
+///
+/// Newell's sign follows the ring's winding order, which runs opposite ways on
+/// the two hands, so the raw result can be the back of the hand. The thumb CMC
+/// fixes it without reference to winding: the palm always faces away from it.
+/// Returns `None` when the ring collapses edge-on to the camera.
+fn palm_plane_normal(lms: &[Landmark; 21]) -> Option<[f32; 3]> {
+    let mut n = [0.0f64; 3];
+    for i in 0..PALM_RING.len() {
+        let a = lms[PALM_RING[i]];
+        let b = lms[PALM_RING[(i + 1) % PALM_RING.len()]];
+        n[0] += (a.y as f64) * (b.z as f64) - (a.z as f64) * (b.y as f64);
+        n[1] += (a.z as f64) * (b.x as f64) - (a.x as f64) * (b.z as f64);
+        n[2] += (a.x as f64) * (b.y as f64) - (a.y as f64) * (b.x as f64);
+    }
+    let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+    if l < 1e-12 {
+        return None;
+    }
+    let n = [n[0] as f32 / l as f32, n[1] as f32 / l as f32, n[2] as f32 / l as f32];
+    let w = lms[0];
+    let t = lms[1];
+    let thumb = [t.x - w.x, t.y - w.y, t.z - w.z];
+    let dot = n[0] * thumb[0] + n[1] * thumb[1] + n[2] * thumb[2];
+    Some(if dot > 0.0 {
+        [-n[0], -n[1], -n[2]]
+    } else {
+        n
+    })
+}
+
+/// A palm normal that must not jump: the wrist orientation comes straight from
+/// it, so a single-frame discontinuity reads as the hand teleporting. Smooth
+/// input has to produce smooth output, including through the antipodal case
+/// where slerp has no defined axis.
+#[test]
+fn palm_smoothing_never_jumps_across_the_antipode() {
+    let from = [1.0f32, 0.0, 0.0];
+    let mut cur = from;
+    for i in 1..=200 {
+        // Walk the target around the far side, passing exactly antipodal.
+        let a = std::f32::consts::PI * (i as f32 / 200.0);
+        let to = [a.cos(), a.sin(), 0.0];
+        let next = smooth_normal(cur, to, 0.5);
+        let swing = normal_angle_deg(cur, next).expect("both unit");
+        assert!(
+            swing < 95.0,
+            "step {i} swung {swing:.1} deg from {cur:?} to {next:?}"
+        );
+        cur = next;
+    }
+}
+fn palm_speed(prev: [f32; 3], cur: [f32; 3]) -> f32 {
+    match normal_angle_deg(prev, cur) {
+        Some(deg) => (deg.to_radians() as f32) / SAMPLE_DT,
+        None => 0.0,
     }
 }
 
@@ -163,6 +264,7 @@ struct Slot {
     has_prev: bool,
     prev_palm: [f32; 3],
     smooth_palm: [f32; 3],
+    has_palm: bool,
     acc_raw_dz: [f64; 5],
     acc_sm_dz: [f64; 5],
     acc_palm_deg: f64,
@@ -189,6 +291,7 @@ impl Slot {
             has_prev: false,
             prev_palm: [0.0; 3],
             smooth_palm: [0.0; 3],
+            has_palm: false,
             acc_raw_dz: [0.0; 5],
             acc_sm_dz: [0.0; 5],
             acc_palm_deg: 0.0,
@@ -228,15 +331,18 @@ impl HandSlots {
         self.frame += 1;
         let mut warnings = Vec::new();
 
-        // Pass 1: active slots claim their nearest detection within the gate.
+        // Pass 1: active slots claim a detection within the gate, preferring
+        // one whose label agrees with the slot's side.
         let mut claimed = vec![false; detections.len()];
         let mut slot_match: [Option<usize>; 2] = [None, None];
         for s in 0..2 {
             if !self.slots[s].active {
                 continue;
             }
+            let want = self.slots[s].expected_label(s);
             let mut best: Option<usize> = None;
             let mut best_d = MATCH_GATE;
+            let mut best_agrees = false;
             for (di, det) in detections.iter().enumerate() {
                 if claimed[di] {
                     continue;
@@ -244,10 +350,20 @@ impl HandSlots {
                 let dx = det.landmarks[0].x - self.slots[s].last_xy.0;
                 let dy = det.landmarks[0].y - self.slots[s].last_xy.1;
                 let d = (dx * dx + dy * dy).sqrt();
-                if d < best_d {
-                    best_d = d;
-                    best = Some(di);
+                if d >= MATCH_GATE {
+                    continue;
                 }
+                // Nearest-first alone hands a slot the wrong physical hand
+                // mid-crossing, because the other hand's wrist can sit closer
+                // to this slot's anchor than its own does. A label agreement
+                // outranks a closer disagreement, so the crossing sticks.
+                let agrees = det.handedness == want;
+                if !agrees && (best_agrees || d >= best_d) {
+                    continue;
+                }
+                best_d = d;
+                best = Some(di);
+                best_agrees = agrees;
             }
             if let Some(di) = best {
                 claimed[di] = true;
@@ -255,17 +371,21 @@ impl HandSlots {
             }
         }
 
-        // Pass 2: unclaimed detections take free slots. Headset-mounted
-        // geometry (rear camera faces forward, unmirrored): the user's left
-        // hand appears on the image-LEFT half, so image-left initializes
-        // slot 0 (left device) and image-right slot 1.
+        // Pass 2: unclaimed detections take free slots, taking the slot their
+        // own MediaPipe label names. Image position is only the tiebreak: a
+        // hand that has already crossed the midline sits in the other half,
+        // and reading its image position there spawns the wrong SteamVR device
+        // with the wrong chirality.
         for (di, det) in detections.iter().enumerate() {
             if claimed[di] {
                 continue;
             }
-            let want = if det.landmarks[0].x > 0.5 { 1 } else { 0 };
-            let pick = if !self.slots[want].active && slot_match[want].is_none() {
-                Some(want)
+            let labelled = if det.handedness == "Right" { 1 } else { 0 };
+            let by_image = if det.landmarks[0].x > 0.5 { 1 } else { 0 };
+            let pick = if !self.slots[labelled].active && slot_match[labelled].is_none() {
+                Some(labelled)
+            } else if !self.slots[by_image].active && slot_match[by_image].is_none() {
+                Some(by_image)
             } else {
                 (0..2).find(|&s| !self.slots[s].active && slot_match[s].is_none())
             };
@@ -288,30 +408,18 @@ impl HandSlots {
                     slot.active = true;
                     slot.missing = 0;
                     slot.last_xy = (det.landmarks[0].x, det.landmarks[0].y);
-                    // Palm EMA: the raw normal wanders degrees per frame on the
-                    // narrow metacarpal fan; orientations downstream use the
-                    // smoothed copy. First sighting snaps, later ones ease.
-                    let pn = raw_palm_normal(det);
-                    if let Some(pn) = pn {
-                        let old_sm = slot.smooth_palm;
-                        let old_raw = slot.prev_palm;
-                        slot.smooth_palm = smooth_normal(old_sm, pn, PALM_ALPHA);
-                        slot.prev_palm = pn;
-                        if slot.initialized && slot.has_prev {
-                            if let Some(swing) = normal_angle_deg(old_raw, pn) {
-                                slot.acc_palm_deg += swing;
-                            }
-                            if let Some(swing) = normal_angle_deg(old_sm, slot.smooth_palm) {
-                                slot.acc_sm_palm_deg += swing;
-                            }
-                        }
-                    }
                     if !slot.initialized {
                         for i in 0..21 {
                             let l = det.world_landmarks[i];
                             slot.smooth_world[i] = [l.x, l.y, l.z];
                         }
                         slot.world_dx = [[0.0; 3]; 21];
+                        // The jitter probe subtracts the previous smoothed tip
+                        // depth, so it has to start at this frame's value or the
+                        // first window reports an absolute depth as a step.
+                        for (k, &ti) in TIP_IDS.iter().enumerate() {
+                            slot.prev_sm_z[k] = slot.smooth_world[ti][2];
+                        }
                         slot.smooth_wx = det.landmarks[0].x;
                         slot.smooth_wy = det.landmarks[0].y;
                         slot.initialized = true;
@@ -326,7 +434,44 @@ impl HandSlots {
                         slot.smooth_wx += ANCHOR_ALPHA * (det.landmarks[0].x - slot.smooth_wx);
                         slot.smooth_wy += ANCHOR_ALPHA * (det.landmarks[0].y - slot.smooth_wy);
                     }
-                    // Jitter probe: raw per-tip |Δz| against the |Δz| that
+                    // Palm normal: sole input to the wrist's 3-DOF orientation.
+                    // Reads the One-Euro filtered joints rather than the raw
+                    // ones, and follows with a velocity-adaptive rate so a
+                    // rolling hand is not held back by the smoothing that a
+                    // resting hand needs. Finger curl is computed inside the
+                    // parent frame, so it stays sharp either way. First
+                    // sighting snaps; a degenerate ring (hand edge-on to the
+                    // camera) keeps the previous normal.
+                    let mut filtered = [Landmark::default(); 21];
+                    for i in 0..21 {
+                        filtered[i] = Landmark {
+                            x: slot.smooth_world[i][0],
+                            y: slot.smooth_world[i][1],
+                            z: slot.smooth_world[i][2],
+                        };
+                    }
+                    if let Some(pn) = palm_plane_normal(&filtered) {
+                        if !slot.has_palm {
+                            slot.smooth_palm = pn;
+                            slot.has_palm = true;
+                        } else {
+                            let alpha = cutoff_alpha(
+                                PALM_MIN_CUTOFF_HZ + PALM_BETA * palm_speed(slot.smooth_palm, pn),
+                            );
+                            let old_sm = slot.smooth_palm;
+                            slot.smooth_palm = smooth_normal(old_sm, pn, alpha);
+                            if let Some(swing) = normal_angle_deg(old_sm, slot.smooth_palm) {
+                                slot.acc_sm_palm_deg += swing;
+                            }
+                        }
+                        if slot.has_prev {
+                            if let Some(swing) = normal_angle_deg(slot.prev_palm, pn) {
+                                slot.acc_palm_deg += swing;
+                            }
+                        }
+                        slot.prev_palm = pn;
+                    }
+                    // Jitter probe: raw per-tip |Î”z| against the |Î”z| that
                     // actually survives the filter, plus raw and smoothed
                     // palm-normal swings. Runs after the filter so the
                     // "smoothed" column is real output motion, which is the
@@ -367,15 +512,31 @@ impl HandSlots {
         // Pass 4: confident cross-hand swap correction (latched per activation).
         // Both slots must agree for ~5s straight; label flicker can never
         // sustain that, so this only fires on a genuinely swapped assignment.
+        // The swap is self-clearing: it is only reached when both slots hold a
+        // detection whose label disagrees, so exchanging them puts each slot on
+        // an agreeing detection and both streaks reset on the next frame. There
+        // is no state where a swap leaves both slots still disagreeing, so the
+        // latch needs no way back.
         let s0 = self.slots[0].disagree_streak;
         let s1 = self.slots[1].disagree_streak;
-        if self.slots[0].active
+        let both_disagree = self.slots[0].active
             && self.slots[1].active
             && s0 >= SWAP_AFTER
             && s1 >= SWAP_AFTER
             && !self.slots[0].swapped_once
-            && !self.slots[1].swapped_once
-        {
+            && !self.slots[1].swapped_once;
+        // One hand tracked alone has no partner to swap with, so the two-slot
+        // correction below can never run for it. Freeing the slot re-runs pass 2,
+        // which reads the label, and the hand lands on the right device.
+        let single_disagrees = self.slots[0].active != self.slots[1].active
+            && s0.max(s1) >= SWAP_AFTER
+            && !self.slots[0].swapped_once
+            && !self.slots[1].swapped_once;
+        if single_disagrees {
+            let s = if self.slots[0].active { 0 } else { 1 };
+            self.slots[s] = Slot::fresh();
+            warnings.push("hands: corrected swapped left/right assignment".into());
+        } else if both_disagree {
             let a = std::mem::replace(&mut self.slots[0], Slot::fresh());
             let b = std::mem::replace(&mut self.slots[1], Slot::fresh());
             self.slots[0].active = b.active;
@@ -392,6 +553,7 @@ impl HandSlots {
             self.slots[0].has_prev = b.has_prev;
             self.slots[0].prev_palm = b.prev_palm;
             self.slots[0].smooth_palm = b.smooth_palm;
+            self.slots[0].has_palm = b.has_palm;
             self.slots[1].active = a.active;
             self.slots[1].last_xy = a.last_xy;
             self.slots[1].smooth_world = a.smooth_world;
@@ -406,11 +568,12 @@ impl HandSlots {
             self.slots[1].has_prev = a.has_prev;
             self.slots[1].prev_palm = a.prev_palm;
             self.slots[1].smooth_palm = a.smooth_palm;
+            self.slots[1].has_palm = a.has_palm;
             warnings.push("hands: corrected swapped left/right assignment".into());
         }
 
         // Pass 5: single-slot mismatch warnings (rate-limited). Fires when
-        // one side persistently disagrees with its labels — e.g. globally
+        // one side persistently disagrees with its labels â€” e.g. globally
         // inverted sides or a systematically confused model.
         for s in 0..2 {
             let slot = &mut self.slots[s];
@@ -454,8 +617,8 @@ impl HandSlots {
         (out, warnings)
     }
 
-    /// Windowed jitter means per active slot: raw tip |Δz|, EMA-step tip
-    /// |Δz| (thumb..pinky order), raw and smoothed palm-normal swings,
+    /// Windowed jitter means per active slot: raw tip |Î”z|, EMA-step tip
+    /// |Î”z| (thumb..pinky order), raw and smoothed palm-normal swings,
     /// frame count. Drains.
     pub fn take_jitter(&mut self) -> Vec<(u8, [f64; 5], [f64; 5], f64, f64, u64)> {
         let mut out = Vec::new();
@@ -509,7 +672,8 @@ mod tests {
 
     #[test]
     fn init_assigns_side_by_image_position() {
-        // Headset-mounted forward camera: image-left holds the user's left hand.
+        // Headset-mounted forward camera: an uncrossed hand's image half and
+        // its MediaPipe label agree, so either one picks the same slot.
         let mut t = HandSlots::new();
         let (out, _) = t.update(&[det(0.3, 0.5, "Left")]);
         assert_eq!(out.len(), 1);
@@ -600,15 +764,35 @@ mod tests {
         for (path, direction) in [(forward, 1.0), (reverse, -1.0)] {
             let mut current = path[0];
             for target in &path[1..] {
-                current = smooth_normal(current, *target, PALM_ALPHA);
+                let a = cutoff_alpha(PALM_MIN_CUTOFF_HZ + PALM_BETA * palm_speed(current, *target));
+                current = smooth_normal(current, *target, a);
                 assert!(
                     current[1] * direction > 0.0,
                     "roll reversed at {current:?}"
                 );
             }
         }
-        let flipped = smooth_normal([1.0, 0.0, 0.0], [-1.0, 0.0, 0.0], PALM_ALPHA);
-        assert!(flipped[0] < -0.999, "opposite palm stalled at {flipped:?}");
+        // An antipodal target must move the normal partway, never all the way in one
+        // step: snapping is what made the wrist teleport. Two steps land on it.
+        let start = [1.0f32, 0.0, 0.0];
+        let target = [-1.0f32, 0.0, 0.0];
+        let mid = smooth_normal(start, target, 0.35);
+        assert!(
+            mid[0] > -0.999 && mid[0] < 0.999,
+            "antipodal step jumped straight to the target: {mid:?}"
+        );
+        assert!(mid[1].abs() > 1e-6, "antipodal step had no axis: {mid:?}");
+        let end = smooth_normal(mid, target, 0.35);
+        assert!(
+            end[0] < mid[0] && mid[0] < start[0],
+            "each step should keep turning toward the target: {start:?} -> {mid:?} -> {end:?}"
+        );
+        // Repeated steps converge on the target, moving a little each time.
+        let mut cur = end;
+        for _ in 0..60 {
+            cur = smooth_normal(cur, target, 0.35);
+        }
+        assert!(cur[0] < -0.99, "should converge on the target, got {cur:?}");
     }
 
     #[test]
@@ -695,7 +879,7 @@ mod tests {
     }
 
     /// A moving hand must not be materially mis-tracked. The adaptive filter
-    /// is not strictly better here — on a slow ramp it gives up ~9% RMS
+    /// is not strictly better here â€” on a slow ramp it gives up ~9% RMS
     /// position error against the old fixed gain (0.99mm vs 0.91mm) in
     /// exchange for the rest-jitter win above. On a 16 mm phalanx that is
     /// under 2 degrees of direction bias, i.e. imperceptible, so the bound
@@ -763,6 +947,68 @@ mod tests {
             }
         }
         assert!(warned, "expected a swap correction warning");
+    }
+
+    /// MediaPipe's label is the anatomical truth. A left hand seen on the
+    /// image-right half (crossed over, or entering frame from that side) is
+    /// still the left hand and must not spawn the right SteamVR device.
+    #[test]
+    fn init_uses_the_label_not_the_image_half() {
+        let mut t = HandSlots::new();
+        let (out, _) = t.update(&[det(0.7, 0.5, "Left")]);
+        assert_eq!(out[0].hand_id, 0, "label says Left but the right device spawned");
+    }
+
+    /// A single tracked hand has no partner to swap with, so a sustained label
+    /// disagreement can only be resolved by re-running the init, which reads
+    /// the label. Freeing the slot is the whole correction.
+    #[test]
+    fn single_hand_reassigns_by_label_after_a_sustained_disagreement() {
+        let mut t = HandSlots::new();
+        t.update(&[det(0.3, 0.5, "Left")]);
+        let mut warned = false;
+        let mut last = None;
+        for _ in 0..(SWAP_AFTER + 5) {
+            let (out, w) = t.update(&[det(0.3, 0.5, "Right")]);
+            if w.iter().any(|s| s.contains("corrected swapped")) {
+                warned = true;
+            }
+            last = out.first().map(|h| h.hand_id);
+        }
+        assert!(warned, "expected a side correction warning");
+        assert_eq!(last, Some(1), "sustained disagreement must move the hand");
+    }
+
+    /// Crossing hands: once the left wrist has moved past the right one it sits
+    /// nearer to slot 1's anchor than to slot 0's, so plain nearest-first
+    /// matching hands each slot the wrong physical hand — which also flips the
+    /// wrist roll, since the palm chirality sign follows the slot. Each slot
+    /// must keep following the hand its own label names.
+    #[test]
+    fn crossing_hands_keep_each_slot_on_its_own_label() {
+        // A hand is identified by a marker in its world landmarks, which no
+        // amount of filtering can wash out the way an image position can.
+        fn marked(x: f32, y: f32, label: &str, tag: f32) -> DetectedHand {
+            let mut d = det(x, y, label);
+            d.world_landmarks[1].x = tag;
+            d
+        }
+        let mut t = HandSlots::new();
+        t.update(&[marked(0.3, 0.5, "Left", 1.0), marked(0.7, 0.5, "Right", 9.0)]);
+        // The left hand walks across the right one, which holds its ground.
+        for lx in [0.4, 0.5, 0.55, 0.65, 0.7] {
+            let (out, _) = t.update(&[marked(lx, 0.5, "Left", 1.0), marked(0.6, 0.5, "Right", 9.0)]);
+            assert_eq!(out.len(), 2, "lost a hand mid-crossing at lx={lx}");
+            let tag = |id: u8| {
+                out.iter()
+                    .find(|h| h.hand_id == id)
+                    .unwrap()
+                    .world_landmarks[1]
+                    .x
+            };
+            assert!(tag(0) < 5.0, "slot 0 took the right hand at lx={lx} (tag {})", tag(0));
+            assert!(tag(1) > 5.0, "slot 1 took the left hand at lx={lx} (tag {})", tag(1));
+        }
     }
 
     #[test]

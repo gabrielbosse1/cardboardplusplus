@@ -19,10 +19,10 @@
     </ProjectConfiguration>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="include\ControllerDriver.h" />
     <ClInclude Include="include\DeviceProvider.h" />
     <ClInclude Include="include\HmdDriver.h" />
     <ClInclude Include="include\HandDriver.h" />
+    <ClInclude Include="include\GripLimit.h" />
     <ClInclude Include="include\VideoEncoder.h" />
     <ClInclude Include="include\CardboardWire.h" />
     <ClInclude Include="include\DriverLog.h" />
@@ -36,7 +36,6 @@
     <ClInclude Include="include\openvr_driver.h" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="src\ControllerDriver.cpp" />
     <ClCompile Include="src\DeviceFactory.cpp" />
     <ClCompile Include="src\DeviceProvider.cpp" />
     <ClCompile Include="src\DirectMode.cpp" />

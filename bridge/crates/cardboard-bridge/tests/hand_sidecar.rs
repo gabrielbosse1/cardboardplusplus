@@ -127,7 +127,11 @@ fn camera_pipeline_lazy_connects_without_startup_client() {
         let mut s = state.lock().unwrap();
         s.hand_enabled = true;
     }
-    cardboard_bridge::net::camera::spawn(state.clone(), None);
+    cardboard_bridge::net::camera::spawn(
+        state.clone(),
+        None,
+        Arc::new(Mutex::new(None)),
+    );
     let sock = UdpSocket::bind("0.0.0.0:0").expect("test udp socket");
     for seq in 0u16..5 {
         let mut dg = seq.to_be_bytes().to_vec();
@@ -151,7 +155,7 @@ fn camera_pipeline_lazy_connects_without_startup_client() {
     assert!(connected, "camera frames must reach state (display path)");
     assert!(lazy, "detect worker must lazy-connect to the sidecar (no startup client)");
     assert_eq!(
-        state.lock().unwrap().camera_detected_hands, 0,
+        state.lock().unwrap().hands_detected, 0,
         "blank frame must detect zero hands"
     );
     let _ = child.kill();

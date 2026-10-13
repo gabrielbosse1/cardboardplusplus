@@ -1,6 +1,6 @@
 import { ScrollView, Slider } from "std-widgets.slint";
 // Product UI: the setup WizardWindow plus the hub MainWindow (top bar, side
-// bar with Stream/Hand/Diagnostics/General pages). BridgeState is the shared
+// bar with Stream/Hand/Controls/General pages). BridgeState is the shared
 // contract with main.rs — Rust pollers write properties, callbacks invoke
 // core actions. Compiled by build.rs via slint-build.
 export global Theme {
@@ -46,6 +46,41 @@ export global BridgeState {
     in-out property <int> hand-det: 50;
     in-out property <int> hand-pres: 50;
     in-out property <int> hand-track: 50;
+    // Controls tab: input mode plus the six gesture slots per hand. Only one hand is
+    // edited at a time (gesture-hand picks which) and the mirror flag copies it to the
+    // other, which is what the defaults use since a glove is symmetric.
+    in-out property <int> input-mode: 1;
+in-out property <bool> controls-applied: false;
+in-out property <bool> gesture-mirror: true;
+// Whether the gesture editor is open over the page. Pure UI state, so it lives here
+// rather than in Rust: the editor is a submenu beside the row that opened it, not a card in
+// the scroll flow, which is where it used to live and where it fell off the bottom of the page.
+in-out property <bool> editor-open: false;
+    // Where the row that opened the editor sits, in window coordinates. The submenu is
+    // anchored there and clamped back inside the window, so it always lands next to the
+    // row the user clicked instead of across the middle of the screen.
+    in-out property <length> editor-anchor-x: 0px;
+    in-out property <length> editor-anchor-y: 0px;
+    in-out property <length> editor-anchor-w: 0px;
+    // Row being edited: which hand and which target, in GestureTarget wire order.
+    // The gesture table lives in Rust; only the selected row's clauses are loaded here.
+    in-out property <int> sel-hand: 0;
+    in-out property <int> sel-target: 0;
+    // Up to MAX_CONDS_PER_GROUP ANDed clauses, plus one OR alternative. kind -1 leaves
+    // a clause out of the group entirely rather than storing a zero threshold, which
+    // would read as "curl at least 0%" and always be true.
+    in-out property <int> sel-c0-kind: -1;
+    in-out property <int> sel-c0-thresh: 70;
+    in-out property <int> sel-c1-kind: -1;
+    in-out property <int> sel-c1-thresh: 70;
+    in-out property <int> sel-c2-kind: -1;
+    in-out property <int> sel-c2-thresh: 70;
+    in-out property <int> sel-c3-kind: -1;
+    in-out property <int> sel-c3-thresh: 70;
+    in-out property <int> sel-alt-kind: -1;
+    in-out property <int> sel-alt-thresh: 70;
+    // Bumping this forces the row-summary callback to re-evaluate when gesture data changes.
+    in-out property <int> gesture-generation: 0;
     // Stream settings form (mirrored into apply-settings args).
     in-out property <int> video-width: 2880;
     in-out property <int> video-height: 1620;
@@ -93,6 +128,27 @@ export global BridgeState {
     callback hand-toggled(bool);
     callback overlay-toggled(bool);
     callback apply-hand-model(int, int, int);
+    // Controls tab actions. apply-controls pushes the whole table (mode plus both
+    // hands) as one BRIDGE_INPUTS datagram; select-gesture-target asks Rust to load a
+    // row into the sel-* properties, set-gesture-target writes the selected row back,
+    // mirror-gestures copies left onto right and keeps both hands identical on every
+    // edit while checked, reset-gestures restores the defaults.
+    // Edits stage locally and only Apply reaches the driver.
+    callback apply-controls();
+    callback select-gesture-target(int, int);
+    callback set-gesture-target(int, int, int, int, int, int, int, int, int, int);
+    callback mirror-gestures(bool);
+    callback reset-gestures();
+    // Per-row lookups back into the gesture table. Rust owns the bindings, and Slint
+    // cannot index a fixed-size array by a runtime value, so the row list asks for
+    // what it should display rather than holding its own copy. Pure so the bindings
+    // that read them can stay in a property expression.
+    pure callback row-summary(int, int, int) -> string;
+    pure callback row-bound(int, int) -> bool;
+    // Display metadata for a GestureTarget index. Pure so the row list and the editor
+    // heading can use them inside property expressions.
+    pure callback target-part(int) -> int;
+    pure callback target-name(int) -> string;
 }
 // Accent-filled action button; clicked fires only when enabled.
 component PrimaryButton inherits Rectangle {
@@ -567,7 +623,7 @@ component TopBar inherits Rectangle {
         }
     }
 }
-// Left tab rail switching current-tab between Stream/Hand/Diagnostics/General.
+// Left tab rail switching current-tab between Stream/Hand/Controls/General.
 component Sidebar inherits Rectangle {
     width: 216px;
     background: Theme.surface;
@@ -588,7 +644,7 @@ component Sidebar inherits Rectangle {
         for t in [
             { index: 0, label: "Stream", icon: @image-url("icons/stream.svg") },
             { index: 1, label: "Hand Tracking", icon: @image-url("icons/hand.svg") },
-            { index: 2, label: "Diagnostics", icon: @image-url("icons/diagnostics.svg") },
+            { index: 2, label: "Controls", icon: @image-url("icons/controls.svg") },
             { index: 3, label: "General", icon: @image-url("icons/general.svg") },
         ] : TabButton {
             label: t.label;
@@ -1225,13 +1281,13 @@ component HandPage inherits HorizontalLayout {
         }
     }
 }
-// Diagnostics tab: live gyro/accel/mag grid, net stats, phone IP, and the
-// scrolling ring-log view (log-text, newest last).
-component DiagnosticsPage inherits VerticalLayout {
+// General tab: live stream/sensor metrics, the phone link, driver + app
+// installers, the latest IMU sample, the bridge log, and the wizard shortcut.
+component GeneralPage inherits VerticalLayout {
     spacing: 14px;
     padding: 20px;
     Text {
-        text: "Diagnostics";
+        text: "General";
         color: Theme.text-hi;
         font-size: 22px;
         font-weight: 700;
@@ -1262,7 +1318,7 @@ component DiagnosticsPage inherits VerticalLayout {
     HorizontalLayout {
         spacing: 12px;
         Metric {
-            label: "Hand FPS";
+            label: "Hand Tracking FPS";
             value: BridgeState.hand-fps + " fps";
             horizontal-stretch: 1;
         }
@@ -1280,6 +1336,39 @@ component DiagnosticsPage inherits VerticalLayout {
             label: "Phone Address";
             value: BridgeState.phone-ip;
             horizontal-stretch: 1;
+        }
+    }
+    Card {
+        title: "Phone Link";
+        HorizontalLayout {
+            spacing: 10px;
+            cross-axis-alignment: center;
+            Text {
+                text: "Telemetry uplink:";
+                color: Theme.text-mid;
+                font-size: 13px;
+                vertical-alignment: center;
+            }
+            Text {
+                text: BridgeState.phone-ip;
+                color: BridgeState.phone-connected ? Theme.text-hi : Theme.text-dim;
+                font-size: 13px;
+                font-weight: 600;
+                vertical-alignment: center;
+            }
+            Rectangle {
+                horizontal-stretch: 1;
+            }
+            StatusPill {
+                label: "reachable";
+                ok: BridgeState.phone-connected;
+            }
+        }
+        Text {
+            text: "Bridge listens on UDP 42071 for gyro, hand-tracking and ping frames. The video stream never enters the bridge.";
+            color: Theme.text-dim;
+            font-size: 11px;
+            wrap: word-wrap;
         }
     }
     Card {
@@ -1356,6 +1445,28 @@ component DiagnosticsPage inherits VerticalLayout {
         }
     }
     Card {
+        title: "Setup wizard";
+        HorizontalLayout {
+            spacing: 10px;
+            cross-axis-alignment: center;
+            Text {
+                text: "Re-run the guided setup (driver install, phone app, SteamVR).";
+                color: Theme.text-mid;
+                font-size: 12px;
+                wrap: word-wrap;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+            }
+            SecondaryButton {
+                width: 190px;
+                text: "Back to setup wizard";
+                clicked => {
+                    BridgeState.reopen-wizard(0);
+                }
+            }
+        }
+    }
+    Card {
         title: "Bridge log";
         hint: "Newest entries on top.";
         Rectangle {
@@ -1381,73 +1492,6 @@ component DiagnosticsPage inherits VerticalLayout {
             }
         }
     }
-}
-// General tab: driver install/update button, SteamVR open button, and the
-// setup-wizard reopen shortcut.
-component GeneralPage inherits VerticalLayout {
-    spacing: 14px;
-    padding: 20px;
-    Text {
-        text: "General";
-        color: Theme.text-hi;
-        font-size: 22px;
-        font-weight: 700;
-    }
-    Card {
-        title: "Phone Link";
-        HorizontalLayout {
-            spacing: 10px;
-            cross-axis-alignment: center;
-            Text {
-                text: "Telemetry uplink:";
-                color: Theme.text-mid;
-                font-size: 13px;
-                vertical-alignment: center;
-            }
-            Text {
-                text: BridgeState.phone-ip;
-                color: BridgeState.phone-connected ? Theme.text-hi : Theme.text-dim;
-                font-size: 13px;
-                font-weight: 600;
-                vertical-alignment: center;
-            }
-            Rectangle {
-                horizontal-stretch: 1;
-            }
-            StatusPill {
-                label: "reachable";
-                ok: BridgeState.phone-connected;
-            }
-        }
-        Text {
-            text: "Bridge listens on UDP 42071 for gyro, hand-tracking and ping frames. The video stream never enters the bridge.";
-            color: Theme.text-dim;
-            font-size: 11px;
-            wrap: word-wrap;
-        }
-    }
-    Card {
-        title: "Setup wizard";
-        HorizontalLayout {
-            spacing: 10px;
-            cross-axis-alignment: center;
-            Text {
-                text: "Re-run the guided setup (driver install, phone app, SteamVR).";
-                color: Theme.text-mid;
-                font-size: 12px;
-                wrap: word-wrap;
-                horizontal-stretch: 1;
-                vertical-alignment: center;
-            }
-            SecondaryButton {
-                width: 190px;
-                text: "Back to setup wizard";
-                clicked => {
-                    BridgeState.reopen-wizard(0);
-                }
-            }
-        }
-    }
     Card {
         title: "About";
         Text {
@@ -1458,6 +1502,528 @@ component GeneralPage inherits VerticalLayout {
         }
     }
 }
+// One gesture condition: which signal (pinch or a finger) and the curl percent it
+// must reach. Pinch has no threshold, so the stepper is hidden for it rather than
+// shown disabled - a dead control reads as a bug.
+// Human label for a condition kind, or "Off" when the clause is not in the group.
+// Human label for a condition kind, or Off when the clause is not in the group.
+component ConditionRow inherits Rectangle {
+    in property <int> kind;
+    in property <int> thresh;
+    callback changed(int, int);
+    height: 40px;
+    background: Theme.surface2;
+    border-width: 1px;
+    border-color: Theme.border;
+    border-radius: 10px;
+    HorizontalLayout {
+        padding: 10px;
+        spacing: 8px;
+        cross-axis-alignment: center;
+        Text {
+            text: root.kind == 0 ? "Pinch" : root.kind == 1 ? "Index" : root.kind == 2 ? "Middle" : root.kind == 3 ? "Ring" : root.kind == 4 ? "Pinky" : "Off";
+            color: root.kind >= 0 ? Theme.text-hi : Theme.text-dim;
+            font-size: 12px;
+            font-weight: 600;
+            horizontal-stretch: 1;
+            vertical-alignment: center;
+        }
+        // Cycles Off -> Pinch -> Index -> Middle -> Ring -> Pinky -> Off. The step back
+        // to Off is what removes the clause from the AND list entirely.
+        Pill {
+            text: "<";
+            active: false;
+            clicked => {
+                root.changed(root.kind <= 0 ? 4 : root.kind - 1, root.thresh);
+            }
+        }
+        Pill {
+            text: ">";
+            active: false;
+            clicked => {
+                root.changed(root.kind < 0 ? 0 : Math.mod(root.kind + 1, 5), root.thresh);
+            }
+        }
+        if root.kind >= 1 : Stepper {
+            label: "min curl";
+            value: root.thresh;
+            min: 5;
+            max: 100;
+            step: 5;
+            unit: "%";
+            horizontal-stretch: 1;
+            changed(v) => {
+                root.changed(root.kind, v);
+            }
+        }
+        if root.kind == 0 : Text {
+            text: "no threshold";
+            color: Theme.text-dim;
+            font-size: 11px;
+            horizontal-stretch: 1;
+        }
+    }
+}
+
+// Part ids (0 none, 1 trigger, 2 palm, 3 a, 4 b, 5 trackpad, 6 thumbstick, 7 system) and the
+// target-to-part mapping live on BridgeState as pure callbacks, next to target-name,
+// so the row list, the editor heading and the controller highlight all read from one
+// place. They mirror TARGET_PART in gen_knuckles_svg.py.
+
+// One controller, drawn from Valve's own render-model geometry.
+//
+// The sources arrive as properties rather than a `hand == 0 ? @image-url(a) :
+// @image-url(b)` ternary: slint-build only collects @image-url() that it can see as a
+// literal at compile time, so a ternary leaves the path unresolved and the image never
+// gets embedded. Passing them in keeps every URL a literal at the call site.
+//
+// Each highlight is a separate transparent overlay stacked on the base, because Slint
+// cannot recolour part of an image and swapping the whole one per hover would stutter.
+//
+// Part ids are the ones BridgeState.target-part() returns. Every id has its own
+// overlay image stacked below; only the active one is visible. See DRAWN and
+// TARGET_PART in gen_knuckles_svg.py.
+component HandView inherits Rectangle {
+    in property <image> base-source;
+    in property <image> trigger-source;
+    in property <image> palm-source;
+    in property <image> trackpad-source;
+    in property <image> thumbstick-source;
+    in property <image> a-source;
+    in property <image> b-source;
+    in property <image> system-source;
+    in property <int> part;      // part id to highlight, 0 for none
+    background: #00000000;
+    Image { source: root.base-source; width: 100%; height: 100%; image-fit: contain; image-rendering: smooth; }
+    Image { source: root.trigger-source; width: 100%; height: 100%; image-fit: contain; image-rendering: smooth; visible: root.part == 1; }
+    Image { source: root.palm-source; width: 100%; height: 100%; image-fit: contain; image-rendering: smooth; visible: root.part == 2; }
+    Image { source: root.a-source; width: 100%; height: 100%; image-fit: contain; image-rendering: smooth; visible: root.part == 3; }
+    Image { source: root.b-source; width: 100%; height: 100%; image-fit: contain; image-rendering: smooth; visible: root.part == 4; }
+    Image { source: root.trackpad-source; width: 100%; height: 100%; image-fit: contain; image-rendering: smooth; visible: root.part == 5; }
+    Image { source: root.thumbstick-source; width: 100%; height: 100%; image-fit: contain; image-rendering: smooth; visible: root.part == 6; }
+    Image { source: root.system-source; width: 100%; height: 100%; image-fit: contain; image-rendering: smooth; visible: root.part == 7; }
+}
+
+// One input-source row, the same shape SteamVR's own binding editor uses. Hovering a
+// row lights the matching part on the model; clicking selects the row for editing.
+component TargetRow inherits Rectangle {
+    in property <int> hand;
+    in property <int> target;
+    in property <string> name;
+    in property <string> summary;
+    in property <bool> selected;
+in property <bool> bound;
+    in property <int> part: 0;
+    callback highlight(int);
+    height: 44px;
+background: root.selected ? Theme.surface3 : hover-area.has_hover ? Theme.surface2 : Theme.bg;
+    border-width: 1px;
+    border-color: root.selected ? Theme.accent : Theme.border;
+    border-radius: 9px;
+    HorizontalLayout {
+        padding: 10px;
+        spacing: 8px;
+        cross-axis-alignment: center;
+        Text {
+            text: root.name;
+            color: root.bound ? Theme.text-hi : Theme.text-dim;
+            font-size: 12px;
+            font-weight: root.bound ? 600 : 400;
+            horizontal-stretch: 1;
+            vertical-alignment: center;
+        }
+        Rectangle {
+            width: 150px;
+            height: 24px;
+            background: root.bound ? Theme.accent-dim : Theme.surface;
+            border-width: 1px;
+            border-color: root.bound ? Theme.accent : Theme.border;
+            border-radius: 6px;
+            Text {
+                text: root.summary;
+                color: root.bound ? Theme.text-hi : Theme.text-dim;
+                font-size: 10px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                width: 100%;
+                height: 100%;
+                wrap: word-wrap;
+            }
+        }
+    }
+// Slint 1.17's TouchArea has no mouse-enter/mouse-leave and PointerEventKind has no
+    // hover kind, so hover is carried by `move`: this row lights its part whenever the
+    // pointer is over it, and ControllerPair clears the highlight when it moves over the
+    // model instead. That covers every path between two rows without a global tracker.
+    hover-area := TouchArea {
+        width: 100%;
+        height: 100%;
+        mouse-cursor: pointer;
+        pointer-event(pe) => {
+            if pe.kind == PointerEventKind.move { root.highlight(root.part); }
+        }
+        clicked => {
+            BridgeState.sel-hand = root.hand;
+            BridgeState.sel-target = root.target;
+            BridgeState.select-gesture-target(root.hand, root.target);
+            // Anchor the submenu to this row, in window coordinates, before opening.
+            BridgeState.editor-anchor-x = self.absolute-position.x;
+            BridgeState.editor-anchor-y = self.absolute-position.y;
+            BridgeState.editor-anchor-w = self.width;
+            BridgeState.editor-open = true;
+        }
+    }
+}
+
+// Editor for the selected row. Group 1's clauses are ANDed; the single alternative is
+// ORed against the whole group, which covers "all of these, or a pinch".
+//
+// A submenu, not a modal: it sits beside the row that opened it and closes on its own
+// button as well as on a click outside.
+component GestureEditor inherits Card {
+    title: "";
+    in property <int> hand;
+    in property <string> name;
+    in property <bool> bound;
+    VerticalLayout {
+        padding: 16px;
+        spacing: 8px;
+        HorizontalLayout {
+            spacing: 8px;
+            cross-axis-alignment: center;
+            Text {
+                text: (root.hand == 0 ? "Left hand" : "Right hand") + " - " + root.name + (root.bound ? "" : " - unbound");
+                color: Theme.text-hi;
+                font-size: 13px;
+                font-weight: 600;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+            }
+            Rectangle {
+                width: 28px;
+                height: 28px;
+                border-radius: 6px;
+                border-width: 2px;
+                border-color: close-ta.has-hover ? Theme.accent : Theme.text-dim;
+                background: close-ta.has-hover ? Theme.accent : Theme.surface3;
+                Text {
+                    x: 0; y: 0;
+                    width: 100%;
+                    height: 100%;
+                    text: "✕";
+                    color: Theme.text-hi;
+                    font-size: 14px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                close-ta := TouchArea {
+                    width: 100%;
+                    height: 100%;
+                    mouse-cursor: pointer;
+                    clicked => { BridgeState.editor-open = false; }
+                }
+            }
+        }
+        Text {
+            text: "All of these must hold";
+            color: Theme.text-mid;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        ConditionRow {
+            kind: BridgeState.sel-c0-kind; thresh: BridgeState.sel-c0-thresh;
+            changed(k, t) => {
+                BridgeState.sel-c0-kind = k; BridgeState.sel-c0-thresh = t;
+                BridgeState.set-gesture-target(BridgeState.sel-c0-kind, BridgeState.sel-c0-thresh, BridgeState.sel-c1-kind, BridgeState.sel-c1-thresh, BridgeState.sel-c2-kind, BridgeState.sel-c2-thresh, BridgeState.sel-c3-kind, BridgeState.sel-c3-thresh, BridgeState.sel-alt-kind, BridgeState.sel-alt-thresh);
+            }
+        }
+        ConditionRow {
+            kind: BridgeState.sel-c1-kind; thresh: BridgeState.sel-c1-thresh;
+            changed(k, t) => {
+                BridgeState.sel-c1-kind = k; BridgeState.sel-c1-thresh = t;
+                BridgeState.set-gesture-target(BridgeState.sel-c0-kind, BridgeState.sel-c0-thresh, BridgeState.sel-c1-kind, BridgeState.sel-c1-thresh, BridgeState.sel-c2-kind, BridgeState.sel-c2-thresh, BridgeState.sel-c3-kind, BridgeState.sel-c3-thresh, BridgeState.sel-alt-kind, BridgeState.sel-alt-thresh);
+            }
+        }
+        ConditionRow {
+            kind: BridgeState.sel-c2-kind; thresh: BridgeState.sel-c2-thresh;
+            changed(k, t) => {
+                BridgeState.sel-c2-kind = k; BridgeState.sel-c2-thresh = t;
+                BridgeState.set-gesture-target(BridgeState.sel-c0-kind, BridgeState.sel-c0-thresh, BridgeState.sel-c1-kind, BridgeState.sel-c1-thresh, BridgeState.sel-c2-kind, BridgeState.sel-c2-thresh, BridgeState.sel-c3-kind, BridgeState.sel-c3-thresh, BridgeState.sel-alt-kind, BridgeState.sel-alt-thresh);
+            }
+        }
+        ConditionRow {
+            kind: BridgeState.sel-c3-kind; thresh: BridgeState.sel-c3-thresh;
+            changed(k, t) => {
+                BridgeState.sel-c3-kind = k; BridgeState.sel-c3-thresh = t;
+                BridgeState.set-gesture-target(BridgeState.sel-c0-kind, BridgeState.sel-c0-thresh, BridgeState.sel-c1-kind, BridgeState.sel-c1-thresh, BridgeState.sel-c2-kind, BridgeState.sel-c2-thresh, BridgeState.sel-c3-kind, BridgeState.sel-c3-thresh, BridgeState.sel-alt-kind, BridgeState.sel-alt-thresh);
+            }
+        }
+        Text {
+            text: "Or, as an alternative to all of them";
+            color: Theme.text-mid;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        ConditionRow {
+            kind: BridgeState.sel-alt-kind; thresh: BridgeState.sel-alt-thresh;
+            changed(k, t) => {
+                BridgeState.sel-alt-kind = k; BridgeState.sel-alt-thresh = t;
+                BridgeState.set-gesture-target(BridgeState.sel-c0-kind, BridgeState.sel-c0-thresh, BridgeState.sel-c1-kind, BridgeState.sel-c1-thresh, BridgeState.sel-c2-kind, BridgeState.sel-c2-thresh, BridgeState.sel-c3-kind, BridgeState.sel-c3-thresh, BridgeState.sel-alt-kind, BridgeState.sel-alt-thresh);
+            }
+        }
+    }
+}
+
+// One hand's column of input-source rows. Summaries are fetched from Rust by
+// (hand, target) because Slint cannot index a fixed-size array by a runtime value.
+component HandColumn inherits VerticalLayout {
+    in property <int> hand;
+    in property <string> heading;
+    callback highlight(int, int);
+    spacing: 5px;
+    Text {
+        text: root.heading;
+        color: Theme.text-mid;
+        font-size: 13px;
+        font-weight: 600;
+    }
+    for r[i] in 12 : TargetRow {
+        hand: root.hand;
+        target: i;
+        name: i == 0 ? "Trigger" : i == 1 ? "Grip" : i == 2 ? "A Button" : i == 3 ? "B Button" : i == 4 ? "Trackpad" : i == 5 ? "Thumb Stick" : i == 6 ? "Trackpad X" : i == 7 ? "Trackpad Y" : i == 8 ? "Stick X" : i == 9 ? "Stick Y" : i == 10 ? "Grip Force" : "Trigger Value";
+summary: BridgeState.row-summary(root.hand, i, BridgeState.gesture-generation);
+        bound: BridgeState.row-bound(root.hand, i);
+        selected: BridgeState.sel-hand == root.hand && BridgeState.sel-target == i;
+        part: BridgeState.target-part(i);
+        highlight(p) => { root.highlight(root.hand, p); }
+    }
+}
+
+// The two controllers between the binding columns, as in SteamVR's editor. Both share
+// one viewBox so they render at the same scale and stay aligned without layout maths.
+component ControllerPair inherits Rectangle {
+    in property <int> left-part;
+    in property <int> right-part;
+    callback highlight(int, int);
+    // Tall enough to sit against the whole binding column: the images are portrait and
+    // centred in the box, so a short box left a gap the row panel did not have.
+    height: 620px;
+    // Fixed width, not a stretch: both neighbouring columns stretch too, so with three
+    // flexible columns this one collapsed and the images had no box to lay out in.
+    preferred-width: 500px;
+    HorizontalLayout {
+        x: 0; y: 0;
+        width: 100%;
+        height: 100%;
+        alignment: center;
+        // The reference editor leaves air between the two controllers, and more between
+        // the columns and the models than between the models themselves.
+        spacing: 14px;
+        HandView {
+            base-source: @image-url("icons/knu_left.png");
+            trigger-source: @image-url("icons/knu_left_trigger_hl.png");
+            palm-source: @image-url("icons/knu_left_palm_hl.png");
+            a-source: @image-url("icons/knu_left_a_hl.png");
+            b-source: @image-url("icons/knu_left_b_hl.png");
+            trackpad-source: @image-url("icons/knu_left_trackpad_hl.png");
+            thumbstick-source: @image-url("icons/knu_left_thumbstick_hl.png");
+            system-source: @image-url("icons/knu_left_system_hl.png");
+            part: root.left-part;
+            horizontal-stretch: 1;
+            height: 100%;
+        }
+        HandView {
+            base-source: @image-url("icons/knu_right.png");
+            trigger-source: @image-url("icons/knu_right_trigger_hl.png");
+            palm-source: @image-url("icons/knu_right_palm_hl.png");
+            a-source: @image-url("icons/knu_right_a_hl.png");
+            b-source: @image-url("icons/knu_right_b_hl.png");
+            trackpad-source: @image-url("icons/knu_right_trackpad_hl.png");
+            thumbstick-source: @image-url("icons/knu_right_thumbstick_hl.png");
+            system-source: @image-url("icons/knu_right_system_hl.png");
+            part: root.right-part;
+            horizontal-stretch: 1;
+            height: 100%;
+        }
+    }
+    // Clearing layer, absolutely positioned so it does not fight the layout for
+    // geometry. A row only reports hover while the pointer is over it, so moving onto
+    // the model would otherwise leave the last row's part lit.
+    TouchArea {
+        x: 0; y: 0;
+        width: 100%;
+        height: 100%;
+        pointer-event(pe) => {
+            // Hand -1 means "no hand is hovering", which clears both models.
+            if pe.kind == PointerEventKind.move { root.highlight(-1, 0); }
+        }
+    }
+}
+
+// Component matrix: what each mode actually publishes. This is the part of Full Finger
+// Tracking that Controller and Hybrid have nothing to say about, and it is the reason
+// the mode cannot be changed without rebuilding the hands.
+component SkeletalPanel inherits Card {
+    title: "Skeletal Output";
+    hint: "A skeleton's tracking level is fixed when its component is created, so this table is decided by the mode rather than switched at runtime.";
+    VerticalLayout {
+        spacing: 8px;
+        for r[m] in 3 : Rectangle {
+            height: 46px;
+            background: Theme.bg;
+            border-width: 1px;
+            border-color: BridgeState.input-mode == m ? Theme.accent : Theme.border;
+            border-radius: 9px;
+            HorizontalLayout {
+                padding: 10px;
+                spacing: 8px;
+                cross-axis-alignment: center;
+                Text {
+                    text: m == 0 ? "Controller" : m == 1 ? "Hybrid" : "Full Finger";
+                    color: Theme.text-hi;
+                    font-size: 12px;
+                    font-weight: 600;
+                    width: 110px;
+                    vertical-alignment: center;
+                }
+                Text {
+                    text: m == 0 ? "no curl, no skeleton" : m == 1 ? "curl scalars, no skeleton" : "curl scalars + 31-bone skeleton";
+                    color: BridgeState.input-mode == m ? Theme.accent : Theme.text-dim;
+                    font-size: 11px;
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                }
+                Text {
+                    text: BridgeState.input-mode == m ? "active" : "";
+                    color: Theme.ok;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                }
+            }
+        }
+        Text {
+            text: "SteamVR reads a skeleton's tracking level as Full, which is what lets apps animate a hand from it. There is no runtime knob for it: the driver rebuilds the hands on a mode change, and falls back to the next SteamVR start if SteamVR declines to re-register them.";
+            color: Theme.text-dim;
+            font-size: 11px;
+            wrap: word-wrap;
+        }
+    }
+}
+
+// Controls tab.
+//
+// Controller and Hybrid share one layout: both publish gesture-mapped buttons and
+// differ only in what sits alongside them, so a binding editor that behaved differently
+// between them would be lying. Full Finger Tracking gets its own layout, led by the
+// skeletal panel, because there the skeleton is the product and the buttons are the
+// override.
+component ControlsPage inherits VerticalLayout {
+    in-out property <int> hover-part: 0;
+    in-out property <int> hover-hand: 0;
+    spacing: 16px;
+    Card {
+        title: "Input Mode";
+        hint: "What the driver hands SteamVR. The mode fixes the hand's input components when they are created, so switching rebuilds the hands; the driver also stores the choice and reuses it on the next SteamVR start.";
+        HorizontalLayout {
+            spacing: 10px;
+            Pill {
+                text: "Controller";
+                active: BridgeState.input-mode == 0;
+                horizontal-stretch: 1;
+                clicked => { BridgeState.input-mode = 0; }
+            }
+            Pill {
+                text: "Hybrid";
+                active: BridgeState.input-mode == 1;
+                horizontal-stretch: 1;
+                clicked => { BridgeState.input-mode = 1; }
+            }
+            Pill {
+                text: "Full Finger Tracking";
+                active: BridgeState.input-mode == 2;
+                horizontal-stretch: 1;
+                clicked => { BridgeState.input-mode = 2; }
+            }
+        }
+        Text {
+            text: BridgeState.input-mode == 0 ? "Buttons only. No finger curl scalars and no skeleton, so games asking for hand tracking get nothing." : BridgeState.input-mode == 1 ? "Finger curl on the knuckles finger paths, skeleton suppressed. Good default for games that read curl but not skeletons." : "Finger curl plus the full 31-bone skeleton. Apps that animate hands themselves pick this up.";
+            color: Theme.text-dim;
+            font-size: 11px;
+            wrap: word-wrap;
+        }
+    }
+
+    if BridgeState.input-mode == 2 : SkeletalPanel {}
+
+if BridgeState.input-mode == 2 : Card {
+        title: "Gesture Overrides";
+        hint: "Most apps draw their own hands from the skeleton and derive their own gestures, so an extra press from the driver can read as a double click. Trigger and grip are bound by default; A, B and the sticks are deliberately left unbound for that reason.";
+        // No controller artwork here on purpose: with the skeleton live, the hand is what
+        // the user is looking at, and the per-button rows belong to the Controller and
+        // Hybrid views below. Mirror mode stays, since it applies to every mode.
+        Toggle {
+            label: "Mirror Mode - copy left onto right";
+            checked: BridgeState.gesture-mirror;
+            changed(b) => { BridgeState.gesture-mirror = b; BridgeState.mirror-gestures(b); }
+        }
+        SecondaryButton {
+            text: "Reset to glove defaults";
+            clicked => { BridgeState.reset-gestures(); }
+        }
+    }
+
+    if BridgeState.input-mode != 2 : Card {
+        title: "Binding Sources";
+        hint: "One row per input the driver creates, laid out like SteamVR's own binding editor. Hover a row to light the part on the controller; click it to edit the gesture.";
+        HorizontalLayout {
+            // Air between the row panel and the controllers is wider than the air between
+            // the two controllers, the way the editor this is modelled on lays it out.
+            spacing: 26px;
+            cross-axis-alignment: start;
+            VerticalLayout {
+                spacing: 10px;
+                horizontal-stretch: 1;
+                HandColumn { hand: 0; heading: "Left Hand Controller"; highlight(h, p) => { root.hover-hand = h; root.hover-part = p; } }
+                Toggle {
+                    label: "Mirror Mode - copy left onto right";
+                    checked: BridgeState.gesture-mirror;
+                    changed(b) => { BridgeState.gesture-mirror = b; BridgeState.mirror-gestures(b); }
+                }
+            }
+            Rectangle {
+                horizontal-stretch: 0;
+                preferred-width: 500px;
+                preferred-height: 620px;
+                ControllerPair {
+                    x: 0; y: 0;
+                    width: 100%;
+                    height: 100%;
+                    left-part: root.hover-hand == 0 ? root.hover-part : 0;
+                    right-part: root.hover-hand == 1 ? root.hover-part : 0;
+                    highlight(h, p) => { root.hover-hand = h; root.hover-part = p; }
+                }
+            }
+            VerticalLayout {
+                spacing: 10px;
+                horizontal-stretch: 1;
+                HandColumn { hand: 1; heading: "Right Hand Controller"; highlight(h, p) => { root.hover-hand = h; root.hover-part = p; } }
+                SecondaryButton {
+                    text: "Reset to glove defaults";
+                    clicked => { BridgeState.reset-gestures(); }
+                }
+            }
+        }
+    }
+
+
+    PrimaryButton {
+        text: BridgeState.controls-applied ? "Apply to Driver" : "Apply to Driver (not sent yet)";
+        horizontal-stretch: 1;
+        clicked => { BridgeState.apply-controls(); }
+    }
+}
+// Card's own.
 // First-run wizard: stepped driver/phone/SteamVR checklist ending in
 // wizard-done. Shown when setup.done is missing; reopen-wizard brings it back.
 export component WizardWindow inherits Window {
@@ -1723,7 +2289,7 @@ export component MainWindow inherits Window {
                     width: parent.width;
                     height: parent.height;
                     horizontal-scrollbar-policy: always-off;
-                    s2 := DiagnosticsPage {}
+                    s2 := ControlsPage {}
                     viewport-height: s2.preferred-height;
                 }
                 if BridgeState.current-tab == 3 : ScrollView {
@@ -1733,6 +2299,41 @@ export component MainWindow inherits Window {
                     horizontal-scrollbar-policy: always-off;
                     s3 := GeneralPage {}
                     viewport-height: s3.preferred-height;
+                }
+
+                // Gesture editor as a submenu beside the row that opened it, rather than a
+                // modal across the page. The binding columns are taller than the window, so
+                // a centred popup sits far from the row it edits and hides the rest of the
+                // column under a scrim. Anchoring it to the row keeps that row next to it
+                // while it is edited, which is what a submenu is for. The catcher is
+                // transparent: clicking outside still dismisses it, the way a submenu does,
+                // but nothing else is dimmed or blocked.
+                if BridgeState.editor-open && BridgeState.current-tab == 2 : Rectangle {
+                    x: 0; y: 0;
+                    width: parent.width;
+                    height: parent.height;
+                    TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        clicked => { BridgeState.editor-open = false; }
+                    }
+                    editor := GestureEditor {
+                        width: 430px;
+                        height: self.preferred-height;
+                        hand: BridgeState.sel-hand;
+                        name: BridgeState.target-name(BridgeState.sel-target);
+                        bound: BridgeState.row-bound(BridgeState.sel-hand, BridgeState.sel-target);
+                        // Anchor is window-relative; the page starts at x=216 (sidebar) + y≈40 (topbar).
+                        // Convert to page-relative: anchor - (216, 40).
+                        // Left hand (0): open to the RIGHT of the row (towards center).
+                        // Right hand (1): open to the LEFT of the row (towards center).
+                        x: Math.max(8px, Math.min(parent.width - self.width - 8px,
+                            (BridgeState.sel-hand == 0 ?
+                                BridgeState.editor-anchor-x - 216px + BridgeState.editor-anchor-w + 8px :
+                                BridgeState.editor-anchor-x - 216px - self.width - 8px)));
+                        y: Math.max(8px, Math.min(parent.height - self.height - 8px,
+                            BridgeState.editor-anchor-y - 40px - 8px));
+                    }
                 }
             }
         }

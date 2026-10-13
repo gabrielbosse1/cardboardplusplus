@@ -58,8 +58,10 @@ const PINKY_PIP: usize = 18;
 const PINKY_DIP: usize = 19;
 const PINKY_TIP: usize = 20;
 
-/// Valve GLB metacarpal lengths (wrist→MCP distance in mm→m), same as hand_tracker.py.
-/// Index 25.8mm, Middle 17.9mm, Ring 17.6mm, Pinky 24.5mm.
+/// Valve GLB wrist→metacarpal-stub distances (m) for the 2-D overlay path's
+/// `short_meta`: Index 25.8mm, Middle 17.9mm, Ring 17.6mm, Pinky 24.5mm.
+/// Not the stub→MCP lengths — those are 74/71/66/63 mm and come from
+/// `BIND_POS` through `place_metacarpal`.
 const META_LEN: [f32; 4] = [0.0258, 0.0179, 0.0176, 0.0245];
 
 /// Vector ops on Landmark (used as 3D points in normalized image space).
@@ -91,7 +93,8 @@ fn add(a: Landmark, b: Landmark) -> Landmark {
     }
 }
 
-/// Short metacarpal: place Finger0 along wrist→MCP at Valve's GLB distance.
+/// Places the 2-D overlay's metacarpal stub `target_len` from the wrist along
+/// the wrist→MCP ray. Preview only; the world path uses `place_metacarpal`.
 fn short_meta(wrist: Landmark, mcp: Landmark, target_len: f32) -> Landmark {
     let d = sub(mcp, wrist);
     let l = norm(d);
@@ -101,11 +104,62 @@ fn short_meta(wrist: Landmark, mcp: Landmark, target_len: f32) -> Landmark {
     add(wrist, scale(d, target_len / l))
 }
 
+/// Model-space joint positions, exposed for tests that need the raw skeleton.
+/// The wire format carries parent-relative transforms, so composing them back
+/// re-derives these through each bone's live frame and will not reproduce a
+/// stub that was placed in model space.
+#[cfg(test)]
+pub fn compute_positions(
+    _image_landmarks: &[Landmark; 21],
+    world_landmarks: &[Landmark; 21],
+    is_right_hand: bool,
+) -> [[f32; 3]; NUM_BONES] {
+    let lm: [[f32; 3]; 21] = std::array::from_fn(|i| {
+        let l = world_landmarks[i];
+        [l.x, -l.y, -l.z]
+    });
+    let mut positions = [[0.0f32; 3]; NUM_BONES];
+    positions[BONE_ROOT] = lm[WRIST];
+    positions[BONE_WRIST] = lm[WRIST];
+    positions[BONE_THUMB0] = lm[THUMB_CMC];
+    positions[BONE_THUMB1] = lm[THUMB_MCP];
+    positions[BONE_THUMB2] = lm[THUMB_IP];
+    positions[BONE_THUMB3] = lm[THUMB_TIP];
+    let bind_pos: &[[f32; 3]; NUM_BONES] = if is_right_hand {
+        &BIND_POS_RIGHT
+    } else {
+        &BIND_POS_LEFT
+    };
+    let mcp = [
+        (BONE_INDEX0, BONE_INDEX1, lm[INDEX_MCP]),
+        (BONE_MIDDLE0, BONE_MIDDLE1, lm[MIDDLE_MCP]),
+        (BONE_RING0, BONE_RING1, lm[RING_MCP]),
+        (BONE_PINKY0, BONE_PINKY1, lm[PINKY_MCP]),
+    ];
+    for (bone, mcp_bone, p) in mcp {
+        positions[bone] =
+            place_metacarpal(bind_pos, [1.0, 0.0, 0.0, 0.0], bone, mcp_bone, p);
+        positions[mcp_bone] = p;
+    }
+    let chain = [
+        (BONE_INDEX1, INDEX_PIP, INDEX_DIP, INDEX_TIP),
+        (BONE_MIDDLE1, MIDDLE_PIP, MIDDLE_DIP, MIDDLE_TIP),
+        (BONE_RING1, RING_PIP, RING_DIP, RING_TIP),
+        (BONE_PINKY1, PINKY_PIP, PINKY_DIP, PINKY_TIP),
+    ];
+    for (b1, pip, dip, tip) in chain {
+        positions[b1 + 1] = lm[pip];
+        positions[b1 + 2] = lm[dip];
+        positions[b1 + 3] = lm[tip];
+    }
+    positions
+}
+
 /// Compute OpenVR bones from 21 MediaPipe landmarks.
 ///
 /// The algorithm does NOT modify the original landmarks. It adds 10 new bones:
 /// - BONE_ROOT(0), BONE_WRIST(1): both at wrist position
-/// - 4 metacarpals (INDEX0=6, MIDDLE0=11, RING0=16, PINKY0=21): wrist→MCP at Valve length
+/// - 4 metacarpals (INDEX0=6, MIDDLE0=11, RING0=16, PINKY0=21): stub on Valve's metacarpal axis
 /// - 5 aux bones (26-30): track their respective tips
 ///
 /// Finger chain matches Valve's GLB node layout (meta, _0, _1, _2, _end):
@@ -234,10 +288,6 @@ fn vnormalize(v: [f32; 3]) -> [f32; 3] {
     [v[0] / l, v[1] / l, v[2] / l]
 }
 
-fn vadd(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
-}
-
 fn vsub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
@@ -267,6 +317,56 @@ fn quat_from_to(from: [f32; 3], to: [f32; 3]) -> [f32; 4] {
     let q = [w, v[0], v[1], v[2]];
     let l = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
     [q[0] / l, q[1] / l, q[2] / l, q[3] / l]
+}
+
+/// Best-fit palm-plane normal over the wrist plus all four MCP joints
+/// (Newell's method), oriented so it points out of the palm.
+///
+/// Newell's winding follows the ring's order, and that order runs opposite
+/// ways on the two hands, so the raw result is the palm on one side and the
+/// back of the hand on the other. `palm_sign` cannot fix that: it is derived
+/// from the *bind* tables, and this function is also handed live landmarks that
+/// have already been through a different axis flip. The thumb settles it
+/// without reference to either — the palm always faces away from it.
+///
+/// Returns `None` when the polygon collapses, which happens when a closed hand
+/// turns edge-on to the camera and every MCP lines up.
+///
+/// A two-point cross product (wrist x index MCP) is the obvious cheaper
+/// construction and it is wrong twice over: the wrist→index-MCP and
+/// wrist→middle-MCP directions are only ~17.6 deg apart, so 1/sin amplifies
+/// landmark noise ~3.3x, and the pair sits at ~90 mm radius on a curved knuckle
+/// ridge where the palm plane wants them at the palm surface. Five points spread
+/// across the palm average that curvature out.
+fn palm_plane_normal(p: &[[f32; 3]; NUM_BONES]) -> Option<[f32; 3]> {
+    let ring = [
+        p[BONE_WRIST],
+        p[BONE_INDEX1],
+        p[BONE_MIDDLE1],
+        p[BONE_RING1],
+        p[BONE_PINKY1],
+    ];
+    let mut n = [0.0f32; 3];
+    for i in 0..ring.len() {
+        let a = ring[i];
+        let b = ring[(i + 1) % ring.len()];
+        n[0] += a[1] * b[2] - a[2] * b[1];
+        n[1] += a[2] * b[0] - a[0] * b[2];
+        n[2] += a[0] * b[1] - a[1] * b[0];
+    }
+    let l = vnorm(n);
+    if l < 1e-9 {
+        return None;
+    }
+    let n = [n[0] / l, n[1] / l, n[2] / l];
+    // Orient out of the palm using the thumb, which sits inside the hand's
+    // silhouette on both sides.
+    let thumb = vnormalize(vsub(p[BONE_THUMB0], p[BONE_WRIST]));
+    if vdot(n, thumb) > 0.0 {
+        Some([-n[0], -n[1], -n[2]])
+    } else {
+        Some(n)
+    }
 }
 
 /// Rotation taking the bind basis (finger, palm) onto the live basis.
@@ -299,12 +399,19 @@ fn quat_from_basis(
 }
 
 /// Convert a 3×3 rotation matrix (row-major) to a quaternion (w,x,y,z).
+///
+/// The four branches below each recover the quaternion from a different
+/// component pair, and they do not agree on its sign: `q` and `-q` are the same
+/// rotation, so whichever branch runs picks an arbitrary representative. The
+/// result is biased toward `w >= 0` here, which is the best a stateless
+/// function can do; `match_sign_to_previous` is what actually keeps a stream
+/// continuous.
 fn mat_to_quat(m: [[f32; 3]; 3]) -> [f32; 4] {
     let (m00, m01, m02) = (m[0][0], m[0][1], m[0][2]);
     let (m10, m11, m12) = (m[1][0], m[1][1], m[1][2]);
     let (m20, m21, m22) = (m[2][0], m[2][1], m[2][2]);
     let trace = m00 + m11 + m22;
-    if trace > 0.0 {
+    let q = if trace > 0.0 {
         let s = 0.5 / (trace + 1.0).sqrt();
         [0.25 / s, (m21 - m12) * s, (m02 - m20) * s, (m10 - m01) * s]
     } else if m00 > m11 && m00 > m22 {
@@ -316,7 +423,40 @@ fn mat_to_quat(m: [[f32; 3]; 3]) -> [f32; 4] {
     } else {
         let s = 2.0 * (1.0 + m22 - m00 - m11).sqrt();
         [(m10 - m01) / s, (m02 + m20) / s, (m12 + m21) / s, 0.25 * s]
+    };
+    match_sign_to(q, [1.0, 0.0, 0.0, 0.0])
+}
+
+/// Pick the representative of the `q` / `-q` pair that continues the previous
+/// frame, so a quaternion stream never crosses a sign boundary.
+///
+/// `q` and `-q` are the same rotation, which is why this is easy to miss: the
+/// skeleton geometry is identical either way, and every check on the resulting
+/// pose passes. It matters because the consumer interpolates. SteamVR slerps
+/// between the frames it is handed, and the short way from `q` to `-q` is a
+/// full 360°, so a lone sign flip reads as the hand spinning once.
+///
+/// No stateless rule avoids this. `w >= 0` flips wherever `w` crosses zero, and
+/// "largest component positive" flips wherever the largest component changes —
+/// a roll through a true 180° passes `w` straight through zero at 172° and
+/// 352° of a full turn, and both rules flip there. Only continuity with the
+/// previous frame cannot flip mid-motion, because the previous frame is what
+/// defines the sign.
+fn match_sign_to_previous(q: [f32; 4], prev: [f32; 4]) -> [f32; 4] {
+    let dot = q[0] * prev[0] + q[1] * prev[1] + q[2] * prev[2] + q[3] * prev[3];
+    if dot < 0.0 {
+        [-q[0], -q[1], -q[2], -q[3]]
+    } else {
+        q
     }
+}
+
+/// Pick the representative of the `q` / `-q` pair that agrees with a reference
+/// rotation, for callers holding no previous frame. `reference` is any
+/// quaternion known to express the same rotation; pass the identity to bias
+/// toward `w >= 0`.
+fn match_sign_to(q: [f32; 4], reference: [f32; 4]) -> [f32; 4] {
+    match_sign_to_previous(q, reference)
 }
 
 /// Quaternion product q * r.
@@ -341,21 +481,91 @@ const PARENT: [i32; NUM_BONES] = [
     0, 0, 0, 0, 0, // aux (children of root per GLB)
 ];
 
-/// Metacarpal lengths from Valve's GLB skeleton (meters), keyed by bone index.
-const META_LEN_WORLD: [(usize, f32); 4] = [
-    (BONE_INDEX0, 0.0258),
-    (BONE_MIDDLE0, 0.0179),
-    (BONE_RING0, 0.0176),
-    (BONE_PINKY0, 0.0245),
+/// Metacarpal bones are placed by `place_metacarpal` and are deliberately
+/// left alone here.
+const METACARPAL_BONES: [usize; 4] = [
+    BONE_INDEX0,
+    BONE_MIDDLE0,
+    BONE_RING0,
+    BONE_PINKY0,
 ];
 
+/// Rescale every phalange to Valve's bind length along its live direction.
+///
+/// MediaPipe's world landmarks are not a metric measurement of the hand. On a
+/// real capture the phalanges come out at roughly 0.55-0.77x Valve's bind
+/// lengths — a pinky MCP-to-PIP of 16 mm against a bind 30 mm. SteamVR skins
+/// the glove with Valve's inverse-bind matrices, so a bone arriving at the
+/// wrong length drags the mesh with it, and a short bone also sweeps a shorter
+/// arc for the same joint angle: a 30 deg abduction moves the pinky tip 21 mm
+/// at capture scale against 33 mm at bind scale. That deficit is what stops the
+/// fingers spreading as far as a real hand.
+///
+/// Each segment keeps its direction, so no joint angle changes and the whole
+/// orientation pass downstream is untouched — only the lengths move. Walking
+/// each chain from the wrist outward is what makes that true: the child is
+/// placed relative to the parent that has already been placed, so the angles
+/// between consecutive segments are preserved exactly.
+///
+/// Mirrors hand_tracker.py `GloveMesh.normalize`, which the Rust port lost.
+fn normalize_segments(positions: &mut [[f32; 3]; NUM_BONES], is_right_hand: bool) {
+    let bind_pos = if is_right_hand {
+        &BIND_POS_RIGHT
+    } else {
+        &BIND_POS_LEFT
+    };
+    let orig = *positions;
+    for i in 2..NUM_BONES {
+        if METACARPAL_BONES.contains(&i) {
+            continue;
+        }
+        let Some((a, b)) = ORIENT_SEG[i] else { continue };
+        let want = vnorm(vsub(bind_pos[b], bind_pos[a]));
+        // Direction from the landmarks, never from the position this loop has
+        // already moved. Rescaling a segment about its parent carries the next
+        // segment's start point with it, so reading the direction back out of
+        // the moved chain bends every joint downstream of it.
+        let d = vsub(orig[b], orig[a]);
+        let l = vnorm(d);
+        if want < 1e-9 || l < 1e-9 {
+            continue;
+        }
+        let k = want / l;
+        positions[b] = [
+            positions[a][0] + d[0] * k,
+            positions[a][1] + d[1] * k,
+            positions[a][2] + d[2] * k,
+        ];
+    }
+}
+
+/// Places a metacarpal stub back from its MCP along Valve's metacarpal axis,
+/// rotated by `basis` so it follows a wrist turn.
+///
+/// The length is the bind stub→MCP distance read straight off `BIND_POS`,
+/// which is what makes the live segment match the bind table instead of
+/// guessing it. Valve's own wrist→stub distances are much shorter than its
+/// stub→MCP ones (26 vs 74 mm on the index), so the two are not
+/// interchangeable and only the bind table settles which one is meant.
+fn place_metacarpal(
+    bind_pos: &[[f32; 3]; NUM_BONES],
+    basis: [f32; 4],
+    stub: usize,
+    mcp_bone: usize,
+    mcp: [f32; 3],
+) -> [f32; 3] {
+    let axis = vsub(bind_pos[mcp_bone], bind_pos[stub]);
+    let len = vnorm(axis);
+    if len < 1e-9 {
+        return mcp;
+    }
+    vsub(mcp, vscale(quat_rot_vec(basis, vscale(axis, 1.0 / len)), len))
+}
+
 /// Bind-pose segment used to orient each bone: model-space direction from
-/// bone A to bone B, matched to the live segment (same indices). `None` =
-/// reuse the previous segment's delta (tips, aux) or identity (root).
-/// Mirrors hand_tracker.py JDIR; directions come from Valve's skeleton GLBs.
 const ORIENT_SEG: [Option<(usize, usize)>; NUM_BONES] = [
     None,                             // 0 root
-    Some((BONE_WRIST, BONE_MIDDLE0)), // 1 wrist
+    None, // 1 wrist: taken by the 3-DOF basis branch below, never read here
     Some((BONE_THUMB0, BONE_THUMB1)),
     Some((BONE_THUMB1, BONE_THUMB2)),
     Some((BONE_THUMB2, BONE_THUMB3)),
@@ -560,17 +770,41 @@ pub fn compute_world_bones(
     world_landmarks: &[Landmark; 21],
     is_right_hand: bool,
 ) -> [BoneTransform; NUM_BONES] {
-    compute_world_bones_with_palm(image_landmarks, world_landmarks, is_right_hand, None)
+    compute_world_bones_with_palm(image_landmarks, world_landmarks, is_right_hand, None, None)
+}
+
+/// `compute_world_bones` plus the previous frame's orientations, for a caller
+/// that sends frames in sequence and wants the sign continuity that requires.
+pub fn compute_world_bones_tracked(
+    image_landmarks: &[Landmark; 21],
+    world_landmarks: &[Landmark; 21],
+    is_right_hand: bool,
+    palm: Option<[f32; 3]>,
+    prev_orientations: &[[f32; 4]; NUM_BONES],
+) -> [BoneTransform; NUM_BONES] {
+    compute_world_bones_with_palm(
+        image_landmarks,
+        world_landmarks,
+        is_right_hand,
+        palm,
+        Some(prev_orientations),
+    )
 }
 
 /// Same skeleton with a caller-supplied palm normal in MediaPipe axes (same
 /// convention as `world_landmarks`; converted to OpenVR axes inside). A
 /// missing or degenerate override falls back to the position-derived normal.
+///
+/// `prev_orientations` is the previous frame's orientations, straight from the
+/// last call. Passing it keeps the quaternion signs continuous, which the
+/// consumer needs because it interpolates between frames; `None` is correct
+/// only for a stateless one-shot (and for tests that do not check continuity).
 pub fn compute_world_bones_with_palm(
     image_landmarks: &[Landmark; 21],
     world_landmarks: &[Landmark; 21],
     is_right_hand: bool,
     palm: Option<[f32; 3]>,
+    prev_orientations: Option<&[[f32; 4]; NUM_BONES]>,
 ) -> [BoneTransform; NUM_BONES] {
     // Convert world landmarks to OpenVR space:
     //   MediaPipe: +X right, +Y down, +Z away from camera (smaller = closer)
@@ -602,6 +836,17 @@ pub fn compute_world_bones_with_palm(
     let wz = -depth; // OpenVR: -Z = forward
     let wrist_abs = [wx, wy, wz];
 
+    let bind_pos: &[[f32; 3]; NUM_BONES] = if is_right_hand {
+        &BIND_POS_RIGHT
+    } else {
+        &BIND_POS_LEFT
+    };
+    let bind_q: &[[f32; 4]; NUM_BONES] = if is_right_hand {
+        &BIND_QUAT_RIGHT
+    } else {
+        &BIND_QUAT_LEFT
+    };
+
     let mut positions = [[0.0f32; 3]; NUM_BONES];
 
     // LOCAL (wrist-relative) skeleton first; the absolute anchor goes into
@@ -614,23 +859,6 @@ pub fn compute_world_bones_with_palm(
     positions[BONE_THUMB1] = lm[THUMB_MCP];
     positions[BONE_THUMB2] = lm[THUMB_IP];
     positions[BONE_THUMB3] = lm[THUMB_TIP];
-
-    // Fingers: metacarpal stubs at Valve GLB length, MCP/PIP/DIP/TIP direct
-    let meta = [
-        (BONE_INDEX0, lm[INDEX_MCP], META_LEN_WORLD[0].1),
-        (BONE_MIDDLE0, lm[MIDDLE_MCP], META_LEN_WORLD[1].1),
-        (BONE_RING0, lm[RING_MCP], META_LEN_WORLD[2].1),
-        (BONE_PINKY0, lm[PINKY_MCP], META_LEN_WORLD[3].1),
-    ];
-    for (bone, mcp, len) in &meta {
-        let d = vsub(*mcp, w);
-        let l = vnorm(d);
-        positions[*bone] = if l < 1e-9 {
-            *mcp
-        } else {
-            vadd(w, vscale(d, len / l))
-        };
-    }
 
     positions[BONE_INDEX1] = lm[INDEX_MCP];
     positions[BONE_INDEX2] = lm[INDEX_PIP];
@@ -652,6 +880,59 @@ pub fn compute_world_bones_with_palm(
     positions[BONE_PINKY3] = lm[PINKY_DIP];
     positions[BONE_PINKY4] = lm[PINKY_TIP];
 
+    // Metacarpal stubs, one per finger.
+    //
+    // The stub sits one metacarpal length back from the MCP along Valve's
+    // metacarpal axis, which is what makes the stub→MCP segment match the bind
+    // table and leaves the metacarpal contributing no spurious flexion.
+    // Landing it on the wrist→MCP ray instead (the obvious construction) puts
+    // it on a different ray and leaves degrees of standing error that every bone
+    // below inherits — the whole finger chain then renders rotated.
+    //
+    // Valve's axis is in model space, so it is mapped through the same rotation
+    // that carries the bind hand onto this one before being applied. A stub
+    // pinned to model space cannot follow a wrist turn: the MCP moves with the
+    // hand while the offset does not, and the segment shears.
+    // One palm normal for the whole skeleton. Deriving it twice — once for the
+    // stub basis and again for the wrist — leaves two normals to disagree, and
+    // the stubs then shear against the wrist instead of moving with it.
+    let palm_bind = palm_plane_normal(bind_pos);
+    let palm_live = match palm {
+        // Wire override arrives in MediaPipe axes; convert it into model space
+        // and orient it out of the palm the same way, since its winding comes
+        // from the caller rather than from these tables.
+        Some(p) if vnorm(p) > 1e-9 => {
+            let n = vnormalize([p[0], -p[1], -p[2]]);
+            let thumb = vnormalize(vsub(positions[BONE_THUMB0], positions[BONE_WRIST]));
+            Some(if vdot(n, thumb) > 0.0 {
+                [-n[0], -n[1], -n[2]]
+            } else {
+                n
+            })
+        }
+        _ => palm_plane_normal(&positions),
+    };
+    let basis = match (palm_bind, palm_live) {
+        (Some(pb), Some(pl)) => quat_from_basis(
+            vsub(bind_pos[BONE_MIDDLE1], bind_pos[BONE_WRIST]),
+            pb,
+            vsub(positions[BONE_MIDDLE1], positions[BONE_WRIST]),
+            pl,
+        ),
+        _ => [1.0, 0.0, 0.0, 0.0],
+    };
+    for (bone, mcp_bone) in [
+        (BONE_INDEX0, BONE_INDEX1),
+        (BONE_MIDDLE0, BONE_MIDDLE1),
+        (BONE_RING0, BONE_RING1),
+        (BONE_PINKY0, BONE_PINKY1),
+    ] {
+        positions[bone] =
+            place_metacarpal(bind_pos, basis, bone, mcp_bone, positions[mcp_bone]);
+    }
+
+    normalize_segments(&mut positions, is_right_hand);
+
     // Aux bones = their tips
     positions[BONE_AUX_THUMB] = positions[BONE_THUMB3];
     positions[BONE_AUX_INDEX] = positions[BONE_INDEX4];
@@ -663,51 +944,40 @@ pub fn compute_world_bones_with_palm(
     // takes each bind segment onto the live segment (hand_tracker.py's
     // live_mats). SteamVR skins with the same inverse-bind matrices, so
     // inventing axes here makes the glove curl against the landmarks.
-    let bind_pos: &[[f32; 3]; NUM_BONES] = if is_right_hand {
-        &BIND_POS_RIGHT
-    } else {
-        &BIND_POS_LEFT
-    };
-    let bind_q: &[[f32; 4]; NUM_BONES] = if is_right_hand {
-        &BIND_QUAT_RIGHT
-    } else {
-        &BIND_QUAT_LEFT
-    };
+    // Palm normal from the live/bind hand basis. Used only for the wrist roll:
+    // shortest-arc along the wrist→MCP axis leaves twist free, which is what
+    // put the palm on the back of the hand.
+    // Both sides of the basis come from the same construction so a hand at the
+    // bind pose maps to identity. The bind side must sample the MCP joints
+    // (BONE_*1), not the metacarpal stubs (BONE_*0): the stubs sit at 18-26 mm
+    // from the wrist on a different ray than the live MCP joints at ~90 mm, and
+    // mixing the two leaves a few degrees of standing roll offset.
+    // `palm_plane_normal` orients itself out of the palm from the thumb, so
+    // no chirality sign is applied here — one did, and it inverted the roll on
+    // one hand, which spins the wrist the wrong way as it turns. Both `palm_bind`
+    // and `palm_live` are the single pair computed above, shared with the
+    // metacarpal stubs so the whole skeleton shares one basis.
+    // Reference finger axis: middle MCP, so it matches the live basis axis and
+    // is long enough to stay well conditioned when the hand tilts.
+    let finger_bind = vsub(bind_pos[BONE_MIDDLE1], bind_pos[BONE_WRIST]);
+    let finger_live = vsub(positions[BONE_MIDDLE1], positions[BONE_WRIST]);
 
-    // Palm normal from the live/bind hand basis (same formula both sides,
-    // chirality sign so left bind → +X, right bind → −X). Used only for the
-    // wrist roll: shortest-arc along wrist→middle0 leaves twist free, which
-    // is what put the palm on the back of the hand.
-    let palm_sign = if is_right_hand { -1.0 } else { 1.0 };
-    let palm_of = |p: &[[f32; 3]; NUM_BONES]| -> [f32; 3] {
-        let idx = vsub(p[BONE_INDEX0], p[BONE_WRIST]);
-        let mid = vsub(p[BONE_MIDDLE0], p[BONE_WRIST]);
-        vscale(vnormalize(vcross(idx, mid)), palm_sign)
-    };
-    let palm_bind = palm_of(bind_pos);
-    let palm_live = match palm {
-        Some(p) if vnorm(p) > 1e-9 => vscale(vnormalize([p[0], -p[1], -p[2]]), palm_sign),
-        _ => palm_of(&positions),
-    };
-    let finger_bind = vsub(bind_pos[BONE_MIDDLE0], bind_pos[BONE_WRIST]);
-    let finger_live = vsub(positions[BONE_MIDDLE0], positions[BONE_WRIST]);
-
-    let mut frames = [[1.0f32, 0.0, 0.0, 0.0]; NUM_BONES];
-    let mut prev_delta = [1.0f32, 0.0, 0.0, 0.0];
+    let mut frames = [[1.0f32; 4]; NUM_BONES];
     for i in 0..NUM_BONES {
         if i == BONE_WRIST {
             // Full 3-DOF wrist: map bind (finger, palm) → live (finger, palm).
             // Curl joints are untouched; this only rolls the glove so the
             // palm faces the same way as the landmarks. Degenerate live
             // basis (zero landmarks): finger-only delta, else identity.
-            let delta = if vnorm(finger_live) > 1e-9 && vnorm(palm_live) > 1e-9 {
-                quat_from_basis(finger_bind, palm_bind, finger_live, palm_live)
-            } else if vnorm(finger_live) > 1e-9 && vnorm(finger_bind) > 1e-9 {
+            let delta = match (palm_bind, palm_live) {
+                (Some(pb), Some(pl)) if vnorm(finger_live) > 1e-9 && vnorm(finger_bind) > 1e-9 => {
+                    quat_from_basis(finger_bind, pb, finger_live, pl)
+                }
+                _ if vnorm(finger_live) > 1e-9 && vnorm(finger_bind) > 1e-9 => {
                 quat_from_to(vnormalize(finger_bind), vnormalize(finger_live))
-            } else {
-                [1.0, 0.0, 0.0, 0.0]
+                }
+                _ => [1.0, 0.0, 0.0, 0.0],
             };
-            prev_delta = delta;
             frames[i] = quat_mul(delta, bind_q[i]);
             continue;
         }
@@ -729,9 +999,12 @@ pub fn compute_world_bones_with_palm(
                         vnormalize(quat_rot_vec(quat_conj(frames[parent]), ld)),
                     )
                 } else {
-                    prev_delta
+                    // A collapsed segment has no direction to hinge about, so
+                    // this bone adds nothing. Reusing another bone's rotation
+                    // would double-apply a global delta or a neighbouring
+                    // finger's flexion.
+                    [1.0, 0.0, 0.0, 0.0]
                 };
-                prev_delta = flex;
                 frames[i] = quat_mul(quat_mul(frames[parent], flex), quat_mul(bp, bind_q[i]));
             }
             None => {
@@ -750,11 +1023,11 @@ pub fn compute_world_bones_with_palm(
         }
     }
 
-    // Aux bones (26-30) sit after the pinky chain in the loop, so the
-    // None-branch prev_delta above would give every one of them the pinky's
-    // last-segment delta. Each aux tracks its own finger's tip instead;
-    // bind quats for aux/tip pairs are identical in the GLB, so sharing the
-    // tip's model-space frame keeps orientation and position in sync.
+    // Aux bones (26-30) are Root children with no ORIENT_SEG of their own, so
+    // the None branch above would hand every one of them the pinky's tip
+    // frame. Each aux tracks its own finger's tip instead; bind quats for
+    // aux/tip pairs are identical in the GLB, so sharing the tip's model-space
+    // frame keeps orientation and position in sync.
     //
     // The aux node is a Root child whose bind origin sits on the DIP (see
     // finger_*_aux in vr_glove_*_model_slim.glb), not a phalanx in the chain.
@@ -793,6 +1066,15 @@ pub fn compute_world_bones_with_palm(
         }
     }
     bones[BONE_ROOT].position = wrist_abs;
+    // Orientations are continuous with the previous frame, which is what keeps a
+    // roll from crossing a quaternion sign boundary. Done last, on the values
+    // actually sent, because these parent-relative quats are what SteamVR
+    // interpolates between.
+    if let Some(prev) = prev_orientations {
+        for i in 0..NUM_BONES {
+            bones[i].orientation = match_sign_to_previous(bones[i].orientation, prev[i]);
+        }
+    }
     bones
 }
 
@@ -1099,18 +1381,77 @@ mod tests {
 
     #[test]
     fn world_metacarpals_match_valve_lengths() {
-        let bones = world_bones(&image_hand(), &metric_hand());
-        // Synthetic wrist→MCP is ~0.05-0.11m (2-4x Valve); metacarpal bones
-        // must be snapped to Valve's GLB lengths regardless.
-        let expected = [0.0258, 0.0179, 0.0176, 0.0245];
-        let slots = [BONE_INDEX0, BONE_MIDDLE0, BONE_RING0, BONE_PINKY0];
-        for (slot, exp) in slots.iter().zip(expected.iter()) {
-            let p = bones[*slot].position;
-            let d = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+        // A hand already at the bind pose must put every stub back on its bind
+        // joint, so both the stub→MCP length and its axis come from BIND_POS.
+        // Valve's wrist→stub distances are a different, much shorter segment
+        // (26 vs 74 mm on the index) and do not satisfy this.
+        let pairs = [
+            (BONE_INDEX0, BONE_INDEX1),
+            (BONE_MIDDLE0, BONE_MIDDLE1),
+            (BONE_RING0, BONE_RING1),
+            (BONE_PINKY0, BONE_PINKY1),
+        ];
+        let wpos = compute_positions(&image_hand(), &bind_pose_landmarks(), false);
+        for (stub, mcp) in pairs {
+            let d = sub3(wpos[mcp], wpos[stub]);
+            let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            let exp = vnorm(sub3(BIND_POS_LEFT[mcp], BIND_POS_LEFT[stub]));
             assert!(
-                (d - exp).abs() < 0.002,
-                "bone {slot} len {d}, expected {exp}"
+                (len - exp).abs() < 1e-6,
+                "bone {stub}->{mcp} len {len}, bind length {exp}"
             );
+            let axis = norm3(sub3(BIND_POS_LEFT[mcp], BIND_POS_LEFT[stub]));
+            let dir = norm3(d);
+            assert!(
+                vdot(dir, axis) > 0.9999,
+                "bone {stub}->{mcp} is {} deg off Valve's metacarpal axis",
+                angle_deg(dir, axis)
+            );
+        }
+    }
+
+    /// The metacarpal stub must sit on Valve's metacarpal axis, not on the
+    /// wrist→MCP ray. Placing it on the wrist ray leaves a few degrees of
+    /// standing error in the stub→MCP segment, and every bone below it inherits
+    /// that rotation — which shows up as a finger chain that twists as the MCP
+    /// moves rather than splaying cleanly.
+    #[test]
+    fn metacarpal_stub_lies_on_the_bind_axis() {
+        let img = image_hand();
+        for is_right in [false, true] {
+            let wlm = bind_pose_landmarks_for(is_right);
+            let bones = if is_right {
+                compute_world_bones(&img, &wlm, true)
+            } else {
+                world_bones(&img, &wlm)
+            };
+            let _ = &bones;
+            let wpos = compute_positions(
+                &image_hand(),
+                &bind_pose_landmarks_for(is_right),
+                is_right,
+            );
+            let bp = if is_right {
+                &BIND_POS_RIGHT
+            } else {
+                &BIND_POS_LEFT
+            };
+            for (stub, mcp) in [
+                (BONE_INDEX0, BONE_INDEX1),
+                (BONE_MIDDLE0, BONE_MIDDLE1),
+                (BONE_RING0, BONE_RING1),
+                (BONE_PINKY0, BONE_PINKY1),
+            ] {
+                let live = norm3(sub3(wpos[mcp], wpos[stub]));
+                let bind = norm3(sub3(bp[mcp], bp[stub]));
+                let dot = live[0] * bind[0] + live[1] * bind[1] + live[2] * bind[2];
+                assert!(
+                    dot > 0.9999,
+                    "right={is_right} bone {stub}: stub axis is {:.2} deg off \
+                     Valve's metacarpal axis (dot={dot})",
+                    angle_deg(live, bind)
+                );
+            }
         }
     }
 
@@ -1118,9 +1459,11 @@ mod tests {
     /// left-multiply the resulting delta by exactly R (bind side untouched).
     #[test]
     fn basis_delta_follows_live_rotation() {
-        // Exact vectors printed from the wrist branch (metric_hand +60° spin).
-        let fb = [0.002177f32, 0.0071199997, 0.016319];
-        let pb = [0.9469149f32, 0.2285864, -0.22605363];
+        // Finger axis and bind palm normal come from the bind tables rather than
+        // literals, so this stays valid when the basis construction changes.
+        let bp = &BIND_POS_LEFT;
+        let fb = vsub(bp[BONE_MIDDLE1], bp[BONE_WRIST]);
+        let pb = palm_plane_normal(bp).expect("bind palm ring");
         let fl = [0.0f32, -0.017826488, -0.0016205898];
         let pl = [-0.022628153f32, 0.09051256, -0.9956382];
         let half = 30.0f32.to_radians();
@@ -1139,16 +1482,27 @@ mod tests {
     /// A single-vector arc delta is blind to roll about the segment axis.
     #[test]
     fn rigid_spin_rotates_every_skin_frame_with_the_hand() {
-        let base = metric_hand();
+        // Bind landmarks, so every joint is a real hand joint and the spin is
+        // an exact rigid rotation of the whole skeleton. Spin about the wrist,
+        // which sits at the model origin, so the hand rotates in place.
+        let base = bind_pose_landmarks();
+        let pivot = base[WRIST];
         let (s, c) = (60.0f32.to_radians().sin(), 60.0f32.to_radians().cos());
-        let spun = base.map(|l| fake_landmark(c * l.x + s * l.z, l.y, -s * l.x + c * l.z));
+        let spun = base.map(|l| {
+            let (dx, dz) = (l.x - pivot.x, l.z - pivot.z);
+            fake_landmark(
+                pivot.x + c * dx - s * dz,
+                l.y,
+                pivot.z + s * dx + c * dz,
+            )
+        });
         let img = image_hand();
         let (_, rot_base) = compose_chain(&world_bones(&img, &base));
         let (_, rot_spun) = compose_chain(&world_bones(&img, &spun));
-        // Landmarks spin +60° about MediaPipe +Y; the [x,-y,-z] axis flip
-        // conjugates that to -60° about OpenVR +Y.
+        // Landmarks spin +60° about MediaPipe +Y; the [x,-y,-z] axis flip maps that
+        // to +60° about OpenVR -Y.
         let half = 30.0f32.to_radians();
-        let q_spin = [half.cos(), 0.0, -half.sin(), 0.0];
+        let q_spin = [half.cos(), 0.0, half.sin(), 0.0];
         let chain = [
             BONE_WRIST,
             BONE_INDEX0,
@@ -1264,27 +1618,70 @@ mod tests {
         }
     }
 
-    /// Right-hand bone +X must point proximal (toward the parent),
-    /// matching the right vr_glove bind pose (children along -X).
-    /// Positions are never mirrored: the chain still lands on the true joints.
+/// Valve's two bind tables disagree on which way a bone's own +X runs: the
+    /// left hand points it distal (toward the child) and the right hand
+    /// proximal. Each hand's landmarks come from its own table, since the
+    /// tables are not mirrors of one another.
+    ///
+    /// The threshold matches the reference data: Valve's own bind axes score
+    /// 0.878/0.895 against their parent direction, so the bones are not exactly
+    /// axial and asking for 0.9 would fail on a perfect reconstruction.
     #[test]
-    fn world_right_x_axis_points_proximal() {
-        let bones = compute_world_bones(&image_hand(), &metric_hand(), true);
-        let (wpos, wrot) = compose_chain(&bones);
-        for (bone, parent) in [(BONE_INDEX1, BONE_INDEX0), (BONE_MIDDLE1, BONE_MIDDLE0)] {
-            let x_axis = quat_rot_vec(wrot[bone], [1.0, 0.0, 0.0]);
-            let to_parent = norm3(sub3(wpos[parent], wpos[bone]));
-            let dot =
-                x_axis[0] * to_parent[0] + x_axis[1] * to_parent[1] + x_axis[2] * to_parent[2];
-            assert!(
-                dot > 0.9,
-                "right bone {bone} +X should point at parent, dot={dot}"
-            );
+    fn bone_x_axis_follows_each_hands_bind_table() {
+        let img = image_hand();
+        for (is_right, toward_parent) in [(false, false), (true, true)] {
+            let wlm = bind_pose_landmarks_for(is_right);
+            let bones = if is_right {
+                compute_world_bones(&img, &wlm, true)
+            } else {
+                world_bones(&img, &wlm)
+            };
+let (_, wrot) = compose_chain(&bones);
+            // Measured against the bind table rather than the composed chain:
+            // the metacarpal stub lives in model space, so composing the
+            // parent-relative wire transforms back cannot reproduce it.
+            let wpos = compute_positions(&img, &wlm, is_right);
+            let bp = if is_right {
+                &BIND_POS_RIGHT
+            } else {
+                &BIND_POS_LEFT
+            };
+            let bq = if is_right {
+                &BIND_QUAT_RIGHT
+            } else {
+                &BIND_QUAT_LEFT
+            };
+            for (bone, parent, child) in [
+                (BONE_INDEX1, BONE_INDEX0, BONE_INDEX2),
+                (BONE_MIDDLE1, BONE_MIDDLE0, BONE_MIDDLE2),
+            ] {
+                let x_axis = quat_rot_vec(wrot[bone], [1.0, 0.0, 0.0]);
+                let target = if toward_parent { parent } else { child };
+                let to = norm3(sub3(bp[target], bp[bone]));
+                let dot = x_axis[0] * to[0] + x_axis[1] * to[1] + x_axis[2] * to[2];
+                let reference = vdot(quat_rot_vec(bq[bone], [1.0, 0.0, 0.0]), to);
+                assert!(
+                    dot >= reference - 1e-3,
+                    "right={is_right} bone {bone} +X should reach its bind \
+                     orientation (got {dot:.4}, bind {reference:.4})"
+                );
+            }
+            // Positions are never mirrored: each finger's reconstructed joints must land
+            // on that hand's own bind joints, tip included.
+            for (tip_bone, bind_tip) in [
+                (BONE_MIDDLE4, BONE_MIDDLE4),
+                (BONE_INDEX4, BONE_INDEX4),
+            ] {
+                let d = sub3(wpos[tip_bone], wpos[BONE_WRIST]);
+                let want = sub3(bp[bind_tip], bp[BONE_WRIST]);
+                let err = sub3(d, want);
+                let e = (err[0] * err[0] + err[1] * err[1] + err[2] * err[2]).sqrt();
+                assert!(
+                    e < 0.002,
+                    "right={is_right} bone {tip_bone} tip is {e:.4} m from its bind position"
+                );
+            }
         }
-        // Chain still reconstructs the true model joints (no mirror).
-        let tip = wpos[BONE_MIDDLE4];
-        let dt = (tip[0] * tip[0] + tip[1] * tip[1] + tip[2] * tip[2]).sqrt();
-        assert!((dt - 0.24).abs() < 0.05, "right middle tip span {dt}");
     }
 
     fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
@@ -1339,11 +1736,26 @@ mod tests {
     #[test]
     fn world_depth_order_matches_mediapipe() {
         let mut wlm = [fake_landmark(0.0, 0.0, 0.0); 21];
-        wlm[INDEX_TIP] = fake_landmark(0.0, 0.1, 0.05);
+        // The index chain laid straight along the depth axis at Valve's own bone
+        // lengths, so normalize_segments is a no-op and the composed depth has
+        // to come out at exactly the landmarks' depth.
+        let (l0, l1, l2) = (
+            vnorm(vsub(BIND_POS_LEFT[BONE_INDEX1], BIND_POS_LEFT[BONE_INDEX0])) * 0.0
+                + vnorm(vsub(BIND_POS_LEFT[BONE_INDEX2], BIND_POS_LEFT[BONE_INDEX1])),
+            vnorm(vsub(BIND_POS_LEFT[BONE_INDEX3], BIND_POS_LEFT[BONE_INDEX2])),
+            vnorm(vsub(BIND_POS_LEFT[BONE_INDEX4], BIND_POS_LEFT[BONE_INDEX3])),
+        );
+        wlm[INDEX_PIP] = fake_landmark(0.0, 0.0, l0);
+        wlm[INDEX_DIP] = fake_landmark(0.0, 0.0, l0 + l1);
+        wlm[INDEX_TIP] = fake_landmark(0.0, 0.0, l0 + l1 + l2);
         let bones = world_bones(&image_hand(), &wlm);
         let (wpos, _) = compose_chain(&bones);
         let z = wpos[BONE_INDEX4][2];
-        assert!((z + 0.05).abs() < 1e-5, "tip depth {z}, expected ~-0.05");
+        assert!(
+            (z + l0 + l1 + l2).abs() < 1e-5,
+            "tip depth {z}, expected ~{}",
+            -(l0 + l1 + l2)
+        );
     }
 
     /// Only `image_landmarks[0].x/.y` reach the skeleton (the wrist anchor);
@@ -1377,14 +1789,24 @@ mod tests {
     #[test]
     fn world_z_drives_the_distal_tip_swing() {
         let img = image_hand();
-        let mut wlm = metric_hand();
-        wlm[INDEX_TIP].z -= 0.03;
-        let (pos, _) = compose_chain(&compute_world_bones(&img, &wlm, false));
-        let (base, _) = compose_chain(&compute_world_bones(&img, &metric_hand(), false));
-        let swing = pos[BONE_INDEX4][2] - base[BONE_INDEX4][2];
+        // Asserted as a monotone response rather than a fixed depth: the tip now
+        // sits at Valve's bone length, so the raw z step reaches it through the
+        // normalization gain instead of unscaled. Direction and ordering are
+        // what this test is about, and those are what a fixed number would miss.
+        let swing_of = |dz: f32| {
+            let mut wlm = metric_hand();
+            wlm[INDEX_TIP].z -= dz;
+            let (pos, _) = compose_chain(&compute_world_bones(&img, &wlm, false));
+            let (base, _) = compose_chain(&compute_world_bones(&img, &metric_hand(), false));
+            pos[BONE_INDEX4][2] - base[BONE_INDEX4][2]
+        };
+        let small = swing_of(0.01);
+        let large = swing_of(0.03);
+        assert!(small > 0.0, "tip must track world z toward the user, got {small}");
         assert!(
-            swing > 0.02,
-            "tip should track world z toward the user, swing {swing}"
+            large > small,
+            "a larger world-z step gave a smaller swing ({large} vs {small}); \
+             the response has to be monotone"
         );
     }
 
@@ -1437,17 +1859,10 @@ mod tests {
             let bones = compute_world_bones(&image_hand(), &metric_hand(), is_right);
             let (wpos, wrot) = compose_chain(&bones);
             let sign = if is_right { -1.0 } else { 1.0 };
-            let palm_live = {
-                let idx = sub3(wpos[BONE_INDEX0], wpos[BONE_WRIST]);
-                let mid = sub3(wpos[BONE_MIDDLE0], wpos[BONE_WRIST]);
-                let c = [
-                    idx[1] * mid[2] - idx[2] * mid[1],
-                    idx[2] * mid[0] - idx[0] * mid[2],
-                    idx[0] * mid[1] - idx[1] * mid[0],
-                ];
-                let n = norm3(c);
-                [n[0] * sign, n[1] * sign, n[2] * sign]
-            };
+            let signed = |n: [f32; 3]| [n[0] * sign, n[1] * sign, n[2] * sign];
+            let palm_live = signed(
+                palm_plane_normal(&wpos).expect("live palm ring is non-degenerate"),
+            );
             // Bind palm in bone-local, pushed through the wrist orientation.
             let bp = if is_right {
                 &BIND_POS_RIGHT
@@ -1459,15 +1874,7 @@ mod tests {
             } else {
                 &BIND_QUAT_LEFT
             };
-            let idx_b = sub3(bp[BONE_INDEX0], bp[BONE_WRIST]);
-            let mid_b = sub3(bp[BONE_MIDDLE0], bp[BONE_WRIST]);
-            let cb = [
-                idx_b[1] * mid_b[2] - idx_b[2] * mid_b[1],
-                idx_b[2] * mid_b[0] - idx_b[0] * mid_b[2],
-                idx_b[0] * mid_b[1] - idx_b[1] * mid_b[0],
-            ];
-            let nb = norm3(cb);
-            let palm_bind = [nb[0] * sign, nb[1] * sign, nb[2] * sign];
+            let palm_bind = signed(palm_plane_normal(bp).expect("bind palm ring"));
             let local = norm3(quat_rot_vec(quat_conj(bq[BONE_WRIST]), palm_bind));
             let mapped = norm3(quat_rot_vec(wrot[BONE_WRIST], local));
             let dot =
@@ -1612,15 +2019,17 @@ mod tests {
         );
     }
 
-    /// The composed wrist orientation must take the bind wrist→middle0
-    /// segment onto the live one (bind+delta tracks palm roll).
+    /// The composed wrist orientation must take the bind wrist→middle-MCP
+    /// segment onto the live one. That segment is the basis reference axis, so
+    /// it also pins the palm-roll sign: getting it backwards spins the whole
+    /// hand the wrong way as the wrist turns.
     #[test]
     fn wrist_follows_palm_rotation() {
         let bones = world_bones(&image_hand(), &metric_hand());
         assert_bind_delta_maps_segments(&bones, false, "metric");
         let (wpos, wrot) = compose_chain(&bones);
-        let bd = norm3(sub3(BIND_POS_LEFT[BONE_MIDDLE0], BIND_POS_LEFT[BONE_WRIST]));
-        let ld = norm3(sub3(wpos[BONE_MIDDLE0], wpos[BONE_WRIST]));
+        let bd = norm3(sub3(BIND_POS_LEFT[BONE_MIDDLE1], BIND_POS_LEFT[BONE_WRIST]));
+        let ld = norm3(sub3(wpos[BONE_MIDDLE1], wpos[BONE_WRIST]));
         let local = norm3(quat_rot_vec(quat_conj(BIND_QUAT_LEFT[BONE_WRIST]), bd));
         let mapped = norm3(quat_rot_vec(wrot[BONE_WRIST], local));
         let dot = mapped[0] * ld[0] + mapped[1] * ld[1] + mapped[2] * ld[2];
@@ -1650,7 +2059,7 @@ mod tests {
         let img = image_hand();
         let wlm = metric_hand();
         let a = compute_world_bones(&img, &wlm, false);
-        let b = compute_world_bones_with_palm(&img, &wlm, false, Some([0.0, 0.0, 0.0]));
+        let b = compute_world_bones_with_palm(&img, &wlm, false, Some([0.0, 0.0, 0.0]), None);
         for i in 0..NUM_BONES {
             for k in 0..3 {
                 assert!((a[i].position[k] - b[i].position[k]).abs() < 1e-6);
@@ -1667,7 +2076,7 @@ mod tests {
         let img = image_hand();
         let wlm = metric_hand();
         let a = compute_world_bones(&img, &wlm, false);
-        let b = compute_world_bones_with_palm(&img, &wlm, false, Some([1.0, 0.0, 0.0]));
+        let b = compute_world_bones_with_palm(&img, &wlm, false, Some([1.0, 0.0, 0.0]), None);
         let mut diff = 0.0f32;
         for k in 0..4 {
             diff = diff.max((a[BONE_WRIST].orientation[k] - b[BONE_WRIST].orientation[k]).abs());
@@ -1678,24 +2087,34 @@ mod tests {
         );
     }
 
+    /// Feeding the caller-supplied normal must reproduce the position-derived
+    /// fallback exactly, so the wire override and the offline path cannot
+    /// disagree on wrist roll. Both sides build the normal the same way, which
+    /// is what makes this an identity check rather than a tolerance check.
     #[test]
     fn palm_override_preserves_left_and_right_wrist_frames() {
         let img = image_hand();
         let wlm = metric_hand();
-        let idx = [
-            wlm[INDEX_MCP].x - wlm[WRIST].x,
-            wlm[INDEX_MCP].y - wlm[WRIST].y,
-            wlm[INDEX_MCP].z - wlm[WRIST].z,
+        let mut live = [[0.0f32; 3]; NUM_BONES];
+        live[BONE_WRIST] = [
+            wlm[WRIST].x,
+            wlm[WRIST].y,
+            wlm[WRIST].z,
         ];
-        let mid = [
-            wlm[MIDDLE_MCP].x - wlm[WRIST].x,
-            wlm[MIDDLE_MCP].y - wlm[WRIST].y,
-            wlm[MIDDLE_MCP].z - wlm[WRIST].z,
-        ];
-        let palm = vnormalize(vcross(idx, mid));
+        for (bone, lm) in [
+            (BONE_INDEX1, INDEX_MCP),
+            (BONE_MIDDLE1, MIDDLE_MCP),
+            (BONE_RING1, RING_MCP),
+            (BONE_PINKY1, PINKY_MCP),
+        ] {
+            live[bone] = [wlm[lm].x, wlm[lm].y, wlm[lm].z];
+        }
+        let palm = palm_plane_normal(&live).expect("palm ring is non-degenerate");
         for is_right in [false, true] {
             let fallback = compute_world_bones(&img, &wlm, is_right);
-            let overridden = compute_world_bones_with_palm(&img, &wlm, is_right, Some(palm));
+            // The override arrives in MediaPipe axes, which is the same basis
+            // these world landmarks are in before the [x,-y,-z] conversion.
+            let overridden = compute_world_bones_with_palm(&img, &wlm, is_right, Some(palm), None);
             for k in 0..4 {
                 let diff = (fallback[BONE_WRIST].orientation[k]
                     - overridden[BONE_WRIST].orientation[k])
@@ -1786,12 +2205,46 @@ mod tests {
         [lm[b].x - lm[a].x, lm[b].y - lm[a].y, lm[b].z - lm[a].z]
     }
 
+
     fn angle_deg(a: [f32; 3], b: [f32; 3]) -> f32 {
         let (la, lb) = (vnorm(a), vnorm(b));
         if la < 1e-9 || lb < 1e-9 {
             return 0.0;
         }
         (vdot(a, b) / (la * lb)).clamp(-1.0, 1.0).acos().to_degrees()
+    }
+
+    /// Every phalange must reach the skeleton at Valve's own bone length. On a real
+    /// capture MediaPipe's phalanges arrive at 0.55-0.77x that, and SteamVR
+    /// skins the glove with Valve's inverse-bind matrices, so a short bone drags
+    /// the mesh and sweeps a shorter arc for the same joint angle — a pinky
+    /// abduction of 30 deg moves the tip 21 mm at capture scale against 33 mm at
+    /// bind scale, which is the fingers refusing to spread like a real hand.
+    #[test]
+    fn phalanges_arrive_at_valve_bone_lengths() {
+        let lm = captured_world();
+        let img = image_hand();
+        for is_right in [false, true] {
+            let (wp, _) = compose_chain(&compute_world_bones(&img, &lm, is_right));
+            let bind = if is_right {
+                &BIND_POS_RIGHT
+            } else {
+                &BIND_POS_LEFT
+            };
+            for i in 2..NUM_BONES {
+                if METACARPAL_BONES.contains(&i) {
+                    continue;
+                }
+                let Some((a, b)) = ORIENT_SEG[i] else { continue };
+                let got = vnorm(vsub(wp[b], wp[a]));
+                let want = vnorm(vsub(bind[b], bind[a]));
+                assert!(
+                    (got - want).abs() < 1e-5,
+                    "right={is_right} bone {a}->{b} is {:.4} m, Valve's is {want:.4} m",
+                    got
+                );
+            }
+        }
     }
 
     /// normalize_segments rescales every PARENT edge to its Valve bind length
@@ -1803,7 +2256,7 @@ mod tests {
     fn normalize_preserves_every_landmark_joint_angle() {
         let lm = captured_world();
         let img = [fake_landmark(0.5, 0.55, 0.0); 21];
-        let (wp, _) = compose_chain(&compute_world_bones_with_palm(&img, &lm, false, None));
+        let (wp, _) = compose_chain(&compute_world_bones_with_palm(&img, &lm, false, None, None));
         for (lm_mcp, lm_pip, lm_dip, lm_tip, b1, b2, b3, b4) in CAPTURED_CHAINS {
             for (la, lb, lc, ba, bb, bc) in [
                 (lm_mcp, lm_pip, lm_dip, b1, b2, b3),
@@ -1850,8 +2303,8 @@ mod tests {
     /// Landmarks rebuilt from Valve's bind pose, so every bone frame equals
     /// its bind orientation until a joint is deliberately curled. Inverts the
     /// [x, -y, -z] world conversion the pipeline applies.
-    fn bind_pose_landmarks() -> [Landmark; 21] {
-        let bp = &BIND_POS_LEFT;
+    fn bind_pose_landmarks_for(is_right: bool) -> [Landmark; 21] {
+        let bp = if is_right { &BIND_POS_RIGHT } else { &BIND_POS_LEFT };
         let un = |p: [f32; 3]| fake_landmark(p[0], -p[1], -p[2]);
         let mut lm = [fake_landmark(0.0, 0.0, 0.0); 21];
         lm[WRIST] = un(bp[BONE_WRIST]);
@@ -1880,6 +2333,10 @@ mod tests {
             lm[l] = un(bp[b]);
         }
         lm
+    }
+
+    fn bind_pose_landmarks() -> [Landmark; 21] {
+        bind_pose_landmarks_for(false)
     }
 
     /// Rodrigues rotation of `p` about the unit axis `palm` through `c`.
@@ -1950,6 +2407,365 @@ mod tests {
                  {prev_flexion:.1} deg"
             );
             prev_flexion = flexion;
+        }
+    }
+
+    /// A hand already at the Valve bind pose must produce an identity wrist
+    /// delta, both hands. Any standing offset between the bind basis and the
+    /// live basis shows up here as a rotation that never goes away no matter
+    /// how the wrist is turned.
+    #[test]
+    fn palm_basis_is_self_consistent_at_bind_pose() {
+        let img = [fake_landmark(0.5, 0.55, 0.0); 21];
+        for is_right in [false, true] {
+            // Each hand needs its own table: the right bind pose is not the left
+            // one mirrored, so feeding left landmarks to the right table would
+            // report a disagreement that is the fixture's, not the math's.
+            let lm = bind_pose_landmarks_for(is_right);
+            let bones = compute_world_bones(&img, &lm, is_right);
+            let (wpos, wrot) = compose_chain(&bones);
+            // The wrist bone sits at the wrist in both frames, so the wrist's
+            // world orientation IS the delta that was applied.
+            let applied = quat_mul(wrot[BONE_WRIST], quat_conj(if is_right {
+                BIND_QUAT_RIGHT[BONE_WRIST]
+            } else {
+                BIND_QUAT_LEFT[BONE_WRIST]
+            }));
+            let (axis, deg) = quat_axis_angle(applied);
+            assert!(
+                deg < 0.5,
+                "right={is_right} bind pose gave {deg:.2} deg of wrist delta \
+                 about {axis:?}; bind and live palm bases disagree"
+            );
+            let w = wpos[BONE_WRIST];
+            assert!(
+                (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]).sqrt() < 1e-3,
+                "right={is_right} wrist should sit at the model origin"
+            );
+        }
+    }
+
+    /// Angle between the wrist's applied rotation and identity, in degrees.
+    /// Compares how far two palm-normal constructions displace the wrist.
+    fn wrist_delta_deg(lm: &[Landmark; 21], palm_override: Option<[f32; 3]>, is_right: bool) -> f32 {
+        let img = [fake_landmark(0.5, 0.55, 0.0); 21];
+        let bones = compute_world_bones_with_palm(&img, lm, is_right, palm_override, None);
+        let (_, wrot) = compose_chain(&bones);
+        let bq = if is_right {
+            &BIND_QUAT_RIGHT
+        } else {
+            &BIND_QUAT_LEFT
+        };
+        let applied = quat_mul(wrot[BONE_WRIST], quat_conj(bq[BONE_WRIST]));
+        quat_axis_angle(applied).1.to_degrees()
+    }
+
+    /// The palm normal is the only input to the 3-DOF wrist roll, and it is
+    /// built from landmark positions, so its noise lands on wrist roll in full.
+    /// Displacing one MCP in depth must move the wrist less when the normal
+    /// uses the whole knuckle row (Newell over 5 points) than when it comes
+    /// from a single wrist x index cross product, whose two vectors are only
+    /// ~17.6 deg apart and therefore amplify depth error by ~3.3x.
+    #[test]
+    fn palm_normal_uses_all_mcp_joints() {
+        let mut lm = bind_pose_landmarks();
+        // Nudge the pinky MCP 4 mm in depth — a realistic MediaPipe world
+        // landmark error on the far edge of the knuckle row.
+        lm[PINKY_MCP].z -= 0.004;
+
+        let mut live = [[0.0f32; 3]; NUM_BONES];
+        live[BONE_WRIST] = [lm[WRIST].x, lm[WRIST].y, lm[WRIST].z];
+        for (bone, l) in [
+            (BONE_INDEX1, INDEX_MCP),
+            (BONE_MIDDLE1, MIDDLE_MCP),
+            (BONE_RING1, RING_MCP),
+            (BONE_PINKY1, PINKY_MCP),
+        ] {
+            live[bone] = [lm[l].x, lm[l].y, lm[l].z];
+        }
+        let plane = palm_plane_normal(&live).expect("palm ring is non-degenerate");
+        let cross2 = {
+            let a = sub3(live[BONE_INDEX1], live[BONE_WRIST]);
+            let b = sub3(live[BONE_MIDDLE1], live[BONE_WRIST]);
+            norm3(vcross(a, b))
+        };
+
+        let via_plane = wrist_delta_deg(&lm, Some(plane), false);
+        let via_cross = wrist_delta_deg(&lm, Some(cross2), false);
+        assert!(
+            via_plane < via_cross,
+            "5-point plane normal moved the wrist {via_plane:.2} deg, \
+             2-point cross product moved it {via_cross:.2} deg — the plane \
+             construction is supposed to be the quieter one"
+        );
+    }
+
+/// Valve's two bind tables are x-mirrors of each other (det < 0), so Newell's
+    /// method returns the same +X-ward normal on both and the pipeline's
+    /// `palm_sign` supplies the handedness. Pin the post-sign result against
+    /// Valve's bind orientation (left palm faces +X, right faces -X): getting
+    /// the winding backwards mirrors the palm, which renders as a glove worn on
+    /// the back of the hand.
+    #[test]
+    fn palm_normal_sign_matches_valve_bind_orientation() {
+        // Newell is sign-agnostic about which face it calls out, so winding it
+        // backwards mirrors the palm and renders as a glove on the back of
+        // the hand. The thumb orients it, and it must land on Valve's bind
+        // orientation: left palm +X, right palm -X.
+        let left = palm_plane_normal(&BIND_POS_LEFT).expect("left palm ring");
+        assert!(
+            left[0] > 0.9,
+            "left bind palm normal x={:.3} should point +X per Valve's bind pose",
+            left[0]
+        );
+        // The right table is the left reflected through x (M = diag(-1,1,1), det -1).
+        // A normal is a pseudovector, so it maps as det(M) * M * n, which flips
+        // y and z and leaves x alone. Production's palm_sign = -1 then lands
+        // the right hand on -X, matching Valve.
+        let right = palm_plane_normal(&BIND_POS_RIGHT).expect("right palm ring");
+        assert!(
+            right[0] < -0.9,
+            "right bind palm normal x={:.3} should point -X per Valve's bind pose",
+            right[0]
+        );
+        // The thumb decides the sign, not the raw winding.
+        for (bp, want) in [(&BIND_POS_LEFT, 1.0f32), (&BIND_POS_RIGHT, -1.0f32)] {
+            let n = palm_plane_normal(bp).expect("ring");
+            let thumb = norm3(sub3(bp[BONE_THUMB0], bp[BONE_WRIST]));
+            let d = n[0] * thumb[0] + n[1] * thumb[1] + n[2] * thumb[2];
+            assert!(
+                d < 0.0,
+                "palm normal {n:?} should face away from the thumb, dot={d}"
+            );
+            assert!(
+                (n[0] * want).abs() > 0.9,
+                "palm normal x={:.3} should land on {want:+.0}X",
+                n[0]
+            );
+        }
+    }
+
+    /// Real captured hand, on the real geometry the previous assertions were
+    /// measured from. MCP/PIP/DIP/TIP are copied from the landmarks, so they
+    /// must land exactly on the bind joints, and each metacarpal stub must sit
+    /// on Valve's axis at Valve's length — which is what keeps the error out of
+    /// every finger chain below it.
+    #[test]
+    fn captured_hand_reconstructs_bind_joints_exactly() {
+        let lm = captured_world();
+        let pos = compute_positions(&image_hand(), &lm, false);
+        for (lm_id, bone) in [
+            (INDEX_MCP, BONE_INDEX1),
+            (MIDDLE_DIP, BONE_MIDDLE3),
+            (PINKY_TIP, BONE_PINKY4),
+        ] {
+            let got = [lm[lm_id].x, -lm[lm_id].y, -lm[lm_id].z];
+            let d = sub3(pos[bone], got);
+            let e = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            assert!(e < 1e-6, "bone {bone} sits {e} m from landmark {lm_id}");
+        }
+        for (stub, mcp) in [
+            (BONE_INDEX0, BONE_INDEX1),
+            (BONE_MIDDLE0, BONE_MIDDLE1),
+            (BONE_RING0, BONE_RING1),
+            (BONE_PINKY0, BONE_PINKY1),
+        ] {
+            let d = sub3(pos[mcp], pos[stub]);
+            let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            // The bind stub→MCP distance, not the wrist→stub one. Valve's two
+            // are 74 vs 26 mm on the index, so a length taken from the wrong
+            // segment passes every orientation check and still collapses the
+            // knuckle row.
+            let len = vnorm(sub3(BIND_POS_LEFT[mcp], BIND_POS_LEFT[stub]));
+            assert!(
+                (l - len).abs() < 1e-6,
+                "bone {stub}->{mcp} is {l} m, bind length {len} m"
+            );
+            let axis = norm3(sub3(BIND_POS_LEFT[mcp], BIND_POS_LEFT[stub]));
+            let dir = norm3(d);
+            let dot = dir[0] * axis[0] + dir[1] * axis[1] + dir[2] * axis[2];
+            assert!(
+                dot > 0.9999,
+                "bone {stub} stub axis is {:.2} deg off Valve's metacarpal axis",
+                angle_deg(dir, axis)
+            );
+        }
+    }
+
+    /// Rolling the wrist must carry the whole hand, finger chains included,
+    /// by exactly that rotation. The metacarpal stub lives in model space, so
+    /// this is what catches it being pinned to the bind tables instead of
+    /// following the hand — which shears the fingers on a wrist turn.
+    #[test]
+    fn wrist_roll_carries_the_whole_skeleton() {
+        let base = captured_world();
+        let img = image_hand();
+        let (_, rot_base) = compose_chain(&world_bones(&img, &base));
+        let axis = [0.0f32, 1.0, 0.0];
+        let half = (20.0f32).to_radians() * 0.5;
+        let q_roll = [half.cos(), axis[0] * half.sin(), axis[1] * half.sin(), axis[2] * half.sin()];
+        let rolled: [Landmark; 21] = std::array::from_fn(|i| {
+            let p = [base[i].x, -base[i].y, -base[i].z];
+            let pivot = [base[0].x, -base[0].y, -base[0].z];
+            let d = sub3(p, pivot);
+            let r = quat_rot_vec(q_roll, d);
+            fake_landmark(
+                pivot[0] + r[0],
+                -(pivot[1] + r[1]),
+                -(pivot[2] + r[2]),
+            )
+        });
+        let (_, rot_rolled) = compose_chain(&world_bones(&img, &rolled));
+        for &i in &[
+            BONE_WRIST,
+            BONE_INDEX0,
+            BONE_INDEX1,
+            BONE_INDEX2,
+            BONE_MIDDLE0,
+            BONE_MIDDLE1,
+            BONE_MIDDLE2,
+            BONE_PINKY0,
+            BONE_PINKY1,
+        ] {
+            let skin_base = quat_mul(rot_base[i], quat_conj(BIND_QUAT_LEFT[i]));
+            let skin_rolled = quat_mul(rot_rolled[i], quat_conj(BIND_QUAT_LEFT[i]));
+            let want = quat_mul(q_roll, skin_base);
+            let dot = (want[0] * skin_rolled[0]
+                + want[1] * skin_rolled[1]
+                + want[2] * skin_rolled[2]
+                + want[3] * skin_rolled[3])
+                .abs();
+            assert!(
+                dot > 0.99,
+                "bone {i} skin does not follow the wrist roll, dot={dot:.4}"
+            );
+        }
+    }
+
+    /// Rolling the wrist one degree at a time must produce a quaternion stream
+    /// that never flips sign. `q` and `-q` are the same rotation, so the
+    /// geometry is unaffected, but SteamVR slerps between the frames it is
+    /// handed and the short way from `q` to `-q` is a full 360° — so a single
+    /// sign flip reads as the hand spinning once mid-roll.
+    ///
+    /// The old matrix-to-quaternion conversion picked its sign from whichever
+    /// of its four branches ran, and adjacent branches disagree, so the sign
+    /// flipped at fixed points in the roll (measured at 172° and 352° of a full
+    /// turn, dot −0.99985 between neighbours). Canonicalizing the sign removes
+    /// it: the largest component is always positive, with ties going to the
+    /// earliest index so the rule stays total.
+    #[test]
+    fn rolling_the_wrist_never_flips_a_quaternion_sign() {
+        let base = captured_world();
+        let img = image_hand();
+        let pivot = [base[0].x, -base[0].y, -base[0].z];
+        let mut prev: Option<[[f32; 4]; NUM_BONES]> = Some(
+            std::array::from_fn(|_| [1.0f32, 0.0, 0.0, 0.0]),
+        );
+        for step in 0..360 {
+            let a = (step as f32).to_radians();
+            let q_roll = [a.cos(), a.sin(), 0.0, 0.0];
+            let rolled: [Landmark; 21] = std::array::from_fn(|i| {
+                let p = [base[i].x, -base[i].y, -base[i].z];
+                let r = quat_rot_vec(q_roll, sub3(p, pivot));
+                fake_landmark(
+                    pivot[0] + r[0],
+                    -(pivot[1] + r[1]),
+                    -(pivot[2] + r[2]),
+                )
+            });
+            let bones = compute_world_bones_tracked(
+                &img,
+                &rolled,
+                false,
+                None,
+                prev.as_ref().unwrap(),
+            );
+            if let Some(p) = prev {
+                for i in 0..NUM_BONES {
+                    let dot: f32 = bones[i]
+                        .orientation
+                        .iter()
+                        .zip(p[i].iter())
+                        .map(|(x, y)| x * y)
+                        .sum();
+                    assert!(
+                        dot >= 0.0,
+                        "bone {i} flipped quaternion sign at roll step {step} \
+                         (dot {dot:+.5} between neighbours)"
+                    );
+                }
+            }
+            prev = Some(bones.map(|b| b.orientation));
+        }
+    }
+
+    #[test]
+    fn splay_survives_per_segment() {
+        let img = image_hand();
+        let base = captured_world();
+        let mut live = [[0.0f32; 3]; NUM_BONES];
+        for (bone, lm) in [
+            (BONE_WRIST, WRIST),
+            (BONE_THUMB0, THUMB_CMC),
+            (BONE_INDEX1, INDEX_MCP),
+            (BONE_MIDDLE1, MIDDLE_MCP),
+            (BONE_RING1, RING_MCP),
+            (BONE_PINKY1, PINKY_MCP),
+        ] {
+            let l = base[lm];
+            live[bone] = [l.x, -l.y, -l.z];
+        }
+        let palm = palm_plane_normal(&live).expect("palm ring");
+        for (name, chain, bones) in [
+            (
+                "index",
+                [INDEX_MCP, INDEX_PIP, INDEX_DIP, INDEX_TIP],
+                [BONE_INDEX1, BONE_INDEX2, BONE_INDEX3, BONE_INDEX4],
+            ),
+            (
+                "middle",
+                [MIDDLE_MCP, MIDDLE_PIP, MIDDLE_DIP, MIDDLE_TIP],
+                [BONE_MIDDLE1, BONE_MIDDLE2, BONE_MIDDLE3, BONE_MIDDLE4],
+            ),
+            (
+                "ring",
+                [RING_MCP, RING_PIP, RING_DIP, RING_TIP],
+                [BONE_RING1, BONE_RING2, BONE_RING3, BONE_RING4],
+            ),
+            (
+                "pinky",
+                [PINKY_MCP, PINKY_PIP, PINKY_DIP, PINKY_TIP],
+                [BONE_PINKY1, BONE_PINKY2, BONE_PINKY3, BONE_PINKY4],
+            ),
+        ] {
+            let (neutral, _) = compose_chain(&world_bones(&img, &base));
+            for seg in 0..3 {
+                // Abduct this phalanx and everything distal to it, about the
+                // palm normal through its own proximal joint.
+                let mut lm = base;
+                for k in seg..4 {
+                    let id = chain[k];
+                    let p = [lm[id].x, -lm[id].y, -lm[id].z];
+                    let pivot = [lm[chain[seg]].x, -lm[chain[seg]].y, -lm[chain[seg]].z];
+                    let r = rotate_about_palm(p, pivot, palm, 30.0f32.to_radians());
+                    lm[id] = fake_landmark(r[0], -r[1], -r[2]);
+                }
+                let (pos, _) = compose_chain(&world_bones(&img, &lm));
+                let want = norm3(vsub(
+                    [lm[chain[seg + 1]].x, -lm[chain[seg + 1]].y, -lm[chain[seg + 1]].z],
+                    [lm[chain[seg]].x, -lm[chain[seg]].y, -lm[chain[seg]].z],
+                ));
+                let neutral_dir = norm3(vsub(neutral[bones[seg + 1]], neutral[bones[seg]]));
+                let now = norm3(vsub(pos[bones[seg + 1]], pos[bones[seg]]));
+                let got = angle_deg(neutral_dir, now);
+                let expected = angle_deg(neutral_dir, want);
+                assert!(
+                    (got - expected).abs() < 0.5,
+                    "{name} segment {seg}: bones turned {got:.1} deg where the \
+                     landmarks say {expected:.1} deg — splay is being lost"
+                );
+            }
         }
     }
 }

@@ -7,12 +7,11 @@ import static org.junit.Assert.*;
 /**
  * Tests for CameraStreamer logic that pretend to be the bridge.
  *
- * These tests verify frame rate limiting, JPEG size guards, and stream
- * lifecycle without requiring a real camera or network.
+ * These tests verify uncapped latest-wins send, JPEG size guards, and
+ * stream lifecycle without requiring a real camera or network.
  */
 public class CameraStreamerTest {
 
-    private static final long FRAME_INTERVAL_MS = 1000 / 30; // 30 fps target
     private static final int JPEG_QUALITY = 38;
     private static final int TARGET_WIDTH = 256;
     private static final int TARGET_HEIGHT = 192;
@@ -22,19 +21,20 @@ public class CameraStreamerTest {
     }
 
     @Test
-    public void frameRateLimitingRejectsFastFrames() {
-        long lastFrameTime = System.currentTimeMillis();
-        long now = lastFrameTime + 20; // 20ms — less than 33ms interval
-        boolean shouldSend = (now - lastFrameTime) >= FRAME_INTERVAL_MS;
-        assertFalse("Frame at 20ms should be dropped", shouldSend);
+    public void uncappedSenderAcceptsBackToBackFrames() {
+        java.util.concurrent.atomic.AtomicBoolean senderBusy = new java.util.concurrent.atomic.AtomicBoolean(false);
+        boolean first = senderBusy.compareAndSet(false, true);
+        senderBusy.set(false);
+        boolean second = senderBusy.compareAndSet(false, true);
+        assertTrue("First back-to-back frame should be accepted", first);
+        assertTrue("Second back-to-back frame should be accepted once sender is free", second);
     }
 
     @Test
-    public void frameRateLimitingAllowsSlowFrames() {
-        long lastFrameTime = System.currentTimeMillis();
-        long now = lastFrameTime + 40; // 40ms — more than 33ms interval
-        boolean shouldSend = (now - lastFrameTime) >= FRAME_INTERVAL_MS;
-        assertTrue("Frame at 40ms should be sent", shouldSend);
+    public void busySenderDropsWithoutBlocking() {
+        java.util.concurrent.atomic.AtomicBoolean senderBusy = new java.util.concurrent.atomic.AtomicBoolean(true);
+        boolean accepted = senderBusy.compareAndSet(false, true);
+        assertFalse("Frame arriving while the sender is busy should be dropped", accepted);
     }
 
     @Test

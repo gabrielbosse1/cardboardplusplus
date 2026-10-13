@@ -194,7 +194,8 @@ public class CrossComponentContractTest {
 
     @Test
     public void cameraWireFormatMatchesBridgeParser() {
-        // Phone sends [u16 seq BE][JPEG 256x192] on 42072.
+        // Phone sends [u16 seq BE][JPEG] on 42072 at native capture size
+        // (at least the 256x192 floor); bridge decodes any size.
         assertEquals(2, AppConstants.CAMERA_SEQ_HEADER_LEN);
         assertEquals(256, AppConstants.CAMERA_STREAM_WIDTH);
         assertEquals(192, AppConstants.CAMERA_STREAM_HEIGHT);

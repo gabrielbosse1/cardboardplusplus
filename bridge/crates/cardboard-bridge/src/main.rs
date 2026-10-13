@@ -1,12 +1,6 @@
 slint::include_modules!();
-mod app;
-mod core;
-mod hand_overlay;
-mod hand_slots;
-mod net;
-mod ovr_bones;
 mod server;
-pub(crate) use app::debug_log;
+use cardboard_bridge::{app, core, net};
 use std::sync::Arc;
 use std::time::Duration;
 use core::AppCore;
@@ -221,6 +215,17 @@ fn wire_callbacks(core: &std::sync::Arc<AppCore>, ui: &MainWindow, reopen: &Wiza
                 core.apply_hand_model(det, pres, track);
             });
     }
+    seed_staged_ui(ui, core);
+}
+
+/// One-time seed for every value the user edits. The 50ms poller must not write these
+/// or the control under the cursor snaps back to the applied value mid-edit.
+fn seed_staged_ui(ui: &MainWindow, core: &AppCore) {
+    let state = ui.global::<BridgeState>();
+    let snap = core.status();
+    state.set_hand_det(snap.hand_min_detection);
+    state.set_hand_pres(snap.hand_min_presence);
+    state.set_hand_track(snap.hand_min_tracking);
 }
 /// Starts the two hub pollers: a 50ms fast loop for stats/preview frames and
 /// a 1s slow loop for the log view plus driver presence. Both leaked timers.
@@ -270,7 +275,7 @@ fn poll_stats(core: &Arc<AppCore>, weak: &slint::Weak<MainWindow>, last_test_res
     global.set_packets_total(snap.packets_total.min(i32::MAX as u64) as i32);
     global.set_gyro_fps(snap.gyro_fps);
     global.set_hand_fps(snap.hand_fps);
-    global.set_hands_detected(snap.camera_detected_hands as i32);
+    global.set_hands_detected(snap.hands_detected);
     global.set_preview_driver_fps(snap.preview_driver_fps);
     global.set_preview_bitrate_kbps(snap.preview_bitrate_kbps);
     global.set_preview_frames(snap.preview_frames.min(i32::MAX as u64) as i32);
@@ -279,9 +284,9 @@ fn poll_stats(core: &Arc<AppCore>, weak: &slint::Weak<MainWindow>, last_test_res
     global.set_camera_fps(snap.camera_fps);
     global.set_hand_enabled(snap.hand_enabled);
     global.set_hand_overlay(snap.hand_overlay);
-    global.set_hand_det(snap.hand_min_detection);
-    global.set_hand_pres(snap.hand_min_presence);
-    global.set_hand_track(snap.hand_min_tracking);
+    // Staged form values are deliberately NOT written here. This loop runs every 50ms,
+    // so anything it sets bounces straight back and the steppers/pills a user is
+    // dragging snap to the applied value. They are seeded once at startup instead.
     global.set_net_decoded_fps(snap.net_decoded_fps);
     global.set_net_stalls(snap.net_stalls as i32);
     global.set_gyro_x(format!("{:.2}", snap.latest_gyro_x).into());

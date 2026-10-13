@@ -1,5 +1,6 @@
 #include "HmdDriver.h"
 #include "DriverLog.h"
+#include "DebugLog.h"
 #include <cstring>
 using namespace vr;
 // Creates VideoEncoder at the default 1920x1080@60 with stored caps applied; called from HmdDriver::Activate.
@@ -114,6 +115,9 @@ bool HmdDriver::ApplyEncoderSettings(int w, int h, int fps, int bitrateBps, bool
 {
     WaitEncoderIdle();
     std::lock_guard<std::mutex> lock(m_encoderMutex);
+    DebugLog("%s: request %dx%d @%d fps, %d bps, gpu=%d (current %dx%d @%d, %d bps, gpu=%d)",
+             reason, w, h, fps, bitrateBps, useGpu ? 1 : 0,
+             m_encoderW, m_encoderH, m_encoderFps, m_encoderBitrate, m_encoderUseGpu ? 1 : 0);
     int newW = w, newH = h;
     if (!SanitizeEncoderDims(newW, newH)) {
         DriverLog("%s: rejecting bad dims %dx%d, keeping %dx%d",
@@ -123,6 +127,9 @@ bool HmdDriver::ApplyEncoderSettings(int w, int h, int fps, int bitrateBps, bool
     }
     int newFps = (fps >= 1 && fps <= 120) ? fps : m_encoderFps;
     int newBitrate = (bitrateBps >= 1000 && bitrateBps <= 100 * 1000 * 1000) ? bitrateBps : m_encoderBitrate;
+    if (newFps != fps || (bitrateBps >= 0 && newBitrate != bitrateBps)) {
+        DebugLog("%s: out-of-range values dropped -> fps=%d bps=%d", reason, newFps, newBitrate);
+    }
     bool newGpu = useGpu;
     int oldW = m_encoderW;
     int oldH = m_encoderH;
@@ -135,6 +142,8 @@ bool HmdDriver::ApplyEncoderSettings(int w, int h, int fps, int bitrateBps, bool
     m_encoderBitrate = newBitrate;
     m_encoderUseGpu = newGpu;
     ClampEncoderToCap();
+    DebugLog("%s: applied %dx%d @%d fps, %d bps, gpu=%d",
+             reason, m_encoderW, m_encoderH, m_encoderFps, m_encoderBitrate, m_encoderUseGpu ? 1 : 0);
     if (!m_encoderInitialized || !m_pVideoEncoder) {
         DriverLog("%s stored (encoder not ready, applied on init)", reason);
         return true;

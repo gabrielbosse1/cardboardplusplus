@@ -1,5 +1,6 @@
 #pragma once
 #include "openvr_driver.h"
+#include "GripLimit.h"
 #include <windows.h>
 #include <atomic>
 #include <cstdint>
@@ -8,11 +9,13 @@ using namespace vr;
 class HmdDriver;
 // Virtual hand-tracker device: receives skeleton bone data from the bridge
 // (via HmdDriver::GetSkeletonHand) and publishes it to SteamVR as a
-// skeletal-input controller. Created/destroyed dynamically by DeviceProvider
-// when hands appear/disappear.
+// skeletal-input hand/controller. Spawned once by DeviceProvider on the first
+// skeleton data and registered until driver shutdown; while no data arrives it
+// publishes a disconnected pose.
 class HandDriver : public ITrackedDeviceServerDriver
 {
 public:
+    static constexpr int BONE_COUNT = 31;
     HandDriver(HmdDriver* hmd, int handId);
     // SteamVR device lifecycle
     EVRInitError Activate(uint32_t unObjectId);
@@ -34,6 +37,10 @@ private:
     std::atomic<bool> m_active{false};
     DriverPose_t m_pose = {};
     // Bone cache for the current frame
-    static constexpr int BONE_COUNT = 31;
     VRBoneTransform_t m_bones[BONE_COUNT]{};
+    // Most-closed pose this hand may reach, in the parent's frame. SteamVR uses
+    // it as the reference for curl/splay and as the ceiling for skeletal
+    // motion, so a null value leaves the Index controller's fist in place and
+    // caps MCP flexion short of a real fist.
+    VRBoneTransform_t m_gripLimit[BONE_COUNT]{};
 };
