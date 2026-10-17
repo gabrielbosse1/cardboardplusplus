@@ -40,10 +40,15 @@ constexpr int kVelocityFilterCutoffFrequency = 6;
 
 constexpr uint64_t kPredictionTimeWithoutVsyncNanos = 50000000;
 
-// Walks a serialized cardboard::DeviceParams proto2 message, finds the
-// inter_lens_distance field (field 4, float), saves its value to *saved_ipd
-// and overwrites it with 0.0f in place. Returns true if the field was found.
-bool ZeroDeviceParamsIpd(uint8_t* data, int size, float* saved_ipd) {
+// Reads the inter_lens_distance field (field 4, float) from a serialized
+// cardboard::DeviceParams proto2 message without changing the profile. The SDK
+// uses this value to position the lens-distortion meshes around the viewer's
+// physical lenses; zeroing it collapses both views toward the screen center.
+bool ReadDeviceParamsIpd(const uint8_t* data, int size, float* saved_ipd) {
+  if (data == nullptr || size <= 0 || saved_ipd == nullptr) {
+    return false;
+  }
+
   constexpr uint32_t kInterLensDistanceField = 4;
   constexpr uint32_t kWireTypeVarint = 0;
   constexpr uint32_t kWireTypeFixed64 = 1;
@@ -107,8 +112,6 @@ bool ZeroDeviceParamsIpd(uint8_t* data, int size, float* saved_ipd) {
         }
         if (field == kInterLensDistanceField) {
           std::memcpy(saved_ipd, data + pos, sizeof(float));
-          const float zero = 0.0f;
-          std::memcpy(data + pos, &zero, sizeof(float));
           return true;
         }
         pos += 4;
@@ -220,9 +223,15 @@ CardboardPlusPlusApp::~CardboardPlusPlusApp() {
     glDeleteTextures(1, &video_texture_);
     video_texture_ = 0;
   }
-  CardboardHeadTracker_destroy(head_tracker_);
-  CardboardLensDistortion_destroy(lens_distortion_);
-  CardboardDistortionRenderer_destroy(distortion_renderer_);
+  if (head_tracker_ != nullptr) {
+    CardboardHeadTracker_destroy(head_tracker_);
+  }
+  if (lens_distortion_ != nullptr) {
+    CardboardLensDistortion_destroy(lens_distortion_);
+  }
+  if (distortion_renderer_ != nullptr) {
+    CardboardDistortionRenderer_destroy(distortion_renderer_);
+  }
 }
 
 void CardboardPlusPlusApp::OnSurfaceCreated(JNIEnv* env) {
@@ -404,18 +413,10 @@ void CardboardPlusPlusApp::OnPause() {
 void CardboardPlusPlusApp::OnResume() {
   CardboardHeadTracker_resume(head_tracker_);
 
-  // Parameters may have changed.
+  // Parameters may have changed while paused. UpdateDeviceParams() loads a
+  // saved viewer profile or falls back to the SDK's built-in Cardboard V1
+  // profile; opening the QR scanner is only an explicit SwitchViewer action.
   device_params_changed_ = true;
-
-  // Check for device parameters existence in external storage. If they're
-  // missing, we must scan a Cardboard QR code and save the obtained parameters.
-  uint8_t* buffer;
-  int size;
-  CardboardQrCode_getSavedDeviceParams(&buffer, &size);
-  if (size == 0) {
-    SwitchViewer();
-  }
-  CardboardQrCode_destroy(buffer);
 }
 
 void CardboardPlusPlusApp::SwitchViewer() {
@@ -423,54 +424,102 @@ void CardboardPlusPlusApp::SwitchViewer() {
 }
 
 bool CardboardPlusPlusApp::UpdateDeviceParams() {
-  // Checks if screen or device parameters changed
+  // A surface callback may not have arrived yet. Never render through the SDK
+  // until both distortion objects have been initialized successfully.
   if (!screen_params_changed_ && !device_params_changed_) {
-    return true;
+    return lens_distortion_ != nullptr && distortion_renderer_ != nullptr;
   }
-
-  // Get saved device parameters
-  uint8_t* buffer;
-  int size;
-  CardboardQrCode_getSavedDeviceParams(&buffer, &size);
-
-  // If there are no parameters saved yet, returns false.
-  if (size == 0) {
+  if (screen_width_ <= 0 || screen_height_ <= 0) {
     return false;
   }
 
-  // Save the viewer's real IPD (inter_lens_distance) before zeroing it so the
-  // lens distortion is built without eye separation; SteamVR applies the IPD.
-  std::vector<uint8_t> params(buffer, buffer + size);
-  CardboardQrCode_destroy(buffer);
-  if (ZeroDeviceParamsIpd(params.data(), static_cast<int>(params.size()),
-                          &saved_ipd_meters_)) {
-    LOGD("Saved viewer IPD %.3fm; lens distortion built with IPD = 0",
-         saved_ipd_meters_);
-  } else {
-    LOGW("inter_lens_distance not found in device params; IPD left untouched");
+  // Prefer a viewer profile saved by the user. Cardboard returns an empty
+  // buffer on a fresh install, so use its built-in Cardboard V1 profile rather
+  // than blocking rendering or trying to launch the QR scanner automatically.
+  uint8_t* saved_buffer = nullptr;
+  int saved_size = 0;
+  CardboardQrCode_getSavedDeviceParams(&saved_buffer, &saved_size);
+
+  std::vector<uint8_t> params;
+  if (saved_buffer != nullptr && saved_size > 0) {
+    params.assign(saved_buffer, saved_buffer + saved_size);
+  }
+  if (saved_buffer != nullptr) {
+    CardboardQrCode_destroy(saved_buffer);
   }
 
-  CardboardLensDistortion_destroy(lens_distortion_);
-  lens_distortion_ = CardboardLensDistortion_create(
-      params.data(), static_cast<int>(params.size()), screen_width_,
-      screen_height_);
+  if (params.empty()) {
+    uint8_t* default_buffer = nullptr;
+    int default_size = 0;
+    CardboardQrCode_getCardboardV1DeviceParams(&default_buffer, &default_size);
+    if (default_buffer == nullptr || default_size <= 0) {
+      LOGE("No saved viewer profile and the SDK Cardboard V1 defaults are "
+           "unavailable");
+      return false;
+    }
+    // The SDK owns this static buffer; copy it, but do not pass it to
+    // CardboardQrCode_destroy().
+    params.assign(default_buffer, default_buffer + default_size);
+    LOGW("No saved viewer profile; using the SDK's built-in Cardboard V1 "
+         "defaults");
+  }
 
-  GlSetup();
+  // Preserve the real inter-lens distance in the profile. It is required by
+  // Cardboard's distortion mesh to place two separate lenses. The HMD runtime's
+  // eye/IPD handling is independent of this optical calibration.
+  saved_ipd_meters_ = 0.0f;
+  if (ReadDeviceParamsIpd(params.data(), static_cast<int>(params.size()),
+                         &saved_ipd_meters_) &&
+      std::isfinite(saved_ipd_meters_) && saved_ipd_meters_ > 0.0f) {
+    LOGD("Viewer IPD %.3fm; preserving lens separation in Cardboard "
+         "distortion",
+         saved_ipd_meters_);
+  } else {
+    saved_ipd_meters_ = 0.0f;
+    LOGW("inter_lens_distance not found in device params; using SDK profile "
+         "values");
+  }
 
-  CardboardDistortionRenderer_destroy(distortion_renderer_);
+  CardboardLensDistortion* new_lens_distortion =
+      CardboardLensDistortion_create(params.data(),
+                                     static_cast<int>(params.size()),
+                                     screen_width_, screen_height_);
+  if (new_lens_distortion == nullptr) {
+    LOGE("Cardboard SDK could not create lens distortion from viewer "
+         "parameters");
+    return false;
+  }
+
   const CardboardOpenGlEsDistortionRendererConfig config{kGlTexture2D};
-  distortion_renderer_ = CardboardOpenGlEs2DistortionRenderer_create(&config);
+  CardboardDistortionRenderer* new_distortion_renderer =
+      CardboardOpenGlEs2DistortionRenderer_create(&config);
+  if (new_distortion_renderer == nullptr) {
+    CardboardLensDistortion_destroy(new_lens_distortion);
+    LOGE("Cardboard SDK could not create the distortion renderer");
+    return false;
+  }
 
   CardboardMesh left_mesh;
   CardboardMesh right_mesh;
-  CardboardLensDistortion_getDistortionMesh(lens_distortion_, kLeft,
+  CardboardLensDistortion_getDistortionMesh(new_lens_distortion, kLeft,
                                             &left_mesh);
-  CardboardLensDistortion_getDistortionMesh(lens_distortion_, kRight,
+  CardboardLensDistortion_getDistortionMesh(new_lens_distortion, kRight,
                                             &right_mesh);
-
-  CardboardDistortionRenderer_setMesh(distortion_renderer_, &left_mesh, kLeft);
-  CardboardDistortionRenderer_setMesh(distortion_renderer_, &right_mesh,
+  CardboardDistortionRenderer_setMesh(new_distortion_renderer, &left_mesh,
+                                      kLeft);
+  CardboardDistortionRenderer_setMesh(new_distortion_renderer, &right_mesh,
                                       kRight);
+
+  if (lens_distortion_ != nullptr) {
+    CardboardLensDistortion_destroy(lens_distortion_);
+  }
+  if (distortion_renderer_ != nullptr) {
+    CardboardDistortionRenderer_destroy(distortion_renderer_);
+  }
+  lens_distortion_ = new_lens_distortion;
+  distortion_renderer_ = new_distortion_renderer;
+
+  GlSetup();
 
   // Get eye matrices
   CardboardLensDistortion_getEyeFromHeadMatrix(lens_distortion_, kLeft,
