@@ -2,15 +2,23 @@
 #include "VideoEncoderFFmpeg.h"
 #include "VideoEncoderLog.h"
 #include "H264Utils.h"
+#include "DriverLog.h"
 #include <cstring>
 // Opens the H.264 codec (hardware candidates when useGpu, libx264 otherwise), the Annex-B filter, SPS/PPS cache, staging texture, and scale/frame state.
 bool VideoEncoder::InitializeFFmpeg()
 {
     ENCODER_LOG("Initializing FFmpeg H264 encoder...");
+#ifdef _WIN32
     const char* hwCandidates[] = { "h264_amf", "h264_nvenc", "h264_qsv", "libx264" };
+    const int hwCandidateCount = 4;
+#else
+    // VAAPI covers Intel/AMD; NVENC and QSV cover the NVIDIA/Intel discrete paths.
+    const char* hwCandidates[] = { "h264_vaapi", "h264_nvenc", "h264_qsv", "libx264" };
+    const int hwCandidateCount = 4;
+#endif
     const char* swCandidates[] = { "libx264" };
     const char** codecNames = m_useGpuEncoding ? hwCandidates : swCandidates;
-    const int codecNameCount = m_useGpuEncoding ? 4 : 1;
+    const int codecNameCount = m_useGpuEncoding ? hwCandidateCount : 1;
     const AVCodec* codec = nullptr;
     for (int n = 0; n < codecNameCount; n++) {
         const char* name = codecNames[n];
@@ -39,28 +47,64 @@ bool VideoEncoder::InitializeFFmpeg()
         m_pCodecContext->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
         bool isLibx264 = (strcmp(name, "libx264") == 0);
         bool isAmf     = (strcmp(name, "h264_amf") == 0);
+        bool isVaapi   = (strcmp(name, "h264_vaapi") == 0);
+#ifdef _WIN32
         if (isAmf) {
-            AVBufferRef* hwdev = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA);
-            if (hwdev) {
+            // AMF is the one encoder that still needs a host graphics device of its
+            // own; the encoder owns none, so it creates a private one here.
+            ID3D11Device* hostDevice = nullptr;
+            D3D_FEATURE_LEVEL level;
+            HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
+                                          nullptr, 0, D3D11_SDK_VERSION, &hostDevice,
+                                          &level, nullptr);
+            AVBufferRef* hwdev = (SUCCEEDED(hr)) ? av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA) : nullptr;
+            if (hwdev && hostDevice) {
                 AVD3D11VADeviceContext* d3d11va =
                     (AVD3D11VADeviceContext*)((AVHWDeviceContext*)hwdev->data)->hwctx;
-                d3d11va->device = m_pDevice;
-                m_pDevice->AddRef();
+                d3d11va->device = hostDevice;
+                hostDevice->AddRef();
                 if (av_hwdevice_ctx_init(hwdev) == 0) {
                     m_pHwDeviceCtx = hwdev;
                     m_pCodecContext->hw_device_ctx = av_buffer_ref(hwdev);
-                    ENCODER_LOG("Wrapped driver ID3D11Device for AMF");
+                    ENCODER_LOG("AMF running on a private host device");
                 } else {
-                    ENCODER_ERROR("Failed to init D3D11VA hw device for AMF");
+                    ENCODER_ERROR("Failed to init the AMF hardware device context");
                     av_buffer_unref(&hwdev);
+                    hostDevice->Release();
                 }
             } else {
-                ENCODER_ERROR("Failed to allocate D3D11VA hw device for AMF");
+                ENCODER_ERROR("Failed to create the AMF hardware device context");
+                if (hwdev) av_buffer_unref(&hwdev);
+                if (hostDevice) hostDevice->Release();
             }
             av_opt_set(m_pCodecContext->priv_data, "usage", "ultralowlatency", 0);
             av_opt_set(m_pCodecContext->priv_data, "rc", "cbr", 0);
             av_opt_set(m_pCodecContext->priv_data, "profile", "baseline", 0);
-        } else if (isLibx264) {
+        } else
+#else
+        if (isVaapi) {
+            // VAAPI takes the DRM render node and uploads the host-visible NV12 the
+            // Vulkan compute pass already produced.
+            AVBufferRef* hwdev = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_VAAPI);
+            if (hwdev) {
+                av_hwdevice_ctx_set_properties(hwdev, "device", "/dev/dri/renderD128", 0, nullptr, 0);
+                if (av_hwdevice_ctx_init(hwdev) == 0) {
+                    m_pHwDeviceCtx = hwdev;
+                    m_pCodecContext->hw_device_ctx = av_buffer_ref(hwdev);
+                    m_pCodecContext->pix_fmt = AV_PIX_FMT_VAAPI;
+                    ENCODER_LOG("VAAPI device /dev/dri/renderD128 ready");
+                } else {
+                    ENCODER_ERROR("Failed to init VAAPI hw device");
+                    av_buffer_unref(&hwdev);
+                }
+            } else {
+                ENCODER_ERROR("Failed to allocate VAAPI hw device");
+            }
+            av_opt_set(m_pCodecContext->priv_data, "rc_mode", "CBR", 0);
+            av_opt_set(m_pCodecContext->priv_data, "profile", "constrained_baseline", 0);
+        } else
+#endif
+        if (isLibx264) {
             av_opt_set(m_pCodecContext->priv_data, "preset", "ultrafast", 0);
             av_opt_set(m_pCodecContext->priv_data, "tune", "zerolatency", 0);
             av_opt_set(m_pCodecContext->priv_data, "profile", "baseline", 0);
@@ -148,22 +192,7 @@ bool VideoEncoder::InitializeFFmpeg()
     }
     ENCODER_LOG("Encoder name: %s, long name: %s",
                 codec->name, codec->long_name ? codec->long_name : "N/A");
-    D3D11_TEXTURE2D_DESC stagingDesc = {};
-    stagingDesc.Width = m_width;
-    stagingDesc.Height = m_height;
-    stagingDesc.MipLevels = 1;
-    stagingDesc.ArraySize = 1;
-    stagingDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    stagingDesc.SampleDesc.Count = 1;
-    stagingDesc.Usage = D3D11_USAGE_STAGING;
-    stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    HRESULT hr = m_pDevice->CreateTexture2D(&stagingDesc, nullptr, &m_pStagingTexture);
-    if (FAILED(hr)) {
-        ENCODER_ERROR("Failed to create staging texture! HRESULT: 0x%x", hr);
-        return false;
-    }
-    ENCODER_LOG("Staging texture created successfully");
-    m_pConvertContext = sws_getContext(
+m_pConvertContext = sws_getContext(
         m_width, m_height, AV_PIX_FMT_BGRA,
         m_width, m_height, AV_PIX_FMT_NV12,
         SWS_FAST_BILINEAR, nullptr, nullptr, nullptr
@@ -236,15 +265,51 @@ void VideoEncoder::CleanupFFmpeg()
     }
     ENCODER_LOG("FFmpeg resources cleaned up.");
 }
-// Converts the BGRA readback buffer to the NV12 software frame; runs on the encoding thread before FinishEncode.
+// Points the encoder frame at the GPU NV12 buffer produced by the Vulkan
+// compute pass; falls back to the CPU swscale conversion when that path did
+// not run for this frame.
+bool VideoEncoder::ConvertFrame()
+{
+    if (!m_pGpuNv12) return SwsConvert();
+    m_pFrame->data[0] = (uint8_t*)m_pGpuNv12;
+    m_pFrame->data[1] = (uint8_t*)m_pGpuNv12 + (size_t)m_width * m_height;
+    return true;
+}
+// Converts the BGRA frame source (Vulkan host copy map or D3D staging readback) to
+// the NV12 software frame; runs on the encoding thread before FinishEncode.
 bool VideoEncoder::SwsConvert()
 {
-    uint8_t* srcData = m_pReadbackBuffer;
+    uint8_t* srcData = m_pSwsSrc;
     int srcPitch = m_width * 4;
     if (!srcData) {
         ENCODER_ERROR("SwsConvert called without readback data!");
         return false;
     }
+    m_pFrame->data[0] = m_pSoftwareFrameBuffer;
+    m_pFrame->data[1] = m_pSoftwareFrameBuffer + m_width * m_height;
+#ifdef DRIVER_DIAG
+    {
+        // Rate-limited source brightness: 0 = black frame, 200-400 = real content.
+        uint64_t sum = 0;
+        int n = 0;
+        for (int y = 0; y < m_height; y += 8) {
+            const uint8_t* row = srcData + (size_t)y * srcPitch;
+            for (int x = 0; x < m_width; x += 8) {
+                const uint8_t* px = row + x * 4;
+                sum += (uint64_t)px[0] + px[1] + px[2];
+                n++;
+            }
+        }
+        static int s_diagSrc = 0;
+        static int s_blackStreak = 0;
+        uint64_t mean = sum / (uint64_t)(n > 0 ? n : 1);
+        bool periodic = ++s_diagSrc % 300 == 0;
+        if (mean < 4) s_blackStreak++; else s_blackStreak = 0;
+        if (periodic || (mean < 4 && s_blackStreak == 1)) {
+            ENCODER_LOG("[DIAG swssrc] meanRGB=%llu", (unsigned long long)mean);
+        }
+    }
+#endif
     uint8_t* srcSlice[1] = { srcData };
     int srcStride[1] = { srcPitch };
     uint8_t* dstSlice[2] = { m_pSoftwareFrameBuffer, m_pSoftwareFrameBuffer + m_width * m_height };
@@ -264,21 +329,20 @@ bool VideoEncoder::FinishEncode(int64_t pts)
         ENCODER_ERROR("FinishEncode called without valid encoder!");
         return false;
     }
-    LARGE_INTEGER t0, t1;
-    QueryPerformanceCounter(&t0);
+    uint64_t t0 = cbpp::PlatformNowUs();
     if (m_lastCallUs != 0) {
-        int64_t intervalUs = ((t0.QuadPart - m_lastCallUs) * 1000000) / m_perfFreq.QuadPart;
+        int64_t intervalUs = (int64_t)(t0 - m_lastCallUs);
         m_intervalSumUs += intervalUs;
         if (intervalUs > m_intervalMaxUs) m_intervalMaxUs = intervalUs;
         m_intervalCount++;
     }
-    m_lastCallUs = t0.QuadPart;
+    m_lastCallUs = t0;
     uint32_t hash = ComputeFrameHash();
     if (m_lastFrameHash != 0 && hash == m_lastFrameHash) m_dupCount++;
     m_lastFrameHash = hash;
     m_summaryFrames++;
-    m_pFrame->pts = pts;
     m_hasValidFrame = true;
+    m_pFrame->pts = pts;
     if (!SendFrameToEncoder()) {
         ENCODER_ERROR("Failed to send SBS frame to encoder!");
         return false;
@@ -287,8 +351,8 @@ bool VideoEncoder::FinishEncode(int64_t pts)
         ENCODER_ERROR("Failed to receive SBS encoded packets!");
         return false;
     }
-    QueryPerformanceCounter(&t1);
-    int64_t elapsedUs = ((t1.QuadPart - t0.QuadPart) * 1000000) / m_perfFreq.QuadPart;
+    uint64_t t1 = cbpp::PlatformNowUs();
+    int64_t elapsedUs = (int64_t)(t1 - t0);
     m_encSumUs += elapsedUs;
     if (elapsedUs > m_encMaxUs) m_encMaxUs = elapsedUs;
     m_encCount++;
@@ -411,15 +475,25 @@ void VideoEncoder::LogFFmpegVersion()
                 AV_VERSION_MICRO(swscale_version()));
 }
 // Samples the NV12 buffer for the duplicate-frame detector in FinishEncode.
+// Every 300th frame also logs the sampled mean brightness (0-255) so a black
+// frame is distinguishable from real content in the driver log.
 uint32_t VideoEncoder::ComputeFrameHash()
 {
     if (!m_pSoftwareFrameBuffer) return 0;
     const uint8_t* p = m_pSoftwareFrameBuffer;
     int total = m_width * m_height * 3 / 2;
     uint32_t h = 2166136261u;
+    uint64_t sum = 0;
+    int count = 0;
+    static unsigned s_nvFrame = 0;
     for (int i = 0; i < total; i += 1024) {
         h ^= p[i];
         h *= 16777619u;
+        sum += p[i];
+        count++;
+    }
+    if (++s_nvFrame % 300 == 0) {
+        DriverLog("NV-MEAN: frame=%u mean=%d", s_nvFrame, (int)(sum / (count > 0 ? count : 1)));
     }
     return h;
 }

@@ -13,18 +13,18 @@ static constexpr int kUdpChunkBytes = 1400;
 // abandons the whole buffer rather than its tail: the phone parses the stream as
 // 4-byte length-prefixed frames, so a partial frame would leave its declared
 // length unfulfilled and desync the reassembler for the rest of the stream.
-static void SendFramedUdp(SOCKET socket, const sockaddr_in* addr,
+static void SendFramedUdp(cbpp::PlatformSocket socket, const sockaddr_in* addr,
                           const uint8_t* framed, int framedSize,
                           uint32_t* droppedCounter)
 {
     int offset = 0;
     while (offset < framedSize) {
         int chunkSize = (framedSize - offset > kUdpChunkBytes) ? kUdpChunkBytes : (framedSize - offset);
-        int res = sendto(socket, (const char*)(framed + offset), chunkSize, 0,
-                         (sockaddr*)addr, sizeof(*addr));
-        if (res == SOCKET_ERROR) {
-            int err = WSAGetLastError();
-            if (err == WSAEWOULDBLOCK) {
+        long res = (long)sendto(socket, (const char*)(framed + offset), chunkSize, 0,
+                                (sockaddr*)addr, sizeof(*addr));
+        if (res < 0) {
+            int err = cbpp::PlatformSocketError();
+            if (cbpp::PlatformWouldBlock(err)) {
                 (*droppedCounter)++;
                 if (*droppedCounter % 30 == 1) {
                     DriverLog("[UDP] Send buffer full, dropping frame (dropped=%d)", (int)*droppedCounter);
@@ -42,26 +42,23 @@ static void SendFramedUdp(SOCKET socket, const sockaddr_in* addr,
     }
 }
 }
-// Starts Winsock plus the non-blocking video socket; preview points at localhost, the phone target waits for discovery.
+// Starts the socket layer plus the non-blocking video socket; preview points at localhost, the phone target waits for discovery.
 bool HmdDriver::InitializeUDP()
 {
     DriverLog("Initializing UDP socket...");
-    WSADATA wsaData;
-    int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
-    if (result != 0) {
-        DriverLog("WSAStartup failed! Error: %d", result);
+    if (!cbpp::PlatformStartupNetworking()) {
+        DriverLog("Socket startup failed! Error: %d", cbpp::PlatformSocketError());
         return false;
     }
     m_udpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (m_udpSocket == INVALID_SOCKET) {
-        DriverLog("socket() failed! WSAError: %d", WSAGetLastError());
-        WSACleanup();
+    if (m_udpSocket == cbpp::kInvalidSocket) {
+        DriverLog("socket() failed! Error: %d", cbpp::PlatformSocketError());
+        cbpp::PlatformShutdownNetworking();
         return false;
     }
     int bufSize = 1024 * 1024;
     setsockopt(m_udpSocket, SOL_SOCKET, SO_SNDBUF, (const char*)&bufSize, sizeof(bufSize));
-    u_long nonBlocking = 1;
-    ioctlsocket(m_udpSocket, FIONBIO, &nonBlocking);
+    cbpp::PlatformSetNonBlocking(m_udpSocket);
     m_previewAddr.sin_family = AF_INET;
     m_previewAddr.sin_port = htons(wire::kDataPort);
     inet_pton(AF_INET, "127.0.0.1", &m_previewAddr.sin_addr);
@@ -73,22 +70,22 @@ bool HmdDriver::InitializeUDP()
     DriverLog("UDP socket initialized. Preview target 127.0.0.1:%d always on; phone target added on discovery", wire::kDataPort);
     return true;
 }
-// Closes the video socket and tears down Winsock; called from Deactivate.
+// Closes the video socket and releases the socket layer; called from Deactivate.
 void HmdDriver::ShutdownUDP()
 {
     DriverLog("Shutting down UDP socket...");
-    if (m_udpSocket != INVALID_SOCKET) {
-        closesocket(m_udpSocket);
-        m_udpSocket = INVALID_SOCKET;
+    if (m_udpSocket != cbpp::kInvalidSocket) {
+        cbpp::PlatformCloseSocket(m_udpSocket);
+        m_udpSocket = cbpp::kInvalidSocket;
     }
     m_udpInitialized = false;
-    WSACleanup();
+    cbpp::PlatformShutdownNetworking();
     DriverLog("UDP socket shutdown complete.");
 }
 // Encoder callback on the encoding thread; repairs a missing IDR marker, adds the 4-byte length header for the phone, and fans out.
 void HmdDriver::OnEncodedPacket(uint8_t* data, int size, int64_t pts, bool keyframe)
 {
-    if (!m_udpInitialized || m_udpSocket == INVALID_SOCKET || !data || size <= 0) {
+    if (!m_udpInitialized || m_udpSocket == cbpp::kInvalidSocket || !data || size <= 0) {
         return;
     }
     if (keyframe && size >= 8) {

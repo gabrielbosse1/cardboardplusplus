@@ -1,13 +1,12 @@
 #pragma once
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
+#include "Platform.h"
+#ifdef _WIN32
 #include <d3d11.h>
+#endif
 #include "openvr_driver.h"
+#include "GpuImage.h"
 #include "VideoEncoder.h"
+#include "VulkanContext.h"
 #include "BridgeServer.h"
 #include <map>
 #include <vector>
@@ -17,13 +16,23 @@
 #include <mutex>
 #include <condition_variable>
 #include <memory>
-#pragma comment(lib, "ws2_32.lib")
 using namespace vr;
 // Triple-buffered eye textures shared with the SteamVR compositor; nextIndex rotates the write slot.
 struct SwapTextureSet {
-    ID3D11Texture2D* pTextures[3];
-    HANDLE hSharedHandles[3];
-    uint32_t nextIndex;
+#ifdef _WIN32
+    ID3D11Texture2D* images[3] = {};
+    HANDLE sharedHandles[3] = {};
+#else
+    // Linux exports each image as a dma-buf fd; the compositor imports the memory
+    // with VK_KHR_external_memory_fd and hands the fd back through SubmitLayer.
+    VkImage images[3] = {};
+    VkDeviceMemory memory[3] = {};
+    int fds[3] = {};
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t format = 0;
+#endif
+    uint32_t nextIndex = 0;
 };
 // One queued compositor layer with per-eye texture handles and UV bounds; filled by SubmitLayer, drained by Present.
 struct SubmitLayerInfo {
@@ -32,16 +41,13 @@ struct SubmitLayerInfo {
     vr::VRTextureBounds_t boundsLeft;
     vr::VRTextureBounds_t boundsRight;
 };
-// Frame handed from the Present thread to the encoding thread; layers carry shared handles plus bounds.
-// Per-layer eye handles with bounds; the encoding thread opens these on its own D3D device.
+// Frame handed from the Present thread to the encoding thread.
 struct PendingFrame {
-    ID3D11Texture2D* pLeft;
-    ID3D11Texture2D* pRight;
     int64_t pts;
     bool valid;
     struct PendingLayer {
-        HANDLE hLeft = nullptr;
-        HANDLE hRight = nullptr;
+        GpuImage left;
+        GpuImage right;
         vr::VRTextureBounds_t boundsLeft;
         vr::VRTextureBounds_t boundsRight;
     };
@@ -109,17 +115,27 @@ private:
     bool AcquireSyncTexture(vr::SharedTextureHandle_t syncTexture);
     void ReleaseSyncTexture();
     void WaitEncoderIdle();
-// Device, swap-set, and sync-texture state; maps connect compositor handles to D3D textures owned here.
+// Device, swap-set, and sync-texture state; maps connect compositor handles to the textures owned here.
     uint32_t m_driverId;
-    ID3D11Device* m_pD3D11Device;
-    ID3D11DeviceContext* m_pD3D11DeviceContext;
+#ifdef _WIN32
+    ID3D11Device* m_pHostDevice;
+    ID3D11DeviceContext* m_pHostContext;
+#endif
+    VulkanContext m_vulkan;
+    bool InitializeVulkan();
     std::map<uint32_t, std::vector<std::shared_ptr<SwapTextureSet>>> m_swapTextureSets;
-    std::map<vr::SharedTextureHandle_t, ID3D11Texture2D*> m_textureHandleMap;
     std::map<vr::SharedTextureHandle_t, std::shared_ptr<SwapTextureSet>> m_setByHandle;
-    HANDLE m_cachedSyncHandle;
+    uint64_t m_cachedSyncHandle = 0;
+    bool m_syncAcquired = false;
+#ifdef _WIN32
+    std::map<vr::SharedTextureHandle_t, ID3D11Texture2D*> m_textureHandleMap;
     ID3D11Texture2D* m_pSyncTexture;
     IDXGIKeyedMutex* m_pSyncMutex;
-    bool m_syncAcquired = false;
+#else
+    // Compositor sync arrives as an external semaphore fd; it is imported once per
+    // handle and waited on in Present.
+    VkSemaphore m_syncSemaphore = VK_NULL_HANDLE;
+#endif
 // Encode queue + encoder config; Present produces PendingFrame, the encoding thread consumes it under m_encoderMutex.
     std::thread m_encodingThread;
     std::atomic<bool> m_encodingRunning;
@@ -147,9 +163,13 @@ private:
         HANDLE hLeft = nullptr;
         ID3D11Texture2D* pRight = nullptr;
         HANDLE hRight = nullptr;
+        IDXGIKeyedMutex* syncLeft = nullptr;
+        IDXGIKeyedMutex* syncRight = nullptr;
+        bool leftSyncHeld = false;
+        bool rightSyncHeld = false;
         int width = 0;
         int height = 0;
-        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+        uint32_t format = 0;
     };
     std::vector<LayerCopy> m_layerCopies;
     bool EnsureLayerCopies(const std::vector<SubmitLayerInfo>& layers);
@@ -162,7 +182,7 @@ private:
     std::vector<SubmitLayerInfo> m_submitLayers;
     std::mutex m_submitLayersMutex;
     std::atomic<bool> m_hasSubmit{false};
-    SOCKET m_udpSocket;
+    cbpp::PlatformSocket m_udpSocket = cbpp::kInvalidSocket;
     sockaddr_in m_serverAddr;
     sockaddr_in m_previewAddr;
     std::atomic<bool> m_hasPhoneTarget{false};
@@ -173,13 +193,13 @@ private:
     std::atomic<uint64_t> m_udpFramesSent{0};
     std::vector<uint8_t> m_scratchFixed;
     std::vector<uint8_t> m_scratchFramed;
-    SOCKET m_discoverySocket;
+    cbpp::PlatformSocket m_discoverySocket = cbpp::kInvalidSocket;
     bool m_discoveryInitialized;
     std::atomic<bool> m_discoveryRunning;
     std::thread m_discoveryThread;
     std::mutex m_targetIpMutex;
     std::atomic<long long> m_lastPhonePacketMs{0};
-    SOCKET m_sensorSocket;
+    cbpp::PlatformSocket m_sensorSocket = cbpp::kInvalidSocket;
     bool m_sensorInitialized;
     std::atomic<bool> m_sensorRunning;
     std::thread m_sensorThread;

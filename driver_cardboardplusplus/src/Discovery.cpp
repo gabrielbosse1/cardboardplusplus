@@ -27,28 +27,27 @@ bool HmdDriver::InitializeDiscovery()
 {
     DriverLog("Initializing UDP discovery socket...");
     m_discoverySocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (m_discoverySocket == INVALID_SOCKET) {
-        DriverLog("discovery socket() failed! WSAError: %d", WSAGetLastError());
+    if (m_discoverySocket == cbpp::kInvalidSocket) {
+        DriverLog("discovery socket() failed! Error: %d", cbpp::PlatformSocketError());
         return false;
     }
-    BOOL broadcast = TRUE;
+    int broadcast = 1;
     setsockopt(m_discoverySocket, SOL_SOCKET, SO_BROADCAST, (const char*)&broadcast, sizeof(broadcast));
-    BOOL reuseAddr = TRUE;
+    int reuseAddr = 1;
     setsockopt(m_discoverySocket, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuseAddr, sizeof(reuseAddr));
     sockaddr_in addr;
     addr.sin_family = AF_INET;
     addr.sin_port = htons(wire::kDiscoveryPort);
     addr.sin_addr.s_addr = INADDR_ANY;
-    if (bind(m_discoverySocket, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        DriverLog("discovery bind() failed! WSAError: %d", WSAGetLastError());
-        closesocket(m_discoverySocket);
-        m_discoverySocket = INVALID_SOCKET;
+    if (bind(m_discoverySocket, (sockaddr*)&addr, sizeof(addr)) < 0) {
+        DriverLog("discovery bind() failed! Error: %d", cbpp::PlatformSocketError());
+        cbpp::PlatformCloseSocket(m_discoverySocket);
+        m_discoverySocket = cbpp::kInvalidSocket;
         return false;
     }
     m_discoveryInitialized = true;
     m_discoveryRunning = true;
-    DWORD recvTimeout = 1000;
-    setsockopt(m_discoverySocket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&recvTimeout, sizeof(recvTimeout));
+    cbpp::PlatformSetRecvTimeout(m_discoverySocket, 1000);
     m_discoveryThread = std::thread(&HmdDriver::DiscoveryThreadFunc, this);
     DriverLog("UDP discovery socket initialized. Listening on port %d", wire::kDiscoveryPort);
     return true;
@@ -59,22 +58,22 @@ void HmdDriver::ShutdownDiscovery()
     DriverLog("Shutting down UDP discovery...");
     if (m_discoveryInitialized) {
         m_discoveryRunning = false;
-        SOCKET wakeSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        if (wakeSocket != INVALID_SOCKET) {
+        cbpp::PlatformSocket wakeSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (wakeSocket != cbpp::kInvalidSocket) {
             sockaddr_in localAddr;
             localAddr.sin_family = AF_INET;
             localAddr.sin_port = htons(wire::kDiscoveryPort);
             inet_pton(AF_INET, "127.0.0.1", &localAddr.sin_addr);
             sendto(wakeSocket, wire::kDiscoveryWakeup, (int)wire::kDiscoveryWakeupLen, 0,
                    (sockaddr*)&localAddr, sizeof(localAddr));
-            closesocket(wakeSocket);
+            cbpp::PlatformCloseSocket(wakeSocket);
         }
         if (m_discoveryThread.joinable()) {
             m_discoveryThread.join();
         }
-        if (m_discoverySocket != INVALID_SOCKET) {
-            closesocket(m_discoverySocket);
-            m_discoverySocket = INVALID_SOCKET;
+        if (m_discoverySocket != cbpp::kInvalidSocket) {
+            cbpp::PlatformCloseSocket(m_discoverySocket);
+            m_discoverySocket = cbpp::kInvalidSocket;
         }
         m_discoveryInitialized = false;
     }
@@ -87,16 +86,16 @@ void HmdDriver::DiscoveryThreadFunc()
     char buffer[256] = {};
     sockaddr_in senderAddr;
     int senderAddrLen = sizeof(senderAddr);
-    static const DWORD kPhoneTimeoutMs = 5000;
+    static const uint32_t kPhoneTimeoutMs = 5000;
     while (m_discoveryRunning) {
         int bytesReceived = recvfrom(m_discoverySocket, buffer, sizeof(buffer) - 1, 0,
                                      (sockaddr*)&senderAddr, &senderAddrLen);
         if (!m_discoveryRunning) {
             break;
         }
-        if (bytesReceived == SOCKET_ERROR) {
-            int err = WSAGetLastError();
-            if (err == WSAETIMEDOUT) {
+        if (bytesReceived < 0) {
+            int err = cbpp::PlatformSocketError();
+            if (cbpp::PlatformTimedOut(err) || cbpp::PlatformInterrupted(err)) {
             } else {
                 DriverLog("Discovery recvfrom error: %d", err);
             }
@@ -110,7 +109,7 @@ void HmdDriver::DiscoveryThreadFunc()
             if (strncmp(buffer, wire::kCardboardCap, wire::kCardboardCapLen) == 0) {
                 int capW = 0;
                 int capH = 0;
-                if (sscanf_s(buffer, "CARDBOARD_CAP %d %d", &capW, &capH) == 2) {
+                if (cbpp::PlatformParseInts(buffer, "CARDBOARD_CAP", capW, capH)) {
                     DriverLog("Hardware decoder cap received from %s: %dx%d", senderIpStr, capW, capH);
                     ApplyHardwareCap(capW, capH);
                 } else {
@@ -137,7 +136,8 @@ void HmdDriver::DiscoveryThreadFunc()
             }
             if (strncmp(buffer, wire::kBridgePreview, wire::kBridgePreviewLen) == 0) {
                 int previewVal = -1;
-                if (sscanf_s(buffer, "BRIDGE_PREVIEW %d", &previewVal) == 1) {
+                int previewIgnored = 0;
+                if (cbpp::PlatformParseInts(buffer, "BRIDGE_PREVIEW", previewVal, previewIgnored)) {
                     bool enabled = (previewVal != 0);
                     m_previewEnabled.store(enabled, std::memory_order_relaxed);
                     DebugLog("BRIDGE_PREVIEW from %s:%d -> local preview %s", senderIpStr, ntohs(senderAddr.sin_port), enabled ? "ON" : "OFF");
@@ -149,7 +149,8 @@ void HmdDriver::DiscoveryThreadFunc()
             if (strncmp(buffer, wire::kBridgeCfg, wire::kBridgeCfgLen) == 0) {
                 int cfgFps = 0, cfgKbps = 0;
                 char cfgCodec[32] = "";
-                if (sscanf_s(buffer, "BRIDGE_CFG %d %d %31s", &cfgFps, &cfgKbps, cfgCodec, (unsigned)sizeof(cfgCodec)) >= 2) {
+                if (cbpp::PlatformParseInts(buffer, "BRIDGE_CFG", cfgFps, cfgKbps) &&
+                    cbpp::PlatformParseWord(buffer, "BRIDGE_CFG", cfgCodec, sizeof(cfgCodec))) {
                     DriverLog("BRIDGE_CFG from %s:%d -> fps=%d bitrate=%d kbps codec=%s",
                               senderIpStr, ntohs(senderAddr.sin_port), cfgFps, cfgKbps, cfgCodec);
                     ApplyBridgeCfg(cfgFps, cfgKbps, cfgCodec);
@@ -159,7 +160,7 @@ void HmdDriver::DiscoveryThreadFunc()
                 continue;
             }
             if (strncmp(buffer, wire::kKeyframeReq, wire::kKeyframeReqLen) == 0) {
-                m_lastPhonePacketMs.store(GetTickCount64(), std::memory_order_relaxed);
+                m_lastPhonePacketMs.store(cbpp::PlatformNowMs(), std::memory_order_relaxed);
                 if (m_pVideoEncoder) {
                     m_pVideoEncoder->RequestKeyframe();
                 }
@@ -168,7 +169,7 @@ void HmdDriver::DiscoveryThreadFunc()
             }
             if (IsPhoneDiscoveryPacket(buffer, bytesReceived)) {
                 SwitchDataTarget(senderIpStr);
-                m_lastPhonePacketMs.store(GetTickCount64(), std::memory_order_relaxed);
+                m_lastPhonePacketMs.store(cbpp::PlatformNowMs(), std::memory_order_relaxed);
                 sockaddr_in responseAddr;
                 responseAddr.sin_family = AF_INET;
                 responseAddr.sin_port = senderAddr.sin_port;
@@ -202,7 +203,7 @@ void HmdDriver::DiscoveryThreadFunc()
             }
         }
         if (m_hasPhoneTarget.load(std::memory_order_relaxed)) {
-            long long now = GetTickCount64();
+            long long now = cbpp::PlatformNowMs();
             long long last = m_lastPhonePacketMs.load(std::memory_order_relaxed);
             if (last > 0 && (now - last) > kPhoneTimeoutMs) {
                 DriverLog("Phone timed out (%lld ms since last packet), clearing data target", now - last);

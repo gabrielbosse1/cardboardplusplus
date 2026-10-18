@@ -46,21 +46,13 @@ void HmdDriver::EncodePendingFrame(const PendingFrame& frame)
         }
         stageStart = std::chrono::steady_clock::now();
     };
-    std::vector<std::pair<HANDLE, HANDLE>> handles;
-    handles.reserve(frame.layers.size());
-    for (const auto& l : frame.layers)
-        handles.push_back({ l.hLeft, l.hRight });
-    std::vector<ID3D11Texture2D*> pLefts, pRights;
-    if (!m_pVideoEncoder->OpenSharedEyeTextures(handles, pLefts, pRights)) {
-        DriverLog("OpenSharedEyeTextures failed for pts=%lld", (long long)frame.pts);
-        return;
+    std::vector<GpuImage> lefts, rights;
+    lefts.reserve(frame.layers.size());
+    rights.reserve(frame.layers.size());
+    for (const auto& l : frame.layers) {
+        lefts.push_back(l.left);
+        rights.push_back(l.right);
     }
-    noteStage("OpenSharedEyeTextures");
-    if (pLefts.empty()) {
-        m_pVideoEncoder->ReleaseEyeTextures();
-        return;
-    }
-    noteStage("OpenSharedEyeTextures");
     std::vector<VideoEncoder::LayerBounds> lbL, lbR;
     lbL.reserve(frame.layers.size());
     lbR.reserve(frame.layers.size());
@@ -68,9 +60,8 @@ void HmdDriver::EncodePendingFrame(const PendingFrame& frame)
         lbL.push_back({ l.boundsLeft.uMin, l.boundsLeft.vMin, l.boundsLeft.uMax, l.boundsLeft.vMax });
         lbR.push_back({ l.boundsRight.uMin, l.boundsRight.vMin, l.boundsRight.uMax, l.boundsRight.vMax });
     }
-    if (!m_pVideoEncoder->ComposeSBSGPU(pLefts, pRights, lbL, lbR)) {
+    if (!m_pVideoEncoder->ComposeSBSGPU(lefts, rights, lbL, lbR)) {
         DriverLog("ComposeSBSGPU failed for pts=%lld", (long long)frame.pts);
-        m_pVideoEncoder->ReleaseEyeTextures();
         return;
     }
     noteStage("ComposeSBSGPU");
@@ -83,15 +74,14 @@ void HmdDriver::EncodePendingFrame(const PendingFrame& frame)
                       (long long)frame.pts, s_readbackFailCount);
         }
         noteStage("ReadbackToBuffer");
-        m_pVideoEncoder->ReleaseEyeTextures();
         return;
     }
     noteStage("ReadbackToBuffer");
-    if (!m_pVideoEncoder->SwsConvert()) {
-        DriverLog("SwsConvert failed for pts=%lld", (long long)frame.pts);
+    if (!m_pVideoEncoder->ConvertFrame()) {
+        DriverLog("ConvertFrame failed for pts=%lld", (long long)frame.pts);
         return;
     }
-    noteStage("SwsConvert");
+    noteStage("ConvertFrame");
     if (!m_pVideoEncoder->FinishEncode(frame.pts)) {
         DriverLog("FinishEncode failed for pts=%lld", (long long)frame.pts);
     }

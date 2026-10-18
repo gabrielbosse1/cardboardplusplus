@@ -1,311 +1,87 @@
 #include "VideoEncoder.h"
 #include "VideoEncoderFFmpeg.h"
 #include "VideoEncoderLog.h"
+#include "VulkanCompose.h"
+#define DRIVER_DIAG
 #include <cassert>
-#include <dxgi.h>
-#include <dxgi1_2.h>
-#include <d3dcompiler.h>
 #include <cstring>
-#pragma comment(lib, "d3dcompiler.lib")
-namespace {
-// Full-screen blit vertex shader plus the SBS pixel shader sampling left/right eyes with per-eye bounds and linear-to-sRGB.
-// Compiles one HLSL source string; source selects the shader text, name/target identify the entry and profile for logging.
-static const char* kBlitVSSource = R"(
-struct VSOut {
-    float4 pos : SV_Position;
-    float2 uv : TEXCOORD0;
-};
-VSOut main(uint id : SV_VertexID) {
-    VSOut o;
-    float2 xy = float2((id << 1) & 2, id & 2);
-    o.pos = float4(xy * float2(2, -2) + float2(-1, 1), 0, 1);
-    o.uv = xy * float2(1, 1);
-    return o;
-}
-)";
 
-static const char* kSBSPSSource = R"(
-Texture2D<float4> leftEye : register(t0);
-Texture2D<float4> rightEye : register(t1);
-SamplerState samp : register(s0);
-cbuffer Bounds : register(b0) {
-    float4 leftRect;
-    float4 rightRect;
-};
-struct PSIn {
-    float4 pos : SV_Position;
-    float2 uv : TEXCOORD0;
-};
-float4 linearToSrgb(float4 c) {
-    float3 lo = 12.92 * c.rgb;
-    float3 hi = 1.055 * pow(c.rgb, 1.0/2.4) - 0.055;
-    c.rgb = (c.rgb <= 0.0031308) ? lo : hi;
-    return saturate(c);
-}
-float4 main(PSIn input) : SV_Target {
-    float4 c;
-    if (input.uv.x < 0.5) {
-        float2 leftUV = leftRect.xy + float2(input.uv.x * 2.0, input.uv.y) * leftRect.zw;
-        c = leftEye.Sample(samp, leftUV);
-    } else {
-        float2 rightUV = rightRect.xy + float2((input.uv.x - 0.5) * 2.0, input.uv.y) * rightRect.zw;
-        c = rightEye.Sample(samp, rightUV);
-    }
-    return linearToSrgb(c);
-}
-)";
-
-// Compiles one HLSL source string; source selects the shader text, name/target identify the entry and profile for logging.
-static ID3DBlob* CompileShader(const char* source, const char* name, const char* target) {
-    ID3DBlob* blob = nullptr;
-    ID3DBlob* errorBlob = nullptr;
-    HRESULT hr = D3DCompile(source, strlen(source), name,
-                            nullptr, nullptr, "main", target, 0, 0, &blob, &errorBlob);
-    if (FAILED(hr)) {
-        ENCODER_ERROR("Failed to compile %s! HRESULT: 0x%x", name, hr);
-        if (errorBlob) {
-            ENCODER_ERROR("Shader error: %s", (char*)errorBlob->GetBufferPointer());
-            errorBlob->Release();
-        }
-        if (blob) blob->Release();
-        return nullptr;
-    }
-    return blob;
-}
-}
-// Creates the SBS render target, blit/SBS shaders, sampler, blend states, bounds buffer, and vertex state for ComposeSBSGPU.
-bool VideoEncoder::InitializeShaderConversion()
+// Brings up the Vulkan composer: it owns the SBS compose render pass, the
+// NV12 compute conversion and the host-visible host copy copy. No D3D11 objects
+// are created here � the frame never leaves Vulkan.
+bool VideoEncoder::InitializeCompose()
 {
-    ENCODER_LOG("Initializing shader-based texture conversion...");
-    D3D11_TEXTURE2D_DESC rtDesc = {};
-    rtDesc.Width = m_width;
-    rtDesc.Height = m_height;
-    rtDesc.MipLevels = 1;
-    rtDesc.ArraySize = 1;
-    rtDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    rtDesc.SampleDesc.Count = 1;
-    rtDesc.Usage = D3D11_USAGE_DEFAULT;
-    rtDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-    HRESULT hr = m_pDevice->CreateTexture2D(&rtDesc, nullptr, &m_pConversionRT);
-    if (FAILED(hr)) {
-        ENCODER_ERROR("Failed to create conversion render target! HRESULT: 0x%x", hr);
+    ENCODER_LOG("Initializing Vulkan compose + conversion...");
+    if (!m_pVulkan || !m_pVulkan->IsReady()) {
+        ENCODER_ERROR("No Vulkan device; the encoder cannot run");
         return false;
     }
-    hr = m_pDevice->CreateRenderTargetView(m_pConversionRT, nullptr, &m_pConversionRTV);
-    if (FAILED(hr)) {
-        ENCODER_ERROR("Failed to create conversion RTV! HRESULT: 0x%x", hr);
+    m_pVkCompose = new VulkanCompose();
+    m_pVkCompose->Init(m_pVulkan);
+    if (!m_pVkCompose->Setup((uint32_t)m_width, (uint32_t)m_height)) {
+        delete m_pVkCompose;
+        m_pVkCompose = nullptr;
         return false;
     }
-    ENCODER_LOG("Conversion render target created: %dx%d", m_width, m_height);
-    ID3DBlob* vsBlob = CompileShader(kBlitVSSource, "BlitVS", "vs_5_0");
-    if (!vsBlob) return false;
-    hr = m_pDevice->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(),
-                                        nullptr, &m_pBlitVS);
-    if (FAILED(hr)) {
-        ENCODER_ERROR("Failed to create vertex shader! HRESULT: 0x%x", hr);
-        vsBlob->Release();
-        return false;
-    }
-    ID3DBlob* sbsPsBlob = CompileShader(kSBSPSSource, "SBSPS", "ps_5_0");
-    if (!sbsPsBlob) { vsBlob->Release(); return false; }
-    hr = m_pDevice->CreatePixelShader(sbsPsBlob->GetBufferPointer(), sbsPsBlob->GetBufferSize(),
-                                       nullptr, &m_pSBSPS);
-    sbsPsBlob->Release();
-    if (FAILED(hr)) {
-        ENCODER_ERROR("Failed to create SBS pixel shader! HRESULT: 0x%x", hr);
-        vsBlob->Release();
-        return false;
-    }
-    D3D11_SAMPLER_DESC sampDesc = {};
-    sampDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
-    sampDesc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
-    sampDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
-    sampDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-    sampDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
-    hr = m_pDevice->CreateSamplerState(&sampDesc, &m_pBlitSampler);
-    if (FAILED(hr)) {
-        ENCODER_ERROR("Failed to create sampler state! HRESULT: 0x%x", hr);
-        vsBlob->Release();
-        return false;
-    }
-    D3D11_BLEND_DESC blendDesc = {};
-    blendDesc.RenderTarget[0].BlendEnable = FALSE;
-    blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-    hr = m_pDevice->CreateBlendState(&blendDesc, &m_pBlitBlend);
-    if (FAILED(hr)) {
-        ENCODER_ERROR("Failed to create blend state! HRESULT: 0x%x", hr);
-        vsBlob->Release();
-        return false;
-    }
-    D3D11_BLEND_DESC layerBlendDesc = {};
-    layerBlendDesc.RenderTarget[0].BlendEnable = TRUE;
-    layerBlendDesc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
-    layerBlendDesc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
-    layerBlendDesc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
-    layerBlendDesc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_SRC_ALPHA;
-    layerBlendDesc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
-    layerBlendDesc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
-    layerBlendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-    hr = m_pDevice->CreateBlendState(&layerBlendDesc, &m_pLayerBlend);
-    if (FAILED(hr)) {
-        ENCODER_ERROR("Failed to create layer blend state! HRESULT: 0x%x", hr);
-        vsBlob->Release();
-        return false;
-    }
-    D3D11_BUFFER_DESC cbDesc = {};
-    cbDesc.ByteWidth = sizeof(float) * 8;
-    cbDesc.Usage = D3D11_USAGE_DYNAMIC;
-    cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-    cbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    hr = m_pDevice->CreateBuffer(&cbDesc, nullptr, &m_pBoundsCB);
-    if (FAILED(hr)) {
-        ENCODER_ERROR("Failed to create bounds constant buffer! HRESULT: 0x%x", hr);
-        vsBlob->Release();
-        return false;
-    }
-    D3D11_INPUT_ELEMENT_DESC inputDesc = { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 };
-    hr = m_pDevice->CreateInputLayout(&inputDesc, 1, vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), &m_pBlitInputLayout);
-    vsBlob->Release();
-    if (FAILED(hr)) {
-        ENCODER_ERROR("Failed to create input layout! HRESULT: 0x%x", hr);
-        return false;
-    }
-    D3D11_BUFFER_DESC vbDesc = {};
-    vbDesc.ByteWidth = 12;
-    vbDesc.Usage = D3D11_USAGE_DEFAULT;
-    vbDesc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-    float dummyVertex[3] = { 0, 0, 0 };
-    D3D11_SUBRESOURCE_DATA vbData = {};
-    vbData.pSysMem = dummyVertex;
-    hr = m_pDevice->CreateBuffer(&vbDesc, &vbData, &m_pBlitVertexBuffer);
-    if (FAILED(hr)) {
-        ENCODER_ERROR("Failed to create vertex buffer! HRESULT: 0x%x", hr);
-        return false;
-    }
-    m_shaderConversionReady = true;
-    ENCODER_LOG("Shader-based texture conversion initialized successfully!");
+    m_composeReady = true;
+    ENCODER_LOG("Vulkan conversion pipeline ready: %dx%d", m_width, m_height);
     return true;
 }
-// Releases the render target, shaders, sampler, blend states, and buffers from InitializeShaderConversion.
-void VideoEncoder::CleanupShaderConversion()
+
+// Releases the Vulkan composer.
+void VideoEncoder::ShutdownCompose()
 {
-    ENCODER_LOG("Cleaning up shader conversion resources...");
-    if (m_pConversionRT) { m_pConversionRT->Release(); m_pConversionRT = nullptr; }
-    if (m_pConversionRTV) { m_pConversionRTV->Release(); m_pConversionRTV = nullptr; }
-    if (m_pBlitVS) { m_pBlitVS->Release(); m_pBlitVS = nullptr; }
-    if (m_pSBSPS) { m_pSBSPS->Release(); m_pSBSPS = nullptr; }
-    if (m_pBlitSampler) { m_pBlitSampler->Release(); m_pBlitSampler = nullptr; }
-    if (m_pBlitBlend) { m_pBlitBlend->Release(); m_pBlitBlend = nullptr; }
-    if (m_pLayerBlend) { m_pLayerBlend->Release(); m_pLayerBlend = nullptr; }
-    if (m_pBoundsCB) { m_pBoundsCB->Release(); m_pBoundsCB = nullptr; }
-    if (m_pBlitInputLayout) { m_pBlitInputLayout->Release(); m_pBlitInputLayout = nullptr; }
-    if (m_pBlitVertexBuffer) { m_pBlitVertexBuffer->Release(); m_pBlitVertexBuffer = nullptr; }
-    m_shaderConversionReady = false;
-    ENCODER_LOG("Shader conversion resources cleaned up.");
+    ENCODER_LOG("Cleaning up Vulkan conversion pipeline...");
+    if (m_pVkCompose) {
+        m_pVkCompose->Shutdown();
+        delete m_pVkCompose;
+        m_pVkCompose = nullptr;
+    }
+    m_composeReady = false;
 }
-// Copies the SBS render target into the CPU readback buffer honoring the GPU row pitch; feeds SwsConvert.
+
+// Produces the frame source for the encode step. The Vulkan NV12 compute pass
+// normally supplies the encoder frame directly; this runs the GPU conversion
+// and, when that did not produce a frame, hands back the host copy's host-visible
+// BGRA copy for the CPU swscale fallback.
 bool VideoEncoder::ReadbackToBuffer()
 {
     if (!m_initialized) {
         ENCODER_ERROR("ReadbackToBuffer called without valid encoder!");
         return false;
     }
-    m_pContext->CopySubresourceRegion(m_pStagingTexture, 0, 0, 0, 0, m_pConversionRT, 0, nullptr);
-    D3D11_MAPPED_SUBRESOURCE mapped;
-    HRESULT hr = m_pContext->Map(m_pStagingTexture, 0, D3D11_MAP_READ, 0, &mapped);
-    if (FAILED(hr)) {
-        ENCODER_ERROR("Failed to map staging texture in ReadbackToBuffer! HRESULT: 0x%x", hr);
+    if (!m_pVkCompose) {
+        ENCODER_ERROR("ReadbackToBuffer without Vulkan compose");
         return false;
     }
-    int bufSize = m_height * mapped.RowPitch;
-    if (!m_pReadbackBuffer || m_readbackBufferSize < bufSize) {
-        delete[] m_pReadbackBuffer;
-        m_pReadbackBuffer = new uint8_t[bufSize];
-        m_readbackBufferSize = bufSize;
-    }
-    assert(mapped.RowPitch >= m_width * 4);
-    for (int y = 0; y < m_height; y++) {
-        memcpy(m_pReadbackBuffer + y * m_width * 4,
-               (uint8_t*)mapped.pData + y * mapped.RowPitch,
-               m_width * 4);
-    }
-#ifdef DRIVER_DIAG
-    {
-        const uint8_t* p = (const uint8_t*)mapped.pData;
-        uint64_t sum = 0;
-        int n = 0;
-        for (int y = 0; y < m_height; y += 8) {
-            const uint8_t* row = p + (size_t)y * mapped.RowPitch;
-            for (int x = 0; x < m_width; x += 8) {
-                const uint8_t* px = row + x * 4;
-                sum += (uint64_t)px[0] + px[1] + px[2];
-                n++;
-            }
-        }
-        if (n > 0) {
-            uint64_t mean = sum / (uint64_t)n;
-            if (mean < 4) {
-                ENCODER_LOG("[DIAG BLACK FRAME] meanRGB=%llu n=%d Lfmt=0x%x Rfmt=0x%x",
-                    (unsigned long long)mean, n, m_lastLeftFmt, m_lastRightFmt);
-            }
+    m_pGpuNv12 = nullptr;
+    m_pSwsSrc = nullptr;
+    if (m_composedOnVulkan && m_pVkCompose) {
+        const uint8_t* nv12 = nullptr;
+        size_t nv12Size = 0;
+        if (m_pVkCompose->ToNv12(&nv12, &nv12Size)) {
+            m_pGpuNv12 = nv12;
+            m_gpuNv12Size = nv12Size;
+            m_gpuNv12Frames++;
+            return true;
         }
     }
-#endif
-    m_pContext->Unmap(m_pStagingTexture, 0);
-    return true;
+    m_pVkCompose->CopyToHost();
+    if (m_pVkCompose->HostData()) {
+        m_pSwsSrc = (uint8_t*)m_pVkCompose->HostData();
+        return true;
+    }
+    static unsigned s_readbackFail = 0;
+    if (++s_readbackFail <= 3 || s_readbackFail % 300 == 0) {
+        ENCODER_ERROR("host copy readback unavailable (drop=%u)", s_readbackFail);
+    }
+    return false;
 }
-// Draws one eye pair into the SBS target with the given UV bounds and blend mode; blendState selects opaque base vs alpha layers.
-bool VideoEncoder::ComposeSBSLayer(ID3D11Texture2D* pLeft, ID3D11Texture2D* pRight,
-                                     const LayerBounds& leftBounds, const LayerBounds& rightBounds,
-                                     ID3D11BlendState* blendState)
-{
-    D3D11_TEXTURE2D_DESC leftDesc, rightDesc;
-    pLeft->GetDesc(&leftDesc);
-    pRight->GetDesc(&rightDesc);
-    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-    srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-    srvDesc.Texture2D.MipLevels = 1;
-    srvDesc.Texture2D.MostDetailedMip = 0;
-    srvDesc.Format = leftDesc.Format;
-    ID3D11ShaderResourceView* pLeftSRV = nullptr;
-    HRESULT hr = m_pDevice->CreateShaderResourceView(pLeft, &srvDesc, &pLeftSRV);
-    if (FAILED(hr)) {
-        ENCODER_ERROR("Failed to create left eye SRV! HRESULT: 0x%x", hr);
-        return false;
-    }
-    srvDesc.Format = rightDesc.Format;
-    ID3D11ShaderResourceView* pRightSRV = nullptr;
-    hr = m_pDevice->CreateShaderResourceView(pRight, &srvDesc, &pRightSRV);
-    if (FAILED(hr)) {
-        ENCODER_ERROR("Failed to create right eye SRV! HRESULT: 0x%x", hr);
-        pLeftSRV->Release();
-        return false;
-    }
-    float rects[8] = {
-        leftBounds.uMin, leftBounds.vMin, leftBounds.uMax - leftBounds.uMin, leftBounds.vMax - leftBounds.vMin,
-        rightBounds.uMin, rightBounds.vMin, rightBounds.uMax - rightBounds.uMin, rightBounds.vMax - rightBounds.vMin
-    };
-    D3D11_MAPPED_SUBRESOURCE mapped = {};
-    hr = m_pContext->Map(m_pBoundsCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-    if (SUCCEEDED(hr)) {
-        memcpy(mapped.pData, rects, sizeof(rects));
-        m_pContext->Unmap(m_pBoundsCB, 0);
-    }
-    ID3D11ShaderResourceView* srvs[2] = { pLeftSRV, pRightSRV };
-    m_pContext->PSSetShaderResources(0, 2, srvs);
-    m_pContext->PSSetConstantBuffers(0, 1, &m_pBoundsCB);
-    float blendFactor[4] = { 0, 0, 0, 0 };
-    m_pContext->OMSetBlendState(blendState ? blendState : m_pLayerBlend, blendFactor, 0xFFFFFFFF);
-    m_pContext->Draw(3, 0);
-    ID3D11ShaderResourceView* nullSRVs[2] = { nullptr, nullptr };
-    m_pContext->PSSetShaderResources(0, 2, nullSRVs);
-    pLeftSRV->Release();
-    pRightSRV->Release();
-    return true;
-}
-// Composites every submitted layer into the SBS target; lefts/rights supply eye textures, leftBounds/rightBounds supply UV rects.
-bool VideoEncoder::ComposeSBSGPU(const std::vector<ID3D11Texture2D*>& lefts,
-                                 const std::vector<ID3D11Texture2D*>& rights,
+
+// Hands the submitted eye layers to the Vulkan composer, which draws them into
+// its own native target.
+bool VideoEncoder::ComposeSBSGPU(const std::vector<GpuImage>& lefts,
+                                 const std::vector<GpuImage>& rights,
                                  const std::vector<LayerBounds>& leftBounds,
                                  const std::vector<LayerBounds>& rightBounds)
 {
@@ -317,57 +93,45 @@ bool VideoEncoder::ComposeSBSGPU(const std::vector<ID3D11Texture2D*>& lefts,
         ENCODER_ERROR("ComposeSBSGPU called with invalid/mismatched layer counts!");
         return false;
     }
-    D3D11_TEXTURE2D_DESC dL = {}, dR = {};
-    lefts.front()->GetDesc(&dL);
-    rights.front()->GetDesc(&dR);
-    m_lastLeftFmt = (uint32_t)dL.Format;
-    m_lastRightFmt = (uint32_t)dR.Format;
+    m_lastLeftFmt = lefts.front().format;
+    m_lastRightFmt = rights.front().format;
 #ifdef DRIVER_DIAG
     {
         static int s_composeDiag = 0;
         if (++s_composeDiag % 120 == 0) {
             ENCODER_LOG("[DIAG compose] layers=%zu L fmt=0x%x (%ux%u) R fmt=0x%x (%ux%u)",
                 lefts.size(),
-                (uint32_t)dL.Format, dL.Width, dL.Height,
-                (uint32_t)dR.Format, dR.Width, dR.Height);
+                lefts.front().format, lefts.front().width, lefts.front().height,
+                rights.front().format, rights.front().width, rights.front().height);
         }
     }
 #endif
-    ID3D11RenderTargetView* pOldRTV = nullptr;
-    ID3D11DepthStencilView* pOldDSV = nullptr;
-    m_pContext->OMGetRenderTargets(1, &pOldRTV, &pOldDSV);
-    D3D11_VIEWPORT oldViewport;
-    UINT numViewports = 1;
-    m_pContext->RSGetViewports(&numViewports, &oldViewport);
-    float clearColor[4] = { 0, 0, 0, 0 };
-    m_pContext->ClearRenderTargetView(m_pConversionRTV, clearColor);
-    m_pContext->OMSetRenderTargets(1, &m_pConversionRTV, nullptr);
-    D3D11_VIEWPORT vp = {};
-    vp.Width = (float)m_width;
-    vp.Height = (float)m_height;
-    vp.MinDepth = 0.0f;
-    vp.MaxDepth = 1.0f;
-    m_pContext->RSSetViewports(1, &vp);
-    m_pContext->VSSetShader(m_pBlitVS, nullptr, 0);
-    m_pContext->PSSetShader(m_pSBSPS, nullptr, 0);
-    m_pContext->PSSetSamplers(0, 1, &m_pBlitSampler);
-    m_pContext->IASetInputLayout(m_pBlitInputLayout);
-    UINT stride = 12;
-    UINT offset = 0;
-    m_pContext->IASetVertexBuffers(0, 1, &m_pBlitVertexBuffer, &stride, &offset);
-    m_pContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    size_t n = lefts.size();
-    for (size_t i = 0; i < n; i++) {
-        const LayerBounds& lbL = (i < leftBounds.size()) ? leftBounds[i] : LayerBounds{};
-        const LayerBounds& lbR = (i < rightBounds.size()) ? rightBounds[i] : LayerBounds{};
-        ID3D11BlendState* blend = (i == 0) ? m_pBlitBlend : m_pLayerBlend;
-        if (!ComposeSBSLayer(lefts[i], rights[i], lbL, lbR, blend)) {
-            ENCODER_ERROR("Failed to compose SBS layer %zu!", i);
+    // Vulkan owns the compose: it draws the same layers into its native target
+    // and the NV12 compute pass converts that to the encoder's frame format.
+    // No software fallback exists; a Vulkan failure drops the frame.
+    if (!m_pVkCompose || !m_pVkCompose->IsReady()) {
+        static unsigned s_noCompose = 0;
+        if (++s_noCompose <= 3 || s_noCompose % 300 == 0) {
+            ENCODER_ERROR("Vulkan compose unavailable (drop=%u)", s_noCompose);
         }
+        m_composedOnVulkan = false;
+        return false;
     }
-    m_pContext->OMSetRenderTargets(1, &pOldRTV, pOldDSV);
-    m_pContext->RSSetViewports(1, &oldViewport);
-    if (pOldRTV) pOldRTV->Release();
-    if (pOldDSV) pOldDSV->Release();
-    return true;
+    std::vector<LayerRect> lbL(lefts.size()), lbR(rights.size());
+    for (size_t i = 0; i < lefts.size(); i++) {
+        const LayerBounds& l = (i < leftBounds.size()) ? leftBounds[i] : LayerBounds{};
+        const LayerBounds& r = (i < rightBounds.size()) ? rightBounds[i] : LayerBounds{};
+        lbL[i] = { l.uMin, l.vMin, l.uMax, l.vMax };
+        lbR[i] = { r.uMin, r.vMin, r.uMax, r.vMax };
+    }
+    if (m_pVkCompose->Compose(lefts, rights, lbL, lbR)) {
+        m_composedOnVulkan = true;
+        return true;
+    }
+    m_composedOnVulkan = false;
+    static unsigned s_composeFail = 0;
+    if (++s_composeFail <= 3 || s_composeFail % 300 == 0) {
+        ENCODER_ERROR("Vulkan compose failed (drop=%u)", s_composeFail);
+    }
+    return false;
 }

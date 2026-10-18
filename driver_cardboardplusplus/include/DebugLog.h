@@ -2,18 +2,14 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
-#include <windows.h>
 #include "openvr_driver.h"
+#include "Platform.h"
 // Gated verbose logging; enabled in debug builds and in release only via CARDBOARD_DEBUG=1.
 namespace cbpp_debug {
 // Reads CARDBOARD_DEBUG once per process in release; always true in debug builds.
 inline bool debug_enabled() {
 #ifdef NDEBUG
-    static const bool enabled = [] {
-        char val[2] = {};
-        return GetEnvironmentVariableA("CARDBOARD_DEBUG", val, sizeof(val)) == 1 &&
-               val[0] == '1';
-    }();
+    static const bool enabled = cbpp::PlatformDebugEnv();
     return enabled;
 #else
     return true;
@@ -24,12 +20,14 @@ inline void log_msg(const char* tag, const char* pFormat, ...) {
     char buffer[2048];
     va_list args;
     va_start(args, pFormat);
-    vsprintf_s(buffer, pFormat, args);
+    vsnprintf(buffer, sizeof(buffer), pFormat, args);
     va_end(args);
     char tagged[2100];
-    sprintf_s(tagged, "[%s] %s", tag, buffer);
-    strcat_s(tagged, "\n");
-    vr::VRDriverLog()->Log(tagged);
+    snprintf(tagged, sizeof(tagged), "[%s] %s\n", tag, buffer);
+    if (vr::VRDriverLog())
+        vr::VRDriverLog()->Log(tagged);
+    else
+        cbpp::PlatformLogStderr(tagged);
 }
 }
 // Public macros: DebugLog/Throttle respect the gate, Warn/Error always emit; Throttle logs 1 in N calls per call-site.

@@ -2,8 +2,13 @@
 #include <cstring>
 #include <mutex>
 namespace cbpp {
-const wchar_t* cbpp::kRegionName = L"Local\\cardboard_pp_bridge";
-const wchar_t* cbpp::kCmdRegionName = L"Local\\cardboard_pp_bridge_cmd";
+#ifdef _WIN32
+const char* cbpp::kRegionName = "Local\\cardboard_pp_bridge";
+const char* cbpp::kCmdRegionName = "Local\\cardboard_pp_bridge_cmd";
+#else
+const char* cbpp::kRegionName = "/cardboard_pp_bridge";
+const char* cbpp::kCmdRegionName = "/cardboard_pp_bridge_cmd";
+#endif
 // Telemetry region name; the bridge opens the same name to read slots published here.
 // Command region name; owned and written by the bridge, polled here for settings changes.
 // Constructs an idle server; call Start to create the shared-memory region.
@@ -22,21 +27,16 @@ bool BridgeServer::Start(uint32_t slotCount, uint32_t slotSize)
     if (slotSize < MIN_SLOT_SIZE || slotCount == 0)
         return false;
     const uint64_t regionSize = HEADER_SIZE + (uint64_t)slotSize * slotCount;
-    mapping_ = CreateFileMappingW(
-        INVALID_HANDLE_VALUE,
-        nullptr,
-        PAGE_READWRITE,
-        (DWORD)(regionSize >> 32),
-        (DWORD)(regionSize & 0xFFFFFFFFu),
-        kRegionName);
-    if (!mapping_ || mapping_ == INVALID_HANDLE_VALUE)
+    mapping_ = PlatformCreateMapping(kRegionName, (size_t)regionSize);
+    if (mapping_ == kInvalidMapping)
         return false;
-    base_ = static_cast<uint8_t*>(MapViewOfFile(mapping_, FILE_MAP_ALL_ACCESS, 0, 0, 0));
+    base_ = PlatformMapView(mapping_, (size_t)regionSize);
     if (!base_) {
-        CloseHandle(mapping_);
-        mapping_ = nullptr;
+        PlatformCloseMapping(mapping_);
+        mapping_ = kInvalidMapping;
         return false;
     }
+    region_size_ = (size_t)regionSize;
     slot_size_ = slotSize;
     slot_count_ = slotCount;
     RegionHeader* h = reinterpret_cast<RegionHeader*>(base_);
@@ -49,7 +49,6 @@ bool BridgeServer::Start(uint32_t slotCount, uint32_t slotSize)
     h->flags = 0;
     std::memset(base_ + HEADER_SIZE, 0, regionSize - HEADER_SIZE);
     StoreReleaseU64(reinterpret_cast<volatile uint64_t&>(h->write_seq), 0);
-    _ReadWriteBarrier();
     running_.store(true, std::memory_order_release);
     return true;
 }
@@ -58,13 +57,14 @@ void BridgeServer::Stop()
 {
     running_.store(false, std::memory_order_release);
     if (base_) {
-        UnmapViewOfFile(base_);
+        PlatformUnmapView(base_, region_size_);
         base_ = nullptr;
     }
-    if (mapping_ && mapping_ != INVALID_HANDLE_VALUE) {
-        CloseHandle(mapping_);
-        mapping_ = nullptr;
+    if (mapping_ != kInvalidMapping) {
+        PlatformCloseMapping(mapping_);
+        mapping_ = kInvalidMapping;
     }
+    region_size_ = 0;
 }
 // Maps a sequence number to its ring slot; helper for Publish.
 void* BridgeServer::SlotPtr(uint64_t seq) const
@@ -76,36 +76,38 @@ void* BridgeServer::SlotPtr(uint64_t seq) const
 void BridgeServer::CleanupCmdMapping()
 {
     if (cmd_base_) {
-        UnmapViewOfFile(cmd_base_);
+        PlatformUnmapView(cmd_base_, cmd_region_size_);
         cmd_base_ = nullptr;
     }
-    if (cmd_mapping_ && cmd_mapping_ != INVALID_HANDLE_VALUE) {
-        CloseHandle(cmd_mapping_);
-        cmd_mapping_ = nullptr;
+    if (cmd_mapping_ != kInvalidMapping) {
+        PlatformCloseMapping(cmd_mapping_);
+        cmd_mapping_ = kInvalidMapping;
     }
+    cmd_region_size_ = 0;
 }
 // Opens the bridge-owned command region and validates magic/version/geometry; positions the cursor at the latest slot.
 bool BridgeServer::OpenCmdMapping()
 {
-    const uint32_t regionSize = CMD_REGION_SIZE;
-    HANDLE h = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, kCmdRegionName);
-    if (!h || h == INVALID_HANDLE_VALUE)
+    const size_t regionSize = CMD_REGION_SIZE;
+    PlatformMapping h = PlatformOpenMapping(kCmdRegionName, regionSize);
+    if (h == kInvalidMapping)
         return false;
-    uint8_t* base = static_cast<uint8_t*>(MapViewOfFile(h, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, regionSize));
+    uint8_t* base = PlatformMapView(h, regionSize);
     if (!base) {
-        CloseHandle(h);
+        PlatformCloseMapping(h);
         return false;
     }
     RegionHeader* header = reinterpret_cast<RegionHeader*>(base);
     if (std::memcmp(header->magic, MAGIC, sizeof(MAGIC)) != 0 ||
         header->version != VERSION || header->header_size != HEADER_SIZE ||
         header->slot_size < MIN_SLOT_SIZE || header->slot_count == 0) {
-        UnmapViewOfFile(base);
-        CloseHandle(h);
+        PlatformUnmapView(base, regionSize);
+        PlatformCloseMapping(h);
         return false;
     }
     cmd_mapping_ = h;
     cmd_base_ = base;
+    cmd_region_size_ = regionSize;
     cmd_slot_size_ = header->slot_size;
     cmd_slot_count_ = header->slot_count;
     uint64_t ws = LoadRelaxedU64(reinterpret_cast<volatile uint64_t&>(header->write_seq));

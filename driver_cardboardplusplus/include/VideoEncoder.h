@@ -1,20 +1,23 @@
 #pragma once
 #define __STDC_CONSTANT_MACROS
-#include <windows.h>
-#include <d3d11.h>
 #include <atomic>
 #include <vector>
 #include <utility>
 #include <functional>
 #include <mutex>
 #include "BridgeProtocol.h"
+#include "GpuImage.h"
 struct AVCodecContext;
 struct AVFrame;
 struct AVPacket;
 struct AVBSFContext;
 struct SwsContext;
 struct AVBufferRef;
-// SBS H.264 encoder: composites eye textures with shaders on D3D11, converts to NV12, encodes via FFmpeg.
+class VulkanContext;
+class VulkanContext;
+class VulkanCompose;
+// SBS H.264 encoder: composites the submitted eye layers in Vulkan, converts the
+// composed frame to NV12 and encodes it with FFmpeg.
 class VideoEncoder
 {
 public:
@@ -24,20 +27,17 @@ public:
     struct LayerBounds {
         float uMin = 0.0f, vMin = 0.0f, uMax = 1.0f, vMax = 1.0f;
     };
-// Main pipeline stages driven by the encoding thread: init, open eyes, compose, read back, convert, encode.
+// Main pipeline stages driven by the encoding thread: init, compose, read back, convert, encode.
     VideoEncoder();
     ~VideoEncoder();
-    bool Initialize(ID3D11Device* pDevice, ID3D11DeviceContext* pContext,
-                    int width, int height, int fps, int bitrate, bool useGpuEncoding);
-    bool OpenSharedEyeTextures(const std::vector<std::pair<HANDLE, HANDLE>>& handles,
-                               std::vector<ID3D11Texture2D*>& outLeft,
-                               std::vector<ID3D11Texture2D*>& outRight);
-    void ReleaseEyeTextures();
+    bool Initialize(int width, int height, int fps, int bitrate, bool useGpuEncoding,
+                    VulkanContext* pVulkan = nullptr);
     void Shutdown();
-    bool ComposeSBSGPU(const std::vector<ID3D11Texture2D*>& lefts,
-                       const std::vector<ID3D11Texture2D*>& rights,
+    bool ComposeSBSGPU(const std::vector<GpuImage>& lefts,
+                       const std::vector<GpuImage>& rights,
                        const std::vector<LayerBounds>& leftBounds,
                        const std::vector<LayerBounds>& rightBounds);
+    bool ConvertFrame();
     bool SwsConvert();
     bool FinishEncode(int64_t pts);
     bool ReadbackToBuffer();
@@ -52,32 +52,24 @@ public:
 private:
     bool InitializeFFmpeg();
     void CleanupFFmpeg();
-    bool InitializeShaderConversion();
-    void CleanupShaderConversion();
-    bool ComposeSBSLayer(ID3D11Texture2D* pLeft, ID3D11Texture2D* pRight,
-                         const LayerBounds& leftBounds, const LayerBounds& rightBounds,
-                         ID3D11BlendState* blendState);
+    bool InitializeCompose();
+    void ShutdownCompose();
     bool SendFrameToEncoder();
     bool ReceiveEncodedPackets();
     void LogFFmpegError(const char* context, int errorCode);
     void LogFFmpegVersion();
-// D3D devices, FFmpeg contexts, shader objects, frame buffers, and encode timing counters for telemetry.
-    ID3D11Device* m_pDevice;
-    ID3D11DeviceContext* m_pContext;
-    ID3D11Device* m_pEncDevice = nullptr;
-    ID3D11DeviceContext* m_pEncContext = nullptr;
-    std::vector<ID3D11Texture2D*> m_encEyeLefts;
-    std::vector<ID3D11Texture2D*> m_encEyeRights;
-    std::vector<std::pair<HANDLE, HANDLE>> m_openedHandles;
+// FFmpeg state, the Vulkan composer, and encode timing.
     AVCodecContext* m_pCodecContext;
     AVBufferRef* m_pHwDeviceCtx;
     AVFrame* m_pFrame;
     AVPacket* m_pPacket;
     AVBSFContext* m_pBsfCtx;
     SwsContext* m_pConvertContext;
-    ID3D11Texture2D* m_pStagingTexture;
     bool m_initialized;
     bool m_useGpuEncoding;
+// Vulkan composer state; the encoder has no graphics device of its own.
+    VulkanContext* m_pVulkan = nullptr;
+    VulkanCompose* m_pVkCompose = nullptr;
     int m_width;
     int m_height;
     int m_fps;
@@ -87,18 +79,8 @@ private:
     TelemetryCallback m_telemetryCallback;
     uint8_t* m_pSoftwareFrameBuffer;
     bool m_hasValidFrame;
-    ID3D11Texture2D* m_pConversionRT;
-    ID3D11RenderTargetView* m_pConversionRTV;
-    ID3D11VertexShader* m_pBlitVS;
-    ID3D11PixelShader* m_pSBSPS;
-    ID3D11SamplerState* m_pBlitSampler;
-    ID3D11BlendState* m_pBlitBlend;
-    ID3D11BlendState* m_pLayerBlend;
-    ID3D11Buffer* m_pBoundsCB;
-    ID3D11InputLayout* m_pBlitInputLayout;
-    ID3D11Buffer* m_pBlitVertexBuffer;
-    bool m_shaderConversionReady;
-    LARGE_INTEGER m_perfFreq;
+    bool m_composeReady;
+    uint64_t m_perfFreq = 0;
     int64_t m_encSumUs;
     int64_t m_encMaxUs;
     int64_t m_encCount;
@@ -112,10 +94,17 @@ private:
     int m_summaryInterval;
     uint32_t ComputeFrameHash();
     void LogTelemetrySummary();
-    uint8_t* m_pReadbackBuffer = nullptr;
     std::vector<uint8_t> m_spsPpsAnnexB;
     std::atomic<bool> m_forceKeyframe{false};
-    int m_readbackBufferSize = 0;
     uint32_t m_lastLeftFmt = 0;
     uint32_t m_lastRightFmt = 0;
+    // Frame source for SwsConvert: the Vulkan host copy when the compute pass did
+    // not produce NV12 for this frame (may stay null).
+    uint8_t* m_pSwsSrc = nullptr;
+    // NV12 computed on the GPU for the current frame (owned by the composer).
+    const uint8_t* m_pGpuNv12 = nullptr;
+    size_t m_gpuNv12Size = 0;
+    uint64_t m_gpuNv12Frames = 0;
+    // True when the Vulkan composer owns the frame that the NV12 pass reads.
+    bool m_composedOnVulkan = false;
 };
