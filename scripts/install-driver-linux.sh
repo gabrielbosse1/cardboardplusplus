@@ -1,10 +1,16 @@
-# Installs the Linux SteamVR driver into the per-user SteamVR driver directory.
+#!/usr/bin/env bash
+# Installs the Linux SteamVR driver and the Cardboard++ bridge app.
 #
-# Layout mirrors the Windows installer (scripts/install-driver.ps1):
-#   <SteamVR>/drivers/cardboardplusplus/
+# Driver layout (mirrors the Windows installer scripts/install-driver.ps1):
+#   ~/.local/share/SteamVR/drivers/cardboardplusplus/
 #       driver.vrdrivermanifest        (required — SteamVR won't load without it)
 #       resources/                     (controller profile, icons, bindings)
 #       bin/linux64/driver_cardboardplusplus.so
+#
+# Bridge app layout (desktop entry + icon so the app shows in the launcher):
+#   ~/.local/bin/cardboard-bridge-svc
+#   ~/.local/share/applications/cardboardplusplus.desktop
+#   ~/.local/share/icons/hicolor/128x128/apps/cardboardplusplus.png
 #
 # The driver links against system FFmpeg (libavcodec/libavformat/libavutil/
 # libswscale via pkg-config), so no FFmpeg shared libs are shipped — install
@@ -16,6 +22,8 @@ build="${here}/driver_cardboardplusplus/build"
 so="${build}/libdriver_cardboardplusplus.so"
 
 [ -f "$so" ] || { echo "Build first: scripts/compile-driver-linux.sh" >&2; exit 1; }
+
+# ── Driver ────────────────────────────────────────────────────────────────────
 
 # Per-user SteamVR driver directory (SteamVR auto-discovers drivers here).
 dest_root="${HOME}/.local/share/SteamVR/drivers/cardboardplusplus"
@@ -59,6 +67,51 @@ while IFS= read -r -d '' f; do
 done < <(find "${here}/driver_cardboardplusplus/resources" -type f -print0)
 echo "Copied ${res_count} resource file(s) to ${dest_res}"
 
+# ── Bridge app (desktop entry + icon) ─────────────────────────────────────────
+
+# Bridge binary: built by cargo into bridge/target/<profile>/cardboard-bridge-svc.
+bridge_bin=""
+for candidate in \
+    "${here}/bridge/target/release/cardboard-bridge-svc" \
+    "${here}/bridge/target/debug/cardboard-bridge-svc"; do
+    if [ -x "$candidate" ]; then
+        bridge_bin="$candidate"
+        break
+    fi
+done
+
+bin_dir="${HOME}/.local/bin"
+apps_dir="${HOME}/.local/share/applications"
+icon_dir="${HOME}/.local/share/icons/hicolor/128x128/apps"
+mkdir -p "$bin_dir" "$apps_dir" "$icon_dir"
+
+if [ -n "$bridge_bin" ]; then
+    cp "$bridge_bin" "${bin_dir}/cardboard-bridge-svc"
+    chmod +x "${bin_dir}/cardboard-bridge-svc"
+    echo "Installed: ${bin_dir}/cardboard-bridge-svc"
+else
+    echo "Note: bridge binary not found in bridge/target/ — build it with:" >&2
+    echo "  cd bridge && cargo build --release" >&2
+    echo "  (desktop entry installed anyway; it will launch once the binary exists)" >&2
+fi
+
+# Desktop entry (launcher icon + app menu entry) — from the app/ directory,
+# not resources/ (resources/ holds SteamVR driver files only).
+desktop_src="${here}/driver_cardboardplusplus/app/cardboardplusplus.desktop"
+[ -f "$desktop_src" ] || { echo "Missing desktop entry: $desktop_src" >&2; exit 1; }
+cp "$desktop_src" "${apps_dir}/cardboardplusplus.desktop"
+echo "Installed: ${apps_dir}/cardboardplusplus.desktop"
+
+# App icon for the launcher.
+icon_src="${here}/driver_cardboardplusplus/app/icons/cardboardplusplus.png"
+if [ -f "$icon_src" ]; then
+    cp "$icon_src" "${icon_dir}/cardboardplusplus.png"
+    echo "Installed: ${icon_dir}/cardboardplusplus.png"
+else
+    echo "Note: app icon not found at $icon_src — launcher will use a default icon" >&2
+fi
+
 echo
 echo "Driver installed to ${dest_root}"
-echo "Restart SteamVR to load the driver."
+echo "Bridge app installed to ${bin_dir}/cardboard-bridge-svc"
+echo "Restart SteamVR to load the driver; run 'cardboard-bridge-svc' to launch the bridge."

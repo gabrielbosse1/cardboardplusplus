@@ -113,14 +113,15 @@ jobs:
     - name: Test install script (dry run into a temp SteamVR tree)
       run: |
         # The installer reads the .so from the repo build dir (driver_cardboardplusplus/build)
-        # and writes the full driver directory to $HOME/.local/share/SteamVR/drivers/cardboardplusplus/.
+        # and writes the full driver + bridge app to $HOME/.local/...
         # Point HOME at a temp dir so the install lands there without touching the runner.
         TMPHOME="$(mktemp -d)"
         HOME="$TMPHOME" bash scripts/install-driver-linux.sh
         # Verify the complete driver layout: .so, manifest, and resources.
-        SO="$TMPHOME/.local/share/SteamVR/drivers/cardboardplusplus/bin/linux64/driver_cardboardplusplus.so"
-        MANIFEST="$TMPHOME/.local/share/SteamVR/drivers/cardboardplusplus/driver.vrdrivermanifest"
-        RES="$TMPHOME/.local/share/SteamVR/drivers/cardboardplusplus/resources"
+        ROOT="$TMPHOME/.local/share/SteamVR/drivers/cardboardplusplus"
+        SO="$ROOT/bin/linux64/driver_cardboardplusplus.so"
+        MANIFEST="$ROOT/driver.vrdrivermanifest"
+        RES="$ROOT/resources"
         for f in "$SO" "$MANIFEST"; do
           [ -f "$f" ] || { echo "missing $f"; find "$TMPHOME" -type f; exit 1; }
         done
@@ -135,6 +136,15 @@ m = json.load(open('$MANIFEST'))
 assert m['name'] == 'cardboardplusplus', m
 print('installed manifest valid')
 "
+        # Verify the bridge app desktop entry + icon are installed for the launcher.
+        DESKTOP="$TMPHOME/.local/share/applications/cardboardplusplus.desktop"
+        [ -f "$DESKTOP" ] || { echo "missing desktop entry $DESKTOP"; exit 1; }
+        grep -q "Type=Application" "$DESKTOP" || { echo "desktop entry missing Type=Application"; exit 1; }
+        grep -q "Icon=cardboardplusplus" "$DESKTOP" || { echo "desktop entry missing Icon"; exit 1; }
+        echo "desktop entry installed correctly"
+        [ -f "$TMPHOME/.local/share/icons/hicolor/128x128/apps/cardboardplusplus.png" ] \
+          || { echo "missing app icon"; exit 1; }
+        echo "app icon installed correctly"
 
     - name: Upload driver artifact
       uses: actions/upload-artifact@v4
