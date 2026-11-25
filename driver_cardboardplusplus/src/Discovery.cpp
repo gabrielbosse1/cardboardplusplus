@@ -85,7 +85,7 @@ void HmdDriver::DiscoveryThreadFunc()
     DriverLog("Discovery thread started");
     char buffer[256] = {};
     sockaddr_in senderAddr;
-    int senderAddrLen = sizeof(senderAddr);
+    cbpp::PlatformSockLen senderAddrLen = sizeof(senderAddr);
     static const uint32_t kPhoneTimeoutMs = 5000;
     while (m_discoveryRunning) {
         int bytesReceived = recvfrom(m_discoverySocket, buffer, sizeof(buffer) - 1, 0,

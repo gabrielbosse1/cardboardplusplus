@@ -158,6 +158,10 @@ private:
     int m_pendingCapH = 0;
     std::mutex m_encoderMutex;
 // Private per-eye copies shared with the encoder thread; rebuilt when layer size or format changes.
+// D3D-only: the Windows path copies compositor textures into private shared copies before the
+// Vulkan composer imports them. Linux hands the compositor's dma-buf fds straight through,
+// so there are no private copies to manage.
+#ifdef _WIN32
     struct LayerCopy {
         ID3D11Texture2D* pLeft = nullptr;
         HANDLE hLeft = nullptr;
@@ -173,6 +177,7 @@ private:
     };
     std::vector<LayerCopy> m_layerCopies;
     bool EnsureLayerCopies(const std::vector<SubmitLayerInfo>& layers);
+#endif
     std::atomic<bool> m_sceneTearingDown{false};
     std::atomic<int> m_streamEnabled{ 1 };
     long long m_lastHeartbeatNs = 0;

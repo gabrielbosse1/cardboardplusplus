@@ -119,7 +119,9 @@ inline uint64_t LoadRelaxedU64(const volatile uint64_t& p) {
 #ifdef _MSC_VER
     return _ReadWriteBarrier(), p;
 #else
-    return std::atomic_ref<const uint64_t>(const_cast<uint64_t&>(p)).load(std::memory_order_relaxed);
+    // GCC/Clang builtins: a relaxed atomic load keeps the read from being
+    // reordered across the shared-memory cursor without needing C++20 atomic_ref.
+    return __atomic_load_n(&p, __ATOMIC_RELAXED);
 #endif
 }
 inline void StoreReleaseU64(volatile uint64_t& p, uint64_t v) {
@@ -128,7 +130,7 @@ inline void StoreReleaseU64(volatile uint64_t& p, uint64_t v) {
     p = v;
     _ReadWriteBarrier();
 #else
-    std::atomic_ref<uint64_t>(reinterpret_cast<uint64_t&>(p)).store(v, std::memory_order_release);
+    __atomic_store_n(&p, v, __ATOMIC_RELEASE);
 #endif
 }
 }

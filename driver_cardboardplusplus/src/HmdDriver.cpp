@@ -484,7 +484,7 @@ void HmdDriver::SensorThreadFunc()
     static constexpr int kSensorPacketLen = 45;
     uint8_t buffer[1024]; // large enough for skeleton packets (31 bones � 28 + header � 871)
     sockaddr_in senderAddr;
-    int senderAddrLen = sizeof(senderAddr);
+    cbpp::PlatformSockLen senderAddrLen = sizeof(senderAddr);
     cbpp::PlatformSetRecvTimeout(m_sensorSocket, 2000);
     int logCounter = 0;
     int recvCount = 0;

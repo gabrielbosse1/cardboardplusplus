@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Cardboard++ Bridge
+Comment=Cardboard++ control plane — SteamVR driver and phone bridge
+Exec=%h/.local/bin/cardboard-bridge-svc
+Icon=cardboardplusplus
+Terminal=false
+Categories=Utility;
+Keywords=vr;steamvr;cardboard;bridge;
+StartupNotify=true
+StartupWMClass=Cardboard++ Bridge

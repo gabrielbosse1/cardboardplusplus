@@ -84,21 +84,19 @@ bool VideoEncoder::InitializeFFmpeg()
 #else
         if (isVaapi) {
             // VAAPI takes the DRM render node and uploads the host-visible NV12 the
-            // Vulkan compute pass already produced.
-            AVBufferRef* hwdev = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_VAAPI);
-            if (hwdev) {
-                av_hwdevice_ctx_set_properties(hwdev, "device", "/dev/dri/renderD128", 0, nullptr, 0);
-                if (av_hwdevice_ctx_init(hwdev) == 0) {
-                    m_pHwDeviceCtx = hwdev;
-                    m_pCodecContext->hw_device_ctx = av_buffer_ref(hwdev);
-                    m_pCodecContext->pix_fmt = AV_PIX_FMT_VAAPI;
-                    ENCODER_LOG("VAAPI device /dev/dri/renderD128 ready");
-                } else {
-                    ENCODER_ERROR("Failed to init VAAPI hw device");
-                    av_buffer_unref(&hwdev);
-                }
+            // Vulkan compute pass already produced. av_hwdevice_ctx_create passes the
+            // node path straight to the VAAPI backend.
+            AVBufferRef* hwdev = nullptr;
+            int hwret = av_hwdevice_ctx_create(&hwdev, AV_HWDEVICE_TYPE_VAAPI,
+                                               "/dev/dri/renderD128", nullptr, 0);
+            if (hwret == 0 && hwdev) {
+                m_pHwDeviceCtx = hwdev;
+                m_pCodecContext->hw_device_ctx = av_buffer_ref(hwdev);
+                m_pCodecContext->pix_fmt = AV_PIX_FMT_VAAPI;
+                ENCODER_LOG("VAAPI device /dev/dri/renderD128 ready");
             } else {
-                ENCODER_ERROR("Failed to allocate VAAPI hw device");
+                ENCODER_ERROR("Failed to init VAAPI hw device (ret=%d)", hwret);
+                if (hwdev) av_buffer_unref(&hwdev);
             }
             av_opt_set(m_pCodecContext->priv_data, "rc_mode", "CBR", 0);
             av_opt_set(m_pCodecContext->priv_data, "profile", "constrained_baseline", 0);

@@ -13,7 +13,6 @@
 #include "compose_ps.spv.h"
 #include "nv12_cs.spv.h"
 #endif
-#pragma comment(lib, "d3dcompiler.lib")
 
 // Vulkan gets y-up NDC; the software complement multiplies y by -2.
 #include "shaders/compose_vs.hlsli"
@@ -182,7 +181,7 @@ bool VulkanCompose::Setup(uint32_t width, uint32_t height) {
         VkResult avr = allocSets(m_pCtx->Device(), &dsai, &m_descSets[i]);
         if (avr != VK_SUCCESS) {
             char msg[96];
-            _snprintf_s(msg, sizeof(msg), _TRUNCATE, "vkAllocateDescriptorSets failed res=%d", (int)avr);
+            cbpp::PlatformFormat(msg, sizeof(msg), "vkAllocateDescriptorSets failed res=%d", (int)avr);
             Fail(msg);
             return false;
         }
@@ -353,7 +352,7 @@ bool VulkanCompose::Setup(uint32_t width, uint32_t height) {
     VkResult vsr = createShaderModule(m_pCtx->Device(), &smci, nullptr, &vsMod);
     if (vsr != VK_SUCCESS) {
         char msg[96];
-        _snprintf_s(msg, sizeof(msg), _TRUNCATE, "vkCreateShaderModule(VS) failed res=%d", (int)vsr);
+        cbpp::PlatformFormat(msg, sizeof(msg), "vkCreateShaderModule(VS) failed res=%d", (int)vsr);
         Fail(msg);
         return false;
     }
@@ -364,7 +363,7 @@ bool VulkanCompose::Setup(uint32_t width, uint32_t height) {
         auto destroyMod0 = (PFN_vkDestroyShaderModule)m_pCtx->GetDeviceProc("vkDestroyShaderModule");
         if (destroyMod0) destroyMod0(m_pCtx->Device(), vsMod, nullptr);
         char msg[96];
-        _snprintf_s(msg, sizeof(msg), _TRUNCATE, "vkCreateShaderModule(PS) failed res=%d", (int)psr);
+        cbpp::PlatformFormat(msg, sizeof(msg), "vkCreateShaderModule(PS) failed res=%d", (int)psr);
         Fail(msg);
         return false;
     }
@@ -837,7 +836,7 @@ int VulkanCompose::FindOrImportEye(const GpuImage& src) {
     // DRM_FORMAT_MOD_INVALID with any supported format matches the same modifier.
     VkImageDrmFormatModifierExplicitCreateInfoEXT drmInfo = {};
     drmInfo.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT;
-    drmInfo.drmFormatModifier = DRM_FORMAT_MOD_INVALID;
+    drmInfo.drmFormatModifier = cbpp::kDrmFormatModInvalid;
     drmInfo.drmFormatModifierPlaneCount = 1;
     drmInfo.pPlaneLayouts = nullptr;
     ici.pNext = &drmInfo;
@@ -1093,6 +1092,7 @@ bool VulkanCompose::Compose(const std::vector<GpuImage>& lefts,
 
     // Keyed mutex entries: the eye textures are D3D-shared, so their keys must
     // be held for the draw. The native target needs no cross-API sync.
+#ifdef _WIN32
     VkDeviceMemory syncs[2 * kMaxLayers] = {};
     uint64_t syncKeys[2 * kMaxLayers] = {};
     uint32_t syncTimeouts[2 * kMaxLayers] = {};
@@ -1122,9 +1122,17 @@ bool VulkanCompose::Compose(const std::vector<GpuImage>& lefts,
     km.releaseCount = syncCount;
     km.pReleaseSyncs = syncs;
     km.pReleaseKeys = syncKeys;
+#else
+    // Linux: the compose sources are same-device Vulkan images (dma-buf imported
+    // from SteamVR or produced locally), so the submit needs no cross-API mutex.
+#endif
     VkSubmitInfo si = {};
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+#ifdef _WIN32
     si.pNext = &km;
+#else
+    si.pNext = nullptr;
+#endif
     si.commandBufferCount = 1;
     si.pCommandBuffers = &m_cmd;
     resetFences(m_pCtx->Device(), 1, &m_fence);
