@@ -16,11 +16,13 @@ The PC must have:
   GNOME Wayland is **not** supported by SteamVR; use X11 or KDE/Sway/Hyprland)
 - A Vulkan GPU (NVIDIA, AMD, or Intel) with working drivers
 - `git`, `cmake`, `pkg-config`, a C++17 compiler (`g++` or `clang`)
-- Rust (stable toolchain) for the bridge
-- Steam + SteamVR installed from the distribution or Valve's Linux package
+- Rust (stable toolchain) for the bridge — **optional**; see "No Rust" below
+- Steam + SteamVR installed (native, Flatpak, or Snap)
 - FFmpeg dev packages (the driver links against system FFmpeg)
 
-Install build dependencies:
+### Install build dependencies — pick your distro
+
+**Debian / Ubuntu / Linux Mint / Pop!_OS:**
 
 ```bash
 sudo apt-get update
@@ -31,11 +33,74 @@ sudo apt-get install -y --no-install-recommends \
     ffmpeg git
 ```
 
-Install Rust if missing:
+**Fedora / RHEL / Silverblue:**
+
+```bash
+sudo dnf install -y \
+    gcc-c++ make cmake pkgconfig \
+    ffmpeg-devel vulkan-headers libX11-devel \
+    ffmpeg git
+```
+
+**Arch Linux / Manjaro / Garuda:**
+
+```bash
+sudo pacman -S --needed --noconfirm \
+    base-devel cmake pkgconf \
+    ffmpeg vulkan-headers libx11 \
+    git
+```
+
+**openSUSE Tumbleweed / Leap:**
+
+```bash
+sudo zypper install -y \
+    gcc-c++ cmake pkg-config \
+    ffmpeg-devel vulkan-devel libX11-devel \
+    ffmpeg git
+```
+
+**Alpine Linux:**
+
+```bash
+sudo apk add --no-cache \
+    build-base cmake pkgconf \
+    ffmpeg-dev vulkan-dev x11-dev \
+    ffmpeg git bash
+```
+
+> **Note on Alpine:** Alpine uses musl libc, not glibc. The driver and bridge
+> will compile, but if you built them on a glibc system and copy the binaries
+> to Alpine (or vice versa), they will not run. Always build on the target
+> system.
+
+### Install Rust (for the bridge)
+
+The bridge (`cardboard-bridge-svc`) is a Rust binary. If Rust is **not**
+installed, the driver will still build and install — only the bridge app and
+its desktop entry will be skipped (see [No Rust installed](#3b-no-rust-installed)
+below). To get the full setup:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
+```
+
+### Install dxc (DirectXShaderCompiler)
+
+The driver's HLSL shaders are compiled to SPIR-V at build time using `dxc`.
+This is **not** a distro package — you must download the prebuilt binary:
+
+```bash
+DXC_VERSION="v1.9.2609"
+DXC_TAR="linux_dxc_2026_09_28.x86_x64.tar.gz"
+curl -fsSL -o /tmp/dxc.tar.gz \
+  "https://github.com/microsoft/DirectXShaderCompiler/releases/download/${DXC_VERSION}/${DXC_TAR}"
+sudo mkdir -p /opt/dxc
+sudo tar -xzf /tmp/dxc.tar.gz -C /opt/dxc
+DXC_BIN=$(find /opt/dxc -name dxc -type f | head -1)
+sudo ln -sf "$DXC_BIN" /usr/local/bin/dxc
+dxc --version
 ```
 
 ---
@@ -72,7 +137,9 @@ fi
 # Remove the bridge binary and desktop integration
 rm -f "$HOME/.local/bin/cardboard-bridge-svc"
 rm -f "$HOME/.local/share/applications/cardboardplusplus.desktop"
-rm -f "$HOME/.local/share/icons/hicolor/128x128/apps/cardboardplusplus.png"
+
+# Remove icons in all sizes the installer may have placed
+find "$HOME/.local/share/icons/hicolor" -name 'cardboardplusplus.png' -delete 2>/dev/null || true
 
 # Remove bridge temp artifacts (hand-frame dumps, etc.)
 rm -rf "$HOME/.cache/cbpp" "$HOME/.local/share/cbpp"
@@ -112,41 +179,50 @@ grep -i cardboard "$HOME/.config/openvr/openvr.vrpaths" 2>&1     # should be emp
 
 ## 2. Build Everything from Source
 
-### Build the SteamVR driver
+### 2a. Set the OpenVR directory
 
-The driver needs `dxc` (DirectXShaderCompiler) to compile the HLSL shaders to
-SPIR-V at build time.
-
-**Install dxc** (if not already present):
-
-```bash
-# Download the Linux dxc release
-DXC_VERSION="v1.9.2609"
-DXC_TAR="linux_dxc_2026_09_28.x86_x64.tar.gz"
-curl -fsSL -o /tmp/dxc.tar.gz \
-  "https://github.com/microsoft/DirectXShaderCompiler/releases/download/${DXC_VERSION}/${DXC_TAR}"
-sudo mkdir -p /opt/dxc
-sudo tar -xzf /tmp/dxc.tar.gz -C /opt/dxc
-DXC_BIN=$(find /opt/dxc -name dxc -type f | head -1)
-sudo ln -sf "$DXC_BIN" /usr/local/bin/dxc
-dxc --version
-```
-
-**Set the OpenVR directory** (point at SteamVR's `bin/linux64`):
+The driver needs to find SteamVR's `openvr_api.so` at build time. The compile
+script auto-detects SteamVR, but you can set it explicitly if detection fails
+(e.g. Flatpak or Snap installs):
 
 ```bash
+# Try auto-detection first:
 export OPENVR_DIR="$HOME/.local/share/Steam/steamapps/common/SteamVR"
-# or: export OPENVR_DIR="$HOME/.steam/steam/steamapps/common/SteamVR"
+# Or for Flatpak Steam:
+# export OPENVR_DIR="$HOME/.var/app/com.valvesoftware.Steam/.steam/steam/steamapps/common/SteamVR"
+# Or for Snap:
+# export OPENVR_DIR="$HOME/snap/steam/common/SteamVR"
 ```
 
-**Build the driver:**
+**How to find your SteamVR path:**
+
+```bash
+# Search common locations
+for p in \
+    "$HOME/.steam/steam/steamapps/common/SteamVR" \
+    "$HOME/.local/share/Steam/steamapps/common/SteamVR" \
+    "$HOME/.var/app/com.valvesoftware.Steam/.steam/steam/steamapps/common/SteamVR" \
+    "$HOME/.var/app/com.valvesoftware.Steam/steam/steamapps/common/SteamVR" \
+    "$HOME/snap/steam/common/SteamVR"; do
+    if [ -f "$p/bin/linux64/openvr_api.so" ]; then
+        echo "Found SteamVR at: $p"
+        export OPENVR_DIR="$p"
+        break
+    fi
+done
+```
+
+### 2b. Build the SteamVR driver
 
 ```bash
 cd /path/to/cardboardplusplus
 bash scripts/compile-driver-linux.sh
 ```
 
-This produces `driver_cardboardplusplus/build/libdriver_cardboardplusplus.so`.
+**If it fails**, check:
+- `dxc` is on PATH: `command -v dxc`
+- `OPENVR_DIR` points to a directory containing `bin/linux64/openvr_api.so`
+- FFmpeg/Vulkan/X11 dev packages are installed (see distro section above)
 
 **Verify the build:**
 
@@ -163,7 +239,9 @@ nm -D --undefined-only "$SO" | grep -qE "\b(VR[A-Z]|OpenVR|InitServerDriverConte
     || echo "OK: no undefined OpenVR symbols"
 ```
 
-### Build the bridge
+### 2c. Build the bridge
+
+**If Rust is installed:**
 
 ```bash
 cd /path/to/cardboardplusplus/bridge
@@ -172,7 +250,13 @@ cargo build --release
 
 This produces `bridge/target/release/cardboard-bridge-svc`.
 
-### Run the driver wire-protocol tests
+**If Rust is NOT installed:**
+
+Skip this step. The driver will still install; only the bridge app and its
+desktop entry will be skipped by the installer. See
+[Section 3b](#3b-no-rust-installed) for what to do.
+
+### 2d. Run the driver wire-protocol tests
 
 ```bash
 cd /path/to/cardboardplusplus
@@ -183,7 +267,7 @@ g++ -std=c++17 -O2 -I driver_cardboardplusplus/include \
 # Expect: "=== All driver tests passed ==="
 ```
 
-### Run the bridge test suite
+### 2e. Run the bridge test suite (only if Rust is installed)
 
 ```bash
 cd /path/to/cardboardplusplus/bridge
@@ -196,29 +280,74 @@ cargo test -- --test-threads=1
 ## 3. Test the Installer
 
 The installer (`scripts/install-driver-linux.sh`) installs **both** the driver
-and the bridge app (with a desktop entry and icon).
+and the bridge app (with a desktop entry and icon). It adapts to the system:
 
-**Install:**
+- **Desktop environment present** → installs `.desktop` entry and icons
+- **No desktop (headless)** → skips `.desktop` and icons (driver still installs)
+- **Rust installed + bridge built** → installs the bridge binary + desktop entry
+- **No Rust / no bridge binary** → installs the driver, skips the bridge app,
+  and tells you how to build it
+
+### 3a. Install
 
 ```bash
 cd /path/to/cardboardplusplus
 bash scripts/install-driver-linux.sh
 ```
 
-**Verify the full layout:**
+**What the installer does:**
+
+| Path | Contents |
+|------|----------|
+| `~/.local/share/SteamVR/drivers/cardboardplusplus/` | SteamVR driver |
+| `~/.local/share/SteamVR/drivers/cardboardplusplus/bin/linux64/driver_cardboardplusplus.so` | Driver shared object |
+| `~/.local/share/SteamVR/drivers/cardboardplusplus/driver.vrdrivermanifest` | Driver manifest |
+| `~/.local/share/SteamVR/drivers/cardboardplusplus/resources/` | Controller profile, bindings |
+| `~/.local/bin/cardboard-bridge-svc` | Bridge binary (if built) |
+| `~/.local/share/applications/cardboardplusplus.desktop` | App launcher entry (if DE present) |
+| `~/.local/share/icons/hicolor/<size>/apps/cardboardplusplus.png` | App icon (all available sizes) |
+
+### 3b. No Rust installed
+
+If Rust is not installed, the installer will:
+1. Install the driver (`.so`, manifest, resources) — **fully functional**
+2. Skip the bridge binary and print instructions:
+   ```
+   Bridge binary NOT found in bridge/target/ — the desktop entry will not
+   launch until you build it:
+     1. Install Rust:  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+     2. Build the bridge:  cd bridge && cargo build --release
+     3. Re-run this installer
+   ```
+
+**To complete the setup later**, install Rust, build the bridge, and re-run
+the installer. The driver does not need to be rebuilt — only the bridge needs
+to be built and the installer re-run to pick it up.
+
+### 3c. Verify the installation
+
+**Verify the driver layout:**
 
 ```bash
 ROOT="$HOME/.local/share/SteamVR/drivers/cardboardplusplus"
 
-# Driver
 [ -f "$ROOT/bin/linux64/driver_cardboardplusplus.so" ] || echo "FAIL: driver .so missing"
 [ -f "$ROOT/driver.vrdrivermanifest" ] || echo "FAIL: manifest missing"
 [ -f "$ROOT/resources/controller_profile.json" ] || echo "FAIL: controller profile missing"
+```
 
-# Bridge app
+**Verify the bridge app (if Rust was installed):**
+
+```bash
 [ -x "$HOME/.local/bin/cardboard-bridge-svc" ] || echo "FAIL: bridge binary missing"
 [ -f "$HOME/.local/share/applications/cardboardplusplus.desktop" ] || echo "FAIL: desktop entry missing"
-[ -f "$HOME/.local/share/icons/hicolor/128x128/apps/cardboardplusplus.png" ] || echo "FAIL: app icon missing"
+```
+
+**Verify icons are installed in all sizes:**
+
+```bash
+find "$HOME/.local/share/icons/hicolor" -name 'cardboardplusplus.png' | sort
+# Expect at least: 16x16, 32x32, 48x48, 64x64, 128x128, 256x256
 ```
 
 **Verify the desktop entry is valid:**
@@ -239,11 +368,11 @@ repo (separate from `resources/`, which holds SteamVR driver files only).
 
 **If the icon doesn't appear in the launcher:**
 
-1. Make sure the icon is in the standard hicolor icon path:
+1. Make sure icons are in the standard hicolor paths:
    ```bash
-   ls "$HOME/.local/share/icons/hicolor/128x128/apps/cardboardplusplus.png"
+   find "$HOME/.local/share/icons/hicolor" -name 'cardboardplusplus.png'
    ```
-2. Update the desktop database:
+2. The installer should have already refreshed the cache. If not, do it manually:
    ```bash
    update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
    gtk-update-icon-cache "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
@@ -602,6 +731,7 @@ With SteamVR + driver + phone all running:
 **Icon doesn't appear in the launcher:**
 - Ensure `~/.local/share/applications/cardboardplusplus.desktop` exists
 - Run `update-desktop-database ~/.local/share/applications`
+- Run `gtk-update-icon-cache ~/.local/share/icons/hicolor`
 - Log out/in to refresh the launcher cache
 
 **Bridge UI won't launch (Slint error):**
@@ -636,6 +766,7 @@ With SteamVR + driver + phone all running:
 pkill -x vrserver; pkill -x vrmonitor; pkill -f cardboard-bridge-svc
 rm -rf ~/.local/share/SteamVR/drivers/cardboardplusplus
 rm -f ~/.local/bin/cardboard-bridge-svc ~/.local/share/applications/cardboardplusplus.desktop
+find ~/.local/share/icons/hicolor -name 'cardboardplusplus.png' -delete 2>/dev/null
 sed -i '/cardboardplusplus/d' ~/.config/openvr/openvr.vrpaths 2>/dev/null
 
 # Build
