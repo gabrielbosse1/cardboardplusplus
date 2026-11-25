@@ -142,9 +142,12 @@ print('installed manifest valid')
         grep -q "Type=Application" "$DESKTOP" || { echo "desktop entry missing Type=Application"; exit 1; }
         grep -q "Icon=cardboardplusplus" "$DESKTOP" || { echo "desktop entry missing Icon"; exit 1; }
         echo "desktop entry installed correctly"
-        [ -f "$TMPHOME/.local/share/icons/hicolor/128x128/apps/cardboardplusplus.png" ] \
-          || { echo "missing app icon"; exit 1; }
-        echo "app icon installed correctly"
+        # Verify the app icon is installed in all expected sizes.
+        for size in 16x16 32x32 48x48 64x64 128x128 256x256; do
+          [ -f "$TMPHOME/.local/share/icons/hicolor/$size/apps/cardboardplusplus.png" ] \
+            || { echo "missing app icon for size $size"; find "$TMPHOME/.local/share/icons" -type f; exit 1; }
+        done
+        echo "app icon installed in all sizes (16x16 through 256x256)"
 
     - name: Upload driver artifact
       uses: actions/upload-artifact@v4
