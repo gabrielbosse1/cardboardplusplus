@@ -113,16 +113,28 @@ jobs:
     - name: Test install script (dry run into a temp SteamVR tree)
       run: |
         # The installer reads the .so from the repo build dir (driver_cardboardplusplus/build)
-        # and writes it to $HOME/.local/share/SteamVR/drivers/cardboardplusplus/bin/linux64/.
+        # and writes the full driver directory to $HOME/.local/share/SteamVR/drivers/cardboardplusplus/.
         # Point HOME at a temp dir so the install lands there without touching the runner.
         TMPHOME="$(mktemp -d)"
         HOME="$TMPHOME" bash scripts/install-driver-linux.sh
-        REAL="$TMPHOME/.local/share/SteamVR/drivers/cardboardplusplus/bin/linux64/driver_cardboardplusplus.so"
-        if [ -f "$REAL" ]; then
-          echo "install script placed the driver .so correctly at $REAL"
-        else
-          echo "install script did not place the driver .so at $REAL"; find "$TMPHOME" -type f; exit 1
-        fi
+        # Verify the complete driver layout: .so, manifest, and resources.
+        SO="$TMPHOME/.local/share/SteamVR/drivers/cardboardplusplus/bin/linux64/driver_cardboardplusplus.so"
+        MANIFEST="$TMPHOME/.local/share/SteamVR/drivers/cardboardplusplus/driver.vrdrivermanifest"
+        RES="$TMPHOME/.local/share/SteamVR/drivers/cardboardplusplus/resources"
+        for f in "$SO" "$MANIFEST"; do
+          [ -f "$f" ] || { echo "missing $f"; find "$TMPHOME" -type f; exit 1; }
+        done
+        echo "install script placed the .so and manifest correctly"
+        # Resources must include the controller profile.
+        [ -f "$RES/controller_profile.json" ] || { echo "missing controller_profile.json"; find "$RES" -type f 2>/dev/null; exit 1; }
+        echo "install script copied resources (incl. controller_profile.json)"
+        # Verify the manifest is valid JSON with the expected name.
+        python3 -c "
+import json, sys
+m = json.load(open('$MANIFEST'))
+assert m['name'] == 'cardboardplusplus', m
+print('installed manifest valid')
+"
 
     - name: Upload driver artifact
       uses: actions/upload-artifact@v4
