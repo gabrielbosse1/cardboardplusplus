@@ -146,7 +146,6 @@ void HmdDriver::CreateSwapTextureSet(uint32_t unPid, const SwapTextureSetDesc_t*
         set->fds[i] = fd;
         pOutSwapTextureSet->rSharedTextureHandles[i] = (vr::SharedTextureHandle_t)(uintptr_t)fd;
     }
-    pOutSwapTextureSet->sharedHandleDepth = INVALID_SHARED_TEXTURE_HANDLE;
     m_swapTextureSets[unPid].push_back(set);
     for (uint32_t i = 0; i < kSwapImages; i++)
         m_setByHandle[pOutSwapTextureSet->rSharedTextureHandles[i]] = set;
@@ -211,8 +210,8 @@ void HmdDriver::SubmitLayer(const SubmitLayerPerEye_t (&perEye)[2])
     SubmitLayerInfo info;
     info.hTextureLeft = perEye[0].hTexture;
     info.hTextureRight = perEye[1].hTexture;
-    info.boundsLeft = perEye[0].vrTextureBounds;
-    info.boundsRight = perEye[1].vrTextureBounds;
+    info.boundsLeft = perEye[0].bounds;
+    info.boundsRight = perEye[1].bounds;
     m_submitLayers.push_back(info);
     m_hasSubmit.store(true, std::memory_order_release);
 }
@@ -306,7 +305,7 @@ bool HmdDriver::AcquireSyncTexture(vr::SharedTextureHandle_t syncTexture)
         sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
         VkImportSemaphoreFdInfoKHR import = {};
         import.sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR;
-        import.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT_EXT;
+        import.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT_KHR;
         import.fd = (int)syncTexture;
         sci.pNext = &import;
         VkSemaphore sem = VK_NULL_HANDLE;
@@ -320,13 +319,11 @@ bool HmdDriver::AcquireSyncTexture(vr::SharedTextureHandle_t syncTexture)
         m_syncSemaphore = sem;
         m_cachedSyncHandle = (uint64_t)syncTexture;
     }
-    auto wait = (PFN_vkWaitForSemaphores)m_vulkan.GetDeviceProc("vkWaitForSemaphores");
-    auto getStatus = (PFN_vkGetSemaphoreStatusKHR)m_vulkan.GetDeviceProc("vkGetSemaphoreStatusKHR");
+    auto wait = (PFN_vkWaitSemaphores)m_vulkan.GetDeviceProc("vkWaitSemaphores");
     if (!wait) return false;
-    if (getStatus && getStatus(m_vulkan.Device(), m_syncSemaphore) == VK_SIGNALED) {
-        m_syncAcquired = true;
-        return true;
-    }
+    // The vendored Vulkan headers expose core 1.1 vkWaitSemaphores only (no
+    // vkGetSemaphoreStatusKHR), so skip the already-signaled early-out and let
+    // the bounded wait below resolve the compositor sync.
     VkSemaphoreWaitInfo wi = {};
     wi.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
     wi.semaphoreCount = 1;
@@ -361,9 +358,11 @@ void HmdDriver::WaitEncoderIdle()
 void HmdDriver::GetFrameTiming(DriverDirectMode_FrameTiming* pFrameTiming)
 {
     if (!pFrameTiming) return;
-    pFrameTiming->flFrameTime = std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-    pFrameTiming->flHostTime = pFrameTiming->flFrameTime;
-    pFrameTiming->flHostTimeTicks = pFrameTiming->flFrameTime;
-    pFrameTiming->flCompositorTime = pFrameTiming->flFrameTime;
+    // The vendored OpenVR header exposes the version-007 struct, which carries
+    // present/drop counters only (no timing fields). Fill the size and counters.
+    pFrameTiming->m_nSize = (uint32_t)sizeof(DriverDirectMode_FrameTiming);
+    pFrameTiming->m_nNumFramePresents = (uint32_t)m_presentCount;
+    pFrameTiming->m_nNumDroppedFrames = 0;
+    pFrameTiming->m_nNumMisPresented = 0;
+    pFrameTiming->m_nReprojectionFlags = 0;
 }

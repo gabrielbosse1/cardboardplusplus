@@ -2,7 +2,6 @@
 #include "HmdDriver.h"
 #include "HandDriver.h"
 #include "openvr_driver.h"
-#include <windows.h>
 using namespace vr;
 // SteamVR device provider; owns the HmdDriver and spawns the hand devices when the
 // bridge first reports hand tracking data. The hands are registered once and live

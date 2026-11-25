@@ -151,14 +151,13 @@ bool VulkanContext::Initialize(const PlatformAdapterId* adapterId)
 #else
     const char* wantedExts[] = {
         VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
-        VK_KHR_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
         VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
         VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME,
         VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
         VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
         VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
     };
-    const uint32_t kWantedExtCount = 7;
+    const uint32_t kWantedExtCount = 6;
 #endif
     const char* enabledExts[8] = {};
     uint32_t n = 0;
@@ -172,11 +171,15 @@ bool VulkanContext::Initialize(const PlatformAdapterId* adapterId)
                         if (std::strcmp(e.extensionName, wantedExts[w]) == 0 && n < 8)
                             enabledExts[n++] = wantedExts[w];
                     }
+#ifdef _WIN32
                     if (std::strcmp(e.extensionName, VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME) == 0)
                         m_hasExternalMemoryWin32 = true;
                     else if (std::strcmp(e.extensionName, VK_KHR_WIN32_KEYED_MUTEX_EXTENSION_NAME) == 0)
                         m_hasKeyedMutex = true;
                     else if (std::strcmp(e.extensionName, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME) == 0)
+#else
+                    if (std::strcmp(e.extensionName, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME) == 0)
+#endif
                         m_hasExternalMemoryFd = true;
                     else if (std::strcmp(e.extensionName, VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME) == 0)
                         m_hasExternalSemaphoreFd = true;

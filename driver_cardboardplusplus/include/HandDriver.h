@@ -1,7 +1,6 @@
 #pragma once
 #include "openvr_driver.h"
 #include "GripLimit.h"
-#include <windows.h>
 #include <atomic>
 #include <cstdint>
 using namespace vr;

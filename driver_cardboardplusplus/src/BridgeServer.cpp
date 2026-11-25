@@ -3,11 +3,11 @@
 #include <mutex>
 namespace cbpp {
 #ifdef _WIN32
-const char* cbpp::kRegionName = "Local\\cardboard_pp_bridge";
-const char* cbpp::kCmdRegionName = "Local\\cardboard_pp_bridge_cmd";
+const char* kRegionName = "Local\\cardboard_pp_bridge";
+const char* kCmdRegionName = "Local\\cardboard_pp_bridge_cmd";
 #else
-const char* cbpp::kRegionName = "/cardboard_pp_bridge";
-const char* cbpp::kCmdRegionName = "/cardboard_pp_bridge_cmd";
+const char* kRegionName = "/cardboard_pp_bridge";
+const char* kCmdRegionName = "/cardboard_pp_bridge_cmd";
 #endif
 // Telemetry region name; the bridge opens the same name to read slots published here.
 // Command region name; owned and written by the bridge, polled here for settings changes.

@@ -5,6 +5,7 @@
 // layers stay free of #ifdef.
 #include <cstdint>
 #include <chrono>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -66,7 +67,21 @@ inline void* PlatformGetSymbol(PlatformModule m, const char* name) {
 using PlatformSocket = int;
 static const PlatformSocket kInvalidSocket = -1;
 
+// Address-length type for recvfrom/sendto; int on Windows, socklen_t on POSIX.
+#ifdef _WIN32
+using PlatformSockLen = int;
+#else
+using PlatformSockLen = socklen_t;
+#endif
+
 using PlatformModule = void*;
+
+// DRM format modifier sentinel used with VK_EXT_image_drm_format_modifier.
+// Equals DRM_FORMAT_MOD_INVALID from libdrm_modes.h; defined here so the driver
+// does not need to link libdrm headers on Linux.
+#ifndef _WIN32
+static const uint64_t kDrmFormatModInvalid = UINT64_MAX;
+#endif
 
 inline bool PlatformStartupNetworking() { return true; }
 inline void PlatformShutdownNetworking() {}
@@ -134,6 +149,19 @@ inline bool PlatformDebugEnv() {
 
 // stderr sink used before the SteamVR log host exists.
 inline void PlatformLogStderr(const char* text) { fputs(text, stderr); fflush(stderr); }
+
+// snprintf into a fixed buffer, always null-terminated; returns the number of
+// characters that would have been written (like snprintf), negative on error.
+// Replaces the MSVC _snprintf_s / _TRUNCATE pair used on Windows.
+inline int PlatformFormat(char* out, size_t outSize, const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    int n = vsnprintf(out, outSize, fmt, args);
+    va_end(args);
+    if (outSize > 0)
+        out[outSize - 1] = '\0';
+    return n;
+}
 
 // Parses "<prefix> <int> [int]" into a and b; returns false on a prefix mismatch
 // or a missing/garbage number, so callers can log the exact datagram instead.

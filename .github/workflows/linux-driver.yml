@@ -1,0 +1,148 @@
+name: Linux Driver
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+jobs:
+  # Build the SteamVR driver as a Linux shared object, run the driver wire
+  # protocol tests under g++, and validate the install path. The driver's
+  # OpenVR driver-API calls are all inline accessors (see openvr_driver.h), so
+  # it links against a stub openvr_api.so with no real symbols — the same .so
+  # SteamVR loads at runtime provides the context at load time, not link time.
+  driver:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0 # DriverVersion.h is baked from rev-list --count
+
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          build-essential cmake pkg-config \
+          libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+          libvulkan-dev libx11-dev
+
+    - name: Download DirectXShaderCompiler (dxc) for Linux
+      run: |
+        DXC_VERSION="v1.9.2609"
+        DXC_TAR="linux_dxc_2026_09_28.x86_x64.tar.gz"
+        curl -fsSL -o /tmp/dxc.tar.gz \
+          "https://github.com/microsoft/DirectXShaderCompiler/releases/download/${DXC_VERSION}/${DXC_TAR}"
+        sudo mkdir -p /opt/dxc
+        sudo tar -xzf /tmp/dxc.tar.gz -C /opt/dxc
+        # The archive extracts to a subdir; find the dxc binary and expose it.
+        DXC_BIN=$(find /opt/dxc -name dxc -type f | head -1)
+        echo "dxc binary: $DXC_BIN"
+        sudo ln -sf "$DXC_BIN" /usr/local/bin/dxc
+        dxc --version || true
+
+    - name: Create stub openvr_api.so for linking
+      # The driver references zero non-inline OpenVR symbols (all driver-API
+      # calls are inline accessors on the module context). SteamVR supplies the
+      # real openvr_api.so at load time; for a CI link a stub is sufficient and
+      # proves the driver does not depend on any OpenVR symbol at link time.
+      run: |
+        sudo mkdir -p /tmp/openvr_stub
+        cat > /tmp/openvr_stub/stub.c <<'EOF'
+        /* CI stub: the driver's OpenVR driver-API calls are inline accessors
+         * (openvr_driver.h), so no real OpenVR symbols are needed at link time.
+         * SteamVR provides the context when it loads the driver .so at runtime. */
+        int __cbpp_openvr_stub(void) { return 0; }
+        EOF
+        gcc -shared -fPIC -o /tmp/openvr_stub/openvr_api.so /tmp/openvr_stub/stub.c
+        ls -la /tmp/openvr_stub/openvr_api.so
+
+    - name: Bake commit count into DriverVersion.h
+      run: bash scripts/bake-driver-version.sh
+
+    - name: Configure and build the driver
+      run: |
+        cmake -S driver_cardboardplusplus -B driver_cardboardplusplus/build \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCBPP_OPENVR_DIR=/tmp/openvr_stub
+        cmake --build driver_cardboardplusplus/build --parallel "$(nproc)"
+
+    - name: Verify the shared object
+      run: |
+        SO=driver_cardboardplusplus/build/libdriver_cardboardplusplus.so
+        [ -f "$SO" ] || { echo "missing $SO"; exit 1; }
+        # The driver factory must be exported (SteamVR calls it via dlopen).
+        if ! nm -D "$SO" | grep -q "T HmdDriverFactory"; then
+          echo "HmdDriverFactory not exported from $SO"; nm -D "$SO" | head; exit 1
+        fi
+        echo "HmdDriverFactory exported from $SO"
+        # Confirm no undefined OpenVR symbols (inline accessors only).
+        if nm -D --undefined-only "$SO" | grep -qE "\b(VR[A-Z]|OpenVR|InitServerDriverContext)"; then
+          echo "unexpected undefined OpenVR symbols:"; nm -D --undefined-only "$SO" | grep -E "\b(VR[A-Z]|OpenVR|InitServerDriverContext)"; exit 1
+        fi
+        echo "no undefined OpenVR symbols (inline accessors confirmed)"
+
+    - name: Driver wire-protocol tests (g++)
+      run: |
+        g++ -std=c++17 -O2 -I driver_cardboardplusplus/include \
+          -o driver_cardboardplusplus/build/driver_tests \
+          driver_cardboardplusplus/tests/test_wire_protocol.cpp
+        ./driver_cardboardplusplus/build/driver_tests
+
+    - name: Validate driver manifest and profile
+      run: |
+        python3 - <<'PY'
+        import json
+        base = "driver_cardboardplusplus/resources"
+        # driver.vrdrivermanifest: documented schema fields (OpenVR DriverManifest).
+        with open(f"{base}/driver.vrdrivermanifest") as f:
+            m = json.load(f)
+        assert m["name"] == "cardboardplusplus", m
+        assert m["alwaysActivate"] is True, m
+        assert "directory" in m, "manifest missing directory field"
+        assert "resourceOnly" in m, "manifest missing resourceOnly field"
+        # The driver .so name must follow driver_<name>.so (SteamVR load convention).
+        assert m["name"] == "cardboardplusplus"
+        with open(f"{base}/controller_profile.json") as f:
+            p = json.load(f)
+        assert "controller_type" in p, p
+        print("manifest and profile valid")
+        PY
+
+    - name: Test install script (dry run into a temp SteamVR tree)
+      run: |
+        # The installer reads the .so from the repo build dir (driver_cardboardplusplus/build)
+        # and writes it to $HOME/.local/share/SteamVR/drivers/cardboardplusplus/bin/linux64/.
+        # Point HOME at a temp dir so the install lands there without touching the runner.
+        TMPHOME="$(mktemp -d)"
+        HOME="$TMPHOME" bash scripts/install-driver-linux.sh
+        REAL="$TMPHOME/.local/share/SteamVR/drivers/cardboardplusplus/bin/linux64/driver_cardboardplusplus.so"
+        if [ -f "$REAL" ]; then
+          echo "install script placed the driver .so correctly at $REAL"
+        else
+          echo "install script did not place the driver .so at $REAL"; find "$TMPHOME" -type f; exit 1
+        fi
+
+    - name: Upload driver artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: driver-linux
+        path: driver_cardboardplusplus/build/libdriver_cardboardplusplus.so
+
+  # The bridge control plane and its end-to-end suite (fake driver/phone/sidecar
+  # over the real wire, image decode comparison, SHM telemetry) are cross-platform
+  # Rust. Run the same suite on Linux to prove the control plane works there too.
+  bridge:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install ffmpeg (e2e image decode)
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+
+    - name: Run bridge tests and e2e suite
+      run: cargo test --manifest-path bridge/Cargo.toml -- --test-threads=1

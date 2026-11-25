@@ -4,6 +4,7 @@
 #include <cstring>
 #include <cassert>
 #include <cstdlib>
+#include <cmath>
 #include <vector>
 #include "CardboardWire.h"
 #include "H264Utils.h"
