@@ -34,6 +34,11 @@ void HmdDriver::EncodePendingFrame(const PendingFrame& frame)
     std::lock_guard<std::mutex> lock(m_encoderMutex);
     if (!m_encoderInitialized || !m_pVideoEncoder) return;
     if (frame.layers.empty()) return;
+    static bool loggedFirstEncode = false;
+    if (!loggedFirstEncode) {
+        loggedFirstEncode = true;
+        DriverLog("Encode: first frame, layers=%zu", frame.layers.size());
+    }
     auto stageStart = std::chrono::steady_clock::now();
     auto noteStage = [&](const char* name) {
         long long us = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -64,6 +69,8 @@ void HmdDriver::EncodePendingFrame(const PendingFrame& frame)
         DriverLog("ComposeSBSGPU failed for pts=%lld", (long long)frame.pts);
         return;
     }
+    static bool loggedCompose = false;
+    if (!loggedCompose) { loggedCompose = true; DriverLog("Encode: compose ok"); }
     noteStage("ComposeSBSGPU");
     if (!m_pVideoEncoder->ReadbackToBuffer()) {
         // Rate-limited: at frame rate this floods the SteamVR log, and the log
@@ -76,14 +83,20 @@ void HmdDriver::EncodePendingFrame(const PendingFrame& frame)
         noteStage("ReadbackToBuffer");
         return;
     }
+    static bool loggedReadback = false;
+    if (!loggedReadback) { loggedReadback = true; DriverLog("Encode: readback ok"); }
     noteStage("ReadbackToBuffer");
     if (!m_pVideoEncoder->ConvertFrame()) {
         DriverLog("ConvertFrame failed for pts=%lld", (long long)frame.pts);
         return;
     }
+    static bool loggedConvert = false;
+    if (!loggedConvert) { loggedConvert = true; DriverLog("Encode: convert ok"); }
     noteStage("ConvertFrame");
     if (!m_pVideoEncoder->FinishEncode(frame.pts)) {
         DriverLog("FinishEncode failed for pts=%lld", (long long)frame.pts);
     }
+    static bool loggedFinish = false;
+    if (!loggedFinish) { loggedFinish = true; DriverLog("Encode: finish ok"); }
     noteStage("FinishEncode");
 }

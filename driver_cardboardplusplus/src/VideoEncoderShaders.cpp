@@ -93,6 +93,13 @@ bool VideoEncoder::ComposeSBSGPU(const std::vector<GpuImage>& lefts,
         ENCODER_ERROR("ComposeSBSGPU called with invalid/mismatched layer counts!");
         return false;
     }
+    static bool loggedComposeEntry = false;
+    if (!loggedComposeEntry) {
+        loggedComposeEntry = true;
+        DriverLogFFmpeg("ComposeSBSGPU entry: layers=%zu Lhandle=%llu Rhandle=%llu",
+                        lefts.size(), (unsigned long long)lefts.front().handle,
+                        (unsigned long long)rights.front().handle);
+    }
     m_lastLeftFmt = lefts.front().format;
     m_lastRightFmt = rights.front().format;
 #ifdef DRIVER_DIAG
@@ -123,6 +130,11 @@ bool VideoEncoder::ComposeSBSGPU(const std::vector<GpuImage>& lefts,
         const LayerBounds& r = (i < rightBounds.size()) ? rightBounds[i] : LayerBounds{};
         lbL[i] = { l.uMin, l.vMin, l.uMax, l.vMax };
         lbR[i] = { r.uMin, r.vMin, r.uMax, r.vMax };
+    }
+    static bool loggedComposeCall = false;
+    if (!loggedComposeCall) {
+        loggedComposeCall = true;
+        DriverLogFFmpeg("Calling VulkanCompose::Compose");
     }
     if (m_pVkCompose->Compose(lefts, rights, lbL, lbR)) {
         m_composedOnVulkan = true;

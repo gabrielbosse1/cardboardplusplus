@@ -477,8 +477,10 @@ void VideoEncoder::LogFFmpegVersion()
 // frame is distinguishable from real content in the driver log.
 uint32_t VideoEncoder::ComputeFrameHash()
 {
-    if (!m_pSoftwareFrameBuffer) return 0;
-    const uint8_t* p = m_pSoftwareFrameBuffer;
+    // Sample the frame being sent to the encoder. On the Vulkan path the
+    // software buffer is unused, so hashing it reports every frame as a dup.
+    const uint8_t* p = m_pFrame ? m_pFrame->data[0] : nullptr;
+    if (!p) return 0;
     int total = m_width * m_height * 3 / 2;
     uint32_t h = 2166136261u;
     uint64_t sum = 0;

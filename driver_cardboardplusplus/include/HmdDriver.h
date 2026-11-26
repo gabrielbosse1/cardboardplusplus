@@ -23,11 +23,13 @@ struct SwapTextureSet {
     ID3D11Texture2D* images[3] = {};
     HANDLE sharedHandles[3] = {};
 #else
-    // Linux exports each image as a dma-buf fd; the compositor imports the memory
-    // with VK_KHR_external_memory_fd and hands the fd back through SubmitLayer.
+    // Linux asks SteamVR's IPC resource manager to allocate each swap image;
+    // the shared handle is published to the compositor and its fd is imported
+    // into our Vulkan device for sampling.
     VkImage images[3] = {};
     VkDeviceMemory memory[3] = {};
     int fds[3] = {};
+    vr::SharedTextureHandle_t ipcHandles[3] = {};
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t format = 0;
@@ -125,6 +127,12 @@ private:
     bool InitializeVulkan();
     std::map<uint32_t, std::vector<std::shared_ptr<SwapTextureSet>>> m_swapTextureSets;
     std::map<vr::SharedTextureHandle_t, std::shared_ptr<SwapTextureSet>> m_setByHandle;
+#ifndef _WIN32
+    // The Linux compositor passes 1-based set indices back instead of the
+    // shared handles we published; keep creation order to resolve them.
+    std::vector<std::shared_ptr<SwapTextureSet>> m_orderedSets;
+    std::shared_ptr<SwapTextureSet> ResolveSwapSet(vr::SharedTextureHandle_t handle);
+#endif
     uint64_t m_cachedSyncHandle = 0;
     bool m_syncAcquired = false;
 #ifdef _WIN32

@@ -1,9 +1,11 @@
-// Linux compositor path: Vulkan-native swap textures with dma-buf export and
-// external-semaphore synchronization, replacing the software11 shared textures the
-// Windows build uses. SteamVR allocates nothing here — CreateSwapTextureSet
-// returns our own Vulkan images as dma-buf fds, and Present hands the same fds
-// to the composer so VulkanCompose can import them straight into its render pass.
+// Linux compositor path: SteamVR allocates the swap images through its IPC
+// resource manager and renders into them; we import the same memory into our
+// Vulkan device and sample it in the compose pass. Present publishes the
+// submitted texture's fd so the composer reads the slot drawn that frame.
 #include "HmdDriver.h"
+#ifndef _WIN32
+#include "LinuxDmabuf.h"
+#endif
 #include "DriverLog.h"
 #include "DebugLog.h"
 #include <vulkan/vulkan.h>
@@ -18,96 +20,115 @@ constexpr uint32_t kSwapImages = 3;
 constexpr uint64_t kSemaphoreTimeoutNs = 1000000000ull; // 1s
 }  // namespace
 
-// Allocates one color image plus exportable device memory and returns the dma-buf
-// fd the compositor needs to import it. Memory comes from a DEVICE_LOCAL|HOST_VISIBLE
-// heap when the driver exposes one so the encoder can read it back on the same GPU.
-static bool CreateExportImage(VulkanContext* ctx, uint32_t width, uint32_t height,
-                              VkFormat format, VkImage* outImage, VkDeviceMemory* outMem,
-                              int* outFd)
+#ifndef _WIN32
+// Lets SteamVR allocate each swap image through its IPC resource manager, then
+// imports that allocation into our Vulkan device. The handle published back to
+// the compositor is the IPC handle, not a raw fd. OPAQUE_FD import matches how
+// SteamVR created the image: same format, MUTABLE_FORMAT, no modifier list.
+static bool CreateSharedEye(VulkanContext* ctx, uint32_t width, uint32_t height,
+                            VkFormat format, VkImage* outImage, VkDeviceMemory* outMem,
+                            int* outFd, vr::SharedTextureHandle_t* outHandle)
 {
+    vr::IVRIPCResourceManagerClient* ipc = vr::IPCResourceManager();
+    if (!ipc) {
+        DriverLog("DirectMode: IPC resource manager unavailable");
+        return false;
+    }
+    VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                              VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
+    uint32_t creationFlags = (uint32_t)VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    if (!ipc->NewSharedVulkanImage((uint32_t)format, width, height, true, false, false,
+                                   1, 1, creationFlags, usage, outHandle) || !*outHandle) {
+        DriverLog("DirectMode: NewSharedVulkanImage failed for %ux%u fmt=%u",
+                  width, height, (uint32_t)format);
+        return false;
+    }
+    uint64_t ipcHandle = 0;
+    int fd = -1;
+    if (!ipc->RefResource(*outHandle, &ipcHandle) ||
+        !ipc->ReceiveSharedFd(ipcHandle, &fd) || fd < 0) {
+        DriverLog("DirectMode: could not get fd for shared eye");
+        ipc->UnrefResource(*outHandle);
+        *outHandle = 0;
+        return false;
+    }
     auto createImage = (PFN_vkCreateImage)ctx->GetDeviceProc("vkCreateImage");
     auto getReq = (PFN_vkGetImageMemoryRequirements)ctx->GetDeviceProc("vkGetImageMemoryRequirements");
-    auto getMemProps = (PFN_vkGetPhysicalDeviceMemoryProperties)ctx->GetDeviceProc("vkGetPhysicalDeviceMemoryProperties");
     auto allocMem = (PFN_vkAllocateMemory)ctx->GetDeviceProc("vkAllocateMemory");
     auto bindImage = (PFN_vkBindImageMemory)ctx->GetDeviceProc("vkBindImageMemory");
-    auto getFd = (PFN_vkGetMemoryFdKHR)ctx->GetDeviceProc("vkGetMemoryFdKHR");
-    if (!createImage || !getReq || !getMemProps || !allocMem || !bindImage || !getFd) {
-        DriverLog("DirectMode: memory/image commands missing (external fd export unavailable)");
+    auto getMemProps = (PFN_vkGetPhysicalDeviceMemoryProperties)
+        ctx->GetInstanceProc("vkGetPhysicalDeviceMemoryProperties");
+    if (!createImage || !getReq || !allocMem || !bindImage || !getMemProps) {
+        ::close(fd);
         return false;
     }
     VkImageCreateInfo ici = {};
     ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     ici.format = format;
     ici.extent = { width, height, 1 };
     ici.mipLevels = 1;
     ici.arrayLayers = 1;
     ici.samples = VK_SAMPLE_COUNT_1_BIT;
     ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                VK_IMAGE_USAGE_SAMPLED_BIT;
+    ici.usage = usage;
     ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkExternalMemoryImageCreateInfo ext = {};
+    ext.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+    ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+    ici.pNext = &ext;
     VkImage img = VK_NULL_HANDLE;
     if (createImage(ctx->Device(), &ici, nullptr, &img) != VK_SUCCESS) {
-        DriverLog("DirectMode: vkCreateImage(%ux%u %u) failed", width, height, (uint32_t)format);
+        DriverLog("DirectMode: vkCreateImage(shared eye) failed");
+        ::close(fd);
         return false;
     }
     VkMemoryRequirements req = {};
     getReq(ctx->Device(), img, &req);
-
     VkPhysicalDeviceMemoryProperties memProps = {};
     getMemProps(ctx->Physical(), &memProps);
-    const uint32_t preferred = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
-    const uint32_t fallback = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-    uint32_t chosen = UINT32_MAX;
-    for (uint32_t pass = 0; pass < 2 && chosen == UINT32_MAX; pass++) {
-        uint32_t want = pass == 0 ? preferred : fallback;
-        for (uint32_t t = 0; t < memProps.memoryTypeCount; t++) {
-            if ((req.memoryTypeBits & (1u << t)) && (memProps.memoryTypes[t].propertyFlags & want) == want) {
-                chosen = t;
-                break;
-            }
+    uint32_t type = UINT32_MAX;
+    for (uint32_t t = 0; t < memProps.memoryTypeCount; t++) {
+        if ((req.memoryTypeBits & (1u << t)) &&
+            (memProps.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+            type = t; break;
         }
     }
-    if (chosen == UINT32_MAX) {
-        DriverLog("DirectMode: no exportable memory type for %ux%u", width, height);
-        return false;
+    if (type == UINT32_MAX) {
+        for (uint32_t t = 0; t < memProps.memoryTypeCount; t++) {
+            if (req.memoryTypeBits & (1u << t)) { type = t; break; }
+        }
     }
-    VkExportMemoryAllocateInfo exportInfo = {};
-    exportInfo.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
-    exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    if (type == UINT32_MAX) { ::close(fd); return false; }
+    VkImportMemoryFdInfoKHR import = {};
+    import.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
+    import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+    import.fd = ::dup(fd); // Vulkan consumes its copy; keep ours for the composer
+    VkMemoryDedicatedAllocateInfo dedicated = {};
+    dedicated.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+    dedicated.image = img;
+    dedicated.pNext = &import;
     VkMemoryAllocateInfo ai = {};
     ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    ai.pNext = &exportInfo;
     ai.allocationSize = req.size;
-    ai.memoryTypeIndex = chosen;
+    ai.memoryTypeIndex = type;
+    ai.pNext = &dedicated;
     VkDeviceMemory mem = VK_NULL_HANDLE;
-    if (allocMem(ctx->Device(), &ai, nullptr, &mem) != VK_SUCCESS) {
-        DriverLog("DirectMode: vkAllocateMemory(exportable) failed");
+    if (allocMem(ctx->Device(), &ai, nullptr, &mem) != VK_SUCCESS ||
+        bindImage(ctx->Device(), img, mem, 0) != VK_SUCCESS) {
+        DriverLog("DirectMode: shared eye import failed");
+        ::close(fd);
         return false;
     }
-    if (bindImage(ctx->Device(), img, mem, 0) != VK_SUCCESS) {
-        DriverLog("DirectMode: vkBindImageMemory failed");
-        return false;
-    }
-    VkMemoryGetFdInfoKHR fdInfo = {};
-    fdInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
-    fdInfo.memory = mem;
-    fdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-    int fd = -1;
-    if (getFd(ctx->Device(), &fdInfo, &fd) != VK_SUCCESS) {
-        DriverLog("DirectMode: vkGetMemoryFdKHR failed (is VK_KHR_external_memory_fd enabled?)");
-        return false;
-    }
-    *outImage = img;
-    *outMem = mem;
-    *outFd = fd;
+    *outImage = img; *outMem = mem; *outFd = fd;
     return true;
 }
+#endif
 
-// Called by the compositor for each application: allocates one triple-buffered set
-// and publishes the dma-buf fds as the shared texture handles.
+// Called by the compositor for each application: creates one triple-buffered set
+// of IPC shared images and publishes their shared texture handles.
 void HmdDriver::CreateSwapTextureSet(uint32_t unPid, const SwapTextureSetDesc_t* pDesc,
                                      SwapTextureSet_t* pOutSwapTextureSet)
 {
@@ -129,8 +150,10 @@ void HmdDriver::CreateSwapTextureSet(uint32_t unPid, const SwapTextureSetDesc_t*
         VkImage img = VK_NULL_HANDLE;
         VkDeviceMemory mem = VK_NULL_HANDLE;
         int fd = -1;
-        if (!CreateExportImage(&m_vulkan, width, height, format, &img, &mem, &fd)) {
-            // Roll back the images already created for this set.
+        vr::SharedTextureHandle_t shared = 0;
+        bool ok = false;
+        ok = CreateSharedEye(&m_vulkan, width, height, format, &img, &mem, &fd, &shared);
+        if (!ok) {
             auto destroyImage = (PFN_vkDestroyImage)m_vulkan.GetDeviceProc("vkDestroyImage");
             auto freeMem = (PFN_vkFreeMemory)m_vulkan.GetDeviceProc("vkFreeMemory");
             for (uint32_t j = 0; j < i; j++) {
@@ -144,12 +167,15 @@ void HmdDriver::CreateSwapTextureSet(uint32_t unPid, const SwapTextureSetDesc_t*
         set->images[i] = img;
         set->memory[i] = mem;
         set->fds[i] = fd;
-        pOutSwapTextureSet->rSharedTextureHandles[i] = (vr::SharedTextureHandle_t)(uintptr_t)fd;
+        set->ipcHandles[i] = shared;
+        pOutSwapTextureSet->rSharedTextureHandles[i] = shared;
     }
+    pOutSwapTextureSet->unTextureFlags = 0;
     m_swapTextureSets[unPid].push_back(set);
+    m_orderedSets.push_back(set);
     for (uint32_t i = 0; i < kSwapImages; i++)
         m_setByHandle[pOutSwapTextureSet->rSharedTextureHandles[i]] = set;
-    DriverLog("DirectMode: swap set %ux%u fmt=%u for pid=%u (%u dma-bufs)", width, height,
+    DriverLog("DirectMode: swap set %ux%u fmt=%u for pid=%u (%u shared images)", width, height,
               (uint32_t)format, unPid, kSwapImages);
 }
 
@@ -158,7 +184,12 @@ void HmdDriver::DestroySwapTextureSet(vr::SharedTextureHandle_t sharedTextureHan
     auto it = m_setByHandle.find(sharedTextureHandle);
     if (it == m_setByHandle.end()) return;
     auto set = it->second;
-    for (uint32_t i = 0; i < kSwapImages; i++) m_setByHandle.erase((vr::SharedTextureHandle_t)(uintptr_t)set->fds[i]);
+    if (vr::IVRIPCResourceManagerClient* ipc = vr::IPCResourceManager()) {
+        for (uint32_t i = 0; i < kSwapImages; i++) {
+            if (set->ipcHandles[i]) ipc->UnrefResource(set->ipcHandles[i]);
+        }
+    }
+    for (uint32_t i = 0; i < kSwapImages; i++) m_setByHandle.erase(set->ipcHandles[i]);
     auto destroyImage = (PFN_vkDestroyImage)m_vulkan.GetDeviceProc("vkDestroyImage");
     auto freeMem = (PFN_vkFreeMemory)m_vulkan.GetDeviceProc("vkFreeMemory");
     for (uint32_t i = 0; i < kSwapImages; i++) {
@@ -169,7 +200,7 @@ void HmdDriver::DestroySwapTextureSet(vr::SharedTextureHandle_t sharedTextureHan
         set->memory[i] = VK_NULL_HANDLE;
         set->fds[i] = -1;
     }
-    m_setByHandle.erase(it);
+    m_setByHandle.erase(sharedTextureHandle);
 }
 
 void HmdDriver::DestroyAllSwapTextureSets(uint32_t unPid)
@@ -177,12 +208,32 @@ void HmdDriver::DestroyAllSwapTextureSets(uint32_t unPid)
     auto it = m_swapTextureSets.find(unPid);
     if (it == m_swapTextureSets.end()) return;
     for (auto& set : it->second) {
-        for (uint32_t i = 0; i < kSwapImages; i++) {
-            if (set->fds[i] < 0) continue;
-            DestroySwapTextureSet((vr::SharedTextureHandle_t)(uintptr_t)set->fds[i]);
+        if (set->ipcHandles[0]) {
+            DestroySwapTextureSet(set->ipcHandles[0]);
+            continue;
         }
     }
     m_swapTextureSets.erase(it);
+    m_orderedSets.clear();
+}
+
+std::shared_ptr<SwapTextureSet> HmdDriver::ResolveSwapSet(vr::SharedTextureHandle_t handle)
+{
+    auto it = m_setByHandle.find(handle);
+    if (it != m_setByHandle.end()) return it->second;
+    if (handle >= 1 && handle <= m_orderedSets.size()) return m_orderedSets[handle - 1];
+    return {};
+}
+
+// Finds which of the three swap slots a submitted texture handle belongs to.
+// The compositor rotates slots on its own; the index reported by
+// GetNextSwapTextureSetIndex is only a hint for the next frame.
+static int SwapIndexForHandle(const SwapTextureSet& set, vr::SharedTextureHandle_t handle)
+{
+    for (uint32_t i = 0; i < kSwapImages; i++) {
+        if (set.ipcHandles[i] == handle) return (int)i;
+    }
+    return -1;
 }
 
 void HmdDriver::GetNextSwapTextureSetIndex(vr::SharedTextureHandle_t sharedTextureHandles[2],
@@ -190,14 +241,25 @@ void HmdDriver::GetNextSwapTextureSetIndex(vr::SharedTextureHandle_t sharedTextu
 {
     pIndices[0][0] = 0;
     pIndices[1][0] = 0;
-    auto it = m_setByHandle.find(sharedTextureHandles[0]);
-    if (it != m_setByHandle.end()) {
-        auto set = it->second;
+    // Each eye has its own triple-buffered set. Advance them independently so
+    // the compositor renders each eye into the slot Present will actually read.
+    for (int eye = 0; eye < 2; eye++) {
+        auto set = ResolveSwapSet(sharedTextureHandles[eye]);
+        if (!set) {
+            // A zero handle means the compositor did not supply an eye here.
+            // Only unexpected handles are worth logging, and only occasionally:
+            // every log line crosses SteamVR's IPC pipe.
+            if (sharedTextureHandles[eye]) {
+                static unsigned unknownLogs = 0;
+                if (++unknownLogs <= 5 || unknownLogs % 300 == 0) {
+                    DriverLog("GetNextSwapTextureSetIndex: unknown handle %llu (eye %d, total=%u)",
+                              (unsigned long long)sharedTextureHandles[eye], eye, unknownLogs);
+                }
+            }
+            continue;
+        }
         set->nextIndex = (set->nextIndex + 1) % kSwapImages;
-        pIndices[0][0] = set->nextIndex;
-        pIndices[1][0] = (set->nextIndex + 1) % kSwapImages;
-    } else {
-        DriverLog("GetNextSwapTextureSetIndex: unknown handle %llu", (unsigned long long)sharedTextureHandles[0]);
+        pIndices[eye][0] = set->nextIndex;
     }
 }
 
@@ -214,6 +276,11 @@ void HmdDriver::SubmitLayer(const SubmitLayerPerEye_t (&perEye)[2])
     info.boundsRight = perEye[1].bounds;
     m_submitLayers.push_back(info);
     m_hasSubmit.store(true, std::memory_order_release);
+    static bool loggedFirstSubmit = false;
+    if (!loggedFirstSubmit) {
+        loggedFirstSubmit = true;
+        DriverLog("SubmitLayer: first layer queued");
+    }
 }
 
 // Composites the queued layers into the encoder frame. The compositor's own sync
@@ -222,11 +289,18 @@ void HmdDriver::SubmitLayer(const SubmitLayerPerEye_t (&perEye)[2])
 void HmdDriver::Present(vr::SharedTextureHandle_t syncTexture)
 {
     m_presentCount++;
+    static uint32_t presentLogs = 0;
+    if (++presentLogs == 1 || presentLogs % 300 == 1) {
+        DriverLog("Present: call=%u sync=%llu", presentLogs, (unsigned long long)syncTexture);
+    }
     if (!m_vulkan.IsReady() || !m_encoderInitialized || !m_pVideoEncoder) {
         m_hasSubmit.store(false, std::memory_order_release);
         return;
     }
-    if (!AcquireSyncTexture(syncTexture)) {
+    // Some SteamVR builds hand Present a null sync handle in direct mode.
+    // That means there is nothing extra to wait on, not that the frame is bad.
+    const bool hasSync = syncTexture != 0;
+    if (hasSync && !AcquireSyncTexture(syncTexture)) {
         m_hasSubmit.store(false, std::memory_order_release);
         return;
     }
@@ -234,7 +308,7 @@ void HmdDriver::Present(vr::SharedTextureHandle_t syncTexture)
     {
         std::lock_guard<std::mutex> lock(m_submitLayersMutex);
         if (!m_hasSubmit.load(std::memory_order_acquire)) {
-            ReleaseSyncTexture();
+            if (hasSync) ReleaseSyncTexture();
             return;
         }
         layers = m_submitLayers;
@@ -245,23 +319,43 @@ void HmdDriver::Present(vr::SharedTextureHandle_t syncTexture)
         m_pendingFrame = { m_encoderPts++, true };
         m_pendingFrame.layers.clear();
         for (const auto& l : layers) {
-            auto itL = m_setByHandle.find(l.hTextureLeft);
-            auto itR = m_setByHandle.find(l.hTextureRight);
-            if (itL == m_setByHandle.end() || itR == m_setByHandle.end()) {
+            auto set = ResolveSwapSet(l.hTextureLeft);
+            auto setRight = ResolveSwapSet(l.hTextureRight);
+            if (!set || !setRight) {
                 DriverLog("Present: unknown swap handle (left=%llu right=%llu)",
                           (unsigned long long)l.hTextureLeft, (unsigned long long)l.hTextureRight);
                 continue;
             }
-            const auto& set = itL->second;
+            // Read the slot the compositor actually rendered into this frame.
+            // The next-index hint is for the compositor's next write, not ours.
+            int idxLeft = SwapIndexForHandle(*set, l.hTextureLeft);
+            int idxRight = SwapIndexForHandle(*setRight, l.hTextureRight);
+            if (idxLeft < 0 || idxRight < 0) {
+                static unsigned slotMisses = 0;
+                if (++slotMisses <= 5 || slotMisses % 300 == 0) {
+                    DriverLog("Present: swap slot not found (left=%llu/%d right=%llu/%d, drop=%u)",
+                              (unsigned long long)l.hTextureLeft, idxLeft,
+                              (unsigned long long)l.hTextureRight, idxRight, slotMisses);
+                }
+                continue;
+            }
             PendingFrame::PendingLayer pl;
-            pl.left.handle = (uint64_t)(uintptr_t)l.hTextureLeft;
+            pl.left.handle = (uint64_t)(uintptr_t)set->fds[idxLeft];
             pl.left.width = set->width;
             pl.left.height = set->height;
             pl.left.format = set->format;
-            pl.right.handle = (uint64_t)(uintptr_t)l.hTextureRight;
-            pl.right.width = set->width;
-            pl.right.height = set->height;
-            pl.right.format = set->format;
+            pl.right.handle = (uint64_t)(uintptr_t)setRight->fds[idxRight];
+            pl.right.width = setRight->width;
+            pl.right.height = setRight->height;
+            pl.right.format = setRight->format;
+            static bool loggedBounds = false;
+            if (!loggedBounds) {
+                loggedBounds = true;
+                DriverLog("Present layer: L=%llu R=%llu bounds L=(%.3f,%.3f)-(%.3f,%.3f) R=(%.3f,%.3f)-(%.3f,%.3f)",
+                          (unsigned long long)l.hTextureLeft, (unsigned long long)l.hTextureRight,
+                          l.boundsLeft.uMin, l.boundsLeft.vMin, l.boundsLeft.uMax, l.boundsLeft.vMax,
+                          l.boundsRight.uMin, l.boundsRight.vMin, l.boundsRight.uMax, l.boundsRight.vMax);
+            }
             pl.boundsLeft = l.boundsLeft;
             pl.boundsRight = l.boundsRight;
             m_pendingFrame.layers.push_back(pl);
@@ -273,7 +367,7 @@ void HmdDriver::Present(vr::SharedTextureHandle_t syncTexture)
         std::lock_guard<std::mutex> lock(m_encodeDoneMutex);
         m_encodeDone = false;
     }
-    ReleaseSyncTexture();
+    if (hasSync) ReleaseSyncTexture();
 }
 
 void HmdDriver::PostPresent()

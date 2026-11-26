@@ -6,6 +6,7 @@ use crate::protocol::{
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 /// Binary header at offset 0 of each region. Mirrors `protocol.rs` layout; `write_seq`/`read_seq` form the producer→consumer cursor.
+#[repr(C)]
 struct RegionHeader {
     magic: [u8; 4],
     version: u32,

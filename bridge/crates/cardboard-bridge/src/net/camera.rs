@@ -134,8 +134,9 @@ fn camera_loop(
             if !silence_hinted && !got_one_ever && started.elapsed() > Duration::from_secs(10) {
                 silence_hinted = true;
                 if let Ok(mut s) = state.lock() {
+                    let fw = if cfg!(windows) { "Windows firewall" } else { "firewall (ufw/firewalld/nftables)" };
                     s.push_log(format!(
-                        "camera bound but silent after 10s — check Windows firewall inbound UDP {CAMERA_PORT} and the phone's Wi-Fi"
+                        "camera bound but silent after 10s — check {fw} inbound UDP {CAMERA_PORT} and the phone's Wi-Fi"
                     ));
                 }
             }

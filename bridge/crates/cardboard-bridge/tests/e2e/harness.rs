@@ -39,8 +39,15 @@ pub struct Http {
 }
 impl Http {
     pub fn request(&self, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
-        let mut sock = TcpStream::connect(("127.0.0.1", self.port))
-            .unwrap_or_else(|e| panic!("REST {method} {path}: connect port {}: {e}", self.port));
+        self.try_request(method, path, body).unwrap_or_else(|| {
+            panic!("REST {method} {path}: no response from port {}", self.port)
+        })
+    }
+    /// Readiness probe: returns None while the bridge has not bound REST yet.
+    fn try_request(&self, method: &str, path: &str, body: Option<&str>) -> Option<(u16, String)> {
+        let Ok(mut sock) = TcpStream::connect(("127.0.0.1", self.port)) else {
+            return None;
+        };
         sock.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
         let mut req = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n");
         if let Some(b) = body {
@@ -50,7 +57,7 @@ impl Http {
         if let Some(b) = body {
             req.push_str(b);
         }
-        sock.write_all(req.as_bytes()).expect("REST request write");
+        sock.write_all(req.as_bytes()).ok()?;
         let mut raw = Vec::new();
         let mut buf = [0u8; 8192];
         loop {
@@ -75,7 +82,7 @@ impl Http {
         let body = header_end(&raw)
             .map(|e| String::from_utf8_lossy(&raw[e + 4..]).into_owned())
             .unwrap_or_default();
-        (status, body)
+        Some((status, body))
     }
     pub fn get(&self, path: &str) -> (u16, String) {
         self.request("GET", path, None)
@@ -99,10 +106,10 @@ impl Http {
         (code, json)
     }
     pub fn healthy(&self) -> bool {
-        match self.get("/health") {
-            (200, body) => body.contains("\"ok\":true"),
-            _ => false,
-        }
+        matches!(
+            self.try_request("GET", "/health", None),
+            Some((200, body)) if body.contains("\"ok\":true")
+        )
     }
 }
 fn header_end(raw: &[u8]) -> Option<usize> {

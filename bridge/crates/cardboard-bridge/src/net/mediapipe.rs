@@ -251,17 +251,47 @@ pub(crate) fn listen_pid(port: u16) -> Option<u32> {
     parse_listen_pid(&String::from_utf8_lossy(&out.stdout), port)
 }
 #[cfg(not(windows))]
-/// Non-Windows stub: port reclaim is a Windows dev-machine concern.
-pub(crate) fn listen_pid(_port: u16) -> Option<u32> {
+/// Linux: finds the PID whose socket inode is LISTENING on `port`, by reading
+/// /proc/net/tcp{,6} and matching /proc/<pid>/fd/* symlinks. No external tools.
+pub(crate) fn listen_pid(port: u16) -> Option<u32> {
+    let mut inodes = Vec::new();
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(text) = std::fs::read_to_string(table) else { continue };
+        for line in text.lines().skip(1) {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            if cols.len() < 10 || cols[3] != "0A" { continue; }
+            let local = cols[1].rsplit(':').next().unwrap_or("");
+            if u16::from_str_radix(local, 16).ok() == Some(port) {
+                inodes.push(cols[9].to_string());
+            }
+        }
+    }
+    if inodes.is_empty() { return None; }
+    let procs = std::fs::read_dir("/proc").ok()?;
+    for entry in procs.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.chars().all(|c| c.is_ascii_digit()) { continue; }
+        let pid = match name.parse::<u32>() { Ok(p) => p, Err(_) => continue };
+        let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else { continue };
+        for fd in fds.flatten() {
+            let Ok(target) = std::fs::read_link(fd.path()) else { continue };
+            let link = target.to_string_lossy();
+            if inodes.iter().any(|i| link == format!("socket:[{i}]")) {
+                return Some(pid);
+            }
+        }
+    }
     None
 }
 /// Splits the port off a "host:port" endpoint, tolerating IPv6 "[::]:port".
+#[cfg(windows)]
 fn endpoint_port(ep: &str) -> Option<&str> {
     ep.rsplit(':').next().map(|p| p.trim_end_matches(']'))
 }
 /// Scans netstat output for a TCP row that is LISTENING on `port` (foreign
 /// address 0.0.0.0:0). Matches the local port exactly so 142073 never matches
 /// 42073, and ignores the state word so localized Windows builds still parse.
+#[cfg(windows)]
 fn parse_listen_pid(netstat: &str, port: u16) -> Option<u32> {
     let want = port.to_string();
     for line in netstat.lines() {
@@ -284,6 +314,10 @@ fn parse_listen_pid(netstat: &str, port: u16) -> Option<u32> {
 /// True only for the Python interpreter binaries. Guards reclaim_port so a
 /// bridge/driver binary squatting on 42073 is never killed by mistake.
 fn is_python_image(image_path: &str) -> bool {
+    if !cfg!(windows) {
+        // Linux receives the full /proc/<pid>/cmdline, including arguments.
+        return image_path.contains("python") && image_path.contains("mediapipe_server.py");
+    }
     let name = image_path
         .rsplit(['\\', '/'])
         .next()
@@ -331,9 +365,11 @@ fn process_image_name(pid: u32) -> Option<String> {
     }
 }
 #[cfg(not(windows))]
-/// Non-Windows stub: process inspection is only implemented for Windows.
-fn process_image_name(_pid: u32) -> Option<String> {
-    None
+/// Linux: reads /proc/<pid>/cmdline (NUL-separated argv).
+fn process_image_name(pid: u32) -> Option<String> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let text = String::from_utf8_lossy(&raw).replace('\0', " ");
+    if text.trim().is_empty() { None } else { Some(text) }
 }
 #[cfg(windows)]
 /// Force-kills `pid` via taskkill. Only called after is_python_image passed.
@@ -345,9 +381,13 @@ fn kill_pid(pid: u32) -> bool {
         .unwrap_or(false)
 }
 #[cfg(not(windows))]
-/// Non-Windows stub: never kills.
-fn kill_pid(_pid: u32) -> bool {
-    false
+/// Linux: SIGTERM via `kill`. Only called after is_python_image passed.
+fn kill_pid(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .arg(pid.to_string())
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 /// Polls up to 5s for `port` to stop accepting connections after a kill.
 /// True means the reclaim worked and a fresh sidecar can bind.
@@ -563,17 +603,21 @@ mod tests {
     fn mediapipe_port_matches_contract() {
         assert_eq!(crate::net::MEDIAPIPE_PORT, 42073);
     }
+    #[cfg(windows)]
     const SAMPLE_NETSTAT: &str = "Active Connections\r\n\r\n  Proto  Local Address          Foreign Address        State           PID\r\n  TCP    127.0.0.1:42073        0.0.0.0:0              LISTENING       1804\r\n  TCP    127.0.0.1:42073        127.0.0.1:51234        ESTABLISHED     1804\r\n  TCP    127.0.0.1:8567         0.0.0.0:0              LISTENING       9999\r\n";
+    #[cfg(windows)]
     #[test]
     fn netstat_output_maps_listener_to_pid() {
         assert_eq!(parse_listen_pid(SAMPLE_NETSTAT, 42073), Some(1804));
         assert_eq!(parse_listen_pid(SAMPLE_NETSTAT, 8567), Some(9999));
     }
+    #[cfg(windows)]
     #[test]
     fn netstat_parser_ignores_localized_state_words() {
         let german = "  Proto  Lokale Adresse         Remoteadresse          Status            PID\r\n  TCP    127.0.0.1:42073        0.0.0.0:0              ABH\u{d6}REN         4321\r\n";
         assert_eq!(parse_listen_pid(german, 42073), Some(4321));
     }
+    #[cfg(windows)]
     #[test]
     fn netstat_parser_returns_none_when_port_absent() {
         assert_eq!(parse_listen_pid(SAMPLE_NETSTAT, 12345), None);
@@ -581,6 +625,7 @@ mod tests {
         let tricky = "  TCP    127.0.0.1:142073       0.0.0.0:0              LISTENING       7\r\n";
         assert_eq!(parse_listen_pid(tricky, 42073), None);
     }
+    #[cfg(windows)]
     #[test]
     fn python_image_check_matches_interpreters_only() {
         assert!(is_python_image(r"C:\Python312\python.exe"));
@@ -589,6 +634,14 @@ mod tests {
         assert!(!is_python_image(r"C:\bridge\cardboard-bridge.exe"));
         assert!(!is_python_image("python"));
         assert!(!is_python_image(r"C:\tools\python_helper.exe"));
+    }
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_python_image_check_matches_sidecar_cmdline() {
+        assert!(is_python_image(
+            "/usr/bin/python3 /home/u/.local/share/CardboardPlusPlus/mediapipe_server.py"
+        ));
+        assert!(!is_python_image("/usr/bin/python3 /some/other.py"));
     }
     #[test]
     #[cfg(windows)]

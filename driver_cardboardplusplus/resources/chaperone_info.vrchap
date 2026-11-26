@@ -1,0 +1,14 @@
+{
+  "jsonid": "chaperone_info",
+  "universes": [
+    {
+      "universeID": "2",
+      "collision_bounds": [],
+      "play_area": [ 1.0, 1.0 ],
+      "seated": { "translation": [ 0.0, 1.6, 0.0 ], "yaw": 0.0 },
+      "standing": { "translation": [ 0.0, 0.0, 0.0 ], "yaw": 0.0 },
+      "time": "Tue Nov 25 2026 00:00:00 GMT"
+    }
+  ],
+  "version": 5
+}

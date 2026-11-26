@@ -4,9 +4,14 @@
 // because RWByteAddressBuffer.Store would write 32 bits per store and make
 // neighbouring pixel writes overlap.
 static const char* kNv12CSSource = R"(
-Texture2D<float4> srcTex : register(t0);
-cbuffer Params : register(b0) { int4 dims; };  // x=width y=height z=uv plane byte offset
-RWStructuredBuffer<uint> outBuf : register(u0);
+#ifdef CBPP_VK_BINDINGS
+#define VK_BIND(n) [[vk::binding(n)]]
+#else
+#define VK_BIND(n)
+#endif
+VK_BIND(1) Texture2D<float4> srcTex : register(t0);
+VK_BIND(0) cbuffer Params : register(b0) { int4 dims; };  // x=width y=height z=uv plane byte offset
+VK_BIND(2) RWStructuredBuffer<uint> outBuf : register(u0);
 
 float RgbToY(float3 c) {
     return 16.0f + 65.481f * c.r + 128.553f * c.g + 24.966f * c.b;
@@ -57,7 +62,8 @@ void main(uint3 tid : SV_DispatchThreadID) {
         float2 c1 = ChromaAt((xBase >> 1) + 1, y >> 1);
         float2 c2 = ChromaAt((xBase >> 1) + 2, y >> 1);
         float2 c3 = ChromaAt((xBase >> 1) + 3, y >> 1);
-        uint uvWord = (uint)((dims.z >> 2) + ((y >> 1) * (w >> 3)) + (xBase >> 2));
+        // NV12 chroma rows are `w` bytes apart (w/4 uints), not w/8.
+        uint uvWord = (uint)((dims.z >> 2) + ((y >> 1) * (w >> 2)) + (xBase >> 2));
         outBuf[uvWord] = (uint)clamp(c0.x, 0.0f, 255.0f) |
                          ((uint)clamp(c0.y, 0.0f, 255.0f) << 8) |
                          ((uint)clamp(c1.x, 0.0f, 255.0f) << 16) |

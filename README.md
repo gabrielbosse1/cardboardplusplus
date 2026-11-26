@@ -50,7 +50,7 @@ The project is functional but needs cleanup. The SteamVR driver captures frames,
 
 - **Moving CPU work to GPU** — the BGRA→NV12 color conversion currently happens on the CPU via FFmpeg's sws_scale. Moving this to a compute shader.
 - **Understanding and cleaning the codebase** — removing dead code, fixing misleading flags, aligning resolution values.
-- **Linux support** — after the core fixes are done, making the driver work on Linux (replacing D3D11 with Vulkan on the linux version).
+- **Linux support** — the Vulkan driver and bridge run on Linux; install with `scripts/install-linux.sh` (distro-aware).
 
 ### Not yet ported / incomplete
 
@@ -82,7 +82,7 @@ cardboardplusplus/
 │       ├── settings/ streaming/ telemetry/ ui/ video/   # one folder per responsibility
 │       ├── VrActivity.java             # Entry point (root package)
 │       └── NativeBridge.java           # JNI interface (root package)
-├── scripts/                            # compile-bridge/driver/app/all.ps1, install-driver/app.ps1
+├── scripts/                            # Windows .ps1 installers + universal Linux installer (install-linux.sh)
 ├── docs/                               # PROJECT_VISION.md (architecture), LLM_DEBUG_GUIDE.md
 ├── sdk/ third_party/ proto/            # Cardboard SDK, Unity XR headers, device-params protobuf
 └── LICENSE                             # GPL v3
@@ -147,6 +147,29 @@ Tests (mocked collaborators, no mock frameworks — pure functions + fakes + con
 cargo test --manifest-path bridge/Cargo.toml   # bridge unit + integration (mock driver + mock phone)
 # android: run `gradlew.bat testDebugUnitTest` inside cardboardplusplus-android/
 ```
+
+### Linux (any distro)
+
+`scripts/install-linux.sh` detects apt/dnf/pacman/apk/zypper and runs the same
+steps as the Windows installers. It installs the distro build/runtime packages
+by default (sudo/doas required); pass `--no-deps` to skip that step. All product
+files are per-user.
+
+```bash
+bash scripts/install-linux.sh            # packages + driver + bridge + MediaPipe + launcher + SteamVR registration
+bash scripts/install-linux.sh --no-deps  # skip the distro package step
+bash scripts/install-linux.sh --start    # same, then launch SteamVR
+bash scripts/install-driver-linux.sh     # just the SteamVR driver
+bash scripts/install-bridge-linux.sh     # just the bridge binary + launcher
+bash scripts/install-mediapipe-linux.sh  # just the Python sidecar (venv)
+bash scripts/install-steamvr-linux.sh --start
+bash scripts/uninstall-linux.sh          # --purge-data also removes the venv + wizard marker
+bash scripts/compile-driver-linux.sh     # builds .so, bootstraps dxc if needed
+```
+
+The launcher icon is installed to `~/.local/share/applications/` with icons in
+`~/.local/share/icons/hicolor/*/apps/`. The wizard marker lives at
+`~/.local/share/CardboardPlusPlus/setup.done`; delete it to replay the tutorial.
 
 ### SteamVR driver (manual)
 

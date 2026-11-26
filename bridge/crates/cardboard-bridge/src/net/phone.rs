@@ -71,8 +71,9 @@ fn telemetry_loop(sock: UdpSocket, state: SharedState) {
         if !silence_hinted && last_seen.is_none() && started.elapsed() > Duration::from_secs(10) {
             silence_hinted = true;
             if let Ok(mut s) = state.lock() {
+                let fw = if cfg!(windows) { "Windows firewall" } else { "firewall (ufw/firewalld/nftables)" };
                 s.push_log(format!(
-                    "telemetry bound but silent after 10s — check Windows firewall inbound UDP {TELEMETRY_PORT} and the phone's Wi-Fi"
+                    "telemetry bound but silent after 10s — check {fw} inbound UDP {TELEMETRY_PORT} and the phone's Wi-Fi"
                 ));
             }
         }

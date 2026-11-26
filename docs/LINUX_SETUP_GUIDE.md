@@ -8,6 +8,12 @@ driver + bridge end to end.
 Follow the steps in order. Each section is self-contained so you can jump to
 what you need.
 
+> **Fast path:** `bash scripts/install-linux.sh` installs the matching packages
+> for your distro and then the driver, bridge, MediaPipe venv, desktop entry and
+> SteamVR registration in one pass. Use `--no-deps` if packages are already
+> installed. The manual steps below are still useful for verification and for
+> distros with custom layouts.
+
 ## Prerequisites
 
 The PC must have:

@@ -52,6 +52,7 @@ set(CBPP_INCLUDE_DIRS
 set(CBPP_SOURCES
     src/DeviceFactory.cpp
     src/DeviceProvider.cpp
+    src/HmdDriver.cpp
     src/DriverLog.cpp
     src/HandDriver.cpp
     src/Discovery.cpp
@@ -106,7 +107,8 @@ foreach(shader compose_vs compose_ps nv12_cs)
     add_custom_command(
         OUTPUT ${_hdr}
         COMMAND ${CMAKE_COMMAND} -E make_directory ${CBPP_SPIRV_DIR}
-        COMMAND ${CBPP_DXC_EXE} -spirv -T ${_profile} -E main -fspv-target-env=vulkan1.1 -O3 ${_hlsl} -Fo ${_spv}
+        COMMAND ${CBPP_DXC_EXE} -spirv -T ${_profile} -E main -fspv-target-env=vulkan1.1
+                -D CBPP_VK_BINDINGS=1 -O3 ${_hlsl} -Fo ${_spv}
         COMMAND ${CMAKE_COMMAND}
                 -DSPV=${_spv} -DHDR=${_hdr} -DNAME=CBPPSpirv_${shader}
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedSpirv.cmake
@@ -120,6 +122,11 @@ add_custom_target(cbpp_shaders DEPENDS ${CBPP_SPIRV_HEADERS})
 
 add_library(driver_cardboardplusplus SHARED ${CBPP_SOURCES})
 add_dependencies(driver_cardboardplusplus cbpp_shaders)
+# Steam launches vrserver inside its own runtime, where /usr/lib is not on the
+# loader path. $ORIGIN finds the FFmpeg libs staged beside the .so; the /run/host
+# paths are where the Steam runtime exposes the host's distro libraries.
+set_target_properties(driver_cardboardplusplus PROPERTIES
+    BUILD_RPATH "$ORIGIN:/usr/lib:/usr/lib64:/run/host/usr/lib:/run/host/usr/lib64")
 
 target_include_directories(driver_cardboardplusplus PRIVATE ${CBPP_INCLUDE_DIRS} ${CBPP_SPIRV_DIR})
 target_compile_definitions(driver_cardboardplusplus PRIVATE

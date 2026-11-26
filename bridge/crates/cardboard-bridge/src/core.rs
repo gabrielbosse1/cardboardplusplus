@@ -186,8 +186,11 @@ pub(crate) fn spawn_mediapipe_server(state: &SharedState) -> (Option<MediapipeCl
     }
     let script_path = {
         let cwd_candidate = std::path::PathBuf::from("mediapipe_server.py");
+        let data_candidate = paths::user_data_dir().join("mediapipe_server.py");
         if cwd_candidate.is_file() {
             Some(cwd_candidate)
+        } else if data_candidate.is_file() {
+            Some(data_candidate)
         } else if let Some(exe_dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf())) {
             let near = exe_dir.join("mediapipe_server.py");
             if near.is_file() {
@@ -215,7 +218,7 @@ pub(crate) fn spawn_mediapipe_server(state: &SharedState) -> (Option<MediapipeCl
     };
     let Some(script_path) = script_path else {
         if let Ok(mut s) = state.lock() {
-            s.push_log("mediapipe server script not found (expected next to the binary or in crates/cardboard-bridge/)".into());
+            s.push_log("mediapipe server script not found (expected in the user data dir, next to the binary, or in crates/cardboard-bridge/)".into());
         }
         return (None, None);
     };
@@ -281,19 +284,27 @@ pub(crate) fn spawn_mediapipe_server(state: &SharedState) -> (Option<MediapipeCl
         }
     }
 }
-/// Picks the python for the sidecar: bundled python/ next to the exe first,
-/// then $PYTHON, then the py launcher, then PATH python. Last resort is the
-/// bare "python" name (spawn reports the failure to the log).
+/// Picks the python for the sidecar: the per-user venv created by the Linux
+/// installer, the bundled Windows python, $PYTHON, then the platform launcher.
 fn python_command() -> (String, Vec<String>) {
     if let Some(bundled) = bundled_python() {
         return (bundled, vec![]);
+    }
+    let venv = paths::user_data_dir().join("mediapipe-venv/bin/python");
+    if venv.is_file() {
+        return (venv.to_string_lossy().into_owned(), vec![]);
     }
     if let Ok(p) = std::env::var("PYTHON") {
         if !p.trim().is_empty() {
             return (p, vec![]);
         }
     }
-    for (prog, args) in [("py", vec!["-3"]), ("python", vec![])] {
+    let candidates: Vec<(&str, Vec<&str>)> = if cfg!(windows) {
+        vec![("py", vec!["-3"]), ("python", vec![])]
+    } else {
+        vec![("python3", vec![]), ("python", vec![])]
+    };
+    for (prog, args) in candidates {
         let ok = Command::new(prog)
             .args(&args)
             .arg("--version")
@@ -307,16 +318,19 @@ fn python_command() -> (String, Vec<String>) {
             );
         }
     }
-    ("python".to_string(), vec![])
+    (if cfg!(windows) { "python" } else { "python3" }.to_string(), vec![])
 }
-/// Installer-bundled interpreter (python/python.exe next to the bridge exe).
-/// None in dev checkouts, which use system python instead.
+/// Installer-bundled interpreter next to the bridge exe (Windows python.exe,
+/// Linux python/bin/python). None in dev checkouts, which use system python.
 fn bundled_python() -> Option<String> {
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|e| e.parent().map(|p| p.to_path_buf()))?;
-    let py = exe_dir.join("python").join("python.exe");
-    py.is_file().then(|| py.to_string_lossy().into_owned())
+    let candidates = [
+        exe_dir.join("python").join("python.exe"),
+        exe_dir.join("python").join("bin").join("python"),
+    ];
+    candidates.iter().find(|p| p.is_file()).map(|p| p.to_string_lossy().into_owned())
 }
 /// Logs the preview ffmpeg version at startup, or how to install it when
 /// missing (then the video preview stays dark but everything else works).
@@ -335,9 +349,12 @@ fn log_ffmpeg_version(state: &SharedState) {
         }
         _ => {
             if let Ok(mut s) = state.lock() {
-                s.push_log(
-                    "ffmpeg not found on PATH — preview stays dark; install via `winget install ffmpeg`".into(),
-                );
+                let hint = if cfg!(windows) {
+                    "winget install ffmpeg"
+                } else {
+                    "ffmpeg via your package manager (or `bash scripts/install-linux.sh --deps`)"
+                };
+                s.push_log(format!("ffmpeg not found on PATH — preview stays dark; install {hint}"));
             }
         }
     }
@@ -654,17 +671,25 @@ impl AppCore {
         }
         let state = self.state.clone();
         thread::spawn(move || {
-            let note = match find_steam_exe() {
-                Some(steam) => {
-                    match Command::new(&steam)
-                        .args(["-applaunch", &STEAMVR_APP_ID.to_string()])
-                        .spawn()
-                    {
-                        Ok(_) => format!("opening SteamVR via Steam ({steam})"),
-                        Err(e) => format!("failed to start SteamVR via {steam}: {e}"),
+            let note = match steam_launch_command() {
+                Some((launcher, args)) => match Command::new(&launcher).args(&args).spawn() {
+                    Ok(mut child) => {
+                        // Own the child until it exits so the kernel reaps it;
+                        // dropping Child alone leaves a zombie vrmonitor.
+                        thread::spawn(move || {
+                            let _ = child.wait();
+                        });
+                        format!("opening SteamVR via {launcher}")
+                    }
+                    Err(e) => format!("failed to start SteamVR via {launcher}: {e}"),
+                },
+                None => {
+                    if cfg!(windows) {
+                        "Steam not found (expected Steam\\steam.exe under Program Files) — open Steam and start SteamVR from Library → Tools".into()
+                    } else {
+                        "vrmonitor.sh not found — install SteamVR or run scripts/install-steamvr-linux.sh".into()
                     }
                 }
-                None => "Steam not found (expected Steam\\steam.exe under Program Files) — open Steam and start SteamVR from Library → Tools".into(),
             };
             if let Ok(mut s) = state.lock() {
                 s.steamvr_note = note.clone();
@@ -898,10 +923,15 @@ impl AppCore {
 }
 /// Steam app id used to launch SteamVR, and the process names whose presence
 /// blocks driver installs (locked DLLs) and gates the "already running" path.
+#[cfg(windows)]
 const STEAMVR_APP_ID: u32 = 250820;
+#[cfg(windows)]
 const STEAMVR_PROCS: [&str; 2] = ["vrserver.exe", "vrmonitor.exe"];
-/// Finds steam.exe under Program Files. None on machines without Steam
-/// (start_steamvr then tells the user where to get it).
+#[cfg(not(windows))]
+const STEAMVR_PROCS: [&str; 2] = ["vrserver", "vrmonitor"];
+/// Windows: steam.exe under Program Files. Linux: SteamVR's vrmonitor.sh in
+/// the native, Flatpak or Snap Steam layout.
+#[cfg(windows)]
 fn find_steam_exe() -> Option<String> {
     let dirs = [
         std::env::var("ProgramFiles(x86)").ok(),
@@ -915,9 +945,35 @@ fn find_steam_exe() -> Option<String> {
     }
     None
 }
+#[cfg(not(windows))]
+fn find_steam_exe() -> Option<String> {
+    let home = std::env::var_os("HOME")?;
+    let home = std::path::PathBuf::from(home);
+    let mut candidates = vec![
+        home.join(".steam/steam/steamapps/common/SteamVR/bin/vrmonitor.sh"),
+        home.join(".local/share/Steam/steamapps/common/SteamVR/bin/vrmonitor.sh"),
+        home.join(".var/app/com.valvesoftware.Steam/.steam/steam/steamapps/common/SteamVR/bin/vrmonitor.sh"),
+        home.join("snap/steam/common/SteamVR/bin/vrmonitor.sh"),
+    ];
+    if let Ok(fp) = std::env::var("FLATPAK_HOME") {
+        candidates.push(std::path::PathBuf::from(fp)
+            .join(".steam/steam/steamapps/common/SteamVR/bin/vrmonitor.sh"));
+    }
+    candidates.into_iter().find(|p| p.is_file()).map(|p| p.to_string_lossy().into_owned())
+}
+/// Command line for starting SteamVR on this platform.
+fn steam_launch_command() -> Option<(String, Vec<String>)> {
+    let exe = find_steam_exe()?;
+    #[cfg(windows)]
+    let args = vec!["-applaunch".to_string(), STEAMVR_APP_ID.to_string()];
+    #[cfg(not(windows))]
+    let args = Vec::new();
+    Some((exe, args))
+}
 /// Matches tasklist CSV output against the SteamVR process names (first
 /// column, case-insensitive). Pure function so tests cover it without
 /// spawning tasklist.
+#[cfg(windows)]
 fn detect_steamvr_in_tasklist(output: &str) -> Vec<&'static str> {
     STEAMVR_PROCS
         .iter()
@@ -934,8 +990,9 @@ fn detect_steamvr_in_tasklist(output: &str) -> Vec<&'static str> {
         .copied()
         .collect()
 }
-/// Live check: which SteamVR processes run right now. Empty when tasklist
-/// itself fails (then installs proceed — the locked-file retry reports it).
+/// Live check: which SteamVR processes run right now. Windows parses tasklist,
+/// Linux asks pgrep. Empty on failure so installs can still proceed.
+#[cfg(windows)]
 fn steamvr_running_now() -> Vec<&'static str> {
     match std::process::Command::new("tasklist")
         .args(["/NH", "/FO", "CSV"])
@@ -947,25 +1004,118 @@ fn steamvr_running_now() -> Vec<&'static str> {
         _ => Vec::new(),
     }
 }
+#[cfg(not(windows))]
+fn steamvr_running_now() -> Vec<&'static str> {
+    let mut running = Vec::new();
+    for proc_ in STEAMVR_PROCS {
+        let Ok(out) = std::process::Command::new("pgrep").args(["-x", proc_]).output() else {
+            continue;
+        };
+        if !out.status.success() {
+            continue;
+        }
+        for pid in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+            // A zombie is a dead child waiting to be reaped; it cannot hold a
+            // driver .so or block a new launch, so it must not count as running.
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+            let state = stat.rsplit_once(')').and_then(|(_, tail)| tail.trim().chars().next());
+            if state != Some('Z') {
+                running.push(proc_);
+                break;
+            }
+        }
+    }
+    running
+}
 /// SteamVR driver slot, its root, and the installed DLL path. Thin wrappers
 /// over bridge_core::paths used across install/presence checks.
 fn steamvr_drivers_dir() -> String {
     paths::default_steamvr_drivers_dir()
 }
-/// SteamVR root derived from the driver slot (for vrsettings + steam exe).
+/// SteamVR root derived from the driver slot (Windows install flow only).
+#[cfg(windows)]
 fn steamvr_root() -> String {
     paths::steamvr_root_from_drivers_dir(&steamvr_drivers_dir())
 }
-/// Installed driver DLL: <slot>/bin/win64/driver_cardboardplusplus.dll.
+/// Installed driver artifact: <slot>/bin/win64/<dll> or bin/linux64/<so>.
 /// Presence of this file drives the install pill.
 fn driver_target_dll() -> String {
-    format!("{}\\bin\\win64\\driver_cardboardplusplus.dll", steamvr_drivers_dir())
+    #[cfg(windows)]
+    let (folder, name) = ("win64", "driver_cardboardplusplus.dll");
+    #[cfg(not(windows))]
+    let (folder, name) = ("linux64", "driver_cardboardplusplus.so");
+    std::path::Path::new(&steamvr_drivers_dir())
+        .join("bin")
+        .join(folder)
+        .join(name)
+        .to_string_lossy()
+        .into_owned()
 }
-/// Six-stage install with progress reports: prepare folders, back up the
-/// current DLL (timestamped .bak), resolve the new DLL (local compile or
-/// release download), atomic swap-in, FFmpeg runtime, resources + vrsettings
-/// force-on. Returns the one-line summary shown in the hub. Called on the
-/// install_driver worker thread.
+/// Linux: install directly from the staged driver bundle (or a checkout build)
+/// so an installed bridge works without a repo, scripts/ or a shell installer.
+#[cfg(not(windows))]
+fn install_driver_files(report: &dyn Fn(f32, &str)) -> Result<String, String> {
+    use bridge_core::driver_deps::replace_locked;
+    use bridge_core::driver_install::{force_driver_enabled, install_resources};
+    use std::path::PathBuf;
+
+    let drivers_dir = PathBuf::from(steamvr_drivers_dir());
+    let target_bin = drivers_dir.join("bin").join("linux64");
+    report(0.08, "preparing folders… (1/6)");
+    std::fs::create_dir_all(&target_bin)
+        .map_err(|e| format!("mkdir {}: {e}", target_bin.display()))?;
+
+    let source = std::env::var_os("CBPP_DRIVER_SO")
+        .map(PathBuf::from)
+        .filter(|p| p.is_file())
+        .or_else(|| {
+            paths::repo_root()
+                .map(|r| r.join("driver_cardboardplusplus/build/libdriver_cardboardplusplus.so"))
+                .filter(|p| p.is_file())
+        })
+        .or_else(|| {
+            let bundled = paths::user_data_dir().join("driver/driver_cardboardplusplus.so");
+            bundled.is_file().then_some(bundled)
+        })
+        .ok_or_else(|| {
+            "driver .so not found — reinstall the bridge with `bash scripts/install-linux.sh --bridge` so the driver bundle is staged".to_string()
+        })?;
+
+    let target = PathBuf::from(driver_target_dll());
+    report(0.20, "backing up current driver… (2/6)");
+    if target.is_file() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let backup = PathBuf::from(format!("{}.bak-{stamp}", target.display()));
+        std::fs::copy(&target, &backup)
+            .map_err(|e| format!("backup {}: {e}", backup.display()))?;
+    }
+    report(0.45, "copying driver… (3/6)");
+    let tmp = PathBuf::from(format!("{}.tmp-{}", target.display(), std::process::id()));
+    if let Err(e) = std::fs::copy(&source, &tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("copy {}: {e}", tmp.display()));
+    }
+    replace_locked(&tmp, &target)?;
+
+    report(0.65, "installing resources… (4/6)");
+    install_resources(&drivers_dir)?;
+    report(0.85, "enabling driver… (5/6)");
+    let root = paths::steamvr_root_from_drivers_dir(&steamvr_drivers_dir());
+    let forced = force_driver_enabled(&root)?;
+    let registered = paths::register_driver(&steamvr_drivers_dir());
+    report(1.0, "done… (6/6)");
+    Ok(format!(
+        "installed Linux driver into {} (vrsettings enabled: {}, registered: {})",
+        target_bin.display(), forced, registered
+    ))
+}
+/// Six-stage Windows install with progress reports: prepare folders, back up
+/// the current DLL, resolve the new DLL, atomic swap-in, FFmpeg runtime,
+/// resources + vrsettings force-on. Called on the install_driver worker thread.
+#[cfg(windows)]
 fn install_driver_files(report: &dyn Fn(f32, &str)) -> Result<String, String> {
     use bridge_core::driver_install::{
         DriverDllSource, download_to, driver_dll_source, force_driver_enabled,
@@ -1101,10 +1251,12 @@ mod tests {
         let running_pos = json.find("steamvr_running").unwrap();
         assert!(progress_pos < running_pos);
     }
+    #[cfg(windows)]
     #[test]
     fn steamvr_app_id_matches_store_page() {
         assert_eq!(STEAMVR_APP_ID, 250820);
     }
+    #[cfg(windows)]
     #[test]
     fn tasklist_csv_detects_steamvr_procs() {
         let out = "\"steam.exe\",\"1234\",\"Console\",\"1\",\"10,000 K\"\r\n\
@@ -1112,6 +1264,7 @@ mod tests {
                    \"vrmonitor.exe\",\"9012\",\"Console\",\"1\",\"20,000 K\"\r\n";
         assert_eq!(detect_steamvr_in_tasklist(out), vec!["vrserver.exe", "vrmonitor.exe"]);
     }
+    #[cfg(windows)]
     #[test]
     fn tasklist_output_without_steamvr_is_empty() {
         let out = "\"steam.exe\",\"1234\",\"Console\",\"1\",\"10,000 K\"\r\n\
@@ -1119,6 +1272,7 @@ mod tests {
         assert!(detect_steamvr_in_tasklist(out).is_empty());
         assert!(detect_steamvr_in_tasklist("").is_empty());
     }
+    #[cfg(windows)]
     #[test]
     fn tasklist_match_is_case_insensitive() {
         assert_eq!(detect_steamvr_in_tasklist("\"VRSERVER.EXE\",\"1\",\"X\",\"1\",\"1 K\""), vec!["vrserver.exe"]);
@@ -1170,5 +1324,26 @@ mod tests {
         assert_eq!(snapshot.preview_bitrate_kbps, 20000);
         assert_eq!(snapshot.preview_frames, 5000);
         assert_eq!(snapshot.preview_drops, 10);
+    }
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_driver_install_works_without_repo_scripts() {
+        let tmp = std::env::temp_dir().join(format!("cbpp-install-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("data/driver")).unwrap();
+        let artifact = tmp.join("driver.so");
+        std::fs::write(&artifact, b"fake driver").unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_so = std::env::var_os("CBPP_DRIVER_SO");
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("CBPP_DRIVER_SO", &artifact);
+        let result = install_driver_files(&|_, _| {});
+        let target = tmp.join(".local/share/SteamVR/drivers/cardboardplusplus/bin/linux64/driver_cardboardplusplus.so");
+        let installed = target.is_file();
+        if let Some(v) = old_home { std::env::set_var("HOME", v); } else { std::env::remove_var("HOME"); }
+        if let Some(v) = old_so { std::env::set_var("CBPP_DRIVER_SO", v); } else { std::env::remove_var("CBPP_DRIVER_SO"); }
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(result.is_ok(), "install failed: {result:?}");
+        assert!(installed, "driver .so was not installed without a checkout");
     }
 }

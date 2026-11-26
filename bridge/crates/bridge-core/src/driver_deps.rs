@@ -117,6 +117,10 @@ pub fn fetch_script_path() -> Option<PathBuf> {
 /// when something is missing. Ok(()) means install_ffmpeg_dlls can copy.
 /// Called before driver installs and bridge staging.
 pub fn ensure_ffmpeg_bin() -> Result<(), String> {
+    // Linux uses the distro FFmpeg packages; there is no vendored DLL set.
+    if !cfg!(windows) {
+        return Ok(());
+    }
     let src_bin = ffmpeg_bin_src();
     if src_bin.is_empty() {
         return Err("repo checkout not found — cannot locate vendored FFmpeg".into());

@@ -88,6 +88,12 @@ void HmdDriver::OnEncodedPacket(uint8_t* data, int size, int64_t pts, bool keyfr
     if (!m_udpInitialized || m_udpSocket == cbpp::kInvalidSocket || !data || size <= 0) {
         return;
     }
+    static bool loggedFirstPacket = false;
+    if (!loggedFirstPacket) {
+        loggedFirstPacket = true;
+        DriverLog("UDP: first encoded packet size=%d keyframe=%d preview=%d", size,
+                  keyframe ? 1 : 0, m_previewEnabled.load(std::memory_order_relaxed) ? 1 : 0);
+    }
     if (keyframe && size >= 8) {
         DebugLog("[Encoded] size=%d, pts=%lld, keyframe=YES, first16=%02X %02X %02X %02X %02X %02X %02X %02X",
                   size, pts,

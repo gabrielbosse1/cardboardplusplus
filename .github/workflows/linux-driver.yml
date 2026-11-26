@@ -28,6 +28,11 @@ jobs:
           libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
           libvulkan-dev libx11-dev
 
+    - name: Check Linux installer scripts
+      run: |
+        for f in scripts/lib/linux-common.sh scripts/*.sh; do bash -n "$f"; done
+        bash scripts/install-linux.sh --help
+
     - name: Download DirectXShaderCompiler (dxc) for Linux
       run: |
         DXC_VERSION="v1.9.2609"
@@ -82,6 +87,12 @@ jobs:
           echo "unexpected undefined OpenVR symbols:"; nm -D --undefined-only "$SO" | grep -E "\b(VR[A-Z]|OpenVR|InitServerDriverContext)"; exit 1
         fi
         echo "no undefined OpenVR symbols (inline accessors confirmed)"
+        # A missing source file leaves C++ symbols unresolved at link time on ELF;
+        # SteamVR only finds them when it dlopen()s the driver.
+        if nm -D --undefined-only "$SO" | grep -qE '\b(HmdDriver|VulkanCompose|VideoEncoder|DeviceProvider|BridgeServer|HandDriver|DirectMode)'; then
+          echo "unresolved driver symbols:"; nm -D --undefined-only "$SO" | grep -E '\b(HmdDriver|VulkanCompose|VideoEncoder|DeviceProvider|BridgeServer|HandDriver|DirectMode)'; exit 1
+        fi
+        echo "no unresolved driver symbols"
 
     - name: Driver wire-protocol tests (g++)
       run: |

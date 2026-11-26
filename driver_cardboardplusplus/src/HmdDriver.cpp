@@ -5,7 +5,13 @@
 #include <chrono>
 #include <cstring>
 #include <fstream>
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
 using namespace vr;
+#ifndef _WIN32
+static void cbpp_dl_anchor() {}
+#endif
 // Called by SteamVR to register the HMD; creates D3D, encoder, UDP/discovery/sensor sockets, encoding thread, bridge SHM, and device properties.
 EVRInitError HmdDriver::Activate(uint32_t unObjectId)
 {
@@ -80,7 +86,38 @@ EVRInitError HmdDriver::Activate(uint32_t unObjectId)
     VRProperties()->SetInt32Property(props, Prop_DeviceClass_Int32, TrackedDeviceClass_HMD);
     VRProperties()->SetStringProperty(props, Prop_ManufacturerName_String, "CardboardPlusPlus");
     VRProperties()->SetStringProperty(props, Prop_TrackingSystemName_String, "cardboardplusplus");
+#ifndef _WIN32
+    {
+        // SteamVR stays in Room Setup until a play area exists for this
+        // universe. Point it at the driver's bundled seated play area.
+        Dl_info dl = {};
+        std::string chapPath;
+        if (dladdr((void*)&cbpp_dl_anchor, &dl) && dl.dli_fname) {
+            std::string soPath = dl.dli_fname;
+            size_t slash = soPath.find_last_of('/');
+            if (slash != std::string::npos) {
+                std::string binDir = soPath.substr(0, slash);       // <root>/bin/linux64
+                slash = binDir.find_last_of('/');
+                if (slash != std::string::npos) {
+                    std::string rootDir = binDir.substr(0, slash);  // <root>/bin
+                    slash = rootDir.find_last_of('/');
+                    if (slash != std::string::npos) {
+                        chapPath = rootDir.substr(0, slash) + "/resources/chaperone_info.vrchap";
+                    }
+                }
+            }
+        }
+        if (!chapPath.empty() && std::ifstream(chapPath).good()) {
+            VRProperties()->SetStringProperty(props, Prop_DriverProvidedChaperonePath_String,
+                                              chapPath.c_str());
+            DriverLog("HMD chaperone: %s", chapPath.c_str());
+        }
+    }
+#endif
     VRProperties()->SetFloatProperty(props, Prop_UserIpdMeters_Float, 0.064f);
+    // SteamVR defaults this to true for direct-mode drivers, which makes it
+    // pass small client-owned indices instead of our shared texture handles.
+    VRProperties()->SetBoolProperty(props, (ETrackedDeviceProperty)2116, false);
     VRProperties()->SetFloatProperty(props, Prop_DisplayFrequency_Float, 60.0f);
     VRProperties()->SetFloatProperty(props, Prop_SecondsFromVsyncToPhotons_Float, 0.011f);
     VRProperties()->SetBoolProperty(props, Prop_ReportsTimeSinceVSync_Bool, true);
@@ -245,13 +282,31 @@ DriverPose_t HmdDriver::GetPose()
     const bool rotFresh = lastRot != 0 && (nowMs - lastRot) < kSensorStaleMs;
     bool hasQ = rotFresh && m_hasQuaternion.load(std::memory_order_relaxed);
     if (!fresh) {
+#ifndef _WIN32
+        // No phone is connected: keep the virtual HMD present at a fixed pose
+        // so the bridge can be tested without a handset. Real phone rotations
+        // take over as soon as they arrive.
+        pose.poseIsValid = true;
+        pose.result = TrackingResult_Running_OK;
+        pose.vecPosition[0] = 0.0;
+        pose.vecPosition[1] = 1.6;
+        pose.vecPosition[2] = 0.0;
+        pose.qRotation.w = 1.0;
+        pose.qRotation.x = 0.0;
+        pose.qRotation.y = 0.0;
+        pose.qRotation.z = 0.0;
+#else
         pose.poseIsValid = false;
         pose.result = TrackingResult_Running_OutOfRange;
+        pose.qRotation.w = 1.0;
+        pose.qRotation.x = 0.0;
+        pose.qRotation.y = 0.0;
+        pose.qRotation.z = 0.0;
+#endif
         pose.qDriverFromHeadRotation.w = 1.0;
         pose.qDriverFromHeadRotation.x = 0.0;
         pose.qDriverFromHeadRotation.y = 0.0;
         pose.qDriverFromHeadRotation.z = 0.0;
-        pose.qRotation = pose.qDriverFromHeadRotation;
         return pose;
     }
     HmdQuaternion_t quat;
@@ -408,7 +463,7 @@ bool HmdDriver::InitializeBridge()
 {
     if (m_bridgeServer.Start()) {
         m_bridgeInitialized.store(true, std::memory_order_relaxed);
-        DriverLog("Bridge shared-memory region created at %ls", cbpp::kRegionName);
+        DriverLog("Bridge shared-memory region created at %s", cbpp::kRegionName);
         m_bridgeServer.PublishStatus();
         return true;
     }

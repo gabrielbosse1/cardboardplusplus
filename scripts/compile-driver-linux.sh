@@ -1,53 +1,43 @@
 #!/usr/bin/env bash
-# Build the Linux SteamVR driver. Produces build/driver_cardboardplusplus.so;
-# copy it to $HOME/.local/share/SteamVR/drivers/cardboardplusplus/bin/linux64/.
+# Build the Linux SteamVR driver. Produces build/libdriver_cardboardplusplus.so.
+# Locates SteamVR's openvr_api.so across native/Flatpak/Snap layouts and
+# bootstraps dxc into the per-user data dir when it is not on PATH.
 set -euo pipefail
+scripts_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+here="$(cd "${scripts_dir}/.." && pwd)"
+# shellcheck source=lib/linux-common.sh
+source "${scripts_dir}/lib/linux-common.sh"
 
-here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 build="${here}/driver_cardboardplusplus/build"
+openvr="$(cbpp_find_openvr_dir 2>/dev/null || true)"
+[ -n "$openvr" ] || cbpp_fail "SteamVR not found. Set OPENVR_DIR to a directory containing bin/linux64/openvr_api.so"
 
-# SteamVR ships openvr_api.so; export OPENVR_DIR if it is not on the default path.
-# Check multiple possible SteamVR install locations (native Steam, Flatpak, etc.)
-if [ -z "${OPENVR_DIR:-}" ]; then
-    for candidate in \
-        "${HOME}/.steam/steam/steamapps/common/SteamVR" \
-        "${HOME}/.local/share/Steam/steamapps/common/SteamVR" \
-        "${HOME}/.var/app/com.valvesoftware.Steam/.steam/steam/steamapps/common/SteamVR" \
-        "${HOME}/.var/app/com.valvesoftware.Steam/steam/steamapps/common/SteamVR" \
-        "${HOME}/snap/steam/common/SteamVR"; do
-        if [ -f "${candidate}/bin/linux64/openvr_api.so" ]; then
-            export OPENVR_DIR="$candidate"
-            break
-        fi
-    done
+dxc=""
+if cbpp_has_cmd dxc; then
+    dxc="$(command -v dxc)"
+else
+    data_dir="$(cbpp_data_dir)"
+    dxc="${data_dir}/dxc/dxc"
+    if [ ! -x "$dxc" ]; then
+        cbpp_log "dxc not found — downloading DirectXShaderCompiler"
+        url="https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/linux_dxc_2026_09_28.x86_x64.tar.gz"
+        archive="$(mktemp)"
+        cbpp_download "$url" "$archive"
+        mkdir -p "${data_dir}/dxc"
+        tar -xzf "$archive" -C "${data_dir}/dxc"
+        rm -f "$archive"
+        found="$(find "${data_dir}/dxc" -type f -name dxc | head -1)"
+        [ -n "$found" ] || cbpp_fail "dxc archive did not contain a dxc binary"
+        dxc="$found"
+        chmod +x "$dxc"
+    fi
 fi
-if [ -z "${OPENVR_DIR:-}" ]; then
-    echo "OPENVR_DIR not set and no SteamVR install found in the default paths." >&2
-    echo "SteamVR paths checked:" >&2
-    echo "  ${HOME}/.steam/steam/steamapps/common/SteamVR" >&2
-    echo "  ${HOME}/.local/share/Steam/steamapps/common/SteamVR" >&2
-    echo "  ${HOME}/.var/app/com.valvesoftware.Steam/.steam/steam/steamapps/common/SteamVR" >&2
-    echo "  ${HOME}/.var/app/com.valvesoftware.Steam/steam/steamapps/common/SteamVR" >&2
-    echo "  ${HOME}/snap/steam/common/SteamVR" >&2
-    echo "" >&2
-    echo "Set OPENVR_DIR to your SteamVR install directory, e.g.:" >&2
-    echo "  export OPENVR_DIR=\$HOME/.local/share/Steam/steamapps/common/SteamVR" >&2
-    exit 1
-fi
-
-# Check that dxc is available (required for SPIR-V shader compilation).
-if ! command -v dxc >/dev/null 2>&1; then
-    echo "dxc (DirectXShaderCompiler) not found on PATH." >&2
-    echo "Install it:" >&2
-    echo "  curl -fsSL -o /tmp/dxc.tar.gz https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/linux_dxc_2026_09_28.x86_x64.tar.gz" >&2
-    echo "  sudo mkdir -p /opt/dxc && sudo tar -xzf /tmp/dxc.tar.gz -C /opt/dxc" >&2
-    echo "  sudo ln -sf \$(find /opt/dxc -name dxc -type f | head -1) /usr/local/bin/dxc" >&2
-    exit 1
-fi
+cbpp_log "dxc: $dxc"
+cbpp_log "openvr: $openvr"
 
 cmake -S "${here}/driver_cardboardplusplus" -B "$build" -DCMAKE_BUILD_TYPE=Release \
-    -DCBPP_OPENVR_DIR="$OPENVR_DIR/bin/linux64" "$@"
-cmake --build "$build" --parallel "$(nproc)"
+    -DCBPP_OPENVR_DIR="${openvr}/bin/linux64" -DCBPP_DXC_EXE="$dxc" "$@"
+cmake --build "$build" --parallel "$(nproc 2>/dev/null || echo 2)"
 
 echo "Built: $build/libdriver_cardboardplusplus.so"
-echo "Install: bash scripts/install-driver-linux.sh"
+echo "Install: bash scripts/install-driver-linux.sh (or scripts/install-linux.sh --all)"

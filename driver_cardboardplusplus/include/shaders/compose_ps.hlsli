@@ -2,10 +2,15 @@
 // converts to sRGB. Descriptor layout is binding 0 = cbuffer, 1 = sampler,
 // 2 = t0 image, 3 = t1 image.
 static const char* kVkSBSPSSource = R"(
-Texture2D<float4> leftEye : register(t0);
-Texture2D<float4> rightEye : register(t1);
-SamplerState samp : register(s0);
-cbuffer Bounds : register(b0) {
+#ifdef CBPP_VK_BINDINGS
+#define VK_BIND(n) [[vk::binding(n)]]
+#else
+#define VK_BIND(n)
+#endif
+VK_BIND(2) Texture2D<float4> leftEye : register(t0);
+VK_BIND(3) Texture2D<float4> rightEye : register(t1);
+VK_BIND(1) SamplerState samp : register(s0);
+VK_BIND(0) cbuffer Bounds : register(b0) {
     float4 leftRect;
     float4 rightRect;
 };
@@ -16,7 +21,8 @@ struct PSIn {
 float4 linearToSrgb(float4 c) {
     float3 lo = 12.92 * c.rgb;
     float3 hi = 1.055 * pow(c.rgb, 1.0/2.4) - 0.055;
-    c.rgb = (c.rgb <= 0.0031308) ? lo : hi;
+    float3 useLo = (float3)(c.rgb <= 0.0031308);
+    c.rgb = lerp(hi, lo, useLo);
     return saturate(c);
 }
 float4 main(PSIn input) : SV_Target {
