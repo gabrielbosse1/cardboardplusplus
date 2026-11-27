@@ -39,7 +39,7 @@ class StallScope {
 };
 }  // namespace
 
-#ifdef _DEBUG
+#if defined(_DEBUG) && !defined(DRIVER_DIAG)
 #define DRIVER_DIAG
 #endif
 #ifdef DRIVER_DIAG

@@ -8,7 +8,7 @@
 
 namespace cbpp {
 
-inline constexpr std::size_t kMaxSubmittedLayers = 4;
+static const std::size_t kMaxSubmittedLayers = 4;
 
 template <typename Layer>
 inline bool StageSubmittedLayer(std::vector<Layer>& staged,
