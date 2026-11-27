@@ -31,7 +31,8 @@ pub fn handle(mut request: Request, core: &AppCore) {
     let _ = request.respond(response);
 }
 /// GET /preview shape: the driver's self-reported stream stats (from
-/// BRIDGE_STATS) that power the bridge preview readout.
+/// BRIDGE_STATS) plus the bridge's own receive counters (net::preview), so
+/// loss can be read from both ends of the localhost link.
 fn preview_payload(core: &AppCore) -> serde_json::Value {
     let s = core.status();
     serde_json::json!({
@@ -41,6 +42,8 @@ fn preview_payload(core: &AppCore) -> serde_json::Value {
             "frames": s.preview_frames,
             "drops": s.preview_drops,
         },
+        "bridge": core.preview_stats(),
+        "state": s.preview_state,
     })
 }
 /// GET /health shape: liveness plus the baked app version. Used by

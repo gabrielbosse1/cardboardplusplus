@@ -6,8 +6,10 @@
 #include <cstdlib>
 #include <cmath>
 #include <vector>
+#include <functional>
 #include "CardboardWire.h"
 #include "H264Utils.h"
+#include "PreviewFraming.h"
 #include "GripLimit.h"
 // --- grip limit -----------------------------------------------------------------
 // SteamVR reads the grip limit as both the curl/splay reference and the ceiling
@@ -704,6 +706,7 @@ enum class DispatchResult {
     BridgeHello,
     BridgePreview,
     BridgeCfg,
+    BridgeKeyframeReq,
     KeyframeReq,
     PhoneDiscovery,
     Unknown,
@@ -720,6 +723,9 @@ static DispatchResult simulate_dispatch(const char* buffer) {
     }
     if (strncmp(buffer, wire::kBridgeCfg, wire::kBridgeCfgLen) == 0) {
         return DispatchResult::BridgeCfg;
+    }
+    if (strncmp(buffer, wire::kBridgeKeyframeReq, wire::kBridgeKeyframeReqLen) == 0) {
+        return DispatchResult::BridgeKeyframeReq;
     }
     if (strncmp(buffer, wire::kKeyframeReq, wire::kKeyframeReqLen) == 0) {
         return DispatchResult::KeyframeReq;
@@ -832,6 +838,147 @@ static void test_phone_timeout_keeps_active_target() {
     assert(hasPhoneTarget);
     printf("PASS: phone timeout does NOT clear active target\n");
 }
+// --- bridge preview framing ------------------------------------------------------
+// Golden bytes shared with bridge net/preview.rs (`header_matches_driver_golden_bytes`).
+static const uint8_t kPreviewGolden[24] = {
+    0x43, 0x42, 0x50, 0x56, 0x01, 0x01, 0x00, 0x01, 0x00, 0x03, 0x05, 0x60,
+    0x01, 0x02, 0x03, 0x04, 0x0A, 0x0B, 0x0C, 0x0D, 0x00, 0x00, 0x0B, 0xB8};
+static void test_preview_constants() {
+    assert(wire::kPreviewHeaderSize == 24);
+    assert(wire::kPreviewMaxDatagram == 1400);
+    assert(wire::kPreviewMaxPayload == 1376);
+    assert(strcmp(wire::kBridgeKeyframeReq, "BRIDGE_KEYFRAME_REQ") == 0);
+    assert(wire::kBridgeKeyframeReqLen == sizeof("BRIDGE_KEYFRAME_REQ") - 1);
+    printf("PASS: preview framing constants match the contract\n");
+}
+static void test_preview_header_golden_bytes() {
+    preview::Header h;
+    h.flags = wire::kPreviewFlagKeyframe;
+    h.fragIndex = 1;
+    h.fragCount = 3;
+    h.payloadLen = 1376;
+    h.session = 0x01020304u;
+    h.frameId = 0x0A0B0C0Du;
+    h.frameSize = 3000;
+    uint8_t out[24];
+    preview::WriteHeader(out, h);
+    assert(memcmp(out, kPreviewGolden, sizeof(out)) == 0);
+    printf("PASS: preview header bytes match the golden vector\n");
+}
+// Collects datagrams like the localhost socket would; `stopAfter` emulates a
+// would-block on the Nth send.
+struct DatagramLog {
+    std::vector<std::vector<uint8_t>> datagrams;
+    int stopAfter = -1;
+    bool operator()(const uint8_t* d, size_t n) {
+        if (stopAfter >= 0 && (int)datagrams.size() >= stopAfter) return false;
+        datagrams.emplace_back(d, d + n);
+        return true;
+    }
+};
+// Reference reassembly: true only when every fragment of one frame arrived.
+static bool reassemble(const std::vector<std::vector<uint8_t>>& dgs, std::vector<uint8_t>* out,
+                       preview::Header* first) {
+    std::vector<bool> seen;
+    for (const auto& d : dgs) {
+        preview::Header h;
+        if (!preview::ReadHeader(d.data(), d.size(), &h)) return false;
+        if (seen.empty()) {
+            *first = h;
+            seen.assign(h.fragCount, false);
+            out->assign(h.frameSize, 0);
+        }
+        if (h.frameId != first->frameId || h.fragCount != first->fragCount) return false;
+        size_t off = (size_t)h.fragIndex * wire::kPreviewMaxPayload;
+        assert(off + h.payloadLen <= out->size());
+        memcpy(out->data() + off, d.data() + wire::kPreviewHeaderSize, h.payloadLen);
+        seen[h.fragIndex] = true;
+    }
+    for (bool b : seen) if (!b) return false;
+    return !seen.empty();
+}
+static void test_preview_fragment_roundtrip() {
+    const uint32_t sizes[] = {1, 1375, 1376, 1377, 2752, 235000};
+    for (uint32_t size : sizes) {
+        std::vector<uint8_t> au(size);
+        for (uint32_t i = 0; i < size; i++) au[i] = (uint8_t)(i * 31 + 7);
+        uint8_t scratch[wire::kPreviewMaxDatagram];
+        DatagramLog log;
+        preview::SendResult r = preview::SendFrame(au.data(), size, 7, 42, true, scratch, std::ref(log));
+        assert(r.complete());
+        assert(r.fragments == (size + 1375) / 1376);
+        for (const auto& d : log.datagrams) assert(d.size() <= wire::kPreviewMaxDatagram);
+        std::vector<uint8_t> back;
+        preview::Header h;
+        assert(reassemble(log.datagrams, &back, &h));
+        assert(back == au);
+        assert(h.session == 7 && h.frameId == 42 && (h.flags & wire::kPreviewFlagKeyframe));
+    }
+    printf("PASS: preview fragments reassemble byte-exact at every boundary size\n");
+}
+static void test_preview_aborted_frame_is_detectably_incomplete() {
+    std::vector<uint8_t> au(235000, 0x5A);
+    uint8_t scratch[wire::kPreviewMaxDatagram];
+    DatagramLog log;
+    log.stopAfter = 60;  // would-block after 60 of 171 fragments
+    preview::SendResult r = preview::SendFrame(au.data(), (uint32_t)au.size(), 1, 9, true, scratch, std::ref(log));
+    assert(!r.complete());
+    assert(r.sent == 60 && r.fragments == 171);
+    std::vector<uint8_t> back;
+    preview::Header h;
+    assert(!reassemble(log.datagrams, &back, &h));
+    printf("PASS: a frame cut short by would-block can never reassemble\n");
+}
+static void test_preview_header_rejects_garbage() {
+    uint8_t d[30] = {};
+    preview::Header h;
+    assert(!preview::ReadHeader(d, sizeof(d), &h));           // no magic
+    memcpy(d, kPreviewGolden, 24);
+    assert(!preview::ReadHeader(d, sizeof(d), &h));           // payload_len 1376 != 6
+    d[10] = 0x00; d[11] = 0x06;
+    assert(preview::ReadHeader(d, sizeof(d), &h));
+    d[6] = 0x00; d[7] = 0x03;                                  // frag_index == frag_count
+    assert(!preview::ReadHeader(d, sizeof(d), &h));
+    d[7] = 0x01; d[4] = 0x02;                                  // unknown version
+    assert(!preview::ReadHeader(d, sizeof(d), &h));
+    printf("PASS: preview header parser rejects foreign and inconsistent datagrams\n");
+}
+static void test_preview_empty_and_oversized_frames_are_not_sent() {
+    uint8_t scratch[wire::kPreviewMaxDatagram];
+    DatagramLog log;
+    preview::SendResult r = preview::SendFrame(nullptr, 0, 1, 0, false, scratch, std::ref(log));
+    assert(r.fragments == 0 && log.datagrams.empty());
+    assert(preview::FragmentCount(0xFFFFu * 1376u) == 0xFFFFu);
+    assert(preview::FragmentCount(0xFFFFu * 1376u + 1) == 0);
+    printf("PASS: empty and unframeable access units send nothing\n");
+}
+static void test_preview_stream_end_golden_bytes() {
+    // Mirrored byte-for-byte in preview.rs (stream_end_golden_bytes).
+    uint8_t d[wire::kPreviewHeaderSize];
+    assert(preview::WriteEnd(d, 0x01020304u) == 24);
+    const uint8_t expected[24] = {0x43, 0x42, 0x50, 0x56, 0x01, 0x02, 0x00, 0x00,
+                                  0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04,
+                                  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    assert(memcmp(d, expected, sizeof(expected)) == 0);
+    preview::Header h;
+    assert(preview::ReadHeader(d, sizeof(d), &h));
+    assert(preview::IsEnd(h) && h.session == 0x01020304u);
+    // A keyframe fragment never reads as STREAM_END, even with bit 0x02 set.
+    uint8_t frame[64] = {0};
+    uint8_t scratch[wire::kPreviewMaxDatagram];
+    DatagramLog log;
+    preview::SendFrame(frame, sizeof(frame), 7, 0, true, scratch, std::ref(log));
+    assert(log.datagrams.size() == 1);
+    log.datagrams[0][5] |= wire::kPreviewFlagEnd;
+    assert(preview::ReadHeader(log.datagrams[0].data(), log.datagrams[0].size(), &h));
+    assert(!preview::IsEnd(h));
+    printf("PASS: STREAM_END control datagram bytes and detection\n");
+}
+static void test_dispatch_bridge_keyframe_req() {
+    assert(simulate_dispatch("BRIDGE_KEYFRAME_REQ") == DispatchResult::BridgeKeyframeReq);
+    assert(simulate_dispatch("KEYFRAME_REQ") == DispatchResult::KeyframeReq);
+    printf("PASS: BRIDGE_KEYFRAME_REQ has its own handler (phone KEYFRAME_REQ unchanged)\n");
+}
 int main() {
     printf("=== Driver wire protocol tests ===\n\n");
     test_grip_limit_is_a_closed_fist();
@@ -893,6 +1040,14 @@ int main() {
     test_carboard_cap_does_not_send_ack();
     test_phone_timeout_clears_target();
     test_phone_timeout_keeps_active_target();
+    test_preview_constants();
+    test_preview_header_golden_bytes();
+    test_preview_fragment_roundtrip();
+    test_preview_aborted_frame_is_detectably_incomplete();
+    test_preview_header_rejects_garbage();
+    test_preview_empty_and_oversized_frames_are_not_sent();
+    test_preview_stream_end_golden_bytes();
+    test_dispatch_bridge_keyframe_req();
     printf("\n=== All driver tests passed ===\n");
     return 0;
 }

@@ -1,11 +1,13 @@
-use std::io::{Read, Write};
 use std::net::UdpSocket;
 use std::ops::Deref;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 use crate::app::{AppState, SharedState};
 use crate::net::mediapipe::{MediapipeClient, Reclaim};
+use crate::net::preview::{self, Decoder, FrameSlot, Link, LinkEvent, PreviewStats, SharedFrameSlot, SharedPreviewStats};
+use crate::preview_lifecycle::{Command as LifecycleCommand, Fault, Input, Lifecycle, State as PreviewState, RETRY_BACKOFF};
 use crate::net::{self, EncoderChoice, DRIVER_DISCOVERY_PORT, MEDIAPIPE_PORT, VIDEO_PORT};
 use bridge_core::paths;
 /// Crate version stamped into /health, the hub title, and release URLs.
@@ -13,6 +15,8 @@ pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Preview frame size the ffmpeg decode scales to (keeps the hub cheap).
 pub const PREVIEW_W: u32 = 480;
 pub const PREVIEW_H: u32 = 270;
+/// Preview supervisor tick: timeout resolution for the lifecycle.
+const PREVIEW_TICK: Duration = Duration::from_millis(50);
 /// Stream settings before the first apply: 2880x1620 @ 60fps, 20 Mbps.
 pub const APPLIED_DEFAULTS: (i32, i32, i32, i32) = (2880, 1620, 60, 20);
 /// JSON-serializable copy of AppState for GET /status and the Slint pollers.
@@ -70,6 +74,7 @@ pub struct StatusSnapshot {
     pub phone_version: String,
     pub install_progress: f32,
     pub steamvr_running: bool,
+    pub preview_state: String,
 }
 impl From<&AppState> for StatusSnapshot {
     /// Snapshots live state for the UI/REST boundary. Copies every field so
@@ -127,6 +132,7 @@ impl From<&AppState> for StatusSnapshot {
             phone_version: s.phone_version.clone(),
             install_progress: s.install_progress,
             steamvr_running: s.steamvr_running,
+            preview_state: s.preview_state.clone(),
         }
     }
 }
@@ -365,14 +371,12 @@ fn log_ffmpeg_version(state: &SharedState) {
 #[derive(Clone)]
 pub struct AppCore {
     state: SharedState,
-    preview_frame: Arc<Mutex<Option<(u32, u32, Vec<u8>)>>>,
-    preview_decode: Arc<Mutex<Option<PreviewDecodeHandle>>>,
+    preview_frame: SharedFrameSlot,
+    preview_decode: Arc<Mutex<Option<Decoder>>>,
+    preview_stats: SharedPreviewStats,
+    preview_link: Arc<Link>,
     mediapipe_proc: Arc<Mutex<Option<Child>>>,
     mediapipe_client: Arc<Mutex<Option<MediapipeClient>>>,
-}
-/// ffmpeg preview decode child handle. Killed on shutdown/restart.
-struct PreviewDecodeHandle {
-    child: Child,
 }
 impl AppCore {
     /// Builds the core and starts every background loop: driver heartbeat,
@@ -440,12 +444,14 @@ impl AppCore {
         );
         let core = Arc::new(Self {
             state,
-            preview_frame: Arc::new(Mutex::new(None)),
+            preview_frame: Arc::new(Mutex::new(FrameSlot::default())),
             preview_decode: Arc::new(Mutex::new(None)),
+            preview_stats: Arc::new(Mutex::new(PreviewStats::default())),
+            preview_link: Arc::new(Link::default()),
             mediapipe_proc,
             mediapipe_client: Arc::new(Mutex::new(mediapipe_client)),
         });
-        core.start_preview_decode();
+        core.start_preview_supervisor();
         core
     }
     /// Thread-safe log append for background workers that only hold &self.
@@ -697,9 +703,12 @@ impl AppCore {
             }
         });
     }
-    /// Stops the sidecar child (if this bridge spawned it) at event-loop exit.
+    /// Stops the preview decoder and the sidecar child (if this bridge spawned
+    /// it) at event-loop exit.
     /// Net threads are daemon-style and end with the process.
     pub fn shutdown(&self) {
+        self.preview_link.stop();
+        self.stop_preview_decoder();
         if let Ok(mut proc) = self.mediapipe_proc.lock() {
             if let Some(mut child) = proc.take() {
                 let _ = child.kill();
@@ -708,12 +717,23 @@ impl AppCore {
         }
         self.push_log("bridge shutting down".into());
     }
-    /// Swaps the latest decoded preview frame out for the hub poller,
-    /// converting it to a Slint image. None when no frame arrived yet.
-    pub fn take_preview_frame(&self) -> Option<slint::Image> {
-        let (w, h, rgba) = self.preview_frame.lock().expect("preview frame lock").take()?;
-        let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&rgba, w, h);
-        Some(slint::Image::from_rgba8(buffer))
+    /// Copy of the preview receive counters for GET /preview.
+    pub fn preview_stats(&self) -> PreviewStats {
+        self.preview_stats.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+    /// Hub poller side of the preview: (reset the viewer to the idle screen,
+    /// newest decoded picture as a Slint image). The reset is set by every
+    /// terminal lifecycle transition; apply it before the picture.
+    pub fn take_preview_update(&self) -> (bool, Option<slint::Image>) {
+        let (cleared, frame) = match self.preview_frame.lock() {
+            Ok(mut slot) => slot.take(),
+            Err(_) => return (false, None),
+        };
+        let image = frame.map(|(w, h, rgba)| {
+            let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&rgba, w, h);
+            slint::Image::from_rgba8(buffer)
+        });
+        (cleared, image)
     }
     /// Swaps the latest camera frame out for the hub poller after a liveness
     /// check: returns None (and clears the pill) when the camera went quiet.
@@ -727,168 +747,185 @@ impl AppCore {
         let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&rgba, w, h);
         Some(slint::Image::from_rgba8(buffer))
     }
-    /// Starts the localhost preview pipeline: binds UDP 42069 (the driver's
-    /// Annex-B copy), pipes datagrams into ffmpeg stdin, and publishes each
-    /// decoded PREVIEW_W x PREVIEW_H RGBA frame to the slot the hub polls.
-    /// Restarts automatically when ffmpeg exits; a held port logs its PID.
-    /// Called once from new(); the pump threads never touch bridge memory
-    /// beyond the single latest-frame slot.
-    fn start_preview_decode(&self) {
-        {
-            let mut decode = self.preview_decode.lock().expect("preview decode lock");
-            if let Some(handle) = decode.as_mut() {
-                match handle.child.try_wait() {
-                    Ok(None) => {
-                        self.push_log("embedded preview already running".into());
-                        return;
+    /// Starts the preview supervisor thread. It binds UDP 42069 once (the
+    /// driver's header-framed copy), keeps the receive thread for the app's
+    /// lifetime, and runs the preview lifecycle (preview_lifecycle.rs): one
+    /// ffmpeg per stream, flushed and replaced on every terminal transition,
+    /// with the viewer cleared to the idle screen each time.
+    fn start_preview_supervisor(&self) {
+        let core = self.clone();
+        thread::spawn(move || core.preview_supervisor());
+    }
+    /// Binds 127.0.0.1:42069, retrying while the port is held. Returns None
+    /// only when the bridge is shutting down.
+    fn bind_preview_socket(&self) -> Option<UdpSocket> {
+        let mut reported = false;
+        loop {
+            if self.preview_link.stop_requested() {
+                return None;
+            }
+            match UdpSocket::bind("127.0.0.1:42069") {
+                Ok(s) => return Some(s),
+                Err(e) => {
+                    if !reported {
+                        reported = true;
+                        let holder = crate::net::mediapipe::listen_pid(VIDEO_PORT)
+                            .map(|pid| format!(" (held by PID {pid})"))
+                            .unwrap_or_default();
+                        self.push_log(format!(
+                            "preview bind failed (port 42069): {e}{holder} — free the port; retrying"
+                        ));
+                        self.set_preview_state(PreviewState::Error(Fault::SocketUnavailable));
                     }
-                    _ => {
-                        let _ = handle.child.kill();
-                        *decode = None;
-                    }
+                    std::thread::sleep(RETRY_BACKOFF);
                 }
             }
         }
-        let frame_slot = self.preview_frame.clone();
-        let socket = {
-            let mut bound = None;
-            for attempt in 0..6 {
-                match UdpSocket::bind("127.0.0.1:42069") {
-                    Ok(s) => {
-                        bound = Some(s);
-                        break;
-                    }
-                    Err(e) => {
-                        if attempt == 5 {
-                            let holder = crate::net::mediapipe::listen_pid(VIDEO_PORT)
-                                .map(|pid| format!(" (held by PID {pid})"))
-                                .unwrap_or_default();
-                            self.push_log(format!(
-                                "preview bind failed (port 42069): {e}{holder} — free the port and restart"
-                            ));
-                            return;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(500));
-                    }
+    }
+    fn set_preview_state(&self, state: PreviewState) {
+        if let Ok(mut s) = self.state.lock() {
+            s.preview_state = state.name().to_string();
+        }
+    }
+    /// Starts decoder `generation`; logs a failure once per streak.
+    fn start_preview_decoder(
+        &self,
+        generation: u64,
+        events: &mpsc::Sender<LinkEvent>,
+        failing: &mut bool,
+    ) -> Input {
+        match preview::start_decoder(
+            generation,
+            &self.preview_link,
+            &self.preview_frame,
+            events,
+            &self.state,
+            &self.preview_stats,
+            (PREVIEW_W, PREVIEW_H),
+        ) {
+            Ok(decoder) => {
+                if let Ok(mut d) = self.preview_decode.lock() {
+                    *d = Some(decoder);
                 }
+                if *failing {
+                    self.push_log("preview decoder recovered".into());
+                }
+                *failing = false;
+                Input::DecoderReady
             }
-            bound.expect("preview socket bound above")
-        };
-        socket.set_nonblocking(true).ok();
-        let vf = format!("scale={PREVIEW_W}:{PREVIEW_H}");
-        let mut child = match Command::new("ffmpeg")
-            .args([
-                "-f", "h264",
-                "-probesize", "32768",
-                "-analyzeduration", "0",
-                "-i", "pipe:0",
-                "-vf",
-            ])
-            .arg(&vf)
-            .args([
-                "-f", "rawvideo",
-                "-pix_fmt", "rgba",
-                "-v", "0",
-                "pipe:1",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            Ok(c) => c,
             Err(e) => {
-                self.push_log(format!("ffmpeg not available for preview: {e}"));
+                if !*failing {
+                    self.push_log(format!("ffmpeg not available for preview: {e}"));
+                }
+                *failing = true;
+                Input::StartFailed(Fault::DecoderUnavailable)
+            }
+        }
+    }
+    /// Flushes the current decoder and clears the viewer (see stop_decoder).
+    fn stop_preview_decoder(&self) {
+        let decoder = self.preview_decode.lock().ok().and_then(|mut d| d.take());
+        preview::stop_decoder(decoder, &self.preview_link, &self.preview_frame);
+    }
+    /// The preview supervisor: turns real events into lifecycle inputs and
+    /// executes the commands it returns. Inputs: STREAM_END and decoder exit
+    /// (LinkEvent channel), datagram and picture counters (polled every
+    /// tick), and the tick itself for timeouts.
+    fn preview_supervisor(&self) {
+        let Some(socket) = self.bind_preview_socket() else { return };
+        let rcvbuf = preview::tune_recv_buffer(&socket);
+        if let Ok(mut st) = self.preview_stats.lock() {
+            st.recv_buffer_bytes = rcvbuf;
+        }
+        self.push_log(format!("preview socket receive buffer: {rcvbuf} bytes"));
+        let (events_tx, events_rx) = mpsc::channel::<LinkEvent>();
+        preview::spawn_receiver(
+            socket,
+            self.preview_link.clone(),
+            events_tx.clone(),
+            self.state.clone(),
+            self.preview_stats.clone(),
+        );
+        let mut lifecycle = Lifecycle::new(Instant::now());
+        let mut generation: u64 = 0;
+        let mut failing = false;
+        let mut published = lifecycle.state();
+        self.set_preview_state(published);
+        // Startup is Stopping(Startup): start the first decoder.
+        let mut pending: Vec<Input> = Vec::new();
+        generation += 1;
+        pending.push(self.start_preview_decoder(generation, &events_tx, &mut failing));
+        let mut seen_traffic = self.preview_link.traffic();
+        let mut seen_pictures = self.preview_link.pictures();
+        loop {
+            if self.preview_link.stop_requested() {
+                self.stop_preview_decoder();
                 return;
             }
-        };
-        let mut stdin = child.stdin.take().expect("ffmpeg stdin");
-        let mut stdout = child.stdout.take().expect("ffmpeg stdout");
-        let frame_w: u32 = PREVIEW_W;
-        let frame_h: u32 = PREVIEW_H;
-        let frame_bytes = (frame_w * frame_h * 4) as usize;
-        thread::spawn(move || {
-            let mut buf = vec![0u8; 65536];
-            loop {
-                loop {
-                    match socket.recv(&mut buf) {
-                        Ok(n) if n > 0 => {
-                            if stdin.write_all(&buf[..n]).is_err() {
-                                return;
-                            }
-                        }
-                        _ => break,
+            match events_rx.recv_timeout(PREVIEW_TICK) {
+                Ok(LinkEvent::Goodbye { .. }) => pending.push(Input::Goodbye),
+                Ok(LinkEvent::DecoderExited { generation: g }) => {
+                    // Exits of decoders we killed ourselves are expected.
+                    let current = self.preview_decode.lock().ok().and_then(|d| d.as_ref().map(|d| d.generation()));
+                    if current == Some(g) {
+                        pending.push(Input::DecoderExited);
                     }
                 }
-                std::thread::sleep(std::time::Duration::from_millis(2));
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
             }
-        });
-        let preview_decode_cleanup = self.preview_decode.clone();
-        thread::spawn(move || {
-            let mut rgba = vec![0u8; frame_bytes];
-            let mut off = 0usize;
+            // Events first: a goodbye's teardown resets the counter baseline,
+            // so frames that arrived just before it cannot reopen the stream.
+            // Then counters, then the timer.
+            let mut counters_read = false;
             loop {
-                if rgba.len() < frame_bytes {
-                    rgba.resize(frame_bytes, 0);
-                }
-                match stdout.read(&mut rgba[off..]) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        off += n;
-                        if off >= frame_bytes {
-                            off = 0;
-                            if let Ok(mut slot) = frame_slot.lock() {
-                                match slot.as_mut() {
-                                    Some((_, _, old)) => std::mem::swap(&mut rgba, old),
-                                    None => {
-                                        *slot = Some((
-                                            frame_w,
-                                            frame_h,
-                                            std::mem::replace(&mut rgba, Vec::new()),
-                                        ));
-                                    }
-                                }
-                            }
-                        }
+                let input = if let Some(i) = (!pending.is_empty()).then(|| pending.remove(0)) {
+                    i
+                } else if !counters_read {
+                    counters_read = true;
+                    let traffic = self.preview_link.traffic();
+                    let pictures = self.preview_link.pictures();
+                    if traffic != seen_traffic {
+                        seen_traffic = traffic;
+                        pending.push(Input::Traffic);
                     }
-                    Err(_) => break,
-                }
-            }
-            if let Ok(mut decode) = preview_decode_cleanup.lock() {
-                if decode.take().is_some() {
-                    eprintln!("[preview] ffmpeg exited, handle cleared");
-                }
-            }
-        });
-        {
-            let mut decode = self.preview_decode.lock().expect("preview decode lock");
-            *decode = Some(PreviewDecodeHandle { child });
-        }
-        self.push_log("embedded preview started (UDP 42069 → ffmpeg → UI)".into());
-        let weak = Arc::downgrade(&{
-            let this = self.clone();
-            Arc::new(this)
-        });
-        let preview_decode = self.preview_decode.clone();
-        thread::spawn(move || {
-            let child_exited = {
-                let decode = preview_decode.lock().expect("preview decode lock");
-                decode.as_ref().map(|h| h.child.id())
-            };
-            let Some(_pid) = child_exited else { return };
-            loop {
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                let decode = preview_decode.lock().expect("preview decode lock");
-                if decode.is_none() {
+                    if pictures != seen_pictures {
+                        seen_pictures = pictures;
+                        pending.push(Input::Picture);
+                    }
+                    pending.push(Input::Tick);
+                    continue;
+                } else {
                     break;
+                };
+                let command = lifecycle.step(input, Instant::now());
+                let state = lifecycle.state();
+                if state != published {
+                    crate::debug_log!(&self.state, "[preview] {} -> {} on {:?}", published.describe(), state.describe(), input);
+                    if matches!(state, PreviewState::Error(_)) || matches!(published, PreviewState::Error(_)) {
+                        self.push_log(format!("preview: {}", state.describe()));
+                    }
+                    published = state;
+                    self.set_preview_state(state);
+                }
+                match command {
+                    Some(LifecycleCommand::Teardown { restart }) => {
+                        self.stop_preview_decoder();
+                        seen_traffic = self.preview_link.traffic();
+                        seen_pictures = self.preview_link.pictures();
+                        if restart {
+                            generation += 1;
+                            pending.insert(0, self.start_preview_decoder(generation, &events_tx, &mut failing));
+                        }
+                    }
+                    Some(LifecycleCommand::Restart) => {
+                        generation += 1;
+                        pending.insert(0, self.start_preview_decoder(generation, &events_tx, &mut failing));
+                    }
+                    None => {}
                 }
             }
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            if let Some(core) = weak.upgrade() {
-                core.push_log("preview auto-restarting...".into());
-                core.start_preview_decode();
-            }
-        });
+        }
     }
     /// Full state snapshot for GET /status and the hub pollers.
     pub fn status(&self) -> StatusSnapshot {
@@ -1299,8 +1336,10 @@ mod tests {
         }
         let core = AppCore {
             state,
-            preview_frame: Arc::new(Mutex::new(None)),
+            preview_frame: Arc::new(Mutex::new(FrameSlot::default())),
             preview_decode: Arc::new(Mutex::new(None)),
+            preview_stats: Arc::new(Mutex::new(PreviewStats::default())),
+            preview_link: Arc::new(Link::default()),
             mediapipe_proc: Arc::new(Mutex::new(None)),
             mediapipe_client: Arc::new(Mutex::new(None)),
         };

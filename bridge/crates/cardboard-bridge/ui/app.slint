@@ -100,6 +100,10 @@ in-out property <bool> editor-open: false;
     in-out property <int> preview-frames: 0;
     in-out property <int> preview-drops: 0;
     in-out property <image> preview-frame: @image-url("icons/stream.svg");
+    // Idle screen the viewer returns to whenever the preview stream ends.
+    out property <image> preview-idle: @image-url("icons/stream.svg");
+    // Preview lifecycle: idle | connecting | streaming | stopping | error.
+    in-out property <string> preview-state: "idle";
     in-out property <image> camera-frame: @image-url("icons/hand.svg");
     in-out property <int> camera-fps: 0;
     in-out property <bool> camera-connected: false;
@@ -865,8 +869,13 @@ component StreamPage inherits HorizontalLayout {
         title: "Preview";
         hint: "The driver's localhost copy (UDP 127.0.0.1:42069), decoded live inside the bridge. The phone stream is unaffected.";
         Text {
-            text: BridgeState.preview-frames > 0 ? "Local preview: streaming" : "Local preview: waiting for the driver…";
-            color: BridgeState.preview-frames > 0 ? Theme.ok : Theme.text-dim;
+            text: BridgeState.preview-state == "streaming" ? "Local preview: streaming"
+                : BridgeState.preview-state == "connecting" ? "Local preview: connecting…"
+                : BridgeState.preview-state == "error" ? "Local preview: decoder error, retrying…"
+                : "Local preview: waiting for the driver…";
+            color: BridgeState.preview-state == "streaming" ? Theme.ok
+                : BridgeState.preview-state == "error" ? Theme.warn
+                : Theme.text-dim;
             font-size: 13px;
             font-weight: 600;
             wrap: word-wrap;

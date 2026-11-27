@@ -3,11 +3,22 @@
 #include "DebugLog.h"
 #include "CardboardWire.h"
 #include "H264Utils.h"
+#include "PreviewFraming.h"
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 using namespace vr;
 namespace {
 static constexpr int kUdpChunkBytes = 1400;
+// Session ids only need to differ between consecutive encoder lifetimes, including
+// across a SteamVR restart (the counter alone would restart at the same value).
+static uint32_t NextPreviewSessionId()
+{
+    static std::atomic<uint32_t> counter{0};
+    uint64_t t = (uint64_t)std::chrono::system_clock::now().time_since_epoch().count();
+    return (uint32_t)(t ^ (t >> 32)) + counter.fetch_add(1) * 0x9E3779B9u;
+}
 // Chunk size for non-blocking UDP sends; keeps each datagram inside a safe MTU.
 // Fragments one buffer into 1400-byte datagrams on socket. A full send buffer
 // abandons the whole buffer rather than its tail: the phone parses the stream as
@@ -67,6 +78,7 @@ bool HmdDriver::InitializeUDP()
     m_serverAddr.sin_addr.s_addr = INADDR_ANY;
     m_hasPhoneTarget.store(false, std::memory_order_relaxed);
     m_udpInitialized = true;
+    BeginPreviewSession("udp init");
     DriverLog("UDP socket initialized. Preview target 127.0.0.1:%d always on; phone target added on discovery", wire::kDataPort);
     return true;
 }
@@ -126,22 +138,84 @@ void HmdDriver::OnEncodedPacket(uint8_t* data, int size, int64_t pts, bool keyfr
         int framedSize = fixedSize + 4;
         uint8_t* framed = ensureScratch(m_scratchFramed, (size_t)framedSize);
         writeLengthPrefixed(fixed, fixedSize, framed);
-        SendFannedOut(fixed, fixedSize, framed, framedSize);
+        SendFannedOut(fixed, fixedSize, framed, framedSize, keyframe);
         DebugLog("[UDP] Fixed keyframe: inserted IDR start code at offset %d", ppsEnd);
         return;
     }
     int framedSize = size + 4;
     uint8_t* framed = ensureScratch(m_scratchFramed, (size_t)framedSize);
     writeLengthPrefixed(data, size, framed);
-    SendFannedOut(data, size, framed, framedSize);
+    SendFannedOut(data, size, framed, framedSize, keyframe);
     DebugLog("[UDP] Sent framed packet: payload=%d bytes", size);
 }
-// Sends raw Annex-B to the localhost preview and the length-headed copy to the phone when discovery set a target.
+// Starts a new preview session: frame ids restart at 0 and the bridge re-acquires
+// on the next keyframe. Called on UDP init and every encoder (re)init.
+void HmdDriver::BeginPreviewSession(const char* reason)
+{
+    uint32_t session = NextPreviewSessionId();
+    m_previewSession.store(session, std::memory_order_relaxed);
+    DriverLog("[Preview] new session %08X (%s)", session, reason);
+}
+// Tells the bridge preview the current session is over (STREAM_END control
+// datagram, see CardboardWire.h) so it clears to idle immediately. Best effort:
+// a lost goodbye falls back to the bridge's receive timeout. Safe from any
+// thread; it touches only the atomic session and the socket.
+void HmdDriver::SendPreviewEnd(const char* reason)
+{
+    if (!m_udpInitialized || m_udpSocket == cbpp::kInvalidSocket) return;
+    uint32_t session = m_previewSession.load(std::memory_order_relaxed);
+    uint8_t datagram[wire::kPreviewHeaderSize];
+    std::size_t len = preview::WriteEnd(datagram, session);
+    // Two copies: localhost loss is rare but the goodbye is a single datagram.
+    for (int i = 0; i < 2; i++) {
+        sendto(m_udpSocket, (const char*)datagram, (int)len, 0,
+               (sockaddr*)&m_previewAddr, sizeof(m_previewAddr));
+    }
+    DriverLog("[Preview] STREAM_END session %08X (%s)", session, reason);
+}
+// Sends one access unit to the bridge preview as header-framed fragments (see
+// CardboardWire.h). Runs on the encoding thread only. A send failure stops the
+// frame; the bridge sees the missing fragments and drops the frame instead of
+// decoding a truncated one.
+void HmdDriver::SendPreviewFrame(const uint8_t* raw, int rawSize, bool keyframe)
+{
+    uint32_t session = m_previewSession.load(std::memory_order_relaxed);
+    if (session != m_previewSentSession) {
+        m_previewSentSession = session;
+        m_previewFrameId = 0;
+    }
+    uint32_t frameId = m_previewFrameId++;
+    uint8_t scratch[wire::kPreviewMaxDatagram];
+    int sendErr = 0;
+    auto sink = [&](const uint8_t* datagram, std::size_t len) -> bool {
+        long res = (long)sendto(m_udpSocket, (const char*)datagram, (int)len, 0,
+                                (sockaddr*)&m_previewAddr, sizeof(m_previewAddr));
+        if (res < 0) {
+            sendErr = cbpp::PlatformSocketError();
+            return false;
+        }
+        return true;
+    };
+    preview::SendResult r = preview::SendFrame(raw, (uint32_t)rawSize, session, frameId,
+                                               keyframe, scratch, sink);
+    if (!r.complete()) {
+        m_udpDroppedPreview++;
+        if (m_udpDroppedPreview % 30 == 1) {
+            DriverLog("[Preview] frame %u incomplete: %u/%u fragments sent (err=%d%s, dropped=%u)",
+                      frameId, r.sent, r.fragments, sendErr,
+                      cbpp::PlatformWouldBlock(sendErr) ? " would-block" : "",
+                      m_udpDroppedPreview);
+        }
+    }
+    DebugLog("[Preview] session=%08X frame=%u size=%d key=%d frags=%u sent=%u",
+             session, frameId, rawSize, keyframe ? 1 : 0, r.fragments, r.sent);
+}
+// Sends the framed preview copy to localhost and the length-headed copy to the phone when discovery set a target.
 void HmdDriver::SendFannedOut(const uint8_t* raw, int rawSize,
-                               const uint8_t* framed, int framedSize)
+                               const uint8_t* framed, int framedSize, bool keyframe)
 {
     if (m_previewEnabled.load(std::memory_order_relaxed)) {
-        SendFramedUdp(m_udpSocket, &m_previewAddr, raw, rawSize, &m_udpDroppedPreview);
+        SendPreviewFrame(raw, rawSize, keyframe);
     }
     sockaddr_in phoneTarget{};
     bool hasTarget = false;

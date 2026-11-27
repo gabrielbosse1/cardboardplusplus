@@ -111,6 +111,11 @@ bool VideoEncoder::InitializeFFmpeg()
             av_opt_set(m_pCodecContext->priv_data, "preset", hwPreset, 0);
             av_opt_set(m_pCodecContext->priv_data, "profile", "baseline", 0);
         }
+        // A requested keyframe (pict_type I) must be an IDR with SPS/PPS, or a
+        // decoder that lost a frame cannot restart on it. libx264 and NVENC expose
+        // this as "forced-idr" (NVENC otherwise emits a non-IDR intra frame);
+        // encoders without the option ignore the call.
+        av_opt_set(m_pCodecContext->priv_data, "forced-idr", "1", 0);
         int ret = avcodec_open2(m_pCodecContext, c, nullptr);
         if (ret < 0) {
             char errbuf[AV_ERROR_MAX_STRING_SIZE];
@@ -362,8 +367,8 @@ bool VideoEncoder::FinishEncode(int64_t pts)
     }
     return true;
 }
-// Arms a one-shot IDR for the next SendFrameToEncoder; set by the KEYFRAME_REQ discovery path.
-// Pushes the NV12 frame into the codec, applying an armed IDR when present.
+// Arms a one-shot IDR for the next SendFrameToEncoder; set by the KEYFRAME_REQ and
+// BRIDGE_KEYFRAME_REQ discovery paths.
 void VideoEncoder::RequestKeyframe()
 {
     m_forceKeyframe.store(true, std::memory_order_relaxed);
@@ -371,8 +376,18 @@ void VideoEncoder::RequestKeyframe()
 // Pushes the NV12 frame into the codec, applying an armed IDR when present.
 bool VideoEncoder::SendFrameToEncoder()
 {
-    if (m_forceKeyframe.exchange(false, std::memory_order_relaxed) && m_pFrame) {
-        m_pFrame->pict_type = AV_PICTURE_TYPE_I;
+    // m_pFrame is reused for every frame, so pict_type must be written every time.
+    // Setting I once and never clearing it made every later frame a forced IDR:
+    // keyframe-sized bursts at frame rate after the first keyframe request.
+    bool forced = m_forceKeyframe.exchange(false, std::memory_order_relaxed);
+    if (m_pFrame) {
+        m_pFrame->pict_type = forced ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
+    }
+    if (forced) {
+        static unsigned s_forcedIdr = 0;
+        if (++s_forcedIdr <= 5 || s_forcedIdr % 50 == 0) {
+            ENCODER_LOG("Forced IDR on request (count=%u)", s_forcedIdr);
+        }
     }
     int ret = avcodec_send_frame(m_pCodecContext, m_pFrame);
     if (ret < 0) {

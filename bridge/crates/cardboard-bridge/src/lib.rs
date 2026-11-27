@@ -6,3 +6,4 @@ pub mod core;
 pub mod hand_overlay;
 pub mod hand_slots;
 pub mod ovr_bones;
+pub mod preview_lifecycle;

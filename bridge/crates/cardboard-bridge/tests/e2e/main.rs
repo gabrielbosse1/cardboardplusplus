@@ -221,6 +221,49 @@ fn stream_frames_captured_every_half_second() {
     assert!(got.iter().any(|au| contains_nal(au, 7)), "no SPS NAL found in the captured stream");
     let _ = bridge;
 }
+/// Task 2 acceptance on the real bridge binary: a driver that dies
+/// mid-stream (datagrams just stop) returns the preview to idle within the
+/// lifecycle timeout, a new stream starts immediately after, and STREAM_END
+/// returns to idle without waiting for the timeout.
+#[test]
+fn preview_returns_to_idle_on_kill_and_goodbye_and_restarts() {
+    let _gate = serial();
+    if live_mode() || !ffmpeg_available() {
+        eprintln!("skipping: live mode or no ffmpeg on PATH");
+        return;
+    }
+    let bridge = start_bridge();
+    let driver = FakeDriver::new();
+    let h264 = artifacts().join("lifecycle.h264");
+    assert!(make_test_stream(&h264), "ffmpeg failed to encode the test stream");
+    let aus = split_access_units(&std::fs::read(&h264).unwrap());
+    assert!(aus.len() >= 60, "expected 3s @30fps of access units, got {}", aus.len());
+    bridge.wait_status("preview_state", serde_json::json!("idle"), Duration::from_secs(10));
+    for round in 0..2 {
+        std::thread::scope(|s| {
+            s.spawn(|| driver.stream_h264(&aus[..60]));
+            bridge.wait_status("preview_state", serde_json::json!("streaming"), Duration::from_secs(10));
+        });
+        // Datagrams stop as if SteamVR was killed: no goodbye.
+        let stopped = std::time::Instant::now();
+        bridge.wait_status("preview_state", serde_json::json!("idle"), Duration::from_secs(5));
+        let took = stopped.elapsed();
+        // STREAM_TIMEOUT (2 s) + tick + status poll slack.
+        assert!(took < Duration::from_millis(3000), "round {round}: idle after {took:?}");
+    }
+    std::thread::scope(|s| {
+        s.spawn(|| driver.stream_h264(&aus[..45]));
+        bridge.wait_status("preview_state", serde_json::json!("streaming"), Duration::from_secs(10));
+    });
+    let ended = std::time::Instant::now();
+    driver.send_preview_end();
+    bridge.wait_status("preview_state", serde_json::json!("idle"), Duration::from_secs(2));
+    assert!(ended.elapsed() < Duration::from_millis(1500), "goodbye took {:?}", ended.elapsed());
+    let preview = bridge.http.get_json("/preview");
+    assert_eq!(preview["state"], serde_json::json!("idle"));
+    assert_eq!(preview["bridge"]["frames_incomplete"], serde_json::json!(0));
+    let _ = bridge;
+}
 /// True when the Annex-B access unit contains a NAL of `nal_type`.
 fn contains_nal(au: &[u8], nal_type: u8) -> bool {
     let mut i = 0;
