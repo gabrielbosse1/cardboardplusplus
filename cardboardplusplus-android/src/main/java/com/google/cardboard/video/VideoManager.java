@@ -15,6 +15,7 @@ public class VideoManager {
   private boolean surfaceCreated = false;
   private Runnable reconnectAction;
   private Runnable reconfigureAction;
+  private Runnable keyframeAction;
   private VideoWatchdog watchdog;
   private NetStatsReporter netStats;
   private TelemetrySender telemetrySender;
@@ -39,6 +40,15 @@ public class VideoManager {
   public void setReconfigureAction(Runnable reconfigureAction) {
     this.reconfigureAction = reconfigureAction;
   }
+  // Registers the KEYFRAME_REQ sender used by the decoder after a codec-side
+  // drop or failure; called from VrActivity.onCreate with DiscoveryManager.requestKeyframe.
+  public void setKeyframeAction(Runnable keyframeAction) {
+    this.keyframeAction = keyframeAction;
+    VideoDecoder d = decoder;
+    if (d != null) {
+      d.setKeyframeRequester(keyframeAction);
+    }
+  }
   // Rebuilds the live decoder; called from VideoWatchdog's poll thread when frames
   // arrive but nothing is decoded.
   public void reconfigureDecoder() {
@@ -57,6 +67,7 @@ public class VideoManager {
     decoder =
         new VideoDecoder(
             bridge, texId, AppConstants.DEFAULT_VIDEO_WIDTH, AppConstants.DEFAULT_VIDEO_HEIGHT);
+    decoder.setKeyframeRequester(keyframeAction);
     bridge.setVideoDecoder(decoder);
     surfaceCreated = true;
     Log.i(TAG, "Video decoder created (tex=" + texId + ")");

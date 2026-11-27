@@ -1,8 +1,8 @@
 # Bridge preview lifecycle
 
 The bridge's embedded preview (driver → `127.0.0.1:42069` → ffmpeg → hub viewer)
-runs this state machine. It covers the Bridge preview only; the phone stream is
-not involved.
+runs this state machine. The phone has its own, smaller version; see
+[Phone stream](#phone-stream) at the end.
 
 - Logic: `bridge/crates/cardboard-bridge/src/preview_lifecycle.rs` (pure, unit-tested)
 - Supervisor: `AppCore::preview_supervisor` in `src/core.rs`
@@ -73,3 +73,31 @@ timeout. A clean shutdown sends `STREAM_END` and the viewer clears at once.
 The receive thread and UDP 42069 stay up the whole time. The next stream goes
 Idle → Connecting with no app restart. A new decoder always starts at a keyframe
 with SPS, because the gate resyncs on each generation change and requests an IDR.
+
+## Phone stream
+
+The phone receives the same CBPV framing (driver → `phone:42069`) and follows the
+same rules, without a separate supervisor:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> Waiting: first complete frame
+    Waiting --> Streaming: keyframe decoded, first picture on the texture
+    Streaming --> Waiting: loss / codec input full (KEYFRAME_REQ sent, last picture held)
+    Waiting --> Waiting: still no keyframe (KEYFRAME_REQ repeated every 250 ms)
+    Streaming --> Idle: STREAM_END / 2 s without video / decode failure
+    Waiting --> Idle: STREAM_END / 2 s without video / decode failure
+```
+
+- Receive: `jni/VideoReceiver.cpp` with `jni/VideoFraming.h` (reassembler, keyframe
+  gate, request throttle, queue trim; unit-tested from the driver tests).
+- Decode: `video/VideoDecoder.java`. `endStream()` flushes and releases MediaCodec,
+  drops cached SPS/PPS and calls `onVideoInactive()`; the renderer draws black
+  (the existing idle screen). `onVideoActive()` fires only once the first picture
+  of the new stream is on the texture, so an old frame is never shown.
+- Loss: the frame is dropped whole, P-frames are held back until a keyframe, and
+  `KEYFRAME_REQ` goes to the driver at once. The last good picture stays up for
+  the round trip; it does not freeze for the rest of the GOP.
+- A new stream starts from Idle with no app restart: the next keyframe configures
+  a fresh codec.

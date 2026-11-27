@@ -190,7 +190,7 @@ fn stream_frames_captured_every_half_second() {
     assert!(make_test_stream(&h264), "ffmpeg failed to encode the test stream");
     let aus = split_access_units(&std::fs::read(&h264).unwrap());
     assert!(aus.len() >= 90, "expected 3s @30fps of access units, got {}", aus.len());
-    let mut raw: Vec<u8> = Vec::new();
+    let mut datagrams: Vec<Vec<u8>> = Vec::new();
     let mut recv_buf = [0u8; 2048];
     let started = std::time::Instant::now();
     let total = aus.len().min(100);
@@ -198,7 +198,7 @@ fn stream_frames_captured_every_half_second() {
         s.spawn(|| driver.stream_h264(&aus[..total]));
         loop {
             match phone.recv_into(&mut recv_buf, Duration::from_millis(400)) {
-                Some(n) => raw.extend_from_slice(&recv_buf[..n]),
+                Some(n) => datagrams.push(recv_buf[..n].to_vec()),
                 None => break,
             }
             if started.elapsed() > Duration::from_secs(15) {
@@ -206,9 +206,9 @@ fn stream_frames_captured_every_half_second() {
             }
         }
     });
-    assert!(!raw.is_empty(), "phone socket received no video bytes");
-    let got = split_length_prefixed(&raw);
-    assert!(got.len() >= 60, "phone got {} of {total} length-prefixed AUs", got.len());
+    assert!(!datagrams.is_empty(), "phone socket received no video datagrams");
+    let got = reassemble_framed(&datagrams);
+    assert!(got.len() >= 60, "phone got {} of {total} framed AUs", got.len());
     // The stream runs at 30fps, so every 15th access unit is one captured
     // frame per 500ms of stream time: 0ms, 500ms, 1000ms.
     let dir = artifacts();
@@ -280,20 +280,33 @@ fn contains_nal(au: &[u8], nal_type: u8) -> bool {
     }
     false
 }
-/// Reassembles the driver->phone framing: u32 BE length + AU, chunked to
-/// arbitrary datagram boundaries.
-fn split_length_prefixed(raw: &[u8]) -> Vec<Vec<u8>> {
-    let mut aus = Vec::new();
-    let mut i = 0;
-    while i + 4 <= raw.len() {
-        let len = u32::from_be_bytes(raw[i..i + 4].try_into().unwrap()) as usize;
-        if len == 0 || i + 4 + len > raw.len() {
-            break;
+/// Reassembles the driver->phone framing (CBPV header per datagram, the same
+/// as the preview): keeps only frames whose every fragment arrived, in frame-id
+/// order, like the phone's VideoFraming.h reassembler.
+fn reassemble_framed(datagrams: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    use cardboard_bridge::net::preview::{Header, HEADER_SIZE, MAX_PAYLOAD};
+    use std::collections::BTreeMap;
+    let mut frames: BTreeMap<u32, (Vec<u8>, Vec<bool>)> = BTreeMap::new();
+    for d in datagrams {
+        let Some(h) = Header::parse(d) else { continue };
+        if h.frag_count == 0 {
+            continue;
         }
-        aus.push(raw[i + 4..i + 4 + len].to_vec());
-        i += 4 + len;
+        let entry = frames
+            .entry(h.frame_id)
+            .or_insert_with(|| (vec![0u8; h.frame_size as usize], vec![false; h.frag_count as usize]));
+        let off = h.frag_index as usize * MAX_PAYLOAD;
+        let payload = &d[HEADER_SIZE..];
+        if off + payload.len() <= entry.0.len() && (h.frag_index as usize) < entry.1.len() {
+            entry.0[off..off + payload.len()].copy_from_slice(payload);
+            entry.1[h.frag_index as usize] = true;
+        }
     }
-    aus
+    frames
+        .into_values()
+        .filter(|(_, got)| got.iter().all(|g| *g))
+        .map(|(au, _)| au)
+        .collect()
 }
 #[test]
 fn shm_region_attaches_and_drains_telemetry() {

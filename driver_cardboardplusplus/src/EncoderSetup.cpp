@@ -46,6 +46,7 @@ bool HmdDriver::InitializeVideoEncoder()
     m_encoderInitialized = true;
     m_encoderPts = 0;
     BeginPreviewSession("encoder init");
+    BeginPhoneSession("encoder init");
     DriverLog("Video Encoder initialized successfully!");
     return true;
 }
@@ -176,6 +177,7 @@ bool HmdDriver::ApplyEncoderSettings(int w, int h, int fps, int bitrateBps, bool
     m_encoderInitialized = true;
     m_encoderPts = 0;
     BeginPreviewSession(reason);
+    BeginPhoneSession(reason);
     DriverLog("Encoder re-initialized at %dx%d @%d fps from %s", m_encoderW, m_encoderH, m_encoderFps, reason);
     return true;
 }

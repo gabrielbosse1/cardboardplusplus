@@ -4,7 +4,8 @@
 #include <vector>
 // Inline H.264 helpers shared by the encoder and UDP paths plus the wire-protocol tests.
 namespace h264 {
-// Builds the phone-bound buffer: 4-byte big-endian length header plus payload copy; caller frees the result. Test helper BuildLengthPrefixedPacket mirrors OnEncodedPacket framing.
+// Legacy phone framing (4-byte big-endian length header plus payload copy); the
+// phone now receives CBPV framing (CardboardWire.h). Kept for its tests; caller frees the result.
 static inline uint8_t* BuildLengthPrefixedPacket(const uint8_t* data, int size, int* outFramedSize)
 {
     int framedSize = size + 4;

@@ -3,7 +3,6 @@
 
 #include <stdint.h>
 #include <vector>
-#include <queue>
 #include <deque>
 #include <thread>
 #include <atomic>
@@ -12,89 +11,85 @@
 #include <chrono>
 #include <netinet/in.h>
 
+#include "VideoFraming.h"
+
 namespace ndk_cardboardplusplus {
 
+// Receives the driver's framed video (CBPV header per datagram, see
+// VideoFraming.h / CardboardWire.h) on UDP 42069 and hands complete access
+// units, plus stream-end events, to the decode thread.
+//
+// Guarantees to the decoder:
+//  - only whole access units, never one with a fragment missing;
+//  - after a start, a new session or any loss, nothing but a keyframe until a
+//    keyframe arrives (and KEYFRAME_REQ goes to the driver at once, repeated
+//    every kNackIntervalMs while still waiting, so recovery takes one round
+//    trip instead of the rest of the GOP);
+//  - an End item when the stream stops: STREAM_END from the driver, or no
+//    datagram for kStreamTimeoutMs. The decode thread tears the decoder down
+//    and the renderer goes back to black.
 class VideoReceiver {
  public:
+  // Why a stream ended (QueueItem::end_reason). Mirrored in VideoDecoder.java.
+  enum EndReason { kEndGoodbye = 1, kEndTimeout = 2 };
+
+  using Item = video_framing::QueueItem;
+
   VideoReceiver();
   ~VideoReceiver();
 
   bool Start(int port);
   void Stop();
 
-  bool HasFrame();
-  // Pops the oldest queued frame. The returned pointer stays valid until the
-  // next GetFrame/WaitAndGetFrame call; *is_key reports the keyframe flag
-  // computed once at receive time (no caller rescan needed).
-  bool GetFrame(uint8_t** data, int* size, bool* is_key);
-  // Same as GetFrame but blocks (condition variable, no polling) until a
-  // frame arrives or Stop() is called. Returns false on stop-with-empty-queue.
-  bool WaitAndGetFrame(uint8_t** data, int* size, bool* is_key);
+  // Blocks (condition variable, no polling) until a frame or End item is queued
+  // or Stop() is called. Returns false on stop with an empty queue.
+  bool WaitAndGetItem(Item* out);
 
  private:
   int socket_fd_;
   std::thread receive_thread_;
   std::atomic<bool> running_;
 
-  // Queue of complete, decoder-ready frames. A single buffer was previously
-  // used, but the receive thread runs far ahead of the render thread and
-  // overwrote it. We keep a queue but bound its depth.
-  //
-  // Frames are dropped only in whole GOPs: a P-frame decoded without its
-  // reference (because an earlier frame was dropped) corrupts the picture
-  // until the next keyframe, so we must never break a keyframe->P-frame
-  // chain. frame_is_key_ parallels frame_queue_ and records whether each
-  // queued frame is a keyframe (detected by scanning the whole payload for
-  // SPS/IDR NALs — libx264 emits AUD first, so checking only the first NAL
-  // would miss real keyframes).
-  std::deque<std::vector<uint8_t>> frame_queue_;
-  std::deque<bool> frame_is_key_;
-  std::vector<uint8_t> current_frame_;
-  bool current_is_key_ = false;
-  std::mutex buffer_mutex_;
-  // Signalled on every queue push and on Stop() so the forwarding thread
-  // blocks instead of 1ms-polling.
-  std::condition_variable frame_cv_;
+  // Receive -> decode queue. Bounded by video_framing::TrimQueue, which drops
+  // whole GOPs only and never leaves a P-frame without its reference.
+  std::deque<Item> queue_;
+  std::mutex queue_mutex_;
+  std::condition_variable queue_cv_;
 
   static const int kMaxPacketSize = 65536;
-  // Upper bound for a single encoded frame. Should comfortably exceed the
-  // largest keyframe (IDR) the encoder can emit, or a valid large frame would
-  // be mistaken for stream desync and dropped. Tied loosely to a 4K-class SBS
-  // stream; raise if you increase resolution/bitrate.
-  static const int kMaxFrameSize = 16 * 1024 * 1024;
-  // Largest *incomplete* frame we keep waiting for before declaring the stream
-  // desynced. A partial frame past this means its 4-byte length prefix was
-  // misread, and the next datagram is a better place to resync than growing the
-  // backlog toward kMaxFrameSize (megabytes of dead air at any bitrate).
-  static const size_t kMaxPartialFrameBytes = 1024 * 1024;
+  // Max queued items before whole GOPs are shed. Above the encoder GOP (10) so a
+  // normal backlog never forces a flush back to the next keyframe.
+  static const size_t kMaxQueueDepth = 16;
+  // No datagram for this long while streaming means the driver is gone (SteamVR
+  // killed, PC asleep, Wi-Fi lost). Same value as the Bridge preview.
+  static const int kStreamTimeoutMs = 2000;
 
-  // Max queued decoded-ready frames. The receiver runs far ahead of the
-  // decoder/render thread; once the backlog exceeds this depth we drop the
-  // oldest *complete GOPs* (keeping the newest intact GOP) so latency stays
-  // bounded without corrupting the picture. Must be >= the encoder GOP size
-  // (see VideoEncoder gop_size) or we would be forced to drop inside a GOP.
-  static const size_t kMaxQueueDepth = 8;
-
-  // Loss recovery: the driver's discovery port. When reassembly desyncs (a
-  // UDP datagram was lost) we send KEYFRAME_REQ here so the driver forces
-  // the next frame to IDR. Mirrors wire::kDiscoveryPort / kKeyframeReq in
-  // the driver's CardboardWire.h — change together.
+  // Loss recovery: the driver's discovery port. Mirrors wire::kDiscoveryPort /
+  // kKeyframeReq in the driver's CardboardWire.h — change together.
   static const int kDiscoveryPort = 42070;
-  // Minimum gap between keyframe requests so a loss burst sends one NACK,
-  // not one per dropped datagram.
-  static const int kNackIntervalMs = 500;
+  // Gap between repeated keyframe requests while the gate is still waiting.
+  static const int kNackIntervalMs = 250;
 
   void ReceiveLoop();
+  // Handles one datagram on the receive thread.
+  void OnDatagram(const uint8_t* data, size_t len, int64_t now_ms);
+  // Queues an item and wakes the decode thread. Returns true when the queue had
+  // to be flushed back to the next keyframe.
+  bool Push(Item item);
+  void PushEnd(int reason);
   // Sends KEYFRAME_REQ to the last-seen video sender (the driver) if the
-  // throttle allows. Called on desync; no-op until the first datagram
-  // arrives. Runs on the receive thread only.
-  void MaybeSendKeyframeNack();
+  // throttle allows. Receive thread only.
+  void MaybeSendKeyframeNack(int64_t now_ms, const char* why);
 
-  // Last sender observed on the video port (i.e. the driver). ReceiveLoop is
-  // the only thread that touches these.
+  // Receive-thread state.
+  video_framing::Reassembler reassembler_;
+  video_framing::KeyframeGate gate_;
+  video_framing::RequestThrottle nack_throttle_{kNackIntervalMs};
+  bool streaming_ = false;
+  int64_t last_datagram_ms_ = 0;
+  uint64_t gated_drops_ = 0;
   sockaddr_in last_sender_;
   bool has_sender_ = false;
-  std::chrono::steady_clock::time_point last_nack_{};
 };
 
 }  // namespace ndk_cardboardplusplus

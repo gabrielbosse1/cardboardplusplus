@@ -33,7 +33,7 @@ The project is functional but needs cleanup. The SteamVR driver captures frames,
 **SteamVR driver (`driver_cardboardplusplus/`, C++ DLL)**
 - HMD registration, Vive-style controller expose, D3D11 direct-mode present path
 - H.264 encoding (FFmpeg: AMF/NVENC/QSV detection, libx264 fallback), GPU eye-composite shaders + readback
-- UDP transport: length-prefixed H.264 to phone:42069 + header-framed copy (CBPV, see `CardboardWire.h`) to localhost:42069 for Bridge preview
+- UDP transport: H.264 access units header-framed (CBPV, see `CardboardWire.h`) to phone:42069 and to localhost:42069 for Bridge preview; `STREAM_END` goodbye on shutdown; forced IDR on `KEYFRAME_REQ`
 - Discovery (UDP 42070): answers `CARDBOARD_DISCOVERY` with `ACK`, honors `CARDBOARD_CAP` resolution clamp, answers `BRIDGE_HELLO` with `BRIDGE_ACK` + `BRIDGE_STATS`
 - Sensor intake (UDP 42074) from Bridge-forwarded phone telemetry
 - Shared-memory producer (`Local\cardboard_pp_bridge`): status/telemetry ring, settings channel (`BridgeProtocol.h` mirrors `protocol.rs`)

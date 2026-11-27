@@ -77,10 +77,10 @@ the whole project before touching any code.
 ## Video transport (decided)
 
 - **Keep UDP for the video stream**: the driver encodes H264 in `VideoEncoder.cpp`
-  and sends it over UDP (`m_udpSocket`) to the phone (port 42069, 4-byte
-  big-endian length-prefixed). This stays as-is.
+  and sends it over UDP (`m_udpSocket`) to the phone (port 42069, CBPV-framed
+  access units, see `CardboardWire.h`). UDP stays.
 - The **Bridge never sits in the video path** — video goes driver → phone
-  directly. The driver additionally sends a raw Annex-B copy to localhost:42069,
+  directly. The driver additionally sends a framed copy to localhost:42069,
   which the Bridge binds and pipes to ffmpeg purely for **preview display**
   (decoded to RGBA in a separate process; no frame copies in Rust).
 - The Bridge is the **control + telemetry plane over UDP**:

@@ -82,12 +82,15 @@ public:
     void Present(vr::SharedTextureHandle_t syncTexture) override;
     void PostPresent() override;
     void GetFrameTiming(DriverDirectMode_FrameTiming* pFrameTiming) override;
-// Encoded-packet fan-out to preview + phone; GetVideoEncoder exposes the encoder, OnEncodedPacket receives each access unit.
-    void SendFannedOut(const uint8_t* raw, int rawSize,
-                       const uint8_t* framed, int framedSize, bool keyframe);
+// Encoded-packet fan-out to preview + phone (both CBPV-framed, see CardboardWire.h);
+// GetVideoEncoder exposes the encoder, OnEncodedPacket receives each access unit.
+    void SendFannedOut(const uint8_t* raw, int rawSize, bool keyframe);
     void SendPreviewFrame(const uint8_t* raw, int rawSize, bool keyframe);
+    void SendPhoneFrame(const sockaddr_in& target, const uint8_t* raw, int rawSize, bool keyframe);
     void BeginPreviewSession(const char* reason);
+    void BeginPhoneSession(const char* reason);
     void SendPreviewEnd(const char* reason);
+    void SendPhoneEnd(const char* reason);
     VideoEncoder* GetVideoEncoder() { return m_pVideoEncoder; }
     void OnEncodedPacket(uint8_t* data, int size, int64_t pts, bool keyframe);
 private:
@@ -208,13 +211,18 @@ private:
     uint32_t m_udpDroppedPhone;
     std::atomic<uint64_t> m_udpFramesSent{0};
     std::vector<uint8_t> m_scratchFixed;
-    std::vector<uint8_t> m_scratchFramed;
     // Bridge preview framing: session changes per encoder lifetime, frame ids
     // count access units within it. m_previewSentSession/m_previewFrameId are
     // touched only by the encoding thread.
     std::atomic<uint32_t> m_previewSession{0};
     uint32_t m_previewSentSession = 0;
     uint32_t m_previewFrameId = 0;
+    // Phone framing, same scheme with its own counters: preview on/off toggles
+    // must not restart the phone's session. Session changes on UDP and encoder
+    // (re)init; m_phoneSentSession/m_phoneFrameId are encoding-thread only.
+    std::atomic<uint32_t> m_phoneSession{0};
+    uint32_t m_phoneSentSession = 0;
+    uint32_t m_phoneFrameId = 0;
     cbpp::PlatformSocket m_discoverySocket = cbpp::kInvalidSocket;
     bool m_discoveryInitialized;
     std::atomic<bool> m_discoveryRunning;

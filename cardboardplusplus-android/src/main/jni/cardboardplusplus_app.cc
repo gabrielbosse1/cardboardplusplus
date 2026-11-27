@@ -307,13 +307,19 @@ void CardboardPlusPlusApp::SetVideoDecoder(JNIEnv* env, jobject decoder) {
     video_decoder_obj_ = nullptr;
   }
   mid_feed_video_ = nullptr;
+  mid_end_stream_ = nullptr;
   if (decoder) {
     video_decoder_obj_ = env->NewGlobalRef(decoder);
     jclass cls = env->GetObjectClass(decoder);
     mid_feed_video_ = env->GetMethodID(cls, "feedDirect", "(Ljava/nio/ByteBuffer;IZ)V");
+    mid_end_stream_ = env->GetMethodID(cls, "endStream", "(I)V");
     env->DeleteLocalRef(cls);
     if (!mid_feed_video_) {
       LOGE("SetVideoDecoder: feedDirect method not found");
+    }
+    if (!mid_end_stream_) {
+      LOGE("SetVideoDecoder: endStream method not found");
+      env->ExceptionClear();
     }
   }
   LOGD("SetVideoDecoder: decoder=%p", (void*)video_decoder_obj_);
@@ -322,6 +328,11 @@ void CardboardPlusPlusApp::SetVideoDecoder(JNIEnv* env, jobject decoder) {
 void CardboardPlusPlusApp::OnVideoActive() {
   video_active_ = true;
   LOGD("Video decoder active");
+}
+
+void CardboardPlusPlusApp::OnVideoInactive() {
+  video_active_ = false;
+  LOGD("Video inactive: rendering idle (black)");
 }
 
 void CardboardPlusPlusApp::SetScreenParams(int width, int height) {
@@ -772,18 +783,32 @@ void CardboardPlusPlusApp::DecodeLoop() {
     return;
   }
 
+  VideoReceiver::Item item;
   while (decode_thread_running_) {
-    uint8_t* frame_data = nullptr;
-    int frame_size = 0;
-    bool is_key = false;
     // Blocks on the receiver's condition variable (no 1ms spin); returns
-    // false when Stop() drained the queue. is_key was computed once at
-    // receive time, so no rescan here — Java only rescans keyframes for SPS.
-    if (!video_receiver_->WaitAndGetFrame(&frame_data, &frame_size, &is_key)) {
+    // false when Stop() drained the queue. Items are whole access units that
+    // already passed the keyframe gate, or an End marker.
+    if (!video_receiver_->WaitAndGetItem(&item)) {
       if (!decode_thread_running_) break;
       continue;
     }
 
+    if (item.kind == VideoReceiver::Item::kEnd) {
+      // Terminal transition: the Java side flushes and releases the codec and
+      // drops the picture; the renderer then draws black until a new stream.
+      if (mid_end_stream_) {
+        env->CallVoidMethod(video_decoder_obj_, mid_end_stream_, (jint)item.end_reason);
+        if (env->ExceptionCheck()) {
+          env->ExceptionDescribe();
+          env->ExceptionClear();
+        }
+      }
+      video_active_ = false;
+      continue;
+    }
+
+    int frame_size = static_cast<int>(item.data.size());
+    if (frame_size <= 0) continue;
     // Reused direct-buffer handoff: one malloc'd region (grown as needed),
     // wrapped per frame without copying into a JNI array.
     if ((size_t)frame_size > direct_buf_cap_) {
@@ -796,13 +821,13 @@ void CardboardPlusPlusApp::DecodeLoop() {
       direct_buf_ = grown;
       direct_buf_cap_ = (size_t)frame_size;
     }
-    memcpy(direct_buf_, frame_data, (size_t)frame_size);
+    memcpy(direct_buf_, item.data.data(), (size_t)frame_size);
     jobject buf = env->NewDirectByteBuffer(direct_buf_, (jlong)frame_size);
     if (!buf) {
       continue;
     }
     env->CallVoidMethod(video_decoder_obj_, mid_feed_video_, buf,
-                        (jint)frame_size, is_key ? JNI_TRUE : JNI_FALSE);
+                        (jint)frame_size, item.keyframe ? JNI_TRUE : JNI_FALSE);
     env->DeleteLocalRef(buf);
 
     if (env->ExceptionCheck()) {

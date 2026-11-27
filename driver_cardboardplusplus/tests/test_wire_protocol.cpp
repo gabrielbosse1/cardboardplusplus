@@ -11,6 +11,10 @@
 #include "H264Utils.h"
 #include "PreviewFraming.h"
 #include "GripLimit.h"
+// Phone receiver framing (Android NDK side), compiled here so the driver's real
+// packetizer output is fed straight into the phone's reassembler.
+#include "../../cardboardplusplus-android/src/main/jni/VideoFraming.h"
+#include <deque>
 // --- grip limit -----------------------------------------------------------------
 // SteamVR reads the grip limit as both the curl/splay reference and the ceiling
 // on skeletal motion. Left null, SteamVR substitutes the Index controller's
@@ -979,6 +983,252 @@ static void test_dispatch_bridge_keyframe_req() {
     assert(simulate_dispatch("KEYFRAME_REQ") == DispatchResult::KeyframeReq);
     printf("PASS: BRIDGE_KEYFRAME_REQ has its own handler (phone KEYFRAME_REQ unchanged)\n");
 }
+// --- phone video framing (driver -> phone:42069) ---------------------------------
+// The phone now receives the same CBPV framing as the preview. These run the
+// driver's preview::SendFrame into the phone's video_framing::Reassembler.
+namespace phone_test {
+// One access unit: keyframes open with AUD + SPS + PPS + IDR like libx264.
+static std::vector<uint8_t> MakeAu(uint32_t id, bool key, size_t size) {
+    std::vector<uint8_t> au;
+    const uint8_t aud[] = {0, 0, 0, 1, 0x09, 0xF0};
+    au.insert(au.end(), aud, aud + sizeof(aud));
+    if (key) {
+        const uint8_t sps_pps_idr[] = {0, 0, 0, 1, 0x67, 0x42, 0, 0x1E, 0, 0, 0, 1, 0x68, 0xCE, 0x38, 0, 0, 0, 1, 0x65};
+        au.insert(au.end(), sps_pps_idr, sps_pps_idr + sizeof(sps_pps_idr));
+    } else {
+        const uint8_t p[] = {0, 0, 0, 1, 0x41};
+        au.insert(au.end(), p, p + sizeof(p));
+    }
+    while (au.size() < size) au.push_back((uint8_t)(id * 13 + au.size()));
+    return au;
+}
+static std::vector<std::vector<uint8_t>> Frame(const std::vector<uint8_t>& au, uint32_t session,
+                                               uint32_t id, bool key) {
+    uint8_t scratch[wire::kPreviewMaxDatagram];
+    DatagramLog log;
+    preview::SendFrame(au.data(), (uint32_t)au.size(), session, id, key, scratch, std::ref(log));
+    return log.datagrams;
+}
+}  // namespace phone_test
+static void test_phone_framing_constants_mirror_driver() {
+    assert(video_framing::kMagic == wire::kPreviewMagic);
+    assert(video_framing::kVersion == wire::kPreviewVersion);
+    assert(video_framing::kHeaderSize == wire::kPreviewHeaderSize);
+    assert(video_framing::kMaxDatagram == wire::kPreviewMaxDatagram);
+    assert(video_framing::kMaxPayload == wire::kPreviewMaxPayload);
+    assert(video_framing::kFlagKeyframe == wire::kPreviewFlagKeyframe);
+    assert(video_framing::kFlagEnd == wire::kPreviewFlagEnd);
+    // Golden datagram parses identically on the phone.
+    uint8_t d[24 + 1376] = {};
+    memcpy(d, kPreviewGolden, 24);
+    video_framing::Header h;
+    assert(video_framing::ParseHeader(d, sizeof(d), &h));
+    assert(h.flags == 0x01 && h.frag_index == 1 && h.frag_count == 3 && h.payload_len == 1376);
+    assert(h.session == 0x01020304u && h.frame_id == 0x0A0B0C0Du && h.frame_size == 3000);
+    printf("PASS: phone framing constants and header parse mirror the driver\n");
+}
+static void test_phone_reassembles_driver_frames_byte_exact() {
+    using namespace phone_test;
+    video_framing::Reassembler ra;
+    const size_t sizes[] = {40, 1376 - 0, 1377, 2752, 190000, 28000};
+    uint32_t id = 0;
+    for (size_t size : sizes) {
+        bool key = (id == 0 || size > 100000);
+        std::vector<uint8_t> au = MakeAu(id, key, size);
+        auto dgs = Frame(au, 77, id, key);
+        int frames = 0;
+        for (size_t i = 0; i < dgs.size(); i++) {
+            video_framing::Output o = ra.Push(dgs[i].data(), dgs[i].size());
+            if (o.kind == video_framing::Output::kFrame) {
+                frames++;
+                assert(i + 1 == dgs.size());  // only after the last fragment
+                assert(o.data == au && o.frame_id == id && o.keyframe == key && !o.loss);
+            }
+        }
+        assert(frames == 1);
+        id++;
+    }
+    assert(ra.stats().incomplete == 0 && ra.stats().skipped == 0);
+    printf("PASS: phone reassembles driver frames byte-exact, only when complete\n");
+}
+static void test_phone_reordered_and_duplicate_fragments() {
+    using namespace phone_test;
+    video_framing::Reassembler ra;
+    std::vector<uint8_t> au = MakeAu(0, true, 9000);
+    auto dgs = Frame(au, 5, 0, true);
+    std::vector<std::vector<uint8_t>> mixed = {dgs[3], dgs[0], dgs[0], dgs[6], dgs[1], dgs[5], dgs[2], dgs[4], dgs[4]};
+    int frames = 0;
+    for (auto& d : mixed) {
+        video_framing::Output o = ra.Push(d.data(), d.size());
+        if (o.kind == video_framing::Output::kFrame) { frames++; assert(o.data == au); }
+    }
+    assert(frames == 1 && ra.stats().duplicates == 1 && ra.stats().stale == 1);
+    printf("PASS: reordered and duplicated fragments still give one exact frame\n");
+}
+static void test_phone_lost_fragment_never_reaches_decoder() {
+    using namespace phone_test;
+    video_framing::Reassembler ra;
+    video_framing::KeyframeGate gate;
+    std::vector<uint32_t> decoded;
+    for (uint32_t id = 0; id < 6; id++) {
+        bool key = (id == 0 || id == 4);
+        auto dgs = Frame(MakeAu(id, key, key ? 20000 : 4000), 9, id, key);
+        for (size_t i = 0; i < dgs.size(); i++) {
+            if (id == 2 && i == 1) continue;  // one fragment of P-frame 2 lost on Wi-Fi
+            video_framing::Output o = ra.Push(dgs[i].data(), dgs[i].size());
+            if (o.kind != video_framing::Output::kFrame) continue;
+            if (o.loss) gate.Invalidate();
+            if (gate.Admit(o.keyframe)) decoded.push_back(o.frame_id);
+        }
+    }
+    // 2 is incomplete, 3 is a P-frame predicting from 2: both held back; 4 is the IDR.
+    std::vector<uint32_t> expect = {0, 1, 4, 5};
+    assert(decoded == expect);
+    assert(ra.stats().incomplete == 1);
+    printf("PASS: a lost fragment drops its frame and gates P-frames until the next keyframe\n");
+}
+static void test_phone_whole_frame_loss_and_truncated_send_are_detected() {
+    using namespace phone_test;
+    video_framing::Reassembler ra;
+    // Frame 1 never arrives at all; frame 2 must carry loss.
+    for (uint32_t id : {0u, 2u}) {
+        auto dgs = Frame(MakeAu(id, id == 0, 3000), 3, id, id == 0);
+        video_framing::Output o;
+        for (auto& d : dgs) o = ra.Push(d.data(), d.size());
+        assert(o.kind == video_framing::Output::kFrame);
+        assert(o.loss == (id == 2));
+    }
+    assert(ra.stats().skipped == 1);
+    // Driver send buffer full: SendFrame stops after 10 of 15 fragments.
+    std::vector<uint8_t> big = MakeAu(3, true, 20000);
+    uint8_t scratch[wire::kPreviewMaxDatagram];
+    DatagramLog cut;
+    cut.stopAfter = 10;
+    preview::SendFrame(big.data(), (uint32_t)big.size(), 3, 3, true, scratch, std::ref(cut));
+    for (auto& d : cut.datagrams) assert(ra.Push(d.data(), d.size()).kind == video_framing::Output::kNone);
+    auto next = Frame(MakeAu(4, false, 3000), 3, 4, false);
+    video_framing::Output o;
+    for (auto& d : next) o = ra.Push(d.data(), d.size());
+    assert(o.kind == video_framing::Output::kFrame && o.loss && ra.stats().incomplete == 1);
+    printf("PASS: whole-frame loss and would-block truncation are reported as loss\n");
+}
+static void test_phone_stream_end_and_sessions() {
+    using namespace phone_test;
+    video_framing::Reassembler ra;
+    auto f0 = Frame(MakeAu(0, true, 3000), 0x11, 0, true);
+    for (auto& d : f0) ra.Push(d.data(), d.size());
+    uint8_t end[wire::kPreviewHeaderSize];
+    preview::WriteEnd(end, 0x11);
+    assert(ra.Push(end, sizeof(end)).kind == video_framing::Output::kEnd);
+    // The driver sends copies; only the first counts.
+    assert(ra.Push(end, sizeof(end)).kind == video_framing::Output::kNone);
+    assert(ra.Push(end, sizeof(end)).kind == video_framing::Output::kNone);
+    // Late fragments of the ended session are stale, never a new stream.
+    auto late = Frame(MakeAu(1, false, 3000), 0x11, 1, false);
+    for (auto& d : late) assert(ra.Push(d.data(), d.size()).kind == video_framing::Output::kNone);
+    // A new stream (new session) starts from idle without a restart.
+    auto n0 = Frame(MakeAu(0, true, 3000), 0x22, 0, true);
+    video_framing::Output o;
+    for (auto& d : n0) o = ra.Push(d.data(), d.size());
+    assert(o.kind == video_framing::Output::kFrame && o.session == 0x22 && !o.loss);
+    // Encoder re-init mid-stream: new session flagged, frame ids restart.
+    auto m0 = Frame(MakeAu(0, true, 3000), 0x33, 0, true);
+    for (auto& d : m0) o = ra.Push(d.data(), d.size());
+    assert(o.kind == video_framing::Output::kFrame && o.new_session && o.frame_id == 0);
+    // A goodbye for some other session is ignored.
+    preview::WriteEnd(end, 0x99);
+    assert(ra.Push(end, sizeof(end)).kind == video_framing::Output::kNone);
+    assert(ra.stats().ends == 1);
+    printf("PASS: phone STREAM_END is honoured once, stale data ignored, new sessions restart cleanly\n");
+}
+static void test_phone_queue_trim_never_breaks_references() {
+    using video_framing::QueueItem;
+    auto item = [](uint32_t id, bool key) {
+        QueueItem q;
+        q.frame_id = id;
+        q.keyframe = key;
+        return q;
+    };
+    // Backlog spanning two GOPs: cut to the newest keyframe, nothing else.
+    std::deque<QueueItem> q;
+    for (uint32_t i = 0; i < 20; i++) q.push_back(item(i, i % 10 == 0));
+    assert(!video_framing::TrimQueue(&q, 16));
+    assert(q.size() == 10 && q.front().frame_id == 10 && q.front().keyframe);
+    for (size_t i = 1; i < q.size(); i++) assert(q[i].frame_id == q[i - 1].frame_id + 1);
+    // One oversized GOP: the old queue popped P-frames from the back and kept
+    // decoding after the hole. Now everything goes and the caller must gate.
+    q.clear();
+    for (uint32_t i = 0; i < 17; i++) q.push_back(item(i, i == 0));
+    assert(video_framing::TrimQueue(&q, 16));
+    assert(q.empty());
+    // End markers survive a flush so the decoder still tears down.
+    q.clear();
+    QueueItem end;
+    end.kind = QueueItem::kEnd;
+    q.push_back(end);
+    for (uint32_t i = 0; i < 17; i++) q.push_back(item(i, false));
+    assert(video_framing::TrimQueue(&q, 16));
+    assert(q.size() == 1 && q.front().kind == QueueItem::kEnd);
+    printf("PASS: phone decode queue drops whole GOPs only, never a reference\n");
+}
+static void test_phone_keyframe_request_throttle_and_nal_scan() {
+    video_framing::RequestThrottle t(250);
+    assert(t.Allow(1000));      // first request after a loss goes out at once
+    assert(!t.Allow(1100));
+    assert(t.Allow(1250));      // repeated while still waiting
+    t.Reset();
+    assert(t.Allow(1260));      // a fresh loss is not held back
+    const uint8_t aud_then_idr[] = {0, 0, 0, 1, 0x09, 0xF0, 0, 0, 1, 0x65, 0x88};
+    const uint8_t p_only[] = {0, 0, 0, 1, 0x09, 0xF0, 0, 0, 0, 1, 0x41, 0x9A};
+    assert(video_framing::HasKeyframeNal(aud_then_idr, sizeof(aud_then_idr)));
+    assert(!video_framing::HasKeyframeNal(p_only, sizeof(p_only)));
+    printf("PASS: keyframe requests repeat every 250 ms while waiting; AUD-first IDR detected\n");
+}
+// Simulated Wi-Fi loss with the phone asking for keyframes: every frame that
+// reaches the decoder has its full reference chain, and the picture recovers
+// within a few frames of each loss instead of waiting out the GOP.
+static void test_phone_random_loss_recovers_with_keyframe_requests() {
+    using namespace phone_test;
+    video_framing::Reassembler ra;
+    video_framing::KeyframeGate gate;
+    uint32_t rng = 12345;
+    auto rnd = [&rng]() { rng = rng * 1103515245u + 12345u; return (rng >> 16) & 0x7FFF; };
+    const uint32_t kGop = 120;  // long GOP: without requests a loss would freeze ~2 s
+    bool forceIdr = false;
+    bool waiting = false;
+    uint32_t waitStart = 0, worstWait = 0, losses = 0;
+    bool haveRef = false;
+    uint32_t lastDecoded = 0;
+    for (uint32_t id = 0; id < 3000; id++) {
+        bool key = (id % kGop == 0) || forceIdr;
+        forceIdr = false;
+        auto dgs = Frame(MakeAu(id, key, key ? 60000 : 6000), 1, id, key);
+        for (auto& d : dgs) {
+            if (rnd() % 1000 < 3) continue;  // 0.3% datagram loss
+            video_framing::Output o = ra.Push(d.data(), d.size());
+            if (o.kind != video_framing::Output::kFrame) continue;
+            if (o.loss) { gate.Invalidate(); losses++; }
+            if (gate.Admit(o.keyframe)) {
+                // Reference check: a P-frame must directly follow what was decoded.
+                if (!o.keyframe) assert(haveRef && o.frame_id == lastDecoded + 1);
+                haveRef = true;
+                lastDecoded = o.frame_id;
+                if (waiting) {
+                    uint32_t w = o.frame_id - waitStart;
+                    if (w > worstWait) worstWait = w;
+                    waiting = false;
+                }
+            } else {
+                if (!waiting) { waiting = true; waitStart = o.frame_id; }
+                forceIdr = true;  // KEYFRAME_REQ: driver encodes the next frame as IDR
+            }
+        }
+    }
+    assert(losses > 10);
+    assert(worstWait <= 6);  // vs up to kGop-1 frames frozen without KEYFRAME_REQ
+    printf("PASS: %u losses under 0.3%% datagram loss, each recovered within %u frames via KEYFRAME_REQ\n",
+           losses, worstWait);
+}
 int main() {
     printf("=== Driver wire protocol tests ===\n\n");
     test_grip_limit_is_a_closed_fist();
@@ -1048,6 +1298,15 @@ int main() {
     test_preview_empty_and_oversized_frames_are_not_sent();
     test_preview_stream_end_golden_bytes();
     test_dispatch_bridge_keyframe_req();
+    test_phone_framing_constants_mirror_driver();
+    test_phone_reassembles_driver_frames_byte_exact();
+    test_phone_reordered_and_duplicate_fragments();
+    test_phone_lost_fragment_never_reaches_decoder();
+    test_phone_whole_frame_loss_and_truncated_send_are_detected();
+    test_phone_stream_end_and_sessions();
+    test_phone_queue_trim_never_breaks_references();
+    test_phone_keyframe_request_throttle_and_nal_scan();
+    test_phone_random_loss_recovers_with_keyframe_requests();
     printf("\n=== All driver tests passed ===\n");
     return 0;
 }

@@ -257,10 +257,11 @@ impl FakeDriver {
         let got = hit.lock().unwrap().take();
         got.unwrap()
     }
-    /// Replays access units like the real driver: 4-byte BE length-prefixed,
-    /// chunked at 1400B to the phone target, and header-framed (CBPV, see
-    /// CardboardWire.h) to the bridge preview socket at 127.0.0.1:42069. Each
-    /// call is one driver session with frame ids from 0.
+    /// Replays access units like the real driver: header-framed (CBPV, see
+    /// CardboardWire.h) to both the phone target and the bridge preview socket
+    /// at 127.0.0.1:42069. Each call is one driver session with frame ids from 0
+    /// (the real driver keeps separate phone/preview counters; one session here
+    /// is enough since each receiver only sees its own copy).
     pub fn stream_h264(&self, aus: &[Vec<u8>]) -> usize {
         let phone = self.phone_target.lock().unwrap().clone();
         let preview: SocketAddr = "127.0.0.1:42069".parse().unwrap();
@@ -271,17 +272,15 @@ impl FakeDriver {
         *self.preview_session.lock().unwrap() = session;
         let mut sent = 0;
         for (frame_id, au) in aus.iter().enumerate() {
+            let keyframe = annexb_has_nal(au, 5) || annexb_has_nal(au, 7);
+            let datagrams = cardboard_bridge::net::preview::packetize(au, session, frame_id as u32, keyframe);
             if let Some(target) = &phone {
-                let mut framed = Vec::with_capacity(4 + au.len());
-                framed.extend_from_slice(&(au.len() as u32).to_be_bytes());
-                framed.extend_from_slice(au);
-                for chunk in framed.chunks(1400) {
-                    let _ = self.video.send_to(chunk, target);
+                for d in &datagrams {
+                    let _ = self.video.send_to(d, target);
                 }
             }
-            let keyframe = annexb_has_nal(au, 5) || annexb_has_nal(au, 7);
-            for d in cardboard_bridge::net::preview::packetize(au, session, frame_id as u32, keyframe) {
-                let _ = self.video.send_to(&d, preview);
+            for d in &datagrams {
+                let _ = self.video.send_to(d, preview);
             }
             sent += 1;
             std::thread::sleep(Duration::from_millis(33));
