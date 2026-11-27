@@ -13,7 +13,7 @@ Endpoints
 GET  /health   {\"ok\":true,\"app_version\":\"...\"}
   GET  /status   live status snapshot (driver/phone/encoder, fps, hands, ...)
   GET  /logs?n=50  newest-first log lines
-   GET  /preview   local-preview driver streaming stats (always on, no toggle)
+   GET  /preview   local-preview stats: driver send side + bridge receive side
    POST /settings push stream settings to the driver:
 
          curl -X POST 127.0.0.1:8567/settings \

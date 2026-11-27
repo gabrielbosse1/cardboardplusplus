@@ -92,6 +92,8 @@ pub struct FakeDriver {
     muted: Arc<AtomicBool>,
     phone_target: Arc<Mutex<Option<SocketAddr>>>,
     phone_port: Arc<AtomicU16>,
+    /// Preview session of the last stream_h264 call (for send_preview_end).
+    preview_session: Mutex<u32>,
 }
 impl FakeDriver {
     pub fn new() -> FakeDriver {
@@ -192,6 +194,7 @@ impl FakeDriver {
             muted,
             phone_target,
             phone_port,
+            preview_session: Mutex::new(0),
         }
     }
     fn snapshot(&self) -> Vec<String> {
@@ -254,30 +257,52 @@ impl FakeDriver {
         let got = hit.lock().unwrap().take();
         got.unwrap()
     }
-    /// Replays access units like the real driver: 4-byte BE length-prefixed,
-    /// chunked at 1400B to the phone target, and raw Annex-B chunked to the
-    /// bridge preview socket at 127.0.0.1:42069.
+    /// Replays access units like the real driver: header-framed (CBPV, see
+    /// CardboardWire.h) to both the phone target and the bridge preview socket
+    /// at 127.0.0.1:42069. Each call is one driver session with frame ids from 0
+    /// (the real driver keeps separate phone/preview counters; one session here
+    /// is enough since each receiver only sees its own copy).
     pub fn stream_h264(&self, aus: &[Vec<u8>]) -> usize {
         let phone = self.phone_target.lock().unwrap().clone();
         let preview: SocketAddr = "127.0.0.1:42069".parse().unwrap();
+        let session = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() ^ d.as_secs() as u32)
+            .unwrap_or(1);
+        *self.preview_session.lock().unwrap() = session;
         let mut sent = 0;
-        for au in aus {
+        for (frame_id, au) in aus.iter().enumerate() {
+            let keyframe = annexb_has_nal(au, 5) || annexb_has_nal(au, 7);
+            let datagrams = cardboard_bridge::net::preview::packetize(au, session, frame_id as u32, keyframe);
             if let Some(target) = &phone {
-                let mut framed = Vec::with_capacity(4 + au.len());
-                framed.extend_from_slice(&(au.len() as u32).to_be_bytes());
-                framed.extend_from_slice(au);
-                for chunk in framed.chunks(1400) {
-                    let _ = self.video.send_to(chunk, target);
+                for d in &datagrams {
+                    let _ = self.video.send_to(d, target);
                 }
             }
-            for chunk in au.chunks(1400) {
-                let _ = self.video.send_to(chunk, preview);
+            for d in &datagrams {
+                let _ = self.video.send_to(d, preview);
             }
             sent += 1;
             std::thread::sleep(Duration::from_millis(33));
         }
         sent
     }
+}
+impl FakeDriver {
+    /// STREAM_END for the last streamed session, sent twice like
+    /// HmdDriver::SendPreviewEnd.
+    pub fn send_preview_end(&self) {
+        let session = *self.preview_session.lock().unwrap();
+        let preview: SocketAddr = "127.0.0.1:42069".parse().unwrap();
+        let end = cardboard_bridge::net::preview::stream_end(session);
+        for _ in 0..2 {
+            let _ = self.video.send_to(&end, preview);
+        }
+    }
+}
+/// True when an Annex-B access unit contains a NAL of `nal_type`.
+fn annexb_has_nal(au: &[u8], nal_type: u8) -> bool {
+    au.windows(4).any(|w| w[0] == 0 && w[1] == 0 && w[2] == 1 && (w[3] & 0x1f) == nal_type)
 }
 impl Drop for FakeDriver {
     fn drop(&mut self) {

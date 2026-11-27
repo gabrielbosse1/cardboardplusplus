@@ -25,6 +25,8 @@ public interface NativeBridge {
   void setVideoDecoder(Object decoder);
   // Signals first decoded video output; called from VideoDecoder once MediaCodec is configured.
   void onVideoActive();
+  // Signals the stream ended (goodbye, timeout, decode failure); native renders black again. Called from VideoDecoder.
+  void onVideoInactive();
   // Corrects the video UV range for padded decode height; called from VideoDecoder after configure.
   void setVideoVMax(float vMax);
   // Clears the camera texture binding; called from CameraController.onPause.

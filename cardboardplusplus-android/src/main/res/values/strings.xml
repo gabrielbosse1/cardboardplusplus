@@ -11,7 +11,7 @@
     <string name="read_storage_permission"
             description="Text shown on Android Toast when permissions are not granted.
                          [CHAR_LIMIT=90]">
-            Cardboard++ requires to read your external storage to load device parameters.</string>
+            Storage access is needed to load your viewer profile.</string>
     <string name="low_storage_error"
             description="Text shown on Android Toast when detector dependencies can not be
                          downloaded due to low storage. [CHAR_LIMIT=70]">

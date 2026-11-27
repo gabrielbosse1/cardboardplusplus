@@ -1,5 +1,6 @@
 #pragma once
 #include <cstddef>
+#include <cstdint>
 // UDP wire contract for Cardboard++ (ports 42069-42074).
 // Source of truth for all discovery/control strings and ports; the bridge
 // (net/mod.rs) and Android app (AppConstants) mirror these values byte-for-byte.
@@ -33,4 +34,45 @@ namespace wire {
     static constexpr std::size_t kKeyframeReqLen = sizeof(kKeyframeReq) - 1;
 // Bridge -> driver sensor forward (rotation quats originating on the phone).
     static constexpr int kSensorPort = 42074;
+
+// --- Video framing (driver -> phone:42069 and driver -> 127.0.0.1:42069) -------
+// Both video copies use this framing. They used to be a byte stream split at
+// arbitrary 1400-byte offsets (raw Annex-B to the preview, 4-byte length prefix
+// to the phone), so a lost datagram was invisible to the receiver and the bytes
+// around the hole were decoded as one frame. Every video datagram now carries
+// this header followed by one fragment of exactly one encoded access unit.
+// All fields big-endian. The kPreview* names predate the phone using it.
+//
+//   off size field
+//    0   4   magic       'C' 'B' 'P' 'V'
+//    4   1   version     kPreviewVersion
+//    5   1   flags       kPreviewFlag*
+//    6   2   frag_index  0 .. frag_count-1
+//    8   2   frag_count  fragments in this access unit (0 for control datagrams)
+//   10   2   payload_len bytes after the header in this datagram
+//   12   4   session     changes on every encoder (re)init; frame ids restart
+//   16   4   frame_id    +1 per access unit within a session
+//   20   4   frame_size  total access-unit bytes (sum of all payload_len)
+//
+// Control datagram: frag_count 0, payload_len 0, frame_id 0, frame_size 0.
+// kPreviewFlagEnd on a control datagram is STREAM_END: the driver is stopping
+// this session on purpose (SteamVR unload, preview turned off), so the receiver
+// can go idle at once instead of waiting for its receive timeout.
+//
+// Phone and preview keep separate session/frame-id counters. On loss the phone
+// sends kKeyframeReq and the bridge kBridgeKeyframeReq to kDiscoveryPort.
+//
+// Mirrored by bridge/crates/cardboard-bridge/src/net/preview.rs and
+// cardboardplusplus-android/src/main/jni/VideoFraming.h — change all three.
+    static constexpr uint32_t kPreviewMagic = 0x43425056u;  // "CBPV"
+    static constexpr uint8_t kPreviewVersion = 1;
+    static constexpr std::size_t kPreviewHeaderSize = 24;
+    static constexpr std::size_t kPreviewMaxDatagram = 1400;
+    static constexpr std::size_t kPreviewMaxPayload = kPreviewMaxDatagram - kPreviewHeaderSize;
+    static constexpr uint8_t kPreviewFlagKeyframe = 0x01;
+    static constexpr uint8_t kPreviewFlagEnd = 0x02;
+// Bridge -> driver: the preview lost a frame and needs an IDR. Distinct from the
+// phone's KEYFRAME_REQ so it never refreshes the phone-liveness timer.
+    static constexpr char kBridgeKeyframeReq[] = "BRIDGE_KEYFRAME_REQ";
+    static constexpr std::size_t kBridgeKeyframeReqLen = sizeof(kBridgeKeyframeReq) - 1;
 }

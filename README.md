@@ -24,16 +24,16 @@ The project is functional but needs cleanup. The SteamVR driver captures frames,
 **Bridge (`bridge/crates/cardboard-bridge/` — the product, Rust + Slint)**
 - Slint desktop UI: status, stream/camera settings, driver + APK installers, diagnostics log (200-line ring buffer)
 - REST API on `127.0.0.1:8567`: `GET /health /status /logs?n= /preview /debug`, `POST /preview /settings /debug`
-- Driver link (UDP 42070): `BRIDGE_HELLO` heartbeat every 500ms, handles `BRIDGE_ACK` + `BRIDGE_STATS`, sends `BRIDGE_CFG` / `BRIDGE_PREVIEW` / `CARDBOARD_CAP`
+- Driver link (UDP 42070): `BRIDGE_HELLO` heartbeat every 500ms, handles `BRIDGE_ACK` + `BRIDGE_STATS`, sends `BRIDGE_CFG` / `BRIDGE_PREVIEW` / `CARDBOARD_CAP` / `BRIDGE_KEYFRAME_REQ`
 - Phone telemetry ingest (UDP 42071): gyro `0x10` (45B), hand `0x11` (15B), rotation quat `0x12` (25B, the real head-tracking path), net-stats `0x13` (21B), ping `0x20`, `CARDBOARD_PHONE_HELLO`; forwards sensors to driver on UDP 42074
 - Camera ingest (UDP 42072 JPEG) → MediaPipe over TCP 42073 (`mediapipe_server.py`, 21-landmark hand skeleton overlay; model file `models/hand_landmarker.task` is vendored)
-- Preview: binds UDP 42069, pipes to ffmpeg → RGBA, optional ffplay popup
+- Preview: binds UDP 42069, reassembles whole frames, drops until the next keyframe after any loss (and asks the driver for one), feeds ffmpeg → RGBA; counters in `GET /preview` (`bridge`), per-frame trace with `CARDBOARD_PREVIEW_TRACE=1`; lifecycle Idle → Connecting → Streaming, back to the idle screen on driver goodbye, 2 s silence or decoder failure ([docs/PREVIEW_LIFECYCLE.md](docs/PREVIEW_LIFECYCLE.md))
 - Installed-artifact serving: driver DLL + APK install/update from the UI (ADB supported) (Still in development, going to ship in the finished app)
 
 **SteamVR driver (`driver_cardboardplusplus/`, C++ DLL)**
 - HMD registration, Vive-style controller expose, D3D11 direct-mode present path
 - H.264 encoding (FFmpeg: AMF/NVENC/QSV detection, libx264 fallback), GPU eye-composite shaders + readback
-- UDP transport: length-prefixed H.264 to phone:42069 + raw Annex-B copy to localhost:42069 for Bridge preview
+- UDP transport: H.264 access units header-framed (CBPV, see `CardboardWire.h`) to phone:42069 and to localhost:42069 for Bridge preview; `STREAM_END` goodbye on shutdown; forced IDR on `KEYFRAME_REQ`
 - Discovery (UDP 42070): answers `CARDBOARD_DISCOVERY` with `ACK`, honors `CARDBOARD_CAP` resolution clamp, answers `BRIDGE_HELLO` with `BRIDGE_ACK` + `BRIDGE_STATS`
 - Sensor intake (UDP 42074) from Bridge-forwarded phone telemetry
 - Shared-memory producer (`Local\cardboard_pp_bridge`): status/telemetry ring, settings channel (`BridgeProtocol.h` mirrors `protocol.rs`)
@@ -109,7 +109,7 @@ Wire protocol (locked — `CardboardWire.h` ↔ `bridge/.../net/mod.rs` ↔ `App
 1. Pushes settings (`BRIDGE_CFG`, `CARDBOARD_CAP`, `BRIDGE_PREVIEW`) to the driver over UDP 42070
 2. Ingests phone telemetry (UDP 42071) and camera JPEGs (UDP 42072), forwards sensors to the driver (UDP 42074)
 3. Sends camera frames to Python MediaPipe over TCP 42073, overlays the 21-landmark hand skeleton
-4. Reads preview H.264 from localhost UDP 42069 via ffmpeg (separate process, no frame copies in Rust)
+4. Reads framed preview H.264 from localhost UDP 42069, decodes via ffmpeg (separate process). Loss check without SteamVR: `python scripts/preview_loss_harness.py --mode framed --loss 0.002 --reconnect 70`
 5. Exposes everything over REST (`:8567`) and the Slint UI; installs driver DLL + APK from the General section
 
 ### SteamVR driver (`driver_cardboardplusplus/`)

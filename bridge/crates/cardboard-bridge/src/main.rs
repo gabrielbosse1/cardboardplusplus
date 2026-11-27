@@ -307,7 +307,15 @@ fn poll_stats(core: &Arc<AppCore>, weak: &slint::Weak<MainWindow>, last_test_res
     if snap.link_test_result_mbps == 0 {
         *last_test_result = 0;
     }
-    if let Some(img) = core.take_preview_frame() {
+    // Preview: every terminal lifecycle transition (goodbye, timeout,
+    // decoder failure) asks for a reset to the idle screen; apply it before
+    // any newer picture so a frozen frame never stays up.
+    global.set_preview_state(snap.preview_state.clone().into());
+    let (preview_cleared, preview_img) = core.take_preview_update();
+    if preview_cleared {
+        global.set_preview_frame(global.get_preview_idle());
+    }
+    if let Some(img) = preview_img {
         global.set_preview_frame(img);
     }
     if let Some(img) = core.take_camera_frame() {

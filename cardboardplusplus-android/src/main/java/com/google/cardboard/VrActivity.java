@@ -112,6 +112,8 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
         "decoder-cap-query")
         .start();
     videoManager.setReconnectAction(() -> discoveryManager.pokeNow());
+    // Loss or a codec-side drop: pull an IDR at once instead of waiting out the GOP.
+    videoManager.setKeyframeAction(() -> discoveryManager.requestKeyframe());
     // A wedged decoder cannot fix itself: rebuild it and pull a fresh IDR so the
     // SPS cache is refreshed from the driver's next keyframe.
     videoManager.setReconfigureAction(
@@ -354,6 +356,7 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
   private native int nativeCreateVideoTexture(long nativeApp);
   private native void nativeSetVideoDecoder(long nativeApp, Object decoder);
   private native void nativeOnVideoActive(long nativeApp);
+  private native void nativeOnVideoInactive(long nativeApp);
   private native void nativeSetVideoVMax(long nativeApp, float vMax);
   private native void nativeResetCameraTexture(long nativeApp);
   private native void nativeStartVideoReceiver(long nativeApp, int port);
@@ -407,6 +410,10 @@ public class VrActivity extends AppCompatActivity implements NativeBridge {
   @Override
   public void onVideoActive() {
     nativeOnVideoActive(nativeApp);
+  }
+  @Override
+  public void onVideoInactive() {
+    nativeOnVideoInactive(nativeApp);
   }
   @Override
   public void setVideoVMax(float vMax) {

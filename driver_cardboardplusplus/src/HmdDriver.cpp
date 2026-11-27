@@ -210,6 +210,9 @@ void HmdDriver::Deactivate()
 #endif
     ShutdownDiscovery();
     ShutdownSensorSocket();
+    // Encode thread is joined: no frame can follow the goodbye on this socket.
+    SendPreviewEnd("driver deactivate");
+    SendPhoneEnd("driver deactivate");
     ShutdownUDP();
     ShutdownVideoEncoder();
     m_vulkan.Destroy();

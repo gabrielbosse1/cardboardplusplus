@@ -44,6 +44,28 @@ fn bridge_preview_wire_format() {
     assert_eq!(b"BRIDGE_PREVIEW 0", b"BRIDGE_PREVIEW 0");
 }
 #[test]
+fn bridge_preview_framing_matches_driver_bytes() {
+    // Byte vectors shared with the driver's test_wire_protocol.cpp
+    // (test_preview_header_golden_bytes / test_preview_stream_end_golden_bytes).
+    use cardboard_bridge::net::preview::{packetize, stream_end, Header, BRIDGE_KEYFRAME_REQ, HEADER_SIZE, MAX_DATAGRAM};
+    let au = vec![0x5Au8; 3000];
+    let dgs = packetize(&au, 0x0102_0304, 0x0A0B_0C0D, true);
+    assert_eq!(dgs.len(), 3);
+    assert_eq!(
+        &dgs[1][..HEADER_SIZE],
+        &[0x43, 0x42, 0x50, 0x56, 0x01, 0x01, 0x00, 0x01, 0x00, 0x03, 0x05, 0x60, 0x01, 0x02, 0x03, 0x04, 0x0A, 0x0B, 0x0C, 0x0D, 0x00, 0x00, 0x0B, 0xB8]
+    );
+    assert!(dgs.iter().all(|d| d.len() <= MAX_DATAGRAM));
+    assert_eq!(dgs[2].len(), HEADER_SIZE + 3000 - 2 * 1376);
+    let end = stream_end(0x0102_0304);
+    assert_eq!(
+        end,
+        vec![0x43, 0x42, 0x50, 0x56, 0x01, 0x02, 0, 0, 0, 0, 0, 0, 0x01, 0x02, 0x03, 0x04, 0, 0, 0, 0, 0, 0, 0, 0]
+    );
+    assert!(Header::parse(&end).unwrap().is_end());
+    assert_eq!(BRIDGE_KEYFRAME_REQ, b"BRIDGE_KEYFRAME_REQ");
+}
+#[test]
 fn cardboard_cap_wire_format() {
     let cap = format!("CARDBOARD_CAP {} {}", 1600, 900);
     assert_eq!(cap, "CARDBOARD_CAP 1600 900");

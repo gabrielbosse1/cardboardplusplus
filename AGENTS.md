@@ -377,9 +377,8 @@ Bad: `// Fixed: driver stayed connected after disconnect (user asked to clear fl
 ## Wire Protocol Details
 
 ### Port 42069 — H.264 Video (UDP, Driver → Phone + Bridge)
-- Driver sends raw Annex-B to localhost:42069 for bridge preview (ffplay or embedded ffmpeg)
-- Driver sends 4-byte big-endian length-prefixed H.264 to phone IP:42069
-- Phone decodes via MediaCodec (hardware H.264)
+- Driver sends each access unit as CBPV-framed fragments (24-byte header, see `CardboardWire.h`) to both phone IP:42069 and localhost:42069 (bridge preview), plus a `STREAM_END` control datagram on shutdown
+- Phone reassembles whole frames only (`jni/VideoFraming.h`), gates on a keyframe after loss and sends `KEYFRAME_REQ` to 42070; decodes via MediaCodec (hardware H.264)
 - Bridge preview: ffmpeg `-f h264 -probesize 32 -i pipe:0 -vf scale=480:270 -f rawvideo -pix_fmt rgba`
 
 ### Port 42070 — Discovery & Control (UDP, bidirectional)

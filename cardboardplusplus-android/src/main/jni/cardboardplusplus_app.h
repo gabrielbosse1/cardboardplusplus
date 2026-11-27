@@ -24,6 +24,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <atomic>
 #include <thread>
 #include <vector>
 
@@ -107,6 +108,8 @@ class CardboardPlusPlusApp {
   int CreateVideoTexture();
   void SetVideoDecoder(JNIEnv* env, jobject decoder);
   void OnVideoActive();
+  // Stream ended (goodbye, timeout or decode failure): render black again.
+  void OnVideoInactive();
   void SetVideoVMax(float v_max) { tex_vmax_value_ = v_max; }
 
   void StartVideoReceiver(int port);
@@ -220,7 +223,10 @@ class CardboardPlusPlusApp {
   // via a reused direct ByteBuffer (single alloc, no per-frame JNI array).
   jobject video_decoder_obj_ = nullptr;
   jmethodID mid_feed_video_ = nullptr;
-  bool video_active_ = false;
+  // VideoDecoder.endStream(int): tears the codec down when the stream ends.
+  jmethodID mid_end_stream_ = nullptr;
+  // Written from the Java decoder (GL and decode threads), read by the GL draw.
+  std::atomic<bool> video_active_{false};
 
   GLuint left_eye_custom_texture_;
   GLuint right_eye_custom_texture_;
@@ -245,7 +251,7 @@ class CardboardPlusPlusApp {
 
   // Decode thread (frame forwarding only; decode happens in Java MediaCodec).
   std::thread decode_thread_;
-  bool decode_thread_running_ = false;
+  std::atomic<bool> decode_thread_running_{false};
   // Reused direct-buffer handoff: one malloc'd region wrapped per frame in a
   // short-lived DirectByteBuffer (no per-frame JNI array alloc/copy).
   uint8_t* direct_buf_ = nullptr;

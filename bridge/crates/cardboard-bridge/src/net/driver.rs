@@ -222,6 +222,15 @@ pub fn send_config(width: i32, height: i32, fps: i32, bitrate_mbps: i32, encoder
     let _ = conn.sock.send_to(&cap, conn.addr);
     let _ = conn.sock.send_to(&cfg, conn.addr);
 }
+/// Asks the driver for an immediate IDR on behalf of the local preview
+/// (BRIDGE_KEYFRAME_REQ, loopback-only on the driver side). Returns false
+/// before spawn() has bound the socket. Throttled by the caller.
+pub fn request_keyframe() -> bool {
+    let Some(conn) = DRIVER_CONN.get() else {
+        return false;
+    };
+    conn.sock.send_to(crate::net::preview::BRIDGE_KEYFRAME_REQ, conn.addr).is_ok()
+}
 /// Builds the two wire packets for send_config. Bitrate converts Mbps -> kbps
 /// on the wire (the driver expects kilobits); resolution goes as plain pixels.
 fn config_wire_packets(

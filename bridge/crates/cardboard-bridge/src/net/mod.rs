@@ -2,6 +2,7 @@ pub mod camera;
 pub mod driver;
 pub mod mediapipe;
 pub mod phone;
+pub mod preview;
 pub mod telemetry;
 // UDP/TCP plane (mirrors CardboardWire.h): video, discovery/control,
 // telemetry, camera, MediaPipe sidecar, and sensor forward.

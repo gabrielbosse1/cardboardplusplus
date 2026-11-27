@@ -139,7 +139,13 @@ void HmdDriver::DiscoveryThreadFunc()
                 int previewIgnored = 0;
                 if (cbpp::PlatformParseInts(buffer, "BRIDGE_PREVIEW", previewVal, previewIgnored)) {
                     bool enabled = (previewVal != 0);
-                    m_previewEnabled.store(enabled, std::memory_order_relaxed);
+                    bool wasEnabled = m_previewEnabled.exchange(enabled, std::memory_order_relaxed);
+                    if (enabled && !wasEnabled) {
+                        // Frames skipped while off would read as loss; start clean.
+                        BeginPreviewSession("preview re-enabled");
+                    } else if (!enabled && wasEnabled) {
+                        SendPreviewEnd("preview disabled");
+                    }
                     DebugLog("BRIDGE_PREVIEW from %s:%d -> local preview %s", senderIpStr, ntohs(senderAddr.sin_port), enabled ? "ON" : "OFF");
                 } else {
                     DebugLog("BRIDGE_PREVIEW from %s:%d malformed, ignored", senderIpStr, ntohs(senderAddr.sin_port));
@@ -156,6 +162,19 @@ void HmdDriver::DiscoveryThreadFunc()
                     ApplyBridgeCfg(cfgFps, cfgKbps, cfgCodec);
                 } else {
                     DebugLog("BRIDGE_CFG from %s:%d malformed, ignored", senderIpStr, ntohs(senderAddr.sin_port));
+                }
+                continue;
+            }
+            if (strncmp(buffer, wire::kBridgeKeyframeReq, wire::kBridgeKeyframeReqLen) == 0) {
+                // Bridge preview lost a frame. Loopback only, and deliberately does
+                // not touch m_lastPhonePacketMs: the bridge is not the phone.
+                if (senderAddr.sin_addr.s_addr == htonl(INADDR_LOOPBACK)) {
+                    if (m_pVideoEncoder) {
+                        m_pVideoEncoder->RequestKeyframe();
+                    }
+                    DebugLog("BRIDGE_KEYFRAME_REQ from %s:%d -> forced IDR requested", senderIpStr, ntohs(senderAddr.sin_port));
+                } else {
+                    DriverLog("BRIDGE_KEYFRAME_REQ from non-loopback %s ignored", senderIpStr);
                 }
                 continue;
             }

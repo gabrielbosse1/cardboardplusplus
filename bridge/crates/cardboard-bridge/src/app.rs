@@ -46,6 +46,8 @@ pub struct AppState {
     pub preview_bitrate_kbps: i32,
     pub preview_frames: u64,
     pub preview_drops: u64,
+    /// Preview lifecycle state name (preview_lifecycle::State::name).
+    pub preview_state: String,
     pub camera_connected: bool,
     pub camera_frame: Option<(u32, u32, Vec<u8>)>,
     pub camera_frame_time: Instant,
@@ -103,6 +105,7 @@ impl Default for AppState {
             preview_bitrate_kbps: 0,
             preview_frames: 0,
             preview_drops: 0,
+            preview_state: "idle".to_string(),
             camera_connected: false,
             camera_frame: None,
             camera_frame_time: Instant::now(),
