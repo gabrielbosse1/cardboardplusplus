@@ -404,8 +404,7 @@ bool HmdDriver::AcquireSyncTexture(vr::SharedTextureHandle_t syncTexture)
     return false;
 }
 
-// The semaphore is consumed by the wait in AcquireSyncTexture; the compositor owns
-// the fence, so there is nothing to signal back here.
+// No sync handle is acquired while its Linux contract is unknown.
 void HmdDriver::ReleaseSyncTexture()
 {
     m_syncAcquired = false;

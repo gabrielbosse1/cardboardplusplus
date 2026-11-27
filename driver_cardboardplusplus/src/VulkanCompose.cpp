@@ -500,7 +500,7 @@ bool VulkanCompose::Setup(uint32_t width, uint32_t height) {
     DriverLog("VK-COMPOSE initialized: %ux%u pipelines ready", m_width, m_height);
     // The NV12 compute pass is optional: a failure here keeps the compose
     // running and leaves the CPU swscale conversion in place.
-    if (!SetupNv12()) {
+    if (!m_pCtx->QueueSupportsCompute() || !SetupNv12()) {
         DriverLog("VK-NV12 unavailable; staying on CPU swscale");
     }
     return true;
