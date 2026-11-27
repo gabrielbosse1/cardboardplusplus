@@ -504,6 +504,36 @@ static void test_idr_insertion_idr_already_present() {
     assert(pos == -1);
     printf("PASS: FindIdrInsertionPoint returns -1 when IDR start code present\n");
 }
+static void test_idr_insertion_sei_before_idr() {
+    // Hardware-encoder layout: SPS PPS SEI IDR. A start code follows PPS, so the
+    // repair must not fire; the old logic inserted an empty IDR NAL between PPS
+    // and SEI, corrupting the keyframe access unit.
+    uint8_t data[] = {
+        0x00, 0x00, 0x00, 0x01, 0x67,
+        0x42, 0x00, 0x1E,
+        0x00, 0x00, 0x00, 0x01, 0x68,
+        0xCE, 0x38, 0x80,
+        0x00, 0x00, 0x00, 0x01, 0x06,  // SEI
+        0x05, 0x01, 0x41, 0x80,
+        0x00, 0x00, 0x00, 0x01, 0x65,  // IDR slice
+        0x88, 0x84, 0x21,
+    };
+    int pos = h264::FindIdrInsertionPoint(data, sizeof(data), true);
+    assert(pos == -1);
+    printf("PASS: FindIdrInsertionPoint returns -1 when SEI sits between PPS and IDR\n");
+}
+static void test_idr_insertion_pps_is_last_nal() {
+    // PPS with no slice following must not trigger the blind fallback insert.
+    uint8_t data[] = {
+        0x00, 0x00, 0x00, 0x01, 0x67,
+        0x42, 0x00, 0x1E,
+        0x00, 0x00, 0x00, 0x01, 0x68,
+        0xCE, 0x38, 0x80,
+    };
+    int pos = h264::FindIdrInsertionPoint(data, sizeof(data), true);
+    assert(pos == -1);
+    printf("PASS: FindIdrInsertionPoint returns -1 when PPS is the last NAL\n");
+}
 static void test_idr_insertion_not_keyframe() {
     uint8_t data[] = { 0x00, 0x00, 0x00, 0x01, 0x41, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05 };
     int pos = h264::FindIdrInsertionPoint(data, sizeof(data), false);
@@ -863,6 +893,8 @@ int main() {
     test_length_prefix_large_payload();
     test_idr_insertion_missing_idr_after_pps();
     test_idr_insertion_idr_already_present();
+    test_idr_insertion_sei_before_idr();
+    test_idr_insertion_pps_is_last_nal();
     test_idr_insertion_not_keyframe();
     test_idr_insertion_no_pps();
     test_idr_insertion_3byte_idr_start_code();
