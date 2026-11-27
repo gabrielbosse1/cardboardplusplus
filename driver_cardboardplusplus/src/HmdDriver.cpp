@@ -1,11 +1,17 @@
-﻿#include "HmdDriver.h"
+#include "HmdDriver.h"
 #include "DriverLog.h"
 #include "DebugLog.h"
 #include "CardboardWire.h"
 #include <chrono>
 #include <cstring>
 #include <fstream>
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
 using namespace vr;
+#ifndef _WIN32
+static void cbpp_dl_anchor() {}
+#endif
 // Called by SteamVR to register the HMD; creates D3D, encoder, UDP/discovery/sensor sockets, encoding thread, bridge SHM, and device properties.
 EVRInitError HmdDriver::Activate(uint32_t unObjectId)
 {
@@ -14,26 +20,25 @@ EVRInitError HmdDriver::Activate(uint32_t unObjectId)
     m_encoderPts = 0;
     m_pVideoEncoder = nullptr;
     m_hasSubmit = false;
-    m_udpSocket = INVALID_SOCKET;
+    m_udpSocket = cbpp::kInvalidSocket;
     m_udpInitialized = false;
     m_udpDroppedPreview = 0;
     m_udpDroppedPhone = 0;
-    m_discoverySocket = INVALID_SOCKET;
+    m_discoverySocket = cbpp::kInvalidSocket;
     m_discoveryInitialized = false;
     m_discoveryRunning = false;
     m_submitLayers.clear();
-    m_cachedSyncHandle = nullptr;
-    m_pSyncTexture = nullptr;
-    m_pSyncMutex = nullptr;
+    m_cachedSyncHandle = 0;
     m_frameQueued = false;
     m_encodeDone = true;
-    m_pendingFrame = { nullptr, nullptr, 0, false };
+    m_pendingFrame = { 0, false };
     m_streamEnabled.store(1, std::memory_order_relaxed);
     m_presentCount = 0;
     m_lastPresentLogNs = 0;
     m_lastHeartbeatNs = 0;
     m_submitLayers.clear();
     DriverLog("HmdDriver::Activate called");
+#ifdef _WIN32
     D3D_FEATURE_LEVEL featureLevel;
     HRESULT hr = D3D11CreateDevice(
         nullptr,
@@ -43,15 +48,19 @@ EVRInitError HmdDriver::Activate(uint32_t unObjectId)
         nullptr,
         0,
         D3D11_SDK_VERSION,
-        &m_pD3D11Device,
+        &m_pHostDevice,
         &featureLevel,
-        &m_pD3D11DeviceContext
+        &m_pHostContext
     );
     if (FAILED(hr)) {
-        DriverLog("D3D11 device creation failed! HRESULT: 0x%x", hr);
+        DriverLog("host device creation failed! HRESULT: 0x%x", hr);
         return VRInitError_Init_Internal;
     }
-    DriverLog("D3D11 device initialized successfully");
+    DriverLog("host device initialized successfully");
+#endif
+    if (!InitializeVulkan()) {
+        DriverLog("WARNING: Vulkan initialization failed. Vulkan path disabled.");
+    }
     if (!InitializeVideoEncoder()) {
         DriverLog("WARNING: Video encoder initialization failed. Encoding will be disabled.");
     }
@@ -77,7 +86,38 @@ EVRInitError HmdDriver::Activate(uint32_t unObjectId)
     VRProperties()->SetInt32Property(props, Prop_DeviceClass_Int32, TrackedDeviceClass_HMD);
     VRProperties()->SetStringProperty(props, Prop_ManufacturerName_String, "CardboardPlusPlus");
     VRProperties()->SetStringProperty(props, Prop_TrackingSystemName_String, "cardboardplusplus");
+#ifndef _WIN32
+    {
+        // SteamVR stays in Room Setup until a play area exists for this
+        // universe. Point it at the driver's bundled seated play area.
+        Dl_info dl = {};
+        std::string chapPath;
+        if (dladdr((void*)&cbpp_dl_anchor, &dl) && dl.dli_fname) {
+            std::string soPath = dl.dli_fname;
+            size_t slash = soPath.find_last_of('/');
+            if (slash != std::string::npos) {
+                std::string binDir = soPath.substr(0, slash);       // <root>/bin/linux64
+                slash = binDir.find_last_of('/');
+                if (slash != std::string::npos) {
+                    std::string rootDir = binDir.substr(0, slash);  // <root>/bin
+                    slash = rootDir.find_last_of('/');
+                    if (slash != std::string::npos) {
+                        chapPath = rootDir.substr(0, slash) + "/resources/chaperone_info.vrchap";
+                    }
+                }
+            }
+        }
+        if (!chapPath.empty() && std::ifstream(chapPath).good()) {
+            VRProperties()->SetStringProperty(props, Prop_DriverProvidedChaperonePath_String,
+                                              chapPath.c_str());
+            DriverLog("HMD chaperone: %s", chapPath.c_str());
+        }
+    }
+#endif
     VRProperties()->SetFloatProperty(props, Prop_UserIpdMeters_Float, 0.064f);
+    // SteamVR defaults this to true for direct-mode drivers, which makes it
+    // pass small client-owned indices instead of our shared texture handles.
+    VRProperties()->SetBoolProperty(props, (ETrackedDeviceProperty)2116, false);
     VRProperties()->SetFloatProperty(props, Prop_DisplayFrequency_Float, 60.0f);
     VRProperties()->SetFloatProperty(props, Prop_SecondsFromVsyncToPhotons_Float, 0.011f);
     VRProperties()->SetBoolProperty(props, Prop_ReportsTimeSinceVSync_Bool, true);
@@ -108,7 +148,32 @@ EVRInitError HmdDriver::Activate(uint32_t unObjectId)
     VRServerDriverHost()->SetDisplayEyeToHead(m_driverId, eyeToHeadLeft, eyeToHeadRight);
     return VRInitError_None;
 }
-// Called by SteamVR at unload; joins threads, releases textures/sockets/encoder/bridge, then drops the D3D device.
+// Creates a Vulkan device on the same GPU adapter as the host device; failure
+// is non-fatal, the driver keeps running and drops video frames.
+bool HmdDriver::InitializeVulkan()
+{
+#ifdef _WIN32
+    LUID luid = {};
+    IDXGIDevice* pDxgiDevice = nullptr;
+    if (SUCCEEDED(m_pHostDevice->QueryInterface(__uuidof(IDXGIDevice), (void**)&pDxgiDevice))) {
+        IDXGIAdapter* pAdapter = nullptr;
+        if (SUCCEEDED(pDxgiDevice->GetAdapter(&pAdapter))) {
+            DXGI_ADAPTER_DESC desc = {};
+            if (SUCCEEDED(pAdapter->GetDesc(&desc))) {
+                luid = desc.AdapterLuid;
+            }
+            pAdapter->Release();
+        }
+        pDxgiDevice->Release();
+    }
+    return m_vulkan.Initialize(&luid);
+#else
+    // No D3D adapter to match against on this platform; the first device with a
+    // graphics queue is the one the compositor hands us frames from.
+    return m_vulkan.Initialize(nullptr);
+#endif
+}
+// Called by SteamVR at unload; joins threads, releases textures/sockets/encoder/bridge, then drops the software device.
 void HmdDriver::Deactivate()
 {
     DriverLog("HmdDriver::Deactivate called");
@@ -119,6 +184,9 @@ void HmdDriver::Deactivate()
     }
     DriverLog("Background encoding thread stopped");
     ReleaseSyncTexture();
+    m_cachedSyncHandle = 0;
+    m_syncAcquired = false;
+#ifdef _WIN32
     if (m_pSyncMutex) {
         m_pSyncMutex->Release();
         m_pSyncMutex = nullptr;
@@ -127,19 +195,24 @@ void HmdDriver::Deactivate()
         m_pSyncTexture->Release();
         m_pSyncTexture = nullptr;
     }
-    m_cachedSyncHandle = nullptr;
-    m_syncAcquired = false;
     for (auto& c : m_layerCopies) {
+        if (c.leftSyncHeld && c.syncLeft) c.syncLeft->ReleaseSync(0);
+        if (c.rightSyncHeld && c.syncRight) c.syncRight->ReleaseSync(0);
+        if (c.syncLeft) { c.syncLeft->Release(); c.syncLeft = nullptr; }
+        if (c.syncRight) { c.syncRight->Release(); c.syncRight = nullptr; }
         if (c.pLeft) { c.pLeft->Release(); c.pLeft = nullptr; }
         if (c.pRight) { c.pRight->Release(); c.pRight = nullptr; }
         if (c.hLeft) { CloseHandle(c.hLeft); c.hLeft = nullptr; }
         if (c.hRight) { CloseHandle(c.hRight); c.hRight = nullptr; }
+        c.leftSyncHeld = c.rightSyncHeld = false;
     }
     m_layerCopies.clear();
+#endif
     ShutdownDiscovery();
     ShutdownSensorSocket();
     ShutdownUDP();
     ShutdownVideoEncoder();
+    m_vulkan.Destroy();
     ShutdownBridge();
     std::vector<uint32_t> pids;
     pids.reserve(m_swapTextureSets.size());
@@ -149,14 +222,16 @@ void HmdDriver::Deactivate()
     for (uint32_t pid : pids) {
         DestroyAllSwapTextureSets(pid);
     }
-    if (m_pD3D11DeviceContext) {
-        m_pD3D11DeviceContext->Release();
-        m_pD3D11DeviceContext = nullptr;
+#ifdef _WIN32
+    if (m_pHostContext) {
+        m_pHostContext->Release();
+        m_pHostContext = nullptr;
     }
-    if (m_pD3D11Device) {
-        m_pD3D11Device->Release();
-        m_pD3D11Device = nullptr;
+    if (m_pHostDevice) {
+        m_pHostDevice->Release();
+        m_pHostDevice = nullptr;
     }
+#endif
     m_driverId = k_unTrackedDeviceIndexInvalid;
 }
 // Standby hook (no-op); SteamVR calls it when the HMD would sleep.
@@ -207,13 +282,31 @@ DriverPose_t HmdDriver::GetPose()
     const bool rotFresh = lastRot != 0 && (nowMs - lastRot) < kSensorStaleMs;
     bool hasQ = rotFresh && m_hasQuaternion.load(std::memory_order_relaxed);
     if (!fresh) {
+#ifndef _WIN32
+        // No phone is connected: keep the virtual HMD present at a fixed pose
+        // so the bridge can be tested without a handset. Real phone rotations
+        // take over as soon as they arrive.
+        pose.poseIsValid = true;
+        pose.result = TrackingResult_Running_OK;
+        pose.vecPosition[0] = 0.0;
+        pose.vecPosition[1] = 1.6;
+        pose.vecPosition[2] = 0.0;
+        pose.qRotation.w = 1.0;
+        pose.qRotation.x = 0.0;
+        pose.qRotation.y = 0.0;
+        pose.qRotation.z = 0.0;
+#else
         pose.poseIsValid = false;
         pose.result = TrackingResult_Running_OutOfRange;
+        pose.qRotation.w = 1.0;
+        pose.qRotation.x = 0.0;
+        pose.qRotation.y = 0.0;
+        pose.qRotation.z = 0.0;
+#endif
         pose.qDriverFromHeadRotation.w = 1.0;
         pose.qDriverFromHeadRotation.x = 0.0;
         pose.qDriverFromHeadRotation.y = 0.0;
         pose.qDriverFromHeadRotation.z = 0.0;
-        pose.qRotation = pose.qDriverFromHeadRotation;
         return pose;
     }
     HmdQuaternion_t quat;
@@ -370,7 +463,7 @@ bool HmdDriver::InitializeBridge()
 {
     if (m_bridgeServer.Start()) {
         m_bridgeInitialized.store(true, std::memory_order_relaxed);
-        DriverLog("Bridge shared-memory region created at %ls", cbpp::kRegionName);
+        DriverLog("Bridge shared-memory region created at %s", cbpp::kRegionName);
         m_bridgeServer.PublishStatus();
         return true;
     }
@@ -390,20 +483,20 @@ bool HmdDriver::InitializeSensorSocket()
 {
     DriverLog("Initializing sensor socket...");
     m_sensorSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (m_sensorSocket == INVALID_SOCKET) {
-        DriverLog("sensor socket() failed! WSAError: %d", WSAGetLastError());
+    if (m_sensorSocket == cbpp::kInvalidSocket) {
+        DriverLog("sensor socket() failed! Error: %d", cbpp::PlatformSocketError());
         return false;
     }
-    BOOL reuseAddr = TRUE;
+    int reuseAddr = 1;
     setsockopt(m_sensorSocket, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuseAddr, sizeof(reuseAddr));
     sockaddr_in addr;
     addr.sin_family = AF_INET;
     addr.sin_port = htons(wire::kSensorPort);
     addr.sin_addr.s_addr = INADDR_ANY;
-    if (bind(m_sensorSocket, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        DriverLog("sensor bind() failed on port %d! WSAError: %d", wire::kSensorPort, WSAGetLastError());
-        closesocket(m_sensorSocket);
-        m_sensorSocket = INVALID_SOCKET;
+    if (bind(m_sensorSocket, (sockaddr*)&addr, sizeof(addr)) < 0) {
+        DriverLog("sensor bind() failed on port %d! Error: %d", wire::kSensorPort, cbpp::PlatformSocketError());
+        cbpp::PlatformCloseSocket(m_sensorSocket);
+        m_sensorSocket = cbpp::kInvalidSocket;
         return false;
     }
     m_sensorInitialized = true;
@@ -418,22 +511,22 @@ void HmdDriver::ShutdownSensorSocket()
     DriverLog("Shutting down sensor socket...");
     if (m_sensorInitialized) {
         m_sensorRunning = false;
-        SOCKET wakeSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        if (wakeSocket != INVALID_SOCKET) {
+        cbpp::PlatformSocket wakeSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (wakeSocket != cbpp::kInvalidSocket) {
             sockaddr_in localAddr;
             localAddr.sin_family = AF_INET;
             localAddr.sin_port = htons(wire::kSensorPort);
             inet_pton(AF_INET, "127.0.0.1", &localAddr.sin_addr);
             const char wake[] = { 0x00 };
             sendto(wakeSocket, wake, 1, 0, (sockaddr*)&localAddr, sizeof(localAddr));
-            closesocket(wakeSocket);
+            cbpp::PlatformCloseSocket(wakeSocket);
         }
         if (m_sensorThread.joinable()) {
             m_sensorThread.join();
         }
-        if (m_sensorSocket != INVALID_SOCKET) {
-            closesocket(m_sensorSocket);
-            m_sensorSocket = INVALID_SOCKET;
+        if (m_sensorSocket != cbpp::kInvalidSocket) {
+            cbpp::PlatformCloseSocket(m_sensorSocket);
+            m_sensorSocket = cbpp::kInvalidSocket;
         }
         m_sensorInitialized = false;
     }
@@ -444,11 +537,10 @@ void HmdDriver::SensorThreadFunc()
 {
     DriverLog("Sensor thread started on port %d", wire::kSensorPort);
     static constexpr int kSensorPacketLen = 45;
-    uint8_t buffer[1024]; // large enough for skeleton packets (31 bones × 28 + header ≈ 871)
+    uint8_t buffer[1024]; // large enough for skeleton packets (31 bones � 28 + header � 871)
     sockaddr_in senderAddr;
-    int senderAddrLen = sizeof(senderAddr);
-    DWORD recvTimeout = 2000;
-    setsockopt(m_sensorSocket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&recvTimeout, sizeof(recvTimeout));
+    cbpp::PlatformSockLen senderAddrLen = sizeof(senderAddr);
+    cbpp::PlatformSetRecvTimeout(m_sensorSocket, 2000);
     int logCounter = 0;
     int recvCount = 0;
     while (m_sensorRunning) {
@@ -456,9 +548,9 @@ void HmdDriver::SensorThreadFunc()
         int bytesReceived = recvfrom(m_sensorSocket, (char*)buffer, sizeof(buffer), 0,
                                      (sockaddr*)&senderAddr, &senderAddrLen);
         if (!m_sensorRunning) break;
-        if (bytesReceived == SOCKET_ERROR) {
-            int err = WSAGetLastError();
-            if (err == WSAETIMEDOUT) {
+        if (bytesReceived < 0) {
+            int err = cbpp::PlatformSocketError();
+            if (cbpp::PlatformTimedOut(err) || cbpp::PlatformInterrupted(err)) {
                 logCounter++;
                 DebugLogThrottle(3, "Sensor: no data received after %d timeouts (hasData=%d)", logCounter, m_hasSensorData.load() ? 1 : 0);
                 continue;
@@ -515,7 +607,7 @@ void HmdDriver::SensorThreadFunc()
             DebugLog("Rotation pkt #%d: quat=(%.3f,%.3f,%.3f,%.3f) ts=%llu",
                 recvCount, quat[0], quat[1], quat[2], quat[3], (unsigned long long)timestamp);
         } else if (bytesReceived >= 4 && buffer[0] == 0x13) {
-            // Skeleton packet: [tag=0x13][timestamp_ms u64 LE][hand_id u8][num_bones u8][bone0..boneN as 7×f32 LE]
+            // Skeleton packet: [tag=0x13][timestamp_ms u64 LE][hand_id u8][num_bones u8][bone0..boneN as 7�f32 LE]
             // Convention (parent-relative, like Valve's sample driver):
             // bone 0 (root) = absolute wrist position (device pose anchor,
             // identity rotation); bones 1..30 = parent-relative offsets and

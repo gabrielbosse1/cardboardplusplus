@@ -56,6 +56,22 @@ pub fn download_to(url: &str, dst: &Path) -> Result<(), String> {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
+    if !cfg!(windows) {
+        for (prog, args) in [
+            ("curl", vec!["-fsSL", "--retry", "3", "-o"]),
+            ("wget", vec!["-q", "-O"]),
+        ] {
+            let out = std::process::Command::new(prog)
+                .args(&args)
+                .arg(dst)
+                .arg(url)
+                .output();
+            if out.map(|o| o.status.success()).unwrap_or(false) {
+                return Ok(());
+            }
+        }
+        return Err(format!("download {url}: curl or wget failed"));
+    }
     let curl = std::process::Command::new("curl.exe")
         .args(["-fSL", "--retry", "3", "--retry-delay", "5", "-o"])
         .arg(dst)
@@ -97,6 +113,10 @@ pub fn download_to(url: &str, dst: &Path) -> Result<(), String> {
 /// the bin zip. With `refresh` it purges stale majors first. Temp dir is
 /// always cleaned up. Returns the installed set for the install log.
 pub fn install_ffmpeg_standalone(dst_dir: &Path, refresh: bool) -> Result<Vec<String>, String> {
+    // Linux links FFmpeg through the system packages; no DLLs are shipped.
+    if !cfg!(windows) {
+        return Ok(Vec::new());
+    }
     let expected = driver_deps::expected_dlls();
     std::fs::create_dir_all(dst_dir)
         .map_err(|e| format!("mkdir {}: {e}", dst_dir.display()))?;
@@ -192,16 +212,36 @@ pub fn steamvr_settings_path(steamvr_root: &str) -> PathBuf {
 /// settings also return false (SteamVR recreates them on launch).
 pub fn force_driver_enabled(steamvr_root: &str) -> Result<bool, String> {
     let path = steamvr_settings_path(steamvr_root);
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Ok(false);
-    };
-    let Some(updated) = apply_force_enable(&text) else {
-        return Ok(false);
-    };
-    let bak = path.with_extension("vrsettings.bak");
-    std::fs::copy(&path, &bak).map_err(|e| format!("backup {}: {e}", bak.display()))?;
-    std::fs::write(&path, updated).map_err(|e| format!("write {}: {e}", path.display()))?;
-    Ok(true)
+    let mut targets = vec![path.clone()];
+    // SteamVR also keeps .backup/.bak copies and restores from them on launch.
+    // Clear the flag in every copy so a stale backup cannot re-block the driver.
+    if let Some(dir) = path.parent() {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with("steamvr.vrsettings")
+                    && entry.path().is_file()
+                    && !targets.contains(&entry.path())
+                {
+                    targets.push(entry.path());
+                }
+            }
+        }
+    }
+    let mut changed = false;
+    for target in targets {
+        let Ok(text) = std::fs::read_to_string(&target) else {
+            continue;
+        };
+        let Some(updated) = apply_force_enable(&text) else {
+            continue;
+        };
+        let bak = target.with_extension("vrsettings.bak");
+        std::fs::copy(&target, &bak).map_err(|e| format!("backup {}: {e}", bak.display()))?;
+        std::fs::write(&target, updated).map_err(|e| format!("write {}: {e}", target.display()))?;
+        changed = true;
+    }
+    Ok(changed)
 }
 /// Pure vrsettings transform behind force_driver_enabled: inserts/creates
 /// our section, sets enable=true, drops blocked_by_safe_mode, preserves
@@ -305,10 +345,18 @@ mod tests {
     }
     #[test]
     fn settings_path_lives_under_config() {
-        let p = steamvr_settings_path("C:\\Steam\\steamapps\\common\\SteamVR");
-        assert_eq!(
-            p,
-            Path::new("C:\\Steam\\steamapps\\common\\SteamVR\\config\\steamvr.vrsettings")
-        );
+        #[cfg(windows)]
+        {
+            let p = steamvr_settings_path("C:\\Steam\\steamapps\\common\\SteamVR");
+            assert_eq!(
+                p,
+                Path::new("C:\\Steam\\steamapps\\common\\SteamVR\\config\\steamvr.vrsettings")
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            let p = steamvr_settings_path("/opt/SteamVR");
+            assert_eq!(p, Path::new("/opt/SteamVR/config/steamvr.vrsettings"));
+        }
     }
 }

@@ -28,6 +28,9 @@
     <ClInclude Include="include\DriverLog.h" />
     <ClInclude Include="include\VideoEncoderFFmpeg.h" />
     <ClInclude Include="include\VideoEncoderLog.h" />
+    <ClInclude Include="include\VulkanContext.h" />
+    <ClInclude Include="include\VulkanCompose.h" />
+    <ClInclude Include="include\SpirvCompiler.h" />
     <ClInclude Include="include\BridgeServer.h" />
     <ClInclude Include="include\BridgeProtocol.h" />
     <ClInclude Include="include\DriverVersion.h" />
@@ -40,6 +43,9 @@
     <ClCompile Include="src\DeviceProvider.cpp" />
     <ClCompile Include="src\DirectMode.cpp" />
     <ClCompile Include="src\Discovery.cpp" />
+    <ClCompile Include="src\SpirvCompiler.cpp">
+      <AdditionalOptions>/std:c++17 /wd4146 /wd4297 /wd4245 /wd4389 /wd4324 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
     <ClCompile Include="src\DriverLog.cpp" />
     <ClCompile Include="src\EncoderSetup.cpp" />
     <ClCompile Include="src\EncodingThread.cpp" />
@@ -49,6 +55,8 @@
     <ClCompile Include="src\VideoEncoder.cpp" />
     <ClCompile Include="src\VideoEncoderFFmpeg.cpp" />
     <ClCompile Include="src\VideoEncoderShaders.cpp" />
+    <ClCompile Include="src\VulkanContext.cpp" />
+    <ClCompile Include="src\VulkanCompose.cpp" />
     <ClCompile Include="src\BridgeServer.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -177,14 +185,14 @@
       <ConformanceMode>true</ConformanceMode>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
-      <AdditionalIncludeDirectories>$(ProjectDir)include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)include\dxil-spirv\dxbc-spirv;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
       <AdditionalLibraryDirectories>lib;$(FFmpegLibPath);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>openvr_api.lib;d3d11.lib;d3dcompiler.lib;dxgi.lib;avcodec.lib;avformat.lib;avutil.lib;swscale.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>openvr_api.lib;d3d11.lib;d3dcompiler.lib;dxgi.lib;avcodec.lib;avformat.lib;avutil.lib;swscale.lib;ws2_32.lib;dxil-spirv\dxbc-spirv.lib;dxil-spirv\dxil-spirv-sbv.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -198,7 +206,7 @@
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
       <WholeProgramOptimization>false</WholeProgramOptimization>
-      <AdditionalIncludeDirectories>$(ProjectDir)include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)include\dxil-spirv\dxbc-spirv;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -207,7 +215,7 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
       <AdditionalLibraryDirectories>lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>openvr_api.lib;d3d11.lib;d3dcompiler.lib;dxgi.lib;avcodec.lib;avformat.lib;avutil.lib;swscale.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>openvr_api.lib;d3d11.lib;d3dcompiler.lib;dxgi.lib;avcodec.lib;avformat.lib;avutil.lib;swscale.lib;ws2_32.lib;dxil-spirv\dxbc-spirv.lib;dxil-spirv\dxil-spirv-sbv.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

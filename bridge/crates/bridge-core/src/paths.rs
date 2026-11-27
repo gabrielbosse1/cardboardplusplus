@@ -29,14 +29,23 @@ fn exe_relative(parts: &[&str]) -> String {
     }
     p.to_string_lossy().into_owned()
 }
-/// Release driver DLL produced by compile-driver.ps1. Read by the General
-/// tab installer before copying into the SteamVR drivers directory.
+/// Release driver artifact produced by the platform build script. Read by the
+/// General tab installer before copying into the SteamVR drivers directory.
+#[cfg(windows)]
 pub fn default_driver_dll() -> String {
     exe_relative(&[
         "driver_cardboardplusplus",
         "x64",
         "Release",
         "driver_cardboardplusplus.dll",
+    ])
+}
+#[cfg(not(windows))]
+pub fn default_driver_dll() -> String {
+    exe_relative(&[
+        "driver_cardboardplusplus",
+        "build",
+        "libdriver_cardboardplusplus.so",
     ])
 }
 /// Debug APK produced by compile-app.ps1. Read by the General tab installer
@@ -55,29 +64,57 @@ pub fn default_apk() -> String {
 /// ANDROID_SDK_ROOT first, then the default LOCALAPPDATA SDK install.
 /// Empty string when no SDK is found (installer then prompts the user).
 pub fn default_adb() -> String {
+    #[cfg(windows)]
+    let adb_name = "adb.exe";
+    #[cfg(not(windows))]
+    let adb_name = "adb";
     for var in ["ANDROID_HOME", "ANDROID_SDK_ROOT"] {
         if let Ok(v) = std::env::var(var) {
-            let p = PathBuf::from(v).join("platform-tools").join("adb.exe");
+            let p = PathBuf::from(v).join("platform-tools").join(adb_name);
             if p.exists() {
                 return p.to_string_lossy().into_owned();
             }
         }
     }
+    #[cfg(windows)]
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
         let p = PathBuf::from(local)
             .join("Android")
             .join("Sdk")
             .join("platform-tools")
-            .join("adb.exe");
+            .join(adb_name);
         if p.exists() {
             return p.to_string_lossy().into_owned();
         }
     }
+    #[cfg(not(windows))]
+    if let Some(home) = std::env::var_os("HOME") {
+        for p in [
+            PathBuf::from(&home).join("Android/Sdk/platform-tools").join(adb_name),
+            PathBuf::from(&home).join(".android/sdk/platform-tools").join(adb_name),
+        ] {
+            if p.exists() {
+                return p.to_string_lossy().into_owned();
+            }
+        }
+    }
+    if which_adb() {
+        return adb_name.to_string();
+    }
     String::new()
 }
+#[cfg(not(windows))]
+fn which_adb() -> bool {
+    std::env::var_os("PATH").map_or(false, |paths| {
+        std::env::split_paths(&paths).any(|p| p.join("adb").is_file())
+    })
+}
+#[cfg(windows)]
+fn which_adb() -> bool { false }
 /// SteamVR driver slot the installer copies into:
 /// <SteamVR>/drivers/cardboardplusplus. ProgramFiles(x86) first because
 /// SteamVR installs 32-bit by default.
+#[cfg(windows)]
 pub fn default_steamvr_drivers_dir() -> String {
     let pf = std::env::var("ProgramFiles(x86)")
         .or_else(|_| std::env::var("ProgramFiles"))
@@ -92,8 +129,51 @@ pub fn default_steamvr_drivers_dir() -> String {
         .to_string_lossy()
         .into_owned()
 }
-/// Climbs two levels from the driver slot to the SteamVR root. Used to find
-/// vrserver / vrpathreg when registering the driver.
+#[cfg(not(windows))]
+pub fn default_steamvr_drivers_dir() -> String {
+    if let Some(dir) = linux_registered_driver_dir() {
+        return dir.to_string_lossy().into_owned();
+    }
+    home().map(|h| h.join(".local/share/SteamVR/drivers/cardboardplusplus").to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+#[cfg(not(windows))]
+fn home() -> Option<PathBuf> { std::env::var_os("HOME").map(PathBuf::from) }
+/// SteamVR runtime directory across native, Flatpak, Snap and system layouts.
+#[cfg(not(windows))]
+fn linux_steamvr_dir() -> Option<PathBuf> {
+    let home = home()?;
+    let mut candidates = vec![home.join(".steam/steam/steamapps/common/SteamVR"),
+                              home.join(".local/share/Steam/steamapps/common/SteamVR")];
+    if let Ok(flatpak) = std::env::var("FLATPAK_HOME") {
+        candidates.push(PathBuf::from(flatpak).join(".steam/steam/steamapps/common/SteamVR"));
+    }
+    candidates.push(home.join(".var/app/com.valvesoftware.Steam/.steam/steam/steamapps/common/SteamVR"));
+    candidates.push(home.join("snap/steam/common/SteamVR"));
+    candidates.push(PathBuf::from("/opt/SteamVR"));
+    candidates.into_iter().find(|p| {
+        p.join("bin/linux64/openvr_api.so").exists() || p.join("bin/linux64/libopenvr_api.so").exists()
+    })
+}
+#[cfg(not(windows))]
+fn linux_registered_driver_dir() -> Option<PathBuf> {
+    let reg = linux_steamvr_dir()?.join("bin/vrpathreg.sh");
+    if !reg.exists() { return None; }
+    let out = std::process::Command::new(&reg).output().ok()?;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if let Some((name, path)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("cardboardplusplus") {
+                let p = path.trim();
+                if p.starts_with('/') && p.ends_with("/drivers/cardboardplusplus") {
+                    return Some(PathBuf::from(p));
+                }
+            }
+        }
+    }
+    None
+}
+/// Climbs two levels from the Windows driver slot to the SteamVR root.
+#[cfg(windows)]
 pub fn steamvr_root_from_drivers_dir(dir: &str) -> String {
     PathBuf::from(dir.trim_end_matches(['\\', '/']))
         .parent()
@@ -101,16 +181,29 @@ pub fn steamvr_root_from_drivers_dir(dir: &str) -> String {
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default()
 }
-/// One-time install wizard marker: %LOCALAPPDATA%/CardboardPlusPlus/setup.done.
+/// Linux config root: <home>/.local/share/Steam/config/steamvr.vrsettings.
+#[cfg(not(windows))]
+pub fn steamvr_root_from_drivers_dir(_dir: &str) -> String {
+    home().map(|h| h.join(".local/share/Steam").to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+/// Per-user data dir used by the wizard marker and the staged sidecar files.
+pub fn user_data_dir() -> PathBuf {
+    if let Ok(v) = std::env::var("LOCALAPPDATA") {
+        return PathBuf::from(v).join("CardboardPlusPlus");
+    }
+    if let Ok(v) = std::env::var("XDG_DATA_HOME") {
+        return PathBuf::from(v).join("CardboardPlusPlus");
+    }
+    if let Some(h) = std::env::var_os("HOME") {
+        return PathBuf::from(h).join(".local/share/CardboardPlusPlus");
+    }
+    std::env::temp_dir().join("CardboardPlusPlus")
+}
+/// One-time install wizard marker: <user data dir>/setup.done.
 /// The bridge shows the wizard when this file is absent.
 pub fn setup_done_file() -> PathBuf {
-    let mut dir = std::env::var("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir());
-    if std::env::var("LOCALAPPDATA").is_ok() {
-        dir.push("CardboardPlusPlus");
-    }
-    dir.join("setup.done")
+    user_data_dir().join("setup.done")
 }
 /// True after the wizard completed once. Checked at bridge startup.
 pub fn is_setup_done() -> bool {
@@ -124,6 +217,28 @@ pub fn mark_setup_done() {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::write(&path, "done");
+}
+/// Ensures SteamVR scans the driver slot. Windows uses a fixed slot; Linux
+/// registers the external path with vrpathreg.sh when SteamVR is installed.
+pub fn register_driver(dir: &str) -> bool {
+    #[cfg(windows)]
+    {
+        let _ = dir;
+        true
+    }
+    #[cfg(not(windows))]
+    {
+        let Some(runtime) = linux_steamvr_dir() else { return false; };
+        let reg = runtime.join("bin/vrpathreg.sh");
+        if !reg.exists() {
+            return false;
+        }
+        std::process::Command::new(&reg)
+            .args(["adddriver", dir])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
 }
 /// Finds MSBuild via vswhere for the driver build step. None when Visual
 /// Studio is missing (the installer then tells the user what to install).

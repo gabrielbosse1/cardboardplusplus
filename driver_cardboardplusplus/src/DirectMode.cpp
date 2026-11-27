@@ -46,7 +46,8 @@ class StallScope {
 static std::atomic<int> g_submitLayerCount{ 0 };
 #endif
 // SteamVR per-process diagnostic counter, active only in debug/diag builds.
-// Called by the SteamVR compositor to allocate 3 shared D3D11 textures; records handles in m_textureHandleMap/m_setByHandle.
+// Called by the SteamVR compositor to allocate 3 shared host textures on the
+// Windows platform layer; records their shared handles in the handle maps.
 void HmdDriver::CreateSwapTextureSet(uint32_t unPid, const SwapTextureSetDesc_t* pSwapTextureSetDesc, SwapTextureSet_t* pOutSwapTextureSet)
 {
     if (pOutSwapTextureSet) {
@@ -74,33 +75,33 @@ void HmdDriver::CreateSwapTextureSet(uint32_t unPid, const SwapTextureSetDesc_t*
         set->nextIndex = 0;
         auto rollback = [&](int created) {
             for (int j = 0; j < created; j++) {
-                m_textureHandleMap.erase((vr::SharedTextureHandle_t)set->hSharedHandles[j]);
-                m_setByHandle.erase((vr::SharedTextureHandle_t)set->hSharedHandles[j]);
-                if (set->pTextures[j]) {
-                    set->pTextures[j]->Release();
-                    set->pTextures[j] = nullptr;
+                m_textureHandleMap.erase((vr::SharedTextureHandle_t)set->sharedHandles[j]);
+                m_setByHandle.erase((vr::SharedTextureHandle_t)set->sharedHandles[j]);
+                if (set->images[j]) {
+                    set->images[j]->Release();
+                    set->images[j] = nullptr;
                 }
             }
         };
         for (int i = 0; i < 3; i++) {
             ID3D11Texture2D* pTexture = nullptr;
-            HRESULT hr = m_pD3D11Device->CreateTexture2D(&desc, nullptr, &pTexture);
+            HRESULT hr = m_pHostDevice->CreateTexture2D(&desc, nullptr, &pTexture);
             if (FAILED(hr)) {
                 DriverLog("Failed to create texture %d! HRESULT: 0x%x", i, hr);
                 rollback(i);
                 return;
             }
-            IDXGIResource* pDXGIResource = nullptr;
-            hr = pTexture->QueryInterface(__uuidof(IDXGIResource), (void**)&pDXGIResource);
+            IDXGIResource* pResource = nullptr;
+            hr = pTexture->QueryInterface(__uuidof(IDXGIResource), (void**)&pResource);
             if (FAILED(hr)) {
-                DriverLog("Failed to get DXGI resource for texture %d! HRESULT: 0x%x", i, hr);
+                DriverLog("Failed to get the host resource for texture %d! HRESULT: 0x%x", i, hr);
                 pTexture->Release();
                 rollback(i);
                 return;
             }
             HANDLE hSharedHandle = nullptr;
-            hr = pDXGIResource->GetSharedHandle(&hSharedHandle);
-            pDXGIResource->Release();
+            hr = pResource->GetSharedHandle(&hSharedHandle);
+            pResource->Release();
             if (FAILED(hr)) {
                 DriverLog("Failed to get shared handle for texture %d! HRESULT: 0x%x", i, hr);
                 pTexture->Release();
@@ -108,8 +109,8 @@ void HmdDriver::CreateSwapTextureSet(uint32_t unPid, const SwapTextureSetDesc_t*
                 return;
             }
             pOutSwapTextureSet->rSharedTextureHandles[i] = (vr::SharedTextureHandle_t)hSharedHandle;
-            set->pTextures[i] = pTexture;
-            set->hSharedHandles[i] = hSharedHandle;
+            set->images[i] = pTexture;
+            set->sharedHandles[i] = hSharedHandle;
             m_textureHandleMap[(vr::SharedTextureHandle_t)hSharedHandle] = pTexture;
             m_setByHandle[(vr::SharedTextureHandle_t)hSharedHandle] = set;
             DriverLog("Texture %d: handle=%llu", i, (uint64_t)hSharedHandle);
@@ -131,11 +132,11 @@ void HmdDriver::DestroySwapTextureSet(vr::SharedTextureHandle_t sharedTextureHan
     }
     std::shared_ptr<SwapTextureSet> set = it->second;
     for (int i = 0; i < 3; i++) {
-        m_textureHandleMap.erase((vr::SharedTextureHandle_t)set->hSharedHandles[i]);
-        m_setByHandle.erase((vr::SharedTextureHandle_t)set->hSharedHandles[i]);
-        if (set->pTextures[i]) {
-            set->pTextures[i]->Release();
-            set->pTextures[i] = nullptr;
+        m_textureHandleMap.erase((vr::SharedTextureHandle_t)set->sharedHandles[i]);
+        m_setByHandle.erase((vr::SharedTextureHandle_t)set->sharedHandles[i]);
+        if (set->images[i]) {
+            set->images[i]->Release();
+            set->images[i] = nullptr;
         }
     }
     for (auto& pair : m_swapTextureSets) {
@@ -157,17 +158,17 @@ void HmdDriver::DestroyAllSwapTextureSets(uint32_t unPid)
     {
         std::lock_guard<std::mutex> lock(m_encodeMutex);
         m_frameQueued = false;
-        m_pendingFrame = { nullptr, nullptr, 0, false };
+        m_pendingFrame = { 0, false };
     }
     auto it = m_swapTextureSets.find(unPid);
     if (it != m_swapTextureSets.end()) {
         for (auto& set : it->second) {
             for (int i = 0; i < 3; i++) {
-                m_textureHandleMap.erase((vr::SharedTextureHandle_t)set->hSharedHandles[i]);
-                m_setByHandle.erase((vr::SharedTextureHandle_t)set->hSharedHandles[i]);
-                if (set->pTextures[i]) {
-                    set->pTextures[i]->Release();
-                    set->pTextures[i] = nullptr;
+                m_textureHandleMap.erase((vr::SharedTextureHandle_t)set->sharedHandles[i]);
+                m_setByHandle.erase((vr::SharedTextureHandle_t)set->sharedHandles[i]);
+                if (set->images[i]) {
+                    set->images[i]->Release();
+                    set->images[i] = nullptr;
                 }
             }
         }
@@ -327,22 +328,45 @@ void HmdDriver::Present(vr::SharedTextureHandle_t syncTexture)
             return;
         }
         for (size_t i = 0; i < resolved.size() && i < m_layerCopies.size(); i++) {
-            m_pD3D11DeviceContext->CopySubresourceRegion(m_layerCopies[i].pLeft, 0, 0, 0, 0,
+            LayerCopy& c = m_layerCopies[i];
+            // Keyed handoff: acquire for the copy, release right after the Flush
+            // so the composer can import the copy.
+            if (c.syncLeft && !c.leftSyncHeld) {
+                if (SUCCEEDED(c.syncLeft->AcquireSync(0, 200))) c.leftSyncHeld = true;
+            }
+            if (c.syncRight && !c.rightSyncHeld) {
+                if (SUCCEEDED(c.syncRight->AcquireSync(0, 200))) c.rightSyncHeld = true;
+            }
+            m_pHostContext->CopySubresourceRegion(c.pLeft, 0, 0, 0, 0,
                                                        resolved[i].first, 0, nullptr);
-            m_pD3D11DeviceContext->CopySubresourceRegion(m_layerCopies[i].pRight, 0, 0, 0, 0,
+            m_pHostContext->CopySubresourceRegion(c.pRight, 0, 0, 0, 0,
                                                        resolved[i].second, 0, nullptr);
         }
-        m_pD3D11DeviceContext->Flush();
+        m_pHostContext->Flush();
+        for (size_t i = 0; i < resolved.size() && i < m_layerCopies.size(); i++) {
+            LayerCopy& c = m_layerCopies[i];
+            if (c.leftSyncHeld && c.syncLeft) { c.syncLeft->ReleaseSync(0); c.leftSyncHeld = false; }
+            if (c.rightSyncHeld && c.syncRight) { c.syncRight->ReleaseSync(0); c.rightSyncHeld = false; }
+        }
     }
     {
         std::lock_guard<std::mutex> lock(m_encodeMutex);
-        m_pendingFrame = { nullptr, nullptr, m_encoderPts++, true };
+        m_pendingFrame = { m_encoderPts++, true };
         m_pendingFrame.layers.clear();
         for (size_t i = 0; i < resolved.size() && i < m_layerCopies.size(); i++) {
             if (!m_layerCopies[i].hLeft || !m_layerCopies[i].hRight) continue;
             PendingFrame::PendingLayer pl;
-            pl.hLeft = m_layerCopies[i].hLeft;
-            pl.hRight = m_layerCopies[i].hRight;
+            const LayerCopy& c = m_layerCopies[i];
+            pl.left.handle = (uint64_t)(uintptr_t)c.hLeft;
+            pl.left.width = (uint32_t)c.width;
+            pl.left.height = (uint32_t)c.height;
+            pl.left.format = (uint32_t)c.format;
+            pl.left.synchronized = c.syncLeft != nullptr;
+            pl.right.handle = (uint64_t)(uintptr_t)c.hRight;
+            pl.right.width = (uint32_t)c.width;
+            pl.right.height = (uint32_t)c.height;
+            pl.right.format = (uint32_t)c.format;
+            pl.right.synchronized = c.syncRight != nullptr;
             pl.boundsLeft = validLayers[i].boundsLeft;
             pl.boundsRight = validLayers[i].boundsRight;
             m_pendingFrame.layers.push_back(pl);
@@ -368,10 +392,10 @@ bool HmdDriver::AcquireSyncTexture(vr::SharedTextureHandle_t syncTexture)
     if (!syncTexture) return false;
     HANDLE hSync = (HANDLE)syncTexture;
     if (hSync == INVALID_HANDLE_VALUE) return false;
-    if (m_cachedSyncHandle != hSync || !m_pSyncMutex) {
+    if (m_cachedSyncHandle != (uint64_t)(uintptr_t)hSync || !m_pSyncMutex) {
         ReleaseSyncTexture();
         ID3D11Texture2D* pSyncTex = nullptr;
-        HRESULT hr = m_pD3D11Device->OpenSharedResource(hSync, __uuidof(ID3D11Texture2D), (void**)&pSyncTex);
+        HRESULT hr = m_pHostDevice->OpenSharedResource(hSync, __uuidof(ID3D11Texture2D), (void**)&pSyncTex);
         if (FAILED(hr)) {
             DriverLog("OpenSharedResource(sync) failed! HRESULT: 0x%x", hr);
             return false;
@@ -379,11 +403,11 @@ bool HmdDriver::AcquireSyncTexture(vr::SharedTextureHandle_t syncTexture)
         IDXGIKeyedMutex* pMutex = nullptr;
         hr = pSyncTex->QueryInterface(__uuidof(IDXGIKeyedMutex), (void**)&pMutex);
         if (FAILED(hr)) {
-            DriverLog("Sync texture has no keyed mutex! HRESULT: 0x%x", hr);
+            DriverLog("Sync texture has no sync object! HRESULT: 0x%x", hr);
             pSyncTex->Release();
             return false;
         }
-        m_cachedSyncHandle = hSync;
+        m_cachedSyncHandle = (uint64_t)(uintptr_t)hSync;
         m_pSyncTexture = pSyncTex;
         m_pSyncMutex = pMutex;
     }
@@ -428,6 +452,11 @@ bool HmdDriver::EnsureLayerCopies(const std::vector<SubmitLayerInfo>& layers)
         if (c.pRight) { c.pRight->Release(); c.pRight = nullptr; }
         if (c.hLeft) { CloseHandle(c.hLeft); c.hLeft = nullptr; }
         if (c.hRight) { CloseHandle(c.hRight); c.hRight = nullptr; }
+        if (c.leftSyncHeld && c.syncLeft) c.syncLeft->ReleaseSync(0);
+        if (c.rightSyncHeld && c.syncRight) c.syncRight->ReleaseSync(0);
+        if (c.syncLeft) { c.syncLeft->Release(); c.syncLeft = nullptr; }
+        if (c.syncRight) { c.syncRight->Release(); c.syncRight = nullptr; }
+        c.leftSyncHeld = c.rightSyncHeld = false;
         auto makeCopy = [&](ID3D11Texture2D* srcTex, D3D11_TEXTURE2D_DESC srcDesc,
                             ID3D11Texture2D** ppOut, HANDLE* phOut) -> bool {
             D3D11_TEXTURE2D_DESC desc = srcDesc;
@@ -436,8 +465,8 @@ bool HmdDriver::EnsureLayerCopies(const std::vector<SubmitLayerInfo>& layers)
             desc.SampleDesc.Count = 1;
             desc.Usage = D3D11_USAGE_DEFAULT;
             desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-            desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
-            HRESULT hr = m_pD3D11Device->CreateTexture2D(&desc, nullptr, ppOut);
+            desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+            HRESULT hr = m_pHostDevice->CreateTexture2D(&desc, nullptr, ppOut);
             if (FAILED(hr)) {
                 DriverLog("Failed to create private eye copy! HRESULT: 0x%x", hr);
                 return false;
@@ -453,6 +482,12 @@ bool HmdDriver::EnsureLayerCopies(const std::vector<SubmitLayerInfo>& layers)
                 (*ppOut)->Release(); *ppOut = nullptr;
                 return false;
             }
+            // Device starts holding key 0; hand it off so the per-frame copy
+            // can acquire it and Vulkan compose can sync reads.
+            IDXGIKeyedMutex* pMutex = nullptr;
+            if (SUCCEEDED((*ppOut)->QueryInterface(__uuidof(IDXGIKeyedMutex), (void**)&pMutex))) {
+                pMutex->ReleaseSync(0);
+            }
             *phOut = h;
             return true;
         };
@@ -462,6 +497,8 @@ bool HmdDriver::EnsureLayerCopies(const std::vector<SubmitLayerInfo>& layers)
             if (c.hLeft) { CloseHandle(c.hLeft); c.hLeft = nullptr; }
             return false;
         }
+        if (c.pLeft) c.pLeft->QueryInterface(__uuidof(IDXGIKeyedMutex), (void**)&c.syncLeft);
+        if (c.pRight) c.pRight->QueryInterface(__uuidof(IDXGIKeyedMutex), (void**)&c.syncRight);
         c.width = (int)dL.Width;
         c.height = (int)dL.Height;
         c.format = dL.Format;

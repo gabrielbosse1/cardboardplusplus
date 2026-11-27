@@ -34,6 +34,11 @@ void HmdDriver::EncodePendingFrame(const PendingFrame& frame)
     std::lock_guard<std::mutex> lock(m_encoderMutex);
     if (!m_encoderInitialized || !m_pVideoEncoder) return;
     if (frame.layers.empty()) return;
+    static bool loggedFirstEncode = false;
+    if (!loggedFirstEncode) {
+        loggedFirstEncode = true;
+        DriverLog("Encode: first frame, layers=%zu", frame.layers.size());
+    }
     auto stageStart = std::chrono::steady_clock::now();
     auto noteStage = [&](const char* name) {
         long long us = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -46,21 +51,13 @@ void HmdDriver::EncodePendingFrame(const PendingFrame& frame)
         }
         stageStart = std::chrono::steady_clock::now();
     };
-    std::vector<std::pair<HANDLE, HANDLE>> handles;
-    handles.reserve(frame.layers.size());
-    for (const auto& l : frame.layers)
-        handles.push_back({ l.hLeft, l.hRight });
-    std::vector<ID3D11Texture2D*> pLefts, pRights;
-    if (!m_pVideoEncoder->OpenSharedEyeTextures(handles, pLefts, pRights)) {
-        DriverLog("OpenSharedEyeTextures failed for pts=%lld", (long long)frame.pts);
-        return;
+    std::vector<GpuImage> lefts, rights;
+    lefts.reserve(frame.layers.size());
+    rights.reserve(frame.layers.size());
+    for (const auto& l : frame.layers) {
+        lefts.push_back(l.left);
+        rights.push_back(l.right);
     }
-    noteStage("OpenSharedEyeTextures");
-    if (pLefts.empty()) {
-        m_pVideoEncoder->ReleaseEyeTextures();
-        return;
-    }
-    noteStage("OpenSharedEyeTextures");
     std::vector<VideoEncoder::LayerBounds> lbL, lbR;
     lbL.reserve(frame.layers.size());
     lbR.reserve(frame.layers.size());
@@ -68,11 +65,12 @@ void HmdDriver::EncodePendingFrame(const PendingFrame& frame)
         lbL.push_back({ l.boundsLeft.uMin, l.boundsLeft.vMin, l.boundsLeft.uMax, l.boundsLeft.vMax });
         lbR.push_back({ l.boundsRight.uMin, l.boundsRight.vMin, l.boundsRight.uMax, l.boundsRight.vMax });
     }
-    if (!m_pVideoEncoder->ComposeSBSGPU(pLefts, pRights, lbL, lbR)) {
+    if (!m_pVideoEncoder->ComposeSBSGPU(lefts, rights, lbL, lbR)) {
         DriverLog("ComposeSBSGPU failed for pts=%lld", (long long)frame.pts);
-        m_pVideoEncoder->ReleaseEyeTextures();
         return;
     }
+    static bool loggedCompose = false;
+    if (!loggedCompose) { loggedCompose = true; DriverLog("Encode: compose ok"); }
     noteStage("ComposeSBSGPU");
     if (!m_pVideoEncoder->ReadbackToBuffer()) {
         // Rate-limited: at frame rate this floods the SteamVR log, and the log
@@ -83,17 +81,22 @@ void HmdDriver::EncodePendingFrame(const PendingFrame& frame)
                       (long long)frame.pts, s_readbackFailCount);
         }
         noteStage("ReadbackToBuffer");
-        m_pVideoEncoder->ReleaseEyeTextures();
         return;
     }
+    static bool loggedReadback = false;
+    if (!loggedReadback) { loggedReadback = true; DriverLog("Encode: readback ok"); }
     noteStage("ReadbackToBuffer");
-    if (!m_pVideoEncoder->SwsConvert()) {
-        DriverLog("SwsConvert failed for pts=%lld", (long long)frame.pts);
+    if (!m_pVideoEncoder->ConvertFrame()) {
+        DriverLog("ConvertFrame failed for pts=%lld", (long long)frame.pts);
         return;
     }
-    noteStage("SwsConvert");
+    static bool loggedConvert = false;
+    if (!loggedConvert) { loggedConvert = true; DriverLog("Encode: convert ok"); }
+    noteStage("ConvertFrame");
     if (!m_pVideoEncoder->FinishEncode(frame.pts)) {
         DriverLog("FinishEncode failed for pts=%lld", (long long)frame.pts);
     }
+    static bool loggedFinish = false;
+    if (!loggedFinish) { loggedFinish = true; DriverLog("Encode: finish ok"); }
     noteStage("FinishEncode");
 }

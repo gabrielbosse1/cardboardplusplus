@@ -7,7 +7,7 @@ namespace wire {
 // Video (driver -> phone + localhost bridge preview) and discovery/control.
     static constexpr int kDataPort = 42069;
     static constexpr int kDiscoveryPort = 42070;
-// Phone -> driver prober: "CARDBOARD_DISCOVERY" poll and "CARDBOARD_CAP W H"
+// Phone -> driver host copyr: "CARDBOARD_DISCOVERY" poll and "CARDBOARD_CAP W H"
 // resolution clamp. Driver answers discovery with kDiscoveryAck.
     static constexpr char kCardboardCap[] = "CARDBOARD_CAP";
     static constexpr std::size_t kCardboardCapLen = sizeof(kCardboardCap) - 1;

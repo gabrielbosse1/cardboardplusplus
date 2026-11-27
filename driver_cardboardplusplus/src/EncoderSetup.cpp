@@ -9,8 +9,8 @@ bool HmdDriver::InitializeVideoEncoder()
     DriverLog("========================================");
     DriverLog("Initializing Video Encoder...");
     DriverLog("========================================");
-    if (!m_pD3D11Device || !m_pD3D11DeviceContext) {
-        DriverLog("Cannot initialize encoder: D3D device not available!");
+    if (!m_vulkan.IsReady()) {
+        DriverLog("Cannot initialize encoder: no Vulkan device!");
         return false;
     }
     m_pVideoEncoder = new VideoEncoder();
@@ -36,7 +36,8 @@ bool HmdDriver::InitializeVideoEncoder()
     DriverLog("  Bitrate: %d bps (%d kbps)", bitrate, bitrate / 1000);
     DriverLog("  GPU Encoding: %s", useGpuEncoding ? "YES" : "NO");
     RegisterEncoderCallbacks(m_pVideoEncoder);
-    if (!m_pVideoEncoder->Initialize(m_pD3D11Device, m_pD3D11DeviceContext, width, height, fps, bitrate, useGpuEncoding)) {
+    if (!m_pVideoEncoder->Initialize(width, height, fps, bitrate, useGpuEncoding,
+                                     &m_vulkan)) {
         DriverLog("VideoEncoder::Initialize failed!");
         delete m_pVideoEncoder;
         m_pVideoEncoder = nullptr;
@@ -164,8 +165,8 @@ bool HmdDriver::ApplyEncoderSettings(int w, int h, int fps, int bitrateBps, bool
         return false;
     }
     RegisterEncoderCallbacks(m_pVideoEncoder);
-    if (!m_pVideoEncoder->Initialize(m_pD3D11Device, m_pD3D11DeviceContext,
-                                     m_encoderW, m_encoderH, m_encoderFps, m_encoderBitrate, m_encoderUseGpu)) {
+    if (!m_pVideoEncoder->Initialize(m_encoderW, m_encoderH, m_encoderFps, m_encoderBitrate, m_encoderUseGpu,
+                                     &m_vulkan)) {
         DriverLog("VideoEncoder re-init failed under %s!", reason);
         delete m_pVideoEncoder;
         m_pVideoEncoder = nullptr;
