@@ -159,8 +159,14 @@ else()
     set(CBPP_OPENVR_LINK "${OPENVR_API_LIB}")
 endif()
 
+# Server drivers call OpenVR through inline vtable accessors in openvr_driver.h
+# and reference zero symbols from openvr_api.so. Scope --as-needed around the
+# OpenVR link entry so toolchains that default to --no-as-needed do not record a
+# spurious DT_NEEDED for openvr_api.so.
 target_link_libraries(driver_cardboardplusplus PRIVATE
+    "-Wl,--push-state,--as-needed"
     ${CBPP_OPENVR_LINK}
+    "-Wl,--pop-state"
     PkgConfig::FFMPEG
     PkgConfig::VULKAN
     PkgConfig::X11

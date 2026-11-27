@@ -101,6 +101,11 @@ jobs:
           echo "unresolved driver symbols:"; nm -D --undefined-only "$SO" | grep -E '\b(HmdDriver|VulkanCompose|VideoEncoder|DeviceProvider|BridgeServer|HandDriver|DirectMode)'; exit 1
         fi
         echo "no unresolved driver symbols"
+        # Server drivers use inline OpenVR vtable accessors only; openvr_api.so must not appear in DT_NEEDED.
+        if readelf -d "$SO" | grep -E '\(NEEDED\).*openvr_api'; then
+          echo "unexpected DT_NEEDED for openvr_api in $SO"; exit 1
+        fi
+        echo "no DT_NEEDED entry for openvr_api"
 
     - name: Driver wire-protocol tests (g++)
       run: |
