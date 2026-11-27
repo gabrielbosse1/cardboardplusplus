@@ -1,7 +1,7 @@
 # Compatibility fix worklog
 
 Branch: `arena/1ac5e66b-cardboardplusplus`; base: `51fca6af3cf174db4c24e16a91a4b7f9a31f770`.
-Current batch: 3 (partial). Next action: status and device identity; lifecycle and allocation cleanup remain open.
+Current batch: 4 (partial). Next action: compatibility/quality fixes; status protocol and device matching remain open.
 
 | ID | Verdict | Status | Commit | Remaining work |
 |---|---|---|---|---|
@@ -12,8 +12,8 @@ Current batch: 3 (partial). Next action: status and device identity; lifecycle a
 | F05 | Confirmed: ApplyHardwareCap mutated active dimensions before change comparison. | Fixed, untested at runtime | Batch 2 | Verify cap-only reinit on hardware and failure rollback. |
 | F06 | Confirmed: Activate tolerates encoder failure and reinit discards old encoder. | Pending | — | Transactional first-frame rollback and retry. |
 | F07 | Confirmed: fallback occurs on open only; frame errors do not trigger recovery. | Pending | — | Probe and recover safely. |
-| F08 | Not yet reverified | Pending | — | Reverify and disposition |
-| F09 | Not yet reverified | Pending | — | Reverify and disposition |
+| F08 | Confirmed: no explicit compositor/encoder adapter matching; Linux selects first Vulkan device and renderD128. | Partial diagnostics | Batch 4 | Match real compositor and encoder identities. |
+| F09 | Confirmed: bridge infers encoder active from ACK and requested name from settings. | Pending | — | Versioned actual encoder status and backward compatibility. |
 | F10 | Confirmed: SubmitLayer cleared previous submitted layers. | Fixed, runtime unverified | Batch 3 | Test scene plus overlays. |
 | F11 | Confirmed: Linux Present ignored stream-enabled flag. | Fixed, runtime unverified | Batch 3 | Test toggle through both settings interfaces. |
 | F12 | Confirmed: device-lost recovery absent; stale D3D fallback message. | Partial | Batch 2 | Device-loss classification and recovery still required. |
@@ -21,7 +21,7 @@ Current batch: 3 (partial). Next action: status and device identity; lifecycle a
 | F14 | Not yet reverified | Pending | — | Reverify and disposition |
 | F15 | Not yet reverified | Pending | — | Reverify and disposition |
 | F16 | Confirmed: CreateSharedEye and swap-set failure paths leak partially created resources. | Pending | — | Transactional allocation cleanup and fault injection. |
-| F17 | Not yet reverified | Pending | — | Reverify and disposition |
+| F17 | Confirmed: named codecs are reduced to a GPU boolean by ApplyBridgeCfg. | Partial | Batch 4 | Reject or honor explicit REST names; UI hint corrected. |
 | F18 | Not yet reverified | Pending | — | Reverify and disposition |
 | F19 | Not yet reverified | Pending | — | Reverify and disposition |
 | F20 | Confirmed: CopyToHost exposed old mapped data after failure. | Fixed, untested at runtime | Batch 2 | Fault-inject all copy stages. |

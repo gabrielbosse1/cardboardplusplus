@@ -278,6 +278,8 @@ bool VulkanContext::Initialize(const PlatformAdapterId* adapterId)
     VkPhysicalDeviceProperties props = {};
     s_vkGetPhysicalDeviceProperties(m_physical, &props);
     DriverLog("Vulkan: device ready (%s, queue family %u)", props.deviceName, m_queueFamily);
+    DriverLog("[compat] event=vulkan_device vendor=0x%04x device=0x%04x driver=%u api=%u",
+              props.vendorID, props.deviceID, props.driverVersion, props.apiVersion);
     return true;
 }
 void VulkanContext::Destroy()
