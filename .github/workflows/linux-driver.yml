@@ -73,11 +73,11 @@ jobs:
           cmake -S driver_cardboardplusplus -B driver_cardboardplusplus/build \
             -DCMAKE_BUILD_TYPE=Release \
             -DCBPP_OPENVR_DIR=/tmp/openvr_stub &&
-          cmake --build driver_cardboardplusplus/build --parallel "$(nproc)"
+          cmake --build driver_cardboardplusplus/build --parallel 2
         } 2>&1 | tee "$RUNNER_TEMP/linux-driver-build.log"
         status=${PIPESTATUS[0]}
         if [ "$status" -ne 0 ]; then
-          python3 -c 'import sys; text="".join(open(sys.argv[1], errors="replace").readlines()[-100:]); print("::error::" + text.replace("%", "%25").replace("\n", "%0A").replace("\r", "%0D"))' "$RUNNER_TEMP/linux-driver-build.log"
+          python3 -c 'import sys; text=open(sys.argv[1], errors="replace").read()[-3000:]; print("::error::" + text.replace("%", "%25").replace("\n", "%0A").replace("\r", "%0D"))' "$RUNNER_TEMP/linux-driver-build.log"
           exit "$status"
         fi
 
@@ -189,6 +189,6 @@ jobs:
         cargo test --manifest-path bridge/Cargo.toml -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/bridge-test.log"
         status=${PIPESTATUS[0]}
         if [ "$status" -ne 0 ]; then
-          python3 -c 'import sys; text="".join(open(sys.argv[1], errors="replace").readlines()[-100:]); print("::error::" + text.replace("%", "%25").replace("\n", "%0A").replace("\r", "%0D"))' "$RUNNER_TEMP/bridge-test.log"
+          python3 -c 'import sys; text=open(sys.argv[1], errors="replace").read()[-3000:]; print("::error::" + text.replace("%", "%25").replace("\n", "%0A").replace("\r", "%0D"))' "$RUNNER_TEMP/bridge-test.log"
           exit "$status"
         fi
