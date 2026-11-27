@@ -26,7 +26,20 @@ jobs:
       shell: pwsh
 
     - name: Build Driver
-      run: msbuild driver_cardboardplusplus\driver_cardboardplusplus.sln /p:Configuration=${{ matrix.configuration }} /p:Platform=x64 /p:PlatformToolset=v143
+      shell: pwsh
+      run: |
+        msbuild driver_cardboardplusplus\driver_cardboardplusplus.sln /p:Configuration=${{ matrix.configuration }} /p:Platform=x64 /p:PlatformToolset=v143 /fl '/flp:logfile=build-driver.log;verbosity=normal'
+        $buildExit = $LASTEXITCODE
+        if ($buildExit -ne 0) {
+          # Preserve actionable diagnostics as check annotations as well as job logs.
+          if (Test-Path build-driver.log) {
+            Get-Content build-driver.log | Where-Object { $_ -match '(?i)\berror\s+(?:[A-Z]+\d+\s*)?:' } | Select-Object -Unique -First 20 | ForEach-Object {
+              $line = $_.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+              Write-Output "::error::$line"
+            }
+          }
+          exit $buildExit
+        }
 
     - name: Driver unit tests
       shell: pwsh
