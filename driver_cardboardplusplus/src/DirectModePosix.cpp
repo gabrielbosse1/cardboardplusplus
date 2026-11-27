@@ -270,7 +270,13 @@ void HmdDriver::GetNextSwapTextureSetIndex(vr::SharedTextureHandle_t sharedTextu
 void HmdDriver::SubmitLayer(const SubmitLayerPerEye_t (&perEye)[2])
 {
     std::lock_guard<std::mutex> lock(m_submitLayersMutex);
-    m_submitLayers.clear();
+    // VulkanCompose supports at most four layers per frame.
+    if (m_submitLayers.size() >= 4) {
+        static unsigned droppedLayers = 0;
+        if (++droppedLayers <= 3 || droppedLayers % 300 == 0)
+            DriverLog("DirectMode: layer limit reached (drop=%u)", droppedLayers);
+        return;
+    }
     SubmitLayerInfo info;
     info.hTextureLeft = perEye[0].hTexture;
     info.hTextureRight = perEye[1].hTexture;
@@ -290,6 +296,12 @@ void HmdDriver::SubmitLayer(const SubmitLayerPerEye_t (&perEye)[2])
 // the imported images from being read mid-render.
 void HmdDriver::Present(vr::SharedTextureHandle_t syncTexture)
 {
+    if (!m_streamEnabled.load(std::memory_order_relaxed)) {
+        std::lock_guard<std::mutex> lock(m_submitLayersMutex);
+        m_submitLayers.clear();
+        m_hasSubmit.store(false, std::memory_order_release);
+        return;
+    }
     m_presentCount++;
     static uint32_t presentLogs = 0;
     if (++presentLogs == 1 || presentLogs % 300 == 1) {
