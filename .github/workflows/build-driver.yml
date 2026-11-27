@@ -40,3 +40,7 @@ jobs:
         if ($LASTEXITCODE -ne 0) { throw "driver test compile failed (cl exit $LASTEXITCODE)" }
         .\driver_tests.exe
         if ($LASTEXITCODE -ne 0) { throw "driver tests failed" }
+        cmd /c "`"$devCmd`" -arch=x64 >nul && cl /nologo /EHsc /std:c++14 /I driver_cardboardplusplus\include /Fe:eye_format_tests.exe /Fo:eye_format_tests_ driver_cardboardplusplus\tests\test_eye_format.cpp"
+        if ($LASTEXITCODE -ne 0) { throw "eye format test compile failed (cl exit $LASTEXITCODE)" }
+        .\eye_format_tests.exe
+        if ($LASTEXITCODE -ne 0) { throw "eye format tests failed" }

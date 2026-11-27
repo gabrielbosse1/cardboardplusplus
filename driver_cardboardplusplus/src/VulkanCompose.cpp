@@ -30,11 +30,10 @@ static int ExportDmaBufSyncFile(int fd) {
     return info.fd;
 }
 // Imports each eye's sync file as a temporary binary semaphore. The compose
-// submission waits on them, so sampling starts exactly when the compositor's
-// writes finish. Returns the semaphores and the fds to close after submission.
+// submission waits on them before sampling. A successful import transfers fd
+// ownership to Vulkan; only failed imports are closed by this function.
 static bool ImportEyeSemaphores(VulkanContext* ctx, int leftFd, int rightFd,
-                                std::vector<VkSemaphore>& outSems,
-                                std::vector<int>& outFds) {
+                                std::vector<VkSemaphore>& outSems) {
     auto createSem = (PFN_vkCreateSemaphore)ctx->GetDeviceProc("vkCreateSemaphore");
     auto importFd = (PFN_vkImportSemaphoreFdKHR)ctx->GetDeviceProc("vkImportSemaphoreFdKHR");
     if (!createSem || !importFd) return false;
@@ -56,7 +55,6 @@ static bool ImportEyeSemaphores(VulkanContext* ctx, int leftFd, int rightFd,
         info.fd = s;
         if (importFd(ctx->Device(), &info) == VK_SUCCESS) {
             outSems.push_back(sem);
-            outFds.push_back(s);
         } else {
             auto destroy = (PFN_vkDestroySemaphore)ctx->GetDeviceProc("vkDestroySemaphore");
             if (destroy) destroy(ctx->Device(), sem, nullptr);
@@ -74,23 +72,7 @@ static bool ImportEyeSemaphores(VulkanContext* ctx, int leftFd, int rightFd,
 
 
 #ifdef _WIN32
-static VkFormat HostFormatToVk(int hostFormat) {
-    switch (hostFormat) {
-        case 87: return VK_FORMAT_B8G8R8A8_UNORM;
-        case 88: return VK_FORMAT_B8G8R8A8_SRGB;
-        case 28: return VK_FORMAT_R8G8B8A8_UNORM;
-        case 29: return VK_FORMAT_R8G8B8A8_SRGB;
-        case 91: return VK_FORMAT_R8_UNORM;
-        case 24: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
-        case 54: return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
-        case 56: return VK_FORMAT_R16G16_SFLOAT;
-        case 61: return VK_FORMAT_R16_SFLOAT;
-        case 45: return VK_FORMAT_R16G16B16A16_SFLOAT;
-        case 10: return VK_FORMAT_R32G32B32A32_SFLOAT;
-        case 95: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
-        default: return VK_FORMAT_UNDEFINED;
-    }
-}
+#include "EyeFormat.h"
 #endif
 
 void VulkanCompose::Init(VulkanContext* ctx) {
@@ -816,8 +798,10 @@ int VulkanCompose::FindOrImportEye(const GpuImage& src) {
     auto allocMem = (PFN_vkAllocateMemory)m_pCtx->GetDeviceProc("vkAllocateMemory");
     auto bindImage = (PFN_vkBindImageMemory)m_pCtx->GetDeviceProc("vkBindImageMemory");
     auto createImgView = (PFN_vkCreateImageView)m_pCtx->GetDeviceProc("vkCreateImageView");
+    auto destroyImg = (PFN_vkDestroyImage)m_pCtx->GetDeviceProc("vkDestroyImage");
+    auto freeMem = (PFN_vkFreeMemory)m_pCtx->GetDeviceProc("vkFreeMemory");
     auto getMemProps = (PFN_vkGetPhysicalDeviceMemoryProperties)m_pCtx->GetInstanceProc("vkGetPhysicalDeviceMemoryProperties");
-    if (!createImage || !getImgReq || !allocMem || !bindImage || !createImgView || !getMemProps) {
+    if (!createImage || !getImgReq || !allocMem || !bindImage || !createImgView || !getMemProps || !destroyImg || !freeMem) {
         Fail("import commands missing");
         return -1;
     }
@@ -837,12 +821,22 @@ int VulkanCompose::FindOrImportEye(const GpuImage& src) {
     VkMemoryRequirements req = {};
     VkImage img = VK_NULL_HANDLE;
     VkDeviceMemory mem = VK_NULL_HANDLE;
+    uint32_t compatibleTypes = UINT32_MAX;
+    auto cleanup = [&]() {
+        if (img) destroyImg(m_pCtx->Device(), img, nullptr);
+        if (mem) freeMem(m_pCtx->Device(), mem, nullptr);
+    };
 
 #ifdef _WIN32
-    // Windows exports the eye texture as a shared NT handle; Vulkan imports the
-    // matching host allocation and binds it to a sampled VkImage.
-    fmt = HostFormatToVk((DXGI_FORMAT)src.format);
+    // Windows uses a legacy DXGI shared KMT handle for the D3D11 eye copy.
+    // Import a VkImage with the corresponding typed DXGI format.
+    if (!m_pCtx->HasLuidMatch() || !m_pCtx->HasExternalMemoryWin32()) {
+        Fail("matching D3D adapter and external Win32 memory are required");
+        return -1;
+    }
+    fmt = cbpp::EyeDxgiToVk(src.format);
     if (fmt == VK_FORMAT_UNDEFINED) {
+        DriverLog("VK-COMPOSE: unsupported DXGI eye format %u", src.format);
         Fail("unsupported eye texture format");
         return -1;
     }
@@ -861,7 +855,22 @@ int VulkanCompose::FindOrImportEye(const GpuImage& src) {
     import.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR;
     import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT;
     import.handle = (HANDLE)src.handle;
-    ai.pNext = &import;
+    auto getHandleProps = (PFN_vkGetMemoryWin32HandlePropertiesKHR)
+        m_pCtx->GetDeviceProc("vkGetMemoryWin32HandlePropertiesKHR");
+    VkMemoryWin32HandlePropertiesKHR handleProps = {};
+    handleProps.sType = VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR;
+    if (!getHandleProps || getHandleProps(m_pCtx->Device(), import.handleType,
+                                          import.handle, &handleProps) != VK_SUCCESS) {
+        cleanup();
+        Fail("D3D11 handle memory properties unavailable");
+        return -1;
+    }
+    compatibleTypes = handleProps.memoryTypeBits;
+    VkMemoryDedicatedAllocateInfo dedicated = {};
+    dedicated.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+    dedicated.image = img;
+    dedicated.pNext = &import;
+    ai.pNext = &dedicated;
 #else
     // Linux gets an fd for the shared image SteamVR allocated. Import it with
     // the same format the compositor used; no modifier list is needed.
@@ -897,6 +906,7 @@ int VulkanCompose::FindOrImportEye(const GpuImage& src) {
     // vkImportMemoryFdKHR consumes the fd it is given. Keep the compositor's
     // original fd intact for subsequent frames by importing a duplicate.
     fdImport.fd = ::dup(fd);
+    if (fdImport.fd < 0) { cleanup(); Fail("dup eye fd failed"); return -1; }
     VkMemoryDedicatedAllocateInfo dedicated = {};
     dedicated.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
     dedicated.image = img;
@@ -911,21 +921,28 @@ int VulkanCompose::FindOrImportEye(const GpuImage& src) {
     bool found = false;
     for (uint32_t pass = 0; pass < 2 && !found; pass++) {
         for (uint32_t t = 0; t < memProps.memoryTypeCount; t++) {
-            if (!(req.memoryTypeBits & (1u << t))) continue;
+            if (!(req.memoryTypeBits & compatibleTypes & (1u << t))) continue;
             if (pass == 0 &&
                 !(memProps.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
                 continue;
             ai.memoryTypeIndex = t; found = true; break;
         }
     }
-    if (!found) { Fail("no compatible eye memory type"); return -1; }
+    if (!found) {
+#ifndef _WIN32
+        ::close(fdImport.fd);
+#endif
+        cleanup(); Fail("no compatible eye memory type"); return -1;
+    }
     if (allocMem(m_pCtx->Device(), &ai, nullptr, &mem) != VK_SUCCESS) {
-        Fail("vkAllocateMemory(eye) failed");
-        return -1;
+#ifndef _WIN32
+        ::close(fdImport.fd);
+#endif
+        cleanup(); Fail("vkAllocateMemory(eye) failed"); return -1;
     }
     FRAME_LOG("VK-COMPOSE: eye memory imported type=%u", ai.memoryTypeIndex);
     if (bindImage(m_pCtx->Device(), img, mem, 0) != VK_SUCCESS) {
-        Fail("vkBindImageMemory(eye) failed");
+        cleanup(); Fail("vkBindImageMemory(eye) failed");
         return -1;
     }
     VkImageViewCreateInfo ivci = {};
@@ -945,7 +962,7 @@ int VulkanCompose::FindOrImportEye(const GpuImage& src) {
     ivci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
     VkImageView view = VK_NULL_HANDLE;
     if (createImgView(m_pCtx->Device(), &ivci, nullptr, &view) != VK_SUCCESS) {
-        Fail("vkCreateImageView(eye) failed");
+        cleanup(); Fail("vkCreateImageView(eye) failed");
         return -1;
     }
     AuxImg a;
@@ -1051,11 +1068,15 @@ bool VulkanCompose::Compose(const std::vector<GpuImage>& lefts,
         AuxImg& al = m_aux[idxL[i]];
         AuxImg& ar = m_aux[idxR[i]];
         VkDescriptorImageInfo imgInfo[2] = {};
-        // Eyes stay in TRANSFER_SRC_OPTIMAL; sampling from that layout is legal.
+        // Windows returns D3D11 external images in GENERAL. Linux's imported
+        // images are transitioned to the shader-readable layout before use.
         imgInfo[0].imageView = al.view;
-        imgInfo[0].imageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         imgInfo[1].imageView = ar.view;
-        imgInfo[1].imageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+#ifdef _WIN32
+        imgInfo[0].imageLayout = imgInfo[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+#else
+        imgInfo[0].imageLayout = imgInfo[1].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+#endif
         VkDescriptorImageInfo sampInfo = {};
         sampInfo.sampler = m_sampler;
         VkDescriptorBufferInfo bufInfo = {};
@@ -1098,25 +1119,44 @@ bool VulkanCompose::Compose(const std::vector<GpuImage>& lefts,
     }
     FRAME_LOG("VK-COMPOSE: command buffer begun");
 
-    // Eye images: UNDEFINED -> TRANSFER_SRC_OPTIMAL once on first use. After
-    // that the layout persists across D3D handshakes (sync object members don't
-    // touch layouts) and further submits can draw straight away.
+    // Each unique image is acquired once, including when both eyes refer to it.
+    std::vector<int> uniqueEyes;
+    for (size_t i = 0; i < n; i++) {
+        for (int idx : {idxL[i], idxR[i]}) {
+            bool seen = false;
+            for (int prev : uniqueEyes) if (prev == idx) seen = true;
+            if (!seen) uniqueEyes.push_back(idx);
+        }
+    }
     VkImageMemoryBarrier imb = {};
     imb.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     imb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    imb.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+#ifdef _WIN32
+    // The keyed mutex orders the D3D access; the image barrier transfers Vulkan
+    // ownership from the external API without discarding the copied pixels.
+    imb.oldLayout = imb.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    imb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+    imb.dstQueueFamilyIndex = m_pCtx->GetQueueFamily();
+    for (int idx : uniqueEyes) {
+        imb.image = m_aux[idx].img;
+        barrier(m_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                0, 0, nullptr, 0, nullptr, 1, &imb);
+    }
+#else
     imb.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    imb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    imb.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     imb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     imb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    imb.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-    for (size_t i = 0; i < n; i++) {
-        AuxImg& al = m_aux[idxL[i]];
-        AuxImg& ar = m_aux[idxR[i]];
-        if (!al.layoutReady || !ar.layoutReady) {
-            if (!al.layoutReady) { imb.image = al.img; barrier(m_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &imb); al.layoutReady = true; }
-            if (!ar.layoutReady) { imb.image = ar.img; barrier(m_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &imb); ar.layoutReady = true; }
+    for (int idx : uniqueEyes) {
+        if (!m_aux[idx].layoutReady) {
+            imb.image = m_aux[idx].img;
+            barrier(m_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                    0, 0, nullptr, 0, nullptr, 1, &imb);
+            m_aux[idx].layoutReady = true;
         }
     }
+#endif
 
     // Native target only needs its first UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL
     // transition; the render pass leaves it in COLOR_ATTACHMENT_OPTIMAL.
@@ -1154,6 +1194,19 @@ bool VulkanCompose::Compose(const std::vector<GpuImage>& lefts,
         cmdDraw(m_cmd, 3, 1, 0, 0);
     }
     endRender(m_cmd);
+#ifdef _WIN32
+    // Return the imported D3D11 resources to the external owner before the
+    // keyed mutex is released by the submission.
+    imb.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    imb.dstAccessMask = 0;
+    imb.srcQueueFamilyIndex = m_pCtx->GetQueueFamily();
+    imb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+    for (int idx : uniqueEyes) {
+        imb.image = m_aux[idx].img;
+        barrier(m_cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                0, 0, nullptr, 0, nullptr, 1, &imb);
+    }
+#endif
     if (endCmd(m_cmd) != VK_SUCCESS) {
         Fail("endCommandBuffer(compose) failed");
         return false;
@@ -1166,20 +1219,13 @@ bool VulkanCompose::Compose(const std::vector<GpuImage>& lefts,
     uint64_t syncKeys[2 * kMaxLayers] = {};
     uint32_t syncTimeouts[2 * kMaxLayers] = {};
     uint32_t syncCount = 0;
-    for (size_t i = 0; i < n; i++) {
-        for (int e = 0; e < 2; e++) {
-            AuxImg& a = m_aux[(e == 0) ? idxL[i] : idxR[i]];
-            if (a.keyed) {
-                syncs[syncCount] = a.mem;
-                syncKeys[syncCount] = 0;
-                syncTimeouts[syncCount] = 200;
-                syncCount++;
-            } else {
-                // D3D writes these same-device textures; no cross-API handoff
-                // is possible here, so a missing key is fine (software compose path
-                // also reads them without a mutex).
-            }
-        }
+    for (int idx : uniqueEyes) {
+        AuxImg& a = m_aux[idx];
+        if (!a.keyed) { Fail("eye texture has no keyed mutex"); return false; }
+        syncs[syncCount] = a.mem;
+        syncKeys[syncCount] = 0;
+        syncTimeouts[syncCount] = 200;
+        syncCount++;
     }
     if (!m_pCtx->HasKeyedMutex()) { Fail("sync object extension missing"); return false; }
     VkWin32KeyedMutexAcquireReleaseInfoKHR km = {};
@@ -1197,18 +1243,14 @@ bool VulkanCompose::Compose(const std::vector<GpuImage>& lefts,
 #endif
 #ifndef _WIN32
     std::vector<VkSemaphore> eyeSems;
-    std::vector<int> syncFds;
-    uint32_t waitCount = 0;
-    VkSemaphore eyeSemaphores[2] = {};
-    VkPipelineStageFlags waitStages[2] = {};
-    if (ImportEyeSemaphores(m_pCtx, (int)lefts[0].handle, (int)rights[0].handle,
-                            eyeSems, syncFds)) {
-        waitCount = (uint32_t)eyeSems.size();
-        for (uint32_t s = 0; s < waitCount; s++) {
-            eyeSemaphores[s] = eyeSems[s];
-            waitStages[s] = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        }
+    for (size_t i = 0; i < n; i++) {
+        ImportEyeSemaphores(m_pCtx, (int)lefts[i].handle, (int)rights[i].handle, eyeSems);
     }
+    std::vector<VkPipelineStageFlags> waitStages(eyeSems.size(), VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    auto destroyEyeSems = [&]() {
+        auto destroySem = (PFN_vkDestroySemaphore)m_pCtx->GetDeviceProc("vkDestroySemaphore");
+        if (destroySem) for (VkSemaphore sem : eyeSems) destroySem(m_pCtx->Device(), sem, nullptr);
+    };
 #endif
     VkSubmitInfo si = {};
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -1216,9 +1258,9 @@ bool VulkanCompose::Compose(const std::vector<GpuImage>& lefts,
     si.pNext = &km;
 #else
     si.pNext = nullptr;
-    si.waitSemaphoreCount = waitCount;
-    si.pWaitSemaphores = eyeSemaphores;
-    si.pWaitDstStageMask = waitStages;
+    si.waitSemaphoreCount = (uint32_t)eyeSems.size();
+    si.pWaitSemaphores = eyeSems.data();
+    si.pWaitDstStageMask = waitStages.data();
 #endif
     si.commandBufferCount = 1;
     si.pCommandBuffers = &m_cmd;
@@ -1227,9 +1269,12 @@ bool VulkanCompose::Compose(const std::vector<GpuImage>& lefts,
     if (res != VK_SUCCESS) {
         // Transient (a busy queue right after a SteamVR restart is the known
         // case): keep the pipeline and let the caller fall back for this frame.
+#ifndef _WIN32
+        destroyEyeSems();
+#endif
         m_submitFails++;
         if (m_submitFails <= 3 || m_submitFails % 300 == 0) {
-            DriverLog("VK-COMPOSE: vkQueueSubmit failed res=%d (fail=%d), using D3D this frame",
+            DriverLog("VK-COMPOSE: vkQueueSubmit failed res=%d (fail=%d), dropping frame",
                       (int)res, m_submitFails);
         }
         return false;
@@ -1243,11 +1288,7 @@ bool VulkanCompose::Compose(const std::vector<GpuImage>& lefts,
     }
     FRAME_LOG("VK-COMPOSE: fence res=%d", (int)res);
 #ifndef _WIN32
-    {
-        auto destroySem = (PFN_vkDestroySemaphore)m_pCtx->GetDeviceProc("vkDestroySemaphore");
-        for (VkSemaphore s : eyeSems) if (destroySem) destroySem(m_pCtx->Device(), s, nullptr);
-        for (int fd : syncFds) if (fd >= 0) ::close(fd);
-    }
+    destroyEyeSems();
 #endif
     m_frame++;
     int used[2 * kMaxLayers] = {};
@@ -1263,9 +1304,6 @@ bool VulkanCompose::Compose(const std::vector<GpuImage>& lefts,
 }
 
 
-// Runs the NV12 compute pass over the composed RT and hands back the mapped
-// host buffer. The RT stays in TRANSFER_SRC_OPTIMAL (shader reads are legal
-// there), so only a same-layout write->read barrier is needed.
 // Runs the NV12 compute pass over the natively composed frame and hands back
 // the mapped host buffer. The native image goes COLOR_ATTACHMENT_OPTIMAL ->
 // SHADER_READ_ONLY_OPTIMAL -> COLOR_ATTACHMENT_OPTIMAL so the next compose pass

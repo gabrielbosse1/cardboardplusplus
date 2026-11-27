@@ -40,7 +40,7 @@ VideoEncoder::~VideoEncoder()
 }
 // Builds the FFmpeg codec, the Vulkan compose/conversion pipeline and the software frame buffers for width x height at fps/bitrate.
 bool VideoEncoder::Initialize(int width, int height, int fps, int bitrate, bool useGpuEncoding,
-                             VulkanContext* pVulkan)
+                             VulkanContext* pVulkan, const char* codec)
 {
     m_pVulkan = pVulkan;
     ENCODER_LOG("========================================");
@@ -63,6 +63,7 @@ bool VideoEncoder::Initialize(int width, int height, int fps, int bitrate, bool 
     m_fps = fps;
     m_bitrate = bitrate;
     m_useGpuEncoding = useGpuEncoding;
+    m_codecChoice = codec ? codec : (useGpuEncoding ? "gpu" : "cpu");
     m_frameCount = 0;
     // Vulkan owns the whole video path; the compositor device is only used
     // to open the eye textures the composer imports.

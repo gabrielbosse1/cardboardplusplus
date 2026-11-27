@@ -16,6 +16,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <memory>
+#include <string>
 using namespace vr;
 // Triple-buffered eye textures shared with the SteamVR compositor; nextIndex rotates the write slot.
 struct SwapTextureSet {
@@ -95,7 +96,8 @@ private:
     void ClampEncoderToCap();
     bool ApplyBridgeCfg(int fps, int bitrateKbps, const char* codec);
     void ApplyStreamSettings(const cbpp::PayloadSettingsChange& settings);
-    bool ApplyEncoderSettings(int w, int h, int fps, int bitrateBps, bool useGpu, const char* reason);
+    bool ApplyEncoderSettings(int w, int h, int fps, int bitrateBps, bool useGpu, const char* reason,
+                              const char* codec = nullptr);
     static bool SanitizeEncoderDims(int& w, int& h);
     void RegisterEncoderCallbacks(VideoEncoder* enc);
     void RunBridgeHeartbeat();
@@ -162,6 +164,7 @@ private:
     int m_encoderFps = 60;
     int m_encoderBitrate = 20000000;
     bool m_encoderUseGpu = false;
+    std::string m_encoderChoice = "cpu";
     int m_pendingCapW = 0;
     int m_pendingCapH = 0;
     std::mutex m_encoderMutex;

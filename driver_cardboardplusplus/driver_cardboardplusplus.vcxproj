@@ -30,6 +30,7 @@
     <ClInclude Include="include\VideoEncoderLog.h" />
     <ClInclude Include="include\VulkanContext.h" />
     <ClInclude Include="include\VulkanCompose.h" />
+    <ClInclude Include="include\EyeFormat.h" />
     <ClInclude Include="include\SpirvCompiler.h" />
     <ClInclude Include="include\BridgeServer.h" />
     <ClInclude Include="include\BridgeProtocol.h" />

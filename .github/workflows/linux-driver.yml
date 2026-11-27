@@ -100,6 +100,10 @@ jobs:
           -o driver_cardboardplusplus/build/driver_tests \
           driver_cardboardplusplus/tests/test_wire_protocol.cpp
         ./driver_cardboardplusplus/build/driver_tests
+        g++ -std=c++17 -O2 -I driver_cardboardplusplus/include \
+          -o driver_cardboardplusplus/build/eye_format_tests \
+          driver_cardboardplusplus/tests/test_eye_format.cpp
+        ./driver_cardboardplusplus/build/eye_format_tests
 
     - name: Validate driver manifest and profile
       run: |

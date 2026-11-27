@@ -456,7 +456,7 @@ void HmdDriver::ApplyStreamSettings(const cbpp::PayloadSettingsChange& settings)
     int bps = (settings.bitrate_kbps >= 1 && settings.bitrate_kbps <= 100000)
         ? (int)settings.bitrate_kbps * 1000 : -1;
     ApplyEncoderSettings((int)settings.width, (int)settings.height, (int)settings.fps,
-                         bps, settings.encoder != 0, "bridge-settings");
+                         bps, settings.encoder != 0, "bridge-settings", settings.encoder ? "gpu" : "cpu");
 }
 // Creates the telemetry SHM region and emits an initial status; called from Activate.
 bool HmdDriver::InitializeBridge()

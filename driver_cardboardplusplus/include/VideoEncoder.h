@@ -5,6 +5,7 @@
 #include <utility>
 #include <functional>
 #include <mutex>
+#include <string>
 #include "BridgeProtocol.h"
 #include "GpuImage.h"
 struct AVCodecContext;
@@ -31,7 +32,7 @@ public:
     VideoEncoder();
     ~VideoEncoder();
     bool Initialize(int width, int height, int fps, int bitrate, bool useGpuEncoding,
-                    VulkanContext* pVulkan = nullptr);
+                    VulkanContext* pVulkan = nullptr, const char* codec = nullptr);
     void Shutdown();
     bool ComposeSBSGPU(const std::vector<GpuImage>& lefts,
                        const std::vector<GpuImage>& rights,
@@ -67,6 +68,7 @@ private:
     SwsContext* m_pConvertContext;
     bool m_initialized;
     bool m_useGpuEncoding;
+    std::string m_codecChoice;
 // Vulkan composer state; the encoder has no graphics device of its own.
     VulkanContext* m_pVulkan = nullptr;
     VulkanCompose* m_pVkCompose = nullptr;

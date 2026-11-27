@@ -1,0 +1,23 @@
+# Video portability audit and verification status
+
+The Linux-port merge replaced the Windows D3D11 compose/readback path with D3D11 copies imported into Vulkan, followed by Vulkan composition and NV12 conversion. The reported Windows staircase pattern has not been reproduced here; the original cause is **not confirmed**. Linux working does not validate the separate Windows import path.
+
+## Changes in this branch
+
+- `EyeFormat.h` maps supported typed Windows DXGI formats to their Vulkan equivalents, with Windows SDK assertions and portable tests. OpenVR documents `nFormat` as a DXGI format on the [driver API page](https://github.com/ValveSoftware/openvr/blob/master/docs/Driver_API_Documentation.md); support for a mapping does not guarantee device import or sampling support. Unknown, typeless, depth, compressed and X-channel formats are rejected. Linux continues to use its existing format convention.
+- Windows eye sampling now uses `GENERAL`, preserving the D3D11-produced content and transferring ownership to and from the external API, instead of sampling a sampled-only image in `TRANSFER_SRC_OPTIMAL` after an `UNDEFINED` transition. KMT import now checks compatible memory types and uses a dedicated allocation; a matching adapter and required Vulkan features are checked. These changes are not validated on Windows drivers or hardware.
+- Windows private-copy mutexes now require `AcquireSync` to return exactly `S_OK`, drop the frame on failure, and recreate abandoned copies. The encoder-busy flag is set before the worker can complete; legacy shared KMT handles are not closed as NT handles.
+- Linux semaphore-fd import no longer closes descriptors after Vulkan takes ownership. The sampled descriptor now uses a shader-readable layout. VAAPI gets an NV12 hardware-frame pool and uploads software frames; the first accessible render node is used, which may not be the best GPU. These changes are not tested on a real Linux GPU. Linux direct-mode layer, sync and lifetime behavior was deliberately left unchanged.
+- Explicit BRIDGE_CFG codec names request that encoder rather than an unrelated hardware encoder. `gpu`/`auto` retain fallback behavior, while the existing shared-memory UI remains a CPU/GPU choice. Actual encoder availability and initialization depend on the FFmpeg build and hardware.
+
+## Remaining risks
+
+- The Windows Vulkan/D3D11 keyed-mutex, layout, ownership and external-image format contract still needs Vulkan validation and real SteamVR tests across AMD, NVIDIA, Intel and hybrid systems. Import compatibility also depends on external image format capabilities. The changes could affect working systems.
+- Linux producer layout, opaque-fd allocation compatibility and the exact SteamVR sync-handle contract are not established. The first Linux layout transition still starts from `UNDEFINED`, and the existing direct-mode code assumes a semaphore-fd contract, uses submitted swap images asynchronously, and handles only its current layer behavior. A slow encoder or teardown may race resource reuse. Do not change these assumptions without testing against the working Linux setup.
+- The Windows encoder-idle wait is bounded, so a stalled worker can outlive the timeout during resource teardown. Fence timeout and failure paths also need GPU validation and lifetime review.
+- `SpirvCompiler.cpp` changes the emitted SPIR-V version header to 1.5 without validating the complete module. Requiring Vulkan 1.2 features is not proof that all translated modules are valid. Validate the real Windows-generated shader modules with SPIR-V Tools and Vulkan validation before claiming portability.
+- VAAPI render-node selection does not match the Vulkan/SteamVR device, and real FFmpeg hardware encoding, frame lifetime and fallback behavior are unverified. The deployed `libx264`, AMF, NVENC and QSV availability varies by distribution and machine.
+
+## Verification required
+
+Capture Windows composed BGRA and pre-encode NV12 for the same frame and compare to a decoded preview; collect `vrserver.txt`, selected adapter/LUID, texture format, import, codec and validation-layer logs. Exercise resize, timeout, abandonment, device loss, multiple overlays, codec selection, hybrid GPUs and slow encoder teardown. Run Linux on the known-working setup, including software and VAAPI encoding. CI and standalone format tests do not replace the project's build/install/launch and real headset gates.
