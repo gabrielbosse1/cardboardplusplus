@@ -84,8 +84,18 @@ void InitDumpState() {
     s.ready = true;
     DriverLogFFmpeg("Frame dump enabled: first %d frames -> %s", s.remaining, s.dir);
 }
+// MSVC /sdl flags fopen (C4996); use fopen_s there.
+FILE* OpenFileWrite(const char* path) {
+#ifdef _WIN32
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "wb") != 0) return nullptr;
+    return f;
+#else
+    return fopen(path, "wb");
+#endif
+}
 void DumpFile(const char* path, const void* data, size_t size) {
-    FILE* f = fopen(path, "wb");
+    FILE* f = OpenFileWrite(path);
     if (!f) {
         DriverLogFFmpeg("frame dump: fopen %s failed", path);
         return;
@@ -114,7 +124,7 @@ void DumpBgraBmp(const FrameDump& s, unsigned frame, const uint8_t* bgra,
     memcpy(header + 34, &imageBytes, 4);
     char path[600];
     snprintf(path, sizeof(path), "%s\\frame%u_%dx%d.bgra.bmp", s.dir, frame, w, h);
-    FILE* f = fopen(path, "wb");
+    FILE* f = OpenFileWrite(path);
     if (!f) {
         DriverLogFFmpeg("frame dump: fopen %s failed", path);
         return;
