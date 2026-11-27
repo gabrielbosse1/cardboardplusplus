@@ -20,7 +20,6 @@ using namespace vr;
 
 namespace {
 constexpr uint32_t kSwapImages = 3;
-constexpr uint64_t kSemaphoreTimeoutNs = 1000000000ull; // 1s
 }  // namespace
 
 #ifndef _WIN32
@@ -386,22 +385,21 @@ void HmdDriver::PostPresent()
     // Frame timing is reported from the compositor, not from here.
 }
 
-// Imports the compositor's sync handle as an external semaphore and waits on it.
-// Reuses the imported semaphore while the handle stays the same, because importing
-// per frame would leak one semaphore per frame.
+// Present performs no host-side read of the eye textures on Linux; GPU ordering
+// against compositor writes comes from the per-eye dma-buf sync_file fences
+// imported in VulkanCompose::Compose. Accept non-zero IPC sync handles so
+// SteamVR builds that supply one still advance frames to the composer.
 bool HmdDriver::AcquireSyncTexture(vr::SharedTextureHandle_t syncTexture)
 {
-    // OpenVR's bundled direct-mode interface does not specify the Linux
-    // handle type or ownership. Never treat it as an fd without that contract.
-    static unsigned failures = 0;
-    if (++failures <= 3 || failures % 300 == 0) {
-        DriverLog("[compat] event=sync_handle_unresolved handle_present=%d drops=%u",
-                  syncTexture != 0, failures);
+    if (syncTexture != 0 && m_cachedSyncHandle != syncTexture) {
+        m_cachedSyncHandle = syncTexture;
+        DriverLog("Present: compositor supplied sync handle 0x%llx; relying on per-eye dma-buf fences",
+                  (unsigned long long)syncTexture);
     }
-    return false;
+    m_syncAcquired = (syncTexture != 0);
+    return true;
 }
 
-// No sync handle is acquired while its Linux contract is unknown.
 void HmdDriver::ReleaseSyncTexture()
 {
     m_syncAcquired = false;

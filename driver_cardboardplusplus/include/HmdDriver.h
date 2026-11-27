@@ -139,10 +139,6 @@ private:
     std::map<vr::SharedTextureHandle_t, ID3D11Texture2D*> m_textureHandleMap;
     ID3D11Texture2D* m_pSyncTexture;
     IDXGIKeyedMutex* m_pSyncMutex;
-#else
-    // Compositor sync arrives as an external semaphore fd; it is imported once per
-    // handle and waited on in Present.
-    VkSemaphore m_syncSemaphore = VK_NULL_HANDLE;
 #endif
 // Encode queue + encoder config; Present produces PendingFrame, the encoding thread consumes it under m_encoderMutex.
     std::thread m_encodingThread;

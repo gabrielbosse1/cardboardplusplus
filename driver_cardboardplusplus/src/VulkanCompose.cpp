@@ -29,40 +29,65 @@ static int ExportDmaBufSyncFile(int fd) {
     if (ioctl(fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &info) != 0) return -1;
     return info.fd;
 }
-// Imports each eye's sync file as a temporary binary semaphore. The compose
-// submission waits on them, so sampling starts exactly when the compositor's
-// writes finish. Successful imports transfer fd ownership to Vulkan.
-static bool ImportEyeSemaphores(VulkanContext* ctx, int leftFd, int rightFd,
+// Imports each unique eye dma-buf's write fence as a temporary binary semaphore.
+// The compose submission waits on them at fragment-shader stage so sampling
+// starts after compositor writes complete. Successful imports transfer fd
+// ownership to Vulkan.
+static bool ImportEyeSemaphores(VulkanContext* ctx,
+                                const std::vector<GpuImage>& lefts,
+                                const std::vector<GpuImage>& rights,
+                                size_t layerCount,
                                 std::vector<VkSemaphore>& outSems) {
     auto createSem = (PFN_vkCreateSemaphore)ctx->GetDeviceProc("vkCreateSemaphore");
     auto importFd = (PFN_vkImportSemaphoreFdKHR)ctx->GetDeviceProc("vkImportSemaphoreFdKHR");
     if (!createSem || !importFd) return false;
-    int syncs[2] = { ExportDmaBufSyncFile(leftFd), ExportDmaBufSyncFile(rightFd) };
-    for (int s : syncs) {
-        if (s < 0) continue;
-        VkSemaphoreCreateInfo sci = {};
-        sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-        VkSemaphore sem = VK_NULL_HANDLE;
-        if (createSem(ctx->Device(), &sci, nullptr, &sem) != VK_SUCCESS) {
-            close(s);
-            continue;
-        }
-        VkImportSemaphoreFdInfoKHR info = {};
-        info.sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR;
-        info.semaphore = sem;
-        info.flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT;
-        info.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
-        info.fd = s;
-        if (importFd(ctx->Device(), &info) == VK_SUCCESS) {
-            // A successful Vulkan import consumes s; never close it ourselves.
-            outSems.push_back(sem);
-        } else {
-            auto destroy = (PFN_vkDestroySemaphore)ctx->GetDeviceProc("vkDestroySemaphore");
-            if (destroy) destroy(ctx->Device(), sem, nullptr);
-            close(s);
+    int seenFds[8] = {};
+    size_t seenCount = 0;
+    for (size_t i = 0; i < layerCount && i < 4; ++i) {
+        int layerFds[2] = { (int)lefts[i].handle, (int)rights[i].handle };
+        for (int dmaFd : layerFds) {
+            if (dmaFd < 0) continue;
+            bool duplicate = false;
+            for (size_t k = 0; k < seenCount; ++k) {
+                if (seenFds[k] == dmaFd) { duplicate = true; break; }
+            }
+            if (duplicate) continue;
+            seenFds[seenCount++] = dmaFd;
+
+            int s = ExportDmaBufSyncFile(dmaFd);
+            if (s < 0) continue;
+            VkSemaphoreCreateInfo sci = {};
+            sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+            VkSemaphore sem = VK_NULL_HANDLE;
+            if (createSem(ctx->Device(), &sci, nullptr, &sem) != VK_SUCCESS) {
+                close(s);
+                continue;
+            }
+            VkImportSemaphoreFdInfoKHR info = {};
+            info.sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR;
+            info.semaphore = sem;
+            info.flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT;
+            info.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+            info.fd = s;
+            if (importFd(ctx->Device(), &info) == VK_SUCCESS) {
+                // A successful Vulkan import consumes s; never close it ourselves.
+                outSems.push_back(sem);
+            } else {
+                auto destroy = (PFN_vkDestroySemaphore)ctx->GetDeviceProc("vkDestroySemaphore");
+                if (destroy) destroy(ctx->Device(), sem, nullptr);
+                close(s);
+            }
         }
     }
     return !outSems.empty();
+}
+
+static void DestroyEyeSemaphores(VulkanContext* ctx, std::vector<VkSemaphore>& sems) {
+    auto destroySem = (PFN_vkDestroySemaphore)ctx->GetDeviceProc("vkDestroySemaphore");
+    if (destroySem) {
+        for (VkSemaphore s : sems) destroySem(ctx->Device(), s, nullptr);
+    }
+    sems.clear();
 }
 #endif
 
@@ -1197,14 +1222,13 @@ bool VulkanCompose::Compose(const std::vector<GpuImage>& lefts,
 #ifndef _WIN32
     std::vector<VkSemaphore> eyeSems;
     uint32_t waitCount = 0;
-    VkSemaphore eyeSemaphores[2] = {};
-    VkPipelineStageFlags waitStages[2] = {};
-    if (ImportEyeSemaphores(m_pCtx, (int)lefts[0].handle, (int)rights[0].handle,
-                            eyeSems)) {
+    VkSemaphore eyeSemaphores[2 * kMaxLayers] = {};
+    VkPipelineStageFlags waitStages[2 * kMaxLayers] = {};
+    if (ImportEyeSemaphores(m_pCtx, lefts, rights, n, eyeSems)) {
         waitCount = (uint32_t)eyeSems.size();
         for (uint32_t s = 0; s < waitCount; s++) {
             eyeSemaphores[s] = eyeSems[s];
-            waitStages[s] = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            waitStages[s] = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
         }
     }
 #endif
@@ -1223,6 +1247,9 @@ bool VulkanCompose::Compose(const std::vector<GpuImage>& lefts,
     resetFences(m_pCtx->Device(), 1, &m_fence);
     VkResult res = submitQ(m_pCtx->Queue(), 1, &si, m_fence);
     if (res != VK_SUCCESS) {
+#ifndef _WIN32
+        DestroyEyeSemaphores(m_pCtx, eyeSems);
+#endif
         // Transient (a busy queue right after a SteamVR restart is the known
         // case): keep the pipeline and let the caller fall back for this frame.
         m_submitFails++;
@@ -1241,10 +1268,7 @@ bool VulkanCompose::Compose(const std::vector<GpuImage>& lefts,
     }
     FRAME_LOG("VK-COMPOSE: fence res=%d", (int)res);
 #ifndef _WIN32
-    {
-        auto destroySem = (PFN_vkDestroySemaphore)m_pCtx->GetDeviceProc("vkDestroySemaphore");
-        for (VkSemaphore s : eyeSems) if (destroySem) destroySem(m_pCtx->Device(), s, nullptr);
-    }
+    DestroyEyeSemaphores(m_pCtx, eyeSems);
 #endif
     m_frame++;
     int used[2 * kMaxLayers] = {};
