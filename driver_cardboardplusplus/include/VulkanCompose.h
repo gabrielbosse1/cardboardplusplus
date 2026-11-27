@@ -19,7 +19,7 @@ public:
     bool ToNv12(const uint8_t** outData, size_t* outSize);
     // Copies the composed frame to host-visible memory. This is the source
     // for the software conversion path and for the frame hash diagnostic.
-    void CopyToHost();
+    bool CopyToHost();
     const uint8_t* HostData() const { return m_hostMap; }
     bool Compose(const std::vector<GpuImage>& lefts,
                  const std::vector<GpuImage>& rights,

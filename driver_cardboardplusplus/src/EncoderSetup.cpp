@@ -172,6 +172,7 @@ bool HmdDriver::ApplyEncoderSettings(int w, int h, int fps, int bitrateBps, bool
         m_pVideoEncoder = nullptr;
         return false;
     }
+    m_pVideoEncoder->RequestKeyframe();
     m_encoderInitialized = true;
     m_encoderPts = 0;
     DriverLog("Encoder re-initialized at %dx%d @%d fps from %s", m_encoderW, m_encoderH, m_encoderFps, reason);
@@ -208,15 +209,8 @@ bool HmdDriver::ApplyHardwareCap(int capW, int capH)
             DriverLog("Hardware cap %dx%d received (encoder not ready, applied on init)", capW, capH);
             return true;
         }
-        int oldW = m_encoderW;
-        int oldH = m_encoderH;
-        ClampEncoderToCap();
-        if (m_encoderW == oldW && m_encoderH == oldH) {
-            DriverLog("Hardware cap %dx%d >= current encoder %dx%d, no change", capW, capH, oldW, oldH);
-            return false;
-        }
-        DriverLog("Re-initializing encoder under hardware cap %dx%d: %dx%d -> %dx%d",
-                  capW, capH, oldW, oldH, m_encoderW, m_encoderH);
+        // Leave active dimensions untouched until ApplyEncoderSettings has
+        // compared them with the newly clamped target.
         clampedW = m_encoderW;
         clampedH = m_encoderH;
         fps = m_encoderFps;
