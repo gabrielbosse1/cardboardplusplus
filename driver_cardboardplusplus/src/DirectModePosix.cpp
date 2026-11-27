@@ -8,6 +8,7 @@
 #endif
 #include "DriverLog.h"
 #include "DebugLog.h"
+#include "SubmitLayerQueue.h"
 #include <vulkan/vulkan.h>
 #include <algorithm>
 #include <chrono>
@@ -269,21 +270,20 @@ void HmdDriver::GetNextSwapTextureSetIndex(vr::SharedTextureHandle_t sharedTextu
 // dma-buf fds to the Vulkan composer without any intermediate copy.
 void HmdDriver::SubmitLayer(const SubmitLayerPerEye_t (&perEye)[2])
 {
-    std::lock_guard<std::mutex> lock(m_submitLayersMutex);
-    // VulkanCompose supports at most four layers per frame.
-    if (m_submitLayers.size() >= 4) {
-        static unsigned droppedLayers = 0;
-        if (++droppedLayers <= 3 || droppedLayers % 300 == 0)
-            DriverLog("DirectMode: layer limit reached (drop=%u)", droppedLayers);
-        return;
-    }
     SubmitLayerInfo info;
     info.hTextureLeft = perEye[0].hTexture;
     info.hTextureRight = perEye[1].hTexture;
     info.boundsLeft = perEye[0].bounds;
     info.boundsRight = perEye[1].bounds;
-    m_submitLayers.push_back(info);
-    m_hasSubmit.store(true, std::memory_order_release);
+
+    std::lock_guard<std::mutex> lock(m_submitLayersMutex);
+    // VulkanCompose supports at most four layers per frame.
+    if (!cbpp::StageSubmittedLayer(m_submitLayers, m_hasSubmit, info)) {
+        static unsigned droppedLayers = 0;
+        if (++droppedLayers <= 3 || droppedLayers % 300 == 0)
+            DriverLog("DirectMode: layer limit reached (drop=%u)", droppedLayers);
+        return;
+    }
     static bool loggedFirstSubmit = false;
     if (!loggedFirstSubmit) {
         loggedFirstSubmit = true;
@@ -291,15 +291,12 @@ void HmdDriver::SubmitLayer(const SubmitLayerPerEye_t (&perEye)[2])
     }
 }
 
-// Composites the queued layers into the encoder frame. The compositor's own sync
-// primitive arrives as an external semaphore fd; waiting on it here is what keeps
-// the imported images from being read mid-render.
+// Composites the queued layers into the encoder frame.
 void HmdDriver::Present(vr::SharedTextureHandle_t syncTexture)
 {
     if (!m_streamEnabled.load(std::memory_order_relaxed)) {
         std::lock_guard<std::mutex> lock(m_submitLayersMutex);
-        m_submitLayers.clear();
-        m_hasSubmit.store(false, std::memory_order_release);
+        cbpp::DiscardSubmittedLayers(m_submitLayers, m_hasSubmit);
         return;
     }
     m_presentCount++;
@@ -308,25 +305,25 @@ void HmdDriver::Present(vr::SharedTextureHandle_t syncTexture)
         DriverLog("Present: call=%u sync=%llu", presentLogs, (unsigned long long)syncTexture);
     }
     if (!m_vulkan.IsReady() || !m_encoderInitialized || !m_pVideoEncoder) {
-        m_hasSubmit.store(false, std::memory_order_release);
+        std::lock_guard<std::mutex> lock(m_submitLayersMutex);
+        cbpp::DiscardSubmittedLayers(m_submitLayers, m_hasSubmit);
         return;
     }
     // Some SteamVR builds hand Present a null sync handle in direct mode.
     // That means there is nothing extra to wait on, not that the frame is bad.
     const bool hasSync = syncTexture != 0;
     if (hasSync && !AcquireSyncTexture(syncTexture)) {
-        m_hasSubmit.store(false, std::memory_order_release);
+        std::lock_guard<std::mutex> lock(m_submitLayersMutex);
+        cbpp::DiscardSubmittedLayers(m_submitLayers, m_hasSubmit);
         return;
     }
     std::vector<SubmitLayerInfo> layers;
     {
         std::lock_guard<std::mutex> lock(m_submitLayersMutex);
-        if (!m_hasSubmit.load(std::memory_order_acquire)) {
+        if (!cbpp::DrainSubmittedLayers(m_submitLayers, m_hasSubmit, layers)) {
             if (hasSync) ReleaseSyncTexture();
             return;
         }
-        layers = m_submitLayers;
-        m_hasSubmit.store(false, std::memory_order_release);
     }
     {
         std::lock_guard<std::mutex> lock(m_encodeMutex);

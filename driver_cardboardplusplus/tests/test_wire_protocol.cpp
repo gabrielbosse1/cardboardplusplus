@@ -9,6 +9,7 @@
 #include "CardboardWire.h"
 #include "H264Utils.h"
 #include "GripLimit.h"
+#include "SubmitLayerQueue.h"
 // --- grip limit -----------------------------------------------------------------
 // SteamVR reads the grip limit as both the curl/splay reference and the ceiling
 // on skeletal motion. Left null, SteamVR substitutes the Index controller's
@@ -832,6 +833,75 @@ static void test_phone_timeout_keeps_active_target() {
     assert(hasPhoneTarget);
     printf("PASS: phone timeout does NOT clear active target\n");
 }
+struct TestSubmitLayer {
+    uint64_t left;
+    uint64_t right;
+};
+static void test_submit_layer_queue_continuous_frames() {
+    std::vector<TestSubmitLayer> staged;
+    std::atomic<bool> hasSubmit{false};
+    for (uint64_t frame = 1; frame <= 200; ++frame) {
+        assert(cbpp::StageSubmittedLayer(staged, hasSubmit, TestSubmitLayer{frame, frame + 1000}));
+        assert(hasSubmit.load(std::memory_order_acquire));
+        std::vector<TestSubmitLayer> drained;
+        assert(cbpp::DrainSubmittedLayers(staged, hasSubmit, drained));
+        assert(!hasSubmit.load(std::memory_order_acquire));
+        assert(staged.empty());
+        assert(drained.size() == 1);
+        assert(drained[0].left == frame && drained[0].right == frame + 1000);
+    }
+    printf("PASS: submit layer queue drains cleanly across continuous frames\n");
+}
+static void test_submit_layer_queue_multilayer_and_cap() {
+    std::vector<TestSubmitLayer> staged;
+    std::atomic<bool> hasSubmit{false};
+    for (uint64_t i = 0; i < cbpp::kMaxSubmittedLayers; ++i) {
+        assert(cbpp::StageSubmittedLayer(staged, hasSubmit, TestSubmitLayer{10 + i, 20 + i}));
+    }
+    assert(!cbpp::StageSubmittedLayer(staged, hasSubmit, TestSubmitLayer{99, 99}));
+    assert(!cbpp::StageSubmittedLayer(staged, hasSubmit, TestSubmitLayer{100, 100}));
+    assert(hasSubmit.load(std::memory_order_acquire));
+    std::vector<TestSubmitLayer> drained;
+    assert(cbpp::DrainSubmittedLayers(staged, hasSubmit, drained));
+    assert(staged.empty());
+    assert(!hasSubmit.load(std::memory_order_acquire));
+    assert(drained.size() == cbpp::kMaxSubmittedLayers);
+    for (uint64_t i = 0; i < cbpp::kMaxSubmittedLayers; ++i) {
+        assert(drained[i].left == 10 + i && drained[i].right == 20 + i);
+    }
+    // Subsequent frame accepts layers immediately after a capped frame drains.
+    assert(cbpp::StageSubmittedLayer(staged, hasSubmit, TestSubmitLayer{55, 66}));
+    drained.clear();
+    assert(cbpp::DrainSubmittedLayers(staged, hasSubmit, drained));
+    assert(drained.size() == 1 && drained[0].left == 55);
+    printf("PASS: submit layer queue preserves up to 4 layers and caps excess per frame\n");
+}
+static void test_submit_layer_queue_discard_on_skipped_present() {
+    std::vector<TestSubmitLayer> staged;
+    std::atomic<bool> hasSubmit{false};
+    // Simulate frames arriving while the encoder is reconfiguring or stream is paused.
+    for (uint64_t frame = 1; frame <= 10; ++frame) {
+        assert(cbpp::StageSubmittedLayer(staged, hasSubmit, TestSubmitLayer{frame, frame}));
+        cbpp::DiscardSubmittedLayers(staged, hasSubmit);
+        assert(staged.empty());
+        assert(!hasSubmit.load(std::memory_order_acquire));
+    }
+    // First frame once ready presents only the fresh submission.
+    assert(cbpp::StageSubmittedLayer(staged, hasSubmit, TestSubmitLayer{42, 43}));
+    std::vector<TestSubmitLayer> drained;
+    assert(cbpp::DrainSubmittedLayers(staged, hasSubmit, drained));
+    assert(drained.size() == 1 && drained[0].left == 42 && drained[0].right == 43);
+    printf("PASS: submit layer queue discards staged layers on skipped presents\n");
+}
+static void test_submit_layer_queue_empty_present_is_noop() {
+    std::vector<TestSubmitLayer> staged;
+    std::atomic<bool> hasSubmit{false};
+    std::vector<TestSubmitLayer> drained;
+    assert(!cbpp::DrainSubmittedLayers(staged, hasSubmit, drained));
+    assert(drained.empty());
+    assert(staged.empty());
+    printf("PASS: submit layer queue empty present returns false without stale layers\n");
+}
 int main() {
     printf("=== Driver wire protocol tests ===\n\n");
     test_grip_limit_is_a_closed_fist();
@@ -893,6 +963,10 @@ int main() {
     test_carboard_cap_does_not_send_ack();
     test_phone_timeout_clears_target();
     test_phone_timeout_keeps_active_target();
+    test_submit_layer_queue_continuous_frames();
+    test_submit_layer_queue_multilayer_and_cap();
+    test_submit_layer_queue_discard_on_skipped_present();
+    test_submit_layer_queue_empty_present_is_noop();
     printf("\n=== All driver tests passed ===\n");
     return 0;
 }
