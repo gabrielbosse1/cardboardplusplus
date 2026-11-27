@@ -31,10 +31,9 @@ static int ExportDmaBufSyncFile(int fd) {
 }
 // Imports each eye's sync file as a temporary binary semaphore. The compose
 // submission waits on them, so sampling starts exactly when the compositor's
-// writes finish. Returns the semaphores and the fds to close after submission.
+// writes finish. Successful imports transfer fd ownership to Vulkan.
 static bool ImportEyeSemaphores(VulkanContext* ctx, int leftFd, int rightFd,
-                                std::vector<VkSemaphore>& outSems,
-                                std::vector<int>& outFds) {
+                                std::vector<VkSemaphore>& outSems) {
     auto createSem = (PFN_vkCreateSemaphore)ctx->GetDeviceProc("vkCreateSemaphore");
     auto importFd = (PFN_vkImportSemaphoreFdKHR)ctx->GetDeviceProc("vkImportSemaphoreFdKHR");
     if (!createSem || !importFd) return false;
@@ -55,8 +54,8 @@ static bool ImportEyeSemaphores(VulkanContext* ctx, int leftFd, int rightFd,
         info.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
         info.fd = s;
         if (importFd(ctx->Device(), &info) == VK_SUCCESS) {
+            // A successful Vulkan import consumes s; never close it ourselves.
             outSems.push_back(sem);
-            outFds.push_back(s);
         } else {
             auto destroy = (PFN_vkDestroySemaphore)ctx->GetDeviceProc("vkDestroySemaphore");
             if (destroy) destroy(ctx->Device(), sem, nullptr);
@@ -1197,12 +1196,11 @@ bool VulkanCompose::Compose(const std::vector<GpuImage>& lefts,
 #endif
 #ifndef _WIN32
     std::vector<VkSemaphore> eyeSems;
-    std::vector<int> syncFds;
     uint32_t waitCount = 0;
     VkSemaphore eyeSemaphores[2] = {};
     VkPipelineStageFlags waitStages[2] = {};
     if (ImportEyeSemaphores(m_pCtx, (int)lefts[0].handle, (int)rights[0].handle,
-                            eyeSems, syncFds)) {
+                            eyeSems)) {
         waitCount = (uint32_t)eyeSems.size();
         for (uint32_t s = 0; s < waitCount; s++) {
             eyeSemaphores[s] = eyeSems[s];
@@ -1246,7 +1244,6 @@ bool VulkanCompose::Compose(const std::vector<GpuImage>& lefts,
     {
         auto destroySem = (PFN_vkDestroySemaphore)m_pCtx->GetDeviceProc("vkDestroySemaphore");
         for (VkSemaphore s : eyeSems) if (destroySem) destroySem(m_pCtx->Device(), s, nullptr);
-        for (int fd : syncFds) if (fd >= 0) ::close(fd);
     }
 #endif
     m_frame++;
