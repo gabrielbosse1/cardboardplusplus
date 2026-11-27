@@ -53,7 +53,7 @@ jobs:
       # real openvr_api.so at load time; for a CI link a stub is sufficient and
       # proves the driver does not depend on any OpenVR symbol at link time.
       run: |
-        sudo mkdir -p /tmp/openvr_stub
+        mkdir -p /tmp/openvr_stub
         cat > /tmp/openvr_stub/stub.c <<'EOF'
         /* CI stub: the driver's OpenVR driver-API calls are inline accessors
          * (openvr_driver.h), so no real OpenVR symbols are needed at link time.
@@ -176,4 +176,11 @@ jobs:
       run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
 
     - name: Run bridge tests and e2e suite
-      run: cargo test --manifest-path bridge/Cargo.toml -- --test-threads=1
+      run: |
+        set +e
+        cargo test --manifest-path bridge/Cargo.toml -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/bridge-test.log"
+        status=${PIPESTATUS[0]}
+        if [ "$status" -ne 0 ]; then
+          python3 -c 'import sys; lines=open(sys.argv[1], errors="replace").readlines(); print("\n".join("::error::" + line.rstrip().replace("%", "%25") for line in lines[-40:]))' "$RUNNER_TEMP/bridge-test.log"
+          exit "$status"
+        fi
