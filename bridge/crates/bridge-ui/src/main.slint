@@ -279,12 +279,6 @@ export component MainWindow inherits Window {
                     NavButton { text: "General";     active: current_tab == 2; clicked() => { current_tab = 2; } }
                     NavButton { text: "Diagnostics"; active: current_tab == 3; clicked() => { current_tab = 3; } }
                     Rectangle { vertical-stretch: 1; }
-                    Text {
-                        text: "video · UDP\nhand tracking · MediaPipe";
-                        font-size: 10px;
-                        color: #5b5b68;
-                        wrap: word-wrap;
-                    }
                 }
             }
             Rectangle {
@@ -297,16 +291,11 @@ export component MainWindow inherits Window {
                         padding: 20px;
                         spacing: 14px;
                         Text { text: "STREAM"; font-size: 21px; font-weight: 700; color: #ebebf3; }
-                        Text {
-                            text: "Encoding & delivery — settings are owned here and pushed to the SteamVR driver.";
-                            font-size: 12px;
-                            color: #85858f;
-                        }
                         Panel {
                             VerticalBox {
                                 padding: 18px;
                                 spacing: 12px;
-                                SectionTitle { text: "Resolution (SBS width × height)"; }
+                                SectionTitle { text: "Resolution (both eyes, width × height)"; }
                                 HorizontalBox {
                                     spacing: 10px;
                                     TextEdit {
@@ -358,13 +347,16 @@ export component MainWindow inherits Window {
                                     value: stream_bitrate_kbps;
                                     changed(v) => { stream_bitrate_kbps = v; }
                                 }
+                                HintText { text: "Higher bitrate looks sharper but needs a stronger Wi-Fi link."; }
                                 Rectangle { height: 1px; background: #2b2b36; }
                                 SectionTitle { text: "Encoder"; }
                                 ComboBox {
-                                    model: ["Software (libx264)", "GPU (NVENC/AMF)"];
+                                    model: ["CPU", "GPU"];
                                     current-index: stream_encoder;
-                                    selected(v) => { stream_encoder = v == "GPU (NVENC/AMF)" ? 1 : 0; }
+                                    selected(v) => { stream_encoder = v == "GPU" ? 1 : 0; }
                                 }
+                                HintText { text: "GPU: hardware encoder, lower CPU usage and latency, requires a supported GPU."; }
+                                HintText { text: "CPU: software encoder, works everywhere, higher CPU load."; }
                             }
                         }
                         HintText { text: telemetry_line; }
@@ -372,7 +364,7 @@ export component MainWindow inherits Window {
                             spacing: 12px;
                             alignment: end;
                             ActionButton {
-                                text: "Apply & push to driver";
+                                text: "Apply";
                                 variant: "primary";
                                 clicked() => { apply_settings(); }
                             }
@@ -388,11 +380,6 @@ export component MainWindow inherits Window {
                         padding: 20px;
                         spacing: 14px;
                         Text { text: "CAMERA"; font-size: 21px; font-weight: 700; color: #ebebf3; }
-                        Text {
-                            text: "Phone camera passthrough + MediaPipe hand tracking.";
-                            font-size: 12px;
-                            color: #85858f;
-                        }
                         Panel {
                             VerticalBox {
                                 padding: 18px;
@@ -402,30 +389,25 @@ export component MainWindow inherits Window {
                             }
                         }
                         HintText {
-                            text: "Hand tracking ships together with the stream — the Bridge is the single switch for both."; }
+                            text: "Hand tracking starts and stops with the stream."; }
                     }
                     if current_tab == 2 : VerticalBox {
                         padding: 20px;
                         spacing: 14px;
                         Text { text: "GENERAL"; font-size: 21px; font-weight: 700; color: #ebebf3; }
-                        Text {
-                            text: "One-click installer / updater for the whole product (driver DLL + Android APK).";
-                            font-size: 12px;
-                            color: #85858f;
-                        }
                         Panel {
                             VerticalBox {
                                 padding: 18px;
                                 spacing: 10px;
                                 SectionTitle { text: "SteamVR driver"; }
-                                HintText { text: "Built DLL → install dir (any current driver is backed up first)."; }
+                                HintText { text: "Driver DLL (the installed driver is backed up first)."; }
                                 TextEdit {
                                     text: driver_dll_src;
                                     edited(t) => { driver_dll_src = t; }
                                     height: 34px;
                                     vertical-stretch: 0;
                                 }
-                                HintText { text: "Install directory: SteamVR\\drivers\\cardboardplusplus"; }
+                                HintText { text: "SteamVR drivers folder"; }
                                 TextEdit {
                                     text: steamvr_drivers_dir;
                                     edited(t) => { steamvr_drivers_dir = t; }
@@ -454,7 +436,7 @@ export component MainWindow inherits Window {
                                 padding: 18px;
                                 spacing: 10px;
                                 SectionTitle { text: "Android client"; }
-                                HintText { text: "APK path (built artifact)."; }
+                                HintText { text: "APK file"; }
                                 TextEdit {
                                     text: apk_path;
                                     edited(t) => { apk_path = t; }
@@ -523,11 +505,6 @@ export component MainWindow inherits Window {
                         padding: 20px;
                         spacing: 14px;
                         Text { text: "DIAGNOSTICS"; font-size: 21px; font-weight: 700; color: #ebebf3; }
-                        Text {
-                            text: "Readout of the shared-memory status region (bridge-shm).";
-                            font-size: 12px;
-                            color: #85858f;
-                        }
                         Panel {
                             VerticalBox {
                                 padding: 18px;
