@@ -40,6 +40,13 @@ jobs:
           exit 1
         }
 
+    - name: Report remaining errors (TEMP diagnostics)
+      if: failure()
+      shell: pwsh
+      run: |
+        $errs = Select-String -Path msbuild.log -Pattern ' error ' | Select-Object -Skip 9 -First 40
+        $errs | ForEach-Object { "::error::$($_.Line)" }
+
     - name: Commit build log (TEMP diagnostics)
       if: failure()
       continue-on-error: true
