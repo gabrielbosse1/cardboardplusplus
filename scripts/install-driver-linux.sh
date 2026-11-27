@@ -46,7 +46,7 @@ stage_closure() {
         case "$libpath" in /*) ;; *) continue ;; esac
         case "$libname" in
             libc.so.6|libm.so.6|libpthread.so.0|libdl.so.2|librt.so.1|libgcc_s.so.1|\
-            ld-linux*|linux-vdso*|libopenvr_api.so|libvulkan.so.1|libX11.so.6) continue ;;
+            ld-linux*|linux-vdso*|libopenvr_api.so|openvr_api.so|libvulkan.so.1|libX11.so.6) continue ;;
         esac
         [ -z "${staged[$libname]:-}" ] || continue
         staged[$libname]=1

@@ -254,7 +254,15 @@ public class VideoDecoder {
       return true;
     } catch (Exception e) {
       Log.e(TAG, "MediaCodec configure failed: " + e.getMessage());
+      if (decoder != null) {
+        try {
+          decoder.release();
+        } catch (Exception releaseError) {
+          Log.w(TAG, "MediaCodec release failed: " + releaseError.getMessage());
+        }
+      }
       decoder = null;
+      configured = false;
       return false;
     }
   }

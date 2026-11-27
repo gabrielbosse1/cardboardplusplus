@@ -1,0 +1,29 @@
+# Hardware test checklist — compatibility audit
+
+**Not run.** The PR remains draft and several findings are unresolved; the pass criteria below describe desired behavior, not a claim the current code meets them. Record OS/session, GPU and driver versions, SteamVR version, FFmpeg build, phone model/Android version, requested and actual codec, logs, and results. Use test accounts and avoid collecting personal information. Run Windows and Linux regressions and compare phone output with the bridge preview.
+
+| ID | Setup and steps | Pass criteria |
+|---|---|---|
+| F01 | Linux AMD RX 580 and Intel iGPU, VAAPI; inject node, allocation, open and first-frame upload/send failures. | Valid VAAPI frames encode; failure falls back to decodable x264 with SPS/PPS and IDR, no leak. Not implemented. |
+| F02 | Linux X11 and Wayland; determine SteamVR sync-handle type from the actual runtime, test null and nonzero handles with Vulkan validation enabled. | Null/nonzero paths use a verified contract; no invalid Vulkan calls, no unsafe reads. Currently nonzero handles are deliberately rejected and may prevent video. |
+| F03 | Vulkan validation; exercise both eyes and FD reuse under export, import, submit and fence failure; repeat with overlays. | Both eyes synchronized; no FD closed after Vulkan consumes it; no leak/use-after-free. Only the double-close portion is addressed. |
+| F04 | Linux, slow encoder, rapid app/scene switch and swap-set teardown. | No early FD/image destruction, corruption, race, hang or validation error. Not implemented. |
+| F05 | Both OSs, change only phone CAP to a lower size while video is running; repeat with tiny caps and size recovery. | Codec output dimensions change to accepted target and phone decodes the first IDR; failed rebuild rolls back. Rollback remains open (F06). |
+| F06 | Both OSs, inject Vulkan and encoder initialization and replacement failures, including session exhaustion. | Activation failure is visible; prior working stream remains usable until a replacement works; bounded retry. Not implemented. |
+| F07 | Windows GPU without NVENC (e.g. GT 1030 if available), iGPU-only, session exhaustion, and injected mid-stream encode errors. | Actual path shown; startup and mid-stream fallback produce decodable IDR with SPS/PPS and no repeated dead stream. Not implemented. |
+| F08 | Windows Optimus/muxless AMD and Linux hybrid with varying Vulkan enumeration / DRM node ordering. | Compositor, encoder and Vulkan identities agree or supported transfers are used; mismatches clearly logged. Only Vulkan vendor/device/driver diagnostics added. |
+| F09 | Both OSs, GPU request with forced x264 fallback and broken encoder; observe bridge with old and new peers. | Actual encoder and state are truthful, GPU unavailable is shown only for a confirmed failed configuration, FPS is measured. Not implemented. |
+| F10 | Linux SteamVR scene plus multiple overlays with ordered SubmitLayer calls. | Scene and up to four overlays/layers accepted by the compositor limit render in expected order; no missing layers or leaks. |
+| F11 | Linux, toggle streaming off/on using SHM settings and primary bridge controls. | Frame processing stops when the relevant setting disables streaming and resumes when enabled; no stale layer. |
+| F12 | Windows TDR/device removed; Linux reset, suspend/resume and resource exhaustion. | Specific failure is logged, dead resources are not reused, recovery is bounded or “Restart SteamVR” appears. Only misleading D3D message corrected. |
+| F13 | Several Android AVC decoders at their real width/height/rate/profile limits and just beyond. | Selected decoder's exact capability is checked; unsupported size renegotiates; no persistent black screen. Not implemented. |
+| F14 | Both OSs and Android phones, color bars including gray ramp and primaries; inspect H.264 VUI for each encoder; test HDR sources. | BT.601 limited shader and VUI agree on phone and preview, no clipped/washed range; HDR is rejected or tone-mapped. Codec metadata requested but hardware encoder behavior and HDR handling remain unverified. |
+| F15 | Linux X11/Wayland, AMD/Intel, restricted render nodes and Steam runtime/sandbox. | A permitted matching node is selected; unavailable access logs actionable codes and safely falls back. Not implemented. |
+| F16 | Linux fault injection at each shared image, IPC, FD and Vulkan allocation/import/bind step. | No partial handles escape; all acquired resources released exactly once. Not implemented. |
+| F17 | Bridge REST sends named AMF/NVENC/QSV values and CPU/GPU; both OSs. | Named choices are honored or explicitly rejected; CPU/GPU help matches actual behavior. Only help corrected. |
+| F18 | Stop/remove preview FFmpeg, feed corrupted H.264, conflict UDP 42069, and continue phone streaming. | Preview-specific error and bounded FFmpeg diagnostics visible; phone stream unaffected. Not implemented. |
+| F19 | Vulkan implementation exposing graphics without compute, and low-feature GPUs/drivers on both OSs. | Compute pass is skipped for graphics-only queue, swscale path gives correct frames; missing required features clearly reported. Feature checks beyond queue support remain open. |
+| F20 | Inject host-copy begin/submit/fence failures after a good frame on both OSs. | Failed copy drops frame; no stale buffer sent; next good frame recovers. |
+| F21 | Android inject MediaCodec configure and start failures repeatedly, then allow success. | Every failed instance released; a subsequent valid configuration starts and decodes; no resource exhaustion. |
+
+For Vulkan validation, run the SteamVR process with the Khronos validation layer enabled if supported, capture its output, and verify external memory/semaphore ownership, image layouts, queue capabilities, teardown and submitted-frame synchronization. Do not disable validation messages to obtain a pass. Test real GPU/SteamVR behavior separately from the code-only checks.

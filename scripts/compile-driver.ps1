@@ -21,10 +21,18 @@ $vsWhereExit = $LASTEXITCODE
 $ErrorActionPreference = $nativePref
 if ($vsWhereExit -ne 0) { throw "vswhere failed" }
 if (-not $msbuild) { throw "MSBuild not found - install the C++ build tools in Visual Studio" }
+$vsRoot = & $vsWhere -latest -property installationPath | Select-Object -First 1
+# The project targets v145 (VS 2026); select v143 automatically on VS 2022 installations.
+$toolsetArg = @()
+if ($vsRoot -and -not (Test-Path (Join-Path $vsRoot "MSBuild\Microsoft\VC\*\Platforms\x64\PlatformToolsets\v145"))) {
+    if (Test-Path (Join-Path $vsRoot "MSBuild\Microsoft\VC\*\Platforms\x64\PlatformToolsets\v143")) {
+        $toolsetArg = @("/p:PlatformToolset=v143")
+    }
+}
 Write-Host "Building driver ($Configuration|x64)..." -ForegroundColor Cyan
 $ErrorActionPreference = "Continue"
 $LASTEXITCODE = 0
-& $msbuild $sln /p:Configuration=$Configuration /p:Platform=x64 /v:minimal
+& $msbuild $sln /p:Configuration=$Configuration /p:Platform=x64 @toolsetArg /v:minimal
 $nativeExit = $LASTEXITCODE
 $ErrorActionPreference = $nativePref
 if ($nativeExit -ne 0) { throw "driver build failed" }
@@ -33,7 +41,6 @@ Write-Host "Driver built: driver_cardboardplusplus\x64\$Configuration\driver_car
 Write-Host "Running driver tests..." -ForegroundColor Cyan
 $clPath = & $vsWhere -latest -find "VC\Tools\MSVC\**\bin\Hostx64\x64\cl.exe" | Select-Object -First 1
 if (-not $clPath) { throw "cl.exe not found - cannot build driver tests" }
-$vsRoot = & $vsWhere -latest -property installationPath
 $devCmd = Join-Path $vsRoot "Common7\Tools\VsDevCmd.bat"
 if (-not (Test-Path $devCmd)) { throw "VsDevCmd.bat not found - cannot build driver tests" }
 $testObj = Join-Path $env:TEMP "cbpp_driver_tests"

@@ -53,7 +53,7 @@ jobs:
       # real openvr_api.so at load time; for a CI link a stub is sufficient and
       # proves the driver does not depend on any OpenVR symbol at link time.
       run: |
-        sudo mkdir -p /tmp/openvr_stub
+        mkdir -p /tmp/openvr_stub
         cat > /tmp/openvr_stub/stub.c <<'EOF'
         /* CI stub: the driver's OpenVR driver-API calls are inline accessors
          * (openvr_driver.h), so no real OpenVR symbols are needed at link time.
@@ -68,10 +68,18 @@ jobs:
 
     - name: Configure and build the driver
       run: |
-        cmake -S driver_cardboardplusplus -B driver_cardboardplusplus/build \
-          -DCMAKE_BUILD_TYPE=Release \
-          -DCBPP_OPENVR_DIR=/tmp/openvr_stub
-        cmake --build driver_cardboardplusplus/build --parallel "$(nproc)"
+        set +e
+        {
+          cmake -S driver_cardboardplusplus -B driver_cardboardplusplus/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCBPP_OPENVR_DIR=/tmp/openvr_stub &&
+          cmake --build driver_cardboardplusplus/build --parallel 2
+        } 2>&1 | tee "$RUNNER_TEMP/linux-driver-build.log"
+        status=${PIPESTATUS[0]}
+        if [ "$status" -ne 0 ]; then
+          python3 -c 'import sys; text=open(sys.argv[1], errors="replace").read()[-3000:]; print("::error::" + text.replace("%", "%25").replace("\n", "%0A").replace("\r", "%0D"))' "$RUNNER_TEMP/linux-driver-build.log"
+          exit "$status"
+        fi
 
     - name: Verify the shared object
       run: |
@@ -93,6 +101,11 @@ jobs:
           echo "unresolved driver symbols:"; nm -D --undefined-only "$SO" | grep -E '\b(HmdDriver|VulkanCompose|VideoEncoder|DeviceProvider|BridgeServer|HandDriver|DirectMode)'; exit 1
         fi
         echo "no unresolved driver symbols"
+        # Server drivers use inline OpenVR vtable accessors only; openvr_api.so must not appear in DT_NEEDED.
+        if readelf -d "$SO" | grep -E '\(NEEDED\).*openvr_api'; then
+          echo "unexpected DT_NEEDED for openvr_api in $SO"; exit 1
+        fi
+        echo "no DT_NEEDED entry for openvr_api"
 
     - name: Driver wire-protocol tests (g++)
       run: |
@@ -141,12 +154,7 @@ jobs:
         [ -f "$RES/controller_profile.json" ] || { echo "missing controller_profile.json"; find "$RES" -type f 2>/dev/null; exit 1; }
         echo "install script copied resources (incl. controller_profile.json)"
         # Verify the manifest is valid JSON with the expected name.
-        python3 -c "
-import json, sys
-m = json.load(open('$MANIFEST'))
-assert m['name'] == 'cardboardplusplus', m
-print('installed manifest valid')
-"
+        python3 -c "import json, sys; m = json.load(open(sys.argv[1])); assert m['name'] == 'cardboardplusplus', m; print('installed manifest valid')" "$MANIFEST"
         # Verify the bridge app desktop entry + icon are installed for the launcher.
         DESKTOP="$TMPHOME/.local/share/applications/cardboardplusplus.desktop"
         [ -f "$DESKTOP" ] || { echo "missing desktop entry $DESKTOP"; exit 1; }
@@ -177,8 +185,15 @@ print('installed manifest valid')
     - name: Set up Rust
       uses: dtolnay/rust-toolchain@stable
 
-    - name: Install ffmpeg (e2e image decode)
-      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+    - name: Install bridge build and test dependencies
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg pkg-config libfontconfig1-dev libfreetype6-dev libxkbcommon-dev
 
     - name: Run bridge tests and e2e suite
-      run: cargo test --manifest-path bridge/Cargo.toml -- --test-threads=1
+      run: |
+        set +e
+        cargo test --manifest-path bridge/Cargo.toml -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/bridge-test.log"
+        status=${PIPESTATUS[0]}
+        if [ "$status" -ne 0 ]; then
+          python3 -c 'import sys; text=open(sys.argv[1], errors="replace").read()[-3000:]; print("::error::" + text.replace("%", "%25").replace("\n", "%0A").replace("\r", "%0D"))' "$RUNNER_TEMP/bridge-test.log"
+          exit "$status"
+        fi

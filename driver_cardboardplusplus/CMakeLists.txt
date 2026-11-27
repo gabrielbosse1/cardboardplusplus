@@ -38,6 +38,17 @@ find_library(OPENVR_API_LIB
           "$ENV{HOME}/.local/share/Steam/steamapps/common/SteamVR/bin/linux64"
           "/usr/lib"
     NO_DEFAULT_PATH)
+# SteamVR ships this library without the usual Unix "lib" prefix, which
+# find_library does not look for on Linux. Accept that filename as well.
+if(NOT OPENVR_API_LIB)
+    find_file(OPENVR_API_LIB
+        NAMES openvr_api.so
+        HINTS ${CBPP_OPENVR_DIR}
+        PATHS "$ENV{HOME}/.steam/steam/steamapps/common/SteamVR/bin/linux64"
+              "$ENV{HOME}/.local/share/Steam/steamapps/common/SteamVR/bin/linux64"
+              "/usr/lib"
+        NO_DEFAULT_PATH)
+endif()
 if(NOT OPENVR_API_LIB)
     message(FATAL_ERROR "openvr_api.so not found. Pass -DCBPP_OPENVR_DIR=<SteamVR>/bin/linux64")
 endif()
@@ -136,8 +147,26 @@ target_compile_definitions(driver_cardboardplusplus PRIVATE
 target_compile_options(driver_cardboardplusplus PRIVATE
     -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
 
+# CMake may turn a full path to a SONAME-less shared object into -lopenvr_api,
+# which cannot find SteamVR's unprefixed openvr_api.so. Ask the ELF linker for
+# the exact filename in that case; keep the normal path for libopenvr_api.so.
+get_filename_component(CBPP_OPENVR_NAME "${OPENVR_API_LIB}" NAME)
+if(CBPP_OPENVR_NAME STREQUAL "openvr_api.so")
+    get_filename_component(CBPP_OPENVR_LIBDIR "${OPENVR_API_LIB}" DIRECTORY)
+    target_link_directories(driver_cardboardplusplus PRIVATE "${CBPP_OPENVR_LIBDIR}")
+    set(CBPP_OPENVR_LINK "-Wl,-l:openvr_api.so")
+else()
+    set(CBPP_OPENVR_LINK "${OPENVR_API_LIB}")
+endif()
+
+# Server drivers call OpenVR through inline vtable accessors in openvr_driver.h
+# and reference zero symbols from openvr_api.so. Scope --as-needed around the
+# OpenVR link entry so toolchains that default to --no-as-needed do not record a
+# spurious DT_NEEDED for openvr_api.so.
 target_link_libraries(driver_cardboardplusplus PRIVATE
-    ${OPENVR_API_LIB}
+    "-Wl,--push-state,--as-needed"
+    ${CBPP_OPENVR_LINK}
+    "-Wl,--pop-state"
     PkgConfig::FFMPEG
     PkgConfig::VULKAN
     PkgConfig::X11

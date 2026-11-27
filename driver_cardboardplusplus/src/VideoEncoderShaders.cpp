@@ -66,8 +66,7 @@ bool VideoEncoder::ReadbackToBuffer()
             return true;
         }
     }
-    m_pVkCompose->CopyToHost();
-    if (m_pVkCompose->HostData()) {
+    if (m_pVkCompose->CopyToHost() && m_pVkCompose->HostData()) {
         m_pSwsSrc = (uint8_t*)m_pVkCompose->HostData();
         return true;
     }
