@@ -26,7 +26,35 @@ jobs:
       shell: pwsh
 
     - name: Build Driver
-      run: msbuild driver_cardboardplusplus\driver_cardboardplusplus.sln /p:Configuration=${{ matrix.configuration }} /p:Platform=x64 /p:PlatformToolset=v143
+      run: |
+        msbuild driver_cardboardplusplus\driver_cardboardplusplus.sln /p:Configuration=${{ matrix.configuration }} /p:Platform=x64 /p:PlatformToolset=v143 *> msbuild.log
+        if ($LASTEXITCODE -ne 0) {
+          $errs = Select-String -Path msbuild.log -Pattern ' error ' | Select-Object -First 9
+          if ($errs.Count -eq 0) {
+            Get-Content msbuild.log -Tail 25 | ForEach-Object { "::error::$_" }
+          } else {
+            $errs | ForEach-Object { "::error::$($_.Line)" }
+          }
+          exit 1
+        }
+
+    - name: Report remaining errors (TEMP diagnostics)
+      if: failure()
+      shell: pwsh
+      run: |
+        $errs = Select-String -Path msbuild.log -Pattern ' error ' | Select-Object -Skip 9 -First 40
+        $errs | ForEach-Object { "::error::$($_.Line)" }
+
+    - name: Commit build log (TEMP diagnostics)
+      if: failure()
+      continue-on-error: true
+      shell: pwsh
+      run: |
+        git config user.name "ci-log-bot"
+        git config user.email "ci-log-bot@users.noreply.github.com"
+        git add -f msbuild.log
+        git commit -m "TEMP: record msbuild log"
+        git push origin HEAD:arena/ad49431b-cardboardplusplus
 
 
     - name: Driver unit tests
