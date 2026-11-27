@@ -183,9 +183,14 @@
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
       <!-- The vendored dxil-spirv libs are release-only (/MD, _ITERATOR_DEBUG_LEVEL=0),
-           so the Debug config must link against the release CRT or LNK2038 rejects them. -->
+           so the Debug config must link against the release CRT or LNK2038 rejects them.
+           _DEBUG must NOT be defined: with /MD + _DEBUG the CRT headers record
+           RuntimeLibrary=MDd_DynamicDebug into the objects, which fails the same check.
+           DRIVER_DIAG replaces the _DEBUG gate used by DirectMode.cpp diagnostics. -->
       <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
-      <PreprocessorDefinitions>_DEBUG;_ITERATOR_DEBUG_LEVEL=0;WIN32_LEAN_AND_MEAN;OPENVRDRIVEREXAMPLE_EXPORTS;_WINDOWS;_USRDLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <BasicRuntimeChecks>Default</BasicRuntimeChecks>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <PreprocessorDefinitions>_ITERATOR_DEBUG_LEVEL=0;DRIVER_DIAG;WIN32_LEAN_AND_MEAN;OPENVRDRIVEREXAMPLE_EXPORTS;_WINDOWS;_USRDLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
