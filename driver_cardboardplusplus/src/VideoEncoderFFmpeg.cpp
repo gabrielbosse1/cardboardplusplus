@@ -40,6 +40,9 @@ bool VideoEncoder::InitializeFFmpeg()
         m_pCodecContext->max_b_frames = 0;
         m_pCodecContext->delay = 0;
         m_pCodecContext->pix_fmt = AV_PIX_FMT_NV12;
+        // Match the current limited-range BT.601 NV12 conversion shader.
+        m_pCodecContext->color_range = AVCOL_RANGE_MPEG;
+        m_pCodecContext->colorspace = AVCOL_SPC_SMPTE170M;
         m_pCodecContext->bit_rate = m_bitrate;
         m_pCodecContext->rc_min_rate = m_bitrate;
         m_pCodecContext->rc_max_rate = m_bitrate;

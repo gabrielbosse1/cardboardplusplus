@@ -30,6 +30,7 @@ public:
     void Destroy();
     bool IsReady() const { return m_instance != VK_NULL_HANDLE && m_device != VK_NULL_HANDLE; }
     uint32_t GetQueueFamily() const { return m_queueFamily; }
+    bool QueueSupportsCompute() const { return m_queueSupportsCompute; }
 // Device pointers for share code (importing external images, host copy readbacks).
     VkPhysicalDevice Physical() const { return m_physical; }
     VkDevice Device() const { return m_device; }
@@ -53,6 +54,7 @@ private:
     VkDevice m_device = VK_NULL_HANDLE;
     VkQueue m_queue = VK_NULL_HANDLE;
     uint32_t m_queueFamily = 0;
+    bool m_queueSupportsCompute = false;
     bool m_luidMatched = false;
     bool m_hasExternalMemoryWin32 = false;
     bool m_hasKeyedMutex = false;

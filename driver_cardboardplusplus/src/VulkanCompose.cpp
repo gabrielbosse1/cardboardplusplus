@@ -31,10 +31,9 @@ static int ExportDmaBufSyncFile(int fd) {
 }
 // Imports each eye's sync file as a temporary binary semaphore. The compose
 // submission waits on them, so sampling starts exactly when the compositor's
-// writes finish. Returns the semaphores and the fds to close after submission.
+// writes finish. Successful imports transfer fd ownership to Vulkan.
 static bool ImportEyeSemaphores(VulkanContext* ctx, int leftFd, int rightFd,
-                                std::vector<VkSemaphore>& outSems,
-                                std::vector<int>& outFds) {
+                                std::vector<VkSemaphore>& outSems) {
     auto createSem = (PFN_vkCreateSemaphore)ctx->GetDeviceProc("vkCreateSemaphore");
     auto importFd = (PFN_vkImportSemaphoreFdKHR)ctx->GetDeviceProc("vkImportSemaphoreFdKHR");
     if (!createSem || !importFd) return false;
@@ -55,8 +54,8 @@ static bool ImportEyeSemaphores(VulkanContext* ctx, int leftFd, int rightFd,
         info.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
         info.fd = s;
         if (importFd(ctx->Device(), &info) == VK_SUCCESS) {
+            // A successful Vulkan import consumes s; never close it ourselves.
             outSems.push_back(sem);
-            outFds.push_back(s);
         } else {
             auto destroy = (PFN_vkDestroySemaphore)ctx->GetDeviceProc("vkDestroySemaphore");
             if (destroy) destroy(ctx->Device(), sem, nullptr);
@@ -501,7 +500,7 @@ bool VulkanCompose::Setup(uint32_t width, uint32_t height) {
     DriverLog("VK-COMPOSE initialized: %ux%u pipelines ready", m_width, m_height);
     // The NV12 compute pass is optional: a failure here keeps the compose
     // running and leaves the CPU swscale conversion in place.
-    if (!SetupNv12()) {
+    if (!m_pCtx->QueueSupportsCompute() || !SetupNv12()) {
         DriverLog("VK-NV12 unavailable; staying on CPU swscale");
     }
     return true;
@@ -1197,12 +1196,11 @@ bool VulkanCompose::Compose(const std::vector<GpuImage>& lefts,
 #endif
 #ifndef _WIN32
     std::vector<VkSemaphore> eyeSems;
-    std::vector<int> syncFds;
     uint32_t waitCount = 0;
     VkSemaphore eyeSemaphores[2] = {};
     VkPipelineStageFlags waitStages[2] = {};
     if (ImportEyeSemaphores(m_pCtx, (int)lefts[0].handle, (int)rights[0].handle,
-                            eyeSems, syncFds)) {
+                            eyeSems)) {
         waitCount = (uint32_t)eyeSems.size();
         for (uint32_t s = 0; s < waitCount; s++) {
             eyeSemaphores[s] = eyeSems[s];
@@ -1229,7 +1227,7 @@ bool VulkanCompose::Compose(const std::vector<GpuImage>& lefts,
         // case): keep the pipeline and let the caller fall back for this frame.
         m_submitFails++;
         if (m_submitFails <= 3 || m_submitFails % 300 == 0) {
-            DriverLog("VK-COMPOSE: vkQueueSubmit failed res=%d (fail=%d), using D3D this frame",
+            DriverLog("VK-COMPOSE: vkQueueSubmit failed res=%d (fail=%d), dropping frame",
                       (int)res, m_submitFails);
         }
         return false;
@@ -1246,7 +1244,6 @@ bool VulkanCompose::Compose(const std::vector<GpuImage>& lefts,
     {
         auto destroySem = (PFN_vkDestroySemaphore)m_pCtx->GetDeviceProc("vkDestroySemaphore");
         for (VkSemaphore s : eyeSems) if (destroySem) destroySem(m_pCtx->Device(), s, nullptr);
-        for (int fd : syncFds) if (fd >= 0) ::close(fd);
     }
 #endif
     m_frame++;
@@ -1348,9 +1345,9 @@ bool VulkanCompose::ToNv12(const uint8_t** outData, size_t* outSize) {
 // Copies the composed frame into a host-visible buffer. Two users: the CPU
 // swscale fallback when the NV12 compute pass did not run, and the frame hash
 // diagnostic (same FNV-1a sampling as the software duplicate-frame check).
-void VulkanCompose::CopyToHost()
+bool VulkanCompose::CopyToHost()
 {
-    if (!m_ready || !m_pCtx || !m_pCtx->IsReady()) return;
+    if (!m_ready || !m_pCtx || !m_pCtx->IsReady()) return false;
     if (!m_hostMap) {
         auto createBuffer = (PFN_vkCreateBuffer)m_pCtx->GetDeviceProc("vkCreateBuffer");
         auto getBufReq = (PFN_vkGetBufferMemoryRequirements)m_pCtx->GetDeviceProc("vkGetBufferMemoryRequirements");
@@ -1358,27 +1355,27 @@ void VulkanCompose::CopyToHost()
         auto bindBuffer = (PFN_vkBindBufferMemory)m_pCtx->GetDeviceProc("vkBindBufferMemory");
         auto mapMem = (PFN_vkMapMemory)m_pCtx->GetDeviceProc("vkMapMemory");
         auto getMemProps = (PFN_vkGetPhysicalDeviceMemoryProperties)m_pCtx->GetInstanceProc("vkGetPhysicalDeviceMemoryProperties");
-        if (!createBuffer || !getBufReq || !allocMem || !bindBuffer || !mapMem || !getMemProps) return;
+        if (!createBuffer || !getBufReq || !allocMem || !bindBuffer || !mapMem || !getMemProps) return false;
         m_hostSize = (size_t)m_width * m_height * 4;
         VkBufferCreateInfo bci = {};
         bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
         bci.size = m_hostSize;
         bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        if (createBuffer(m_pCtx->Device(), &bci, nullptr, &m_hostBuf) != VK_SUCCESS) return;
+        if (createBuffer(m_pCtx->Device(), &bci, nullptr, &m_hostBuf) != VK_SUCCESS) return false;
         VkMemoryRequirements req = {};
         getBufReq(m_pCtx->Device(), m_hostBuf, &req);
         uint32_t type = 0;
-        if (!PickCoherentHostType(req, m_pCtx->Physical(), getMemProps, &type)) return;
+        if (!PickCoherentHostType(req, m_pCtx->Physical(), getMemProps, &type)) return false;
         VkMemoryAllocateInfo ai = {};
         ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         ai.allocationSize = req.size;
         ai.memoryTypeIndex = type;
-        if (allocMem(m_pCtx->Device(), &ai, nullptr, &m_hostMem) != VK_SUCCESS) return;
-        if (bindBuffer(m_pCtx->Device(), m_hostBuf, m_hostMem, 0) != VK_SUCCESS) return;
+        if (allocMem(m_pCtx->Device(), &ai, nullptr, &m_hostMem) != VK_SUCCESS) return false;
+        if (bindBuffer(m_pCtx->Device(), m_hostBuf, m_hostMem, 0) != VK_SUCCESS) return false;
         if (mapMem(m_pCtx->Device(), m_hostMem, 0, VK_WHOLE_SIZE, 0, (void**)&m_hostMap) != VK_SUCCESS) {
             m_hostMap = nullptr;
-            return;
+            return false;
         }
         DriverLog("VK-COMPOSE: host copy buffer mapped (%zu bytes)", m_hostSize);
     }
@@ -1389,11 +1386,11 @@ void VulkanCompose::CopyToHost()
     auto submitQ = (PFN_vkQueueSubmit)m_pCtx->GetDeviceProc("vkQueueSubmit");
     auto waitFences = (PFN_vkWaitForFences)m_pCtx->GetDeviceProc("vkWaitForFences");
     auto resetFences = (PFN_vkResetFences)m_pCtx->GetDeviceProc("vkResetFences");
-    if (!beginCmd || !endCmd || !barrier || !copyImage || !submitQ || !waitFences || !resetFences) return;
+    if (!beginCmd || !endCmd || !barrier || !copyImage || !submitQ || !waitFences || !resetFences) return false;
     VkCommandBufferBeginInfo bi = {};
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (beginCmd(m_cmd, &bi) != VK_SUCCESS) return;
+    if (beginCmd(m_cmd, &bi) != VK_SUCCESS) return false;
     VkImageMemoryBarrier imb = {};
     imb.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     imb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
@@ -1420,14 +1417,14 @@ void VulkanCompose::CopyToHost()
     back.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     barrier(m_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
             0, 0, nullptr, 0, nullptr, 1, &back);
-    if (endCmd(m_cmd) != VK_SUCCESS) return;
+    if (endCmd(m_cmd) != VK_SUCCESS) return false;
     VkSubmitInfo si = {};
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
     si.pCommandBuffers = &m_cmd;
     resetFences(m_pCtx->Device(), 1, &m_fence);
-    if (submitQ(m_pCtx->Queue(), 1, &si, m_fence) != VK_SUCCESS) return;
-    if (waitFences(m_pCtx->Device(), 1, &m_fence, VK_TRUE, 1000 * 1000000ULL) != VK_SUCCESS) return;
+    if (submitQ(m_pCtx->Queue(), 1, &si, m_fence) != VK_SUCCESS) return false;
+    if (waitFences(m_pCtx->Device(), 1, &m_fence, VK_TRUE, 1000 * 1000000ULL) != VK_SUCCESS) return false;
     m_hostFrame++;
     uint32_t hash = 2166136261u;
     uint64_t sum = 0;
@@ -1447,4 +1444,5 @@ void VulkanCompose::CopyToHost()
                   (unsigned long long)m_hostFrame, hash, (unsigned long long)m_hostChanges,
                   (int)(sum / (samples > 0 ? samples : 1)));
     }
+    return true;
 }

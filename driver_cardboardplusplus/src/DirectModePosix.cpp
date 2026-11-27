@@ -270,7 +270,13 @@ void HmdDriver::GetNextSwapTextureSetIndex(vr::SharedTextureHandle_t sharedTextu
 void HmdDriver::SubmitLayer(const SubmitLayerPerEye_t (&perEye)[2])
 {
     std::lock_guard<std::mutex> lock(m_submitLayersMutex);
-    m_submitLayers.clear();
+    // VulkanCompose supports at most four layers per frame.
+    if (m_submitLayers.size() >= 4) {
+        static unsigned droppedLayers = 0;
+        if (++droppedLayers <= 3 || droppedLayers % 300 == 0)
+            DriverLog("DirectMode: layer limit reached (drop=%u)", droppedLayers);
+        return;
+    }
     SubmitLayerInfo info;
     info.hTextureLeft = perEye[0].hTexture;
     info.hTextureRight = perEye[1].hTexture;
@@ -290,6 +296,12 @@ void HmdDriver::SubmitLayer(const SubmitLayerPerEye_t (&perEye)[2])
 // the imported images from being read mid-render.
 void HmdDriver::Present(vr::SharedTextureHandle_t syncTexture)
 {
+    if (!m_streamEnabled.load(std::memory_order_relaxed)) {
+        std::lock_guard<std::mutex> lock(m_submitLayersMutex);
+        m_submitLayers.clear();
+        m_hasSubmit.store(false, std::memory_order_release);
+        return;
+    }
     m_presentCount++;
     static uint32_t presentLogs = 0;
     if (++presentLogs == 1 || presentLogs % 300 == 1) {
@@ -382,72 +394,17 @@ void HmdDriver::PostPresent()
 // per frame would leak one semaphore per frame.
 bool HmdDriver::AcquireSyncTexture(vr::SharedTextureHandle_t syncTexture)
 {
-    if (!m_vulkan.IsReady() || !syncTexture) return false;
-    if (m_cachedSyncHandle != (uint64_t)syncTexture || !m_syncSemaphore) {
-        if (m_syncSemaphore) {
-            auto destroy = (PFN_vkDestroySemaphore)m_vulkan.GetDeviceProc("vkDestroySemaphore");
-            if (destroy) destroy(m_vulkan.Device(), m_syncSemaphore, nullptr);
-            m_syncSemaphore = VK_NULL_HANDLE;
-        }
-        auto importFd = (PFN_vkImportSemaphoreFdKHR)m_vulkan.GetDeviceProc("vkImportSemaphoreFdKHR");
-        if (!importFd) {
-            DriverLog("AcquireSyncTexture: vkImportSemaphoreFdKHR missing (is VK_KHR_external_semaphore_fd enabled?)");
-            return false;
-        }
-        int syncFd = (int)syncTexture;
-        if (syncFd < 0 || ::fcntl(syncFd, F_GETFD) < 0) {
-            static unsigned s_badHandles = 0;
-            if (++s_badHandles <= 3 || s_badHandles % 300 == 0) {
-                DriverLog("AcquireSyncTexture: sync handle is not a usable fd (%llu, drop=%u)",
-                          (unsigned long long)syncTexture, s_badHandles);
-            }
-            return false;
-        }
-        // Vulkan consumes the fd on a successful import. Import a duplicate so
-        // an unexpected handle cannot close a descriptor owned by vrserver.
-        int semaphoreFd = ::dup(syncFd);
-        if (semaphoreFd < 0) return false;
-        VkSemaphoreCreateInfo sci = {};
-        sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-        VkImportSemaphoreFdInfoKHR import = {};
-        import.sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR;
-        import.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT_KHR;
-        import.fd = semaphoreFd;
-        sci.pNext = &import;
-        VkSemaphore sem = VK_NULL_HANDLE;
-        VkResult res = ((PFN_vkCreateSemaphore)m_vulkan.GetDeviceProc("vkCreateSemaphore"))(
-            m_vulkan.Device(), &sci, nullptr, &sem);
-        if (res != VK_SUCCESS) {
-            ::close(semaphoreFd);
-            DriverLog("AcquireSyncTexture: sync semaphore import failed (%d)", res);
-            return false;
-        }
-        m_syncSemaphore = sem;
-        m_cachedSyncHandle = (uint64_t)syncTexture;
+    // OpenVR's bundled direct-mode interface does not specify the Linux
+    // handle type or ownership. Never treat it as an fd without that contract.
+    static unsigned failures = 0;
+    if (++failures <= 3 || failures % 300 == 0) {
+        DriverLog("[compat] event=sync_handle_unresolved handle_present=%d drops=%u",
+                  syncTexture != 0, failures);
     }
-    auto wait = (PFN_vkWaitSemaphores)m_vulkan.GetDeviceProc("vkWaitSemaphores");
-    if (!wait) return false;
-    // The vendored Vulkan headers expose core 1.1 vkWaitSemaphores only (no
-    // vkGetSemaphoreStatusKHR), so skip the already-signaled early-out and let
-    // the bounded wait below resolve the compositor sync.
-    VkSemaphoreWaitInfo wi = {};
-    wi.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
-    wi.semaphoreCount = 1;
-    wi.pSemaphores = &m_syncSemaphore;
-    wi.pValues = nullptr;
-    VkResult res = wait(m_vulkan.Device(), &wi, kSemaphoreTimeoutNs);
-    if (res != VK_SUCCESS) {
-        static unsigned s_timeouts = 0;
-        if (++s_timeouts <= 3 || s_timeouts % 300 == 0)
-            DriverLog("AcquireSyncTexture: semaphore wait returned %d (drop=%u)", res, s_timeouts);
-        return false;
-    }
-    m_syncAcquired = true;
-    return true;
+    return false;
 }
 
-// The semaphore is consumed by the wait in AcquireSyncTexture; the compositor owns
-// the fence, so there is nothing to signal back here.
+// No sync handle is acquired while its Linux contract is unknown.
 void HmdDriver::ReleaseSyncTexture()
 {
     m_syncAcquired = false;

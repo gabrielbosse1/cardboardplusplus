@@ -902,7 +902,7 @@ component StreamPage inherits HorizontalLayout {
     }
     Card {
         title: "Encoder";
-        hint: "GPU lets the driver pick the hardware backend for your card (AMF → NVENC → QSV, libx264 fallback). CPU forces software encoding.";
+        hint: "GPU auto-selects an encoder (Windows: AMF, NVENC, QSV; Linux: VAAPI, NVENC, QSV), with software fallback. CPU uses software.";
         HorizontalLayout {
             spacing: 10px;
             Pill {

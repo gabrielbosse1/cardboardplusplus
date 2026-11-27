@@ -215,6 +215,9 @@ bool VulkanContext::Initialize(const PlatformAdapterId* adapterId)
         return false;
     }
     m_queueFamily = (uint32_t)picked;
+    m_queueSupportsCompute = (queues[m_queueFamily].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0;
+    if (!m_queueSupportsCompute)
+        DriverLog("[compat] event=compute_unavailable fallback=swscale");
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci = {};
     qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
@@ -278,10 +281,13 @@ bool VulkanContext::Initialize(const PlatformAdapterId* adapterId)
     VkPhysicalDeviceProperties props = {};
     s_vkGetPhysicalDeviceProperties(m_physical, &props);
     DriverLog("Vulkan: device ready (%s, queue family %u)", props.deviceName, m_queueFamily);
+    DriverLog("[compat] event=vulkan_device vendor=0x%04x device=0x%04x driver=%u api=%u",
+              props.vendorID, props.deviceID, props.driverVersion, props.apiVersion);
     return true;
 }
 void VulkanContext::Destroy()
 {
+    m_queueSupportsCompute = false;
     if (m_device && s_vkDestroyDevice) {
         s_vkDestroyDevice(m_device, nullptr);
         m_device = VK_NULL_HANDLE;
