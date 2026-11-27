@@ -38,6 +38,17 @@ find_library(OPENVR_API_LIB
           "$ENV{HOME}/.local/share/Steam/steamapps/common/SteamVR/bin/linux64"
           "/usr/lib"
     NO_DEFAULT_PATH)
+# SteamVR ships this library without the usual Unix "lib" prefix, which
+# find_library does not look for on Linux. Accept that filename as well.
+if(NOT OPENVR_API_LIB)
+    find_file(OPENVR_API_LIB
+        NAMES openvr_api.so
+        HINTS ${CBPP_OPENVR_DIR}
+        PATHS "$ENV{HOME}/.steam/steam/steamapps/common/SteamVR/bin/linux64"
+              "$ENV{HOME}/.local/share/Steam/steamapps/common/SteamVR/bin/linux64"
+              "/usr/lib"
+        NO_DEFAULT_PATH)
+endif()
 if(NOT OPENVR_API_LIB)
     message(FATAL_ERROR "openvr_api.so not found. Pass -DCBPP_OPENVR_DIR=<SteamVR>/bin/linux64")
 endif()
