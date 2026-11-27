@@ -11,7 +11,9 @@
 #include <vulkan/vulkan.h>
 #include <algorithm>
 #include <chrono>
+#include <fcntl.h>
 #include <mutex>
+#include <unistd.h>
 #include <vector>
 using namespace vr;
 
@@ -388,28 +390,38 @@ bool HmdDriver::AcquireSyncTexture(vr::SharedTextureHandle_t syncTexture)
             m_syncSemaphore = VK_NULL_HANDLE;
         }
         auto importFd = (PFN_vkImportSemaphoreFdKHR)m_vulkan.GetDeviceProc("vkImportSemaphoreFdKHR");
-        auto getFd = (PFN_vkGetSemaphoreFdKHR)m_vulkan.GetDeviceProc("vkGetSemaphoreFdKHR");
         if (!importFd) {
             DriverLog("AcquireSyncTexture: vkImportSemaphoreFdKHR missing (is VK_KHR_external_semaphore_fd enabled?)");
             return false;
         }
-        // The handle is the compositor's semaphore fd; adopt it directly when the
-        // spec allows, otherwise round-trip through our own import/export.
+        int syncFd = (int)syncTexture;
+        if (syncFd < 0 || ::fcntl(syncFd, F_GETFD) < 0) {
+            static unsigned s_badHandles = 0;
+            if (++s_badHandles <= 3 || s_badHandles % 300 == 0) {
+                DriverLog("AcquireSyncTexture: sync handle is not a usable fd (%llu, drop=%u)",
+                          (unsigned long long)syncTexture, s_badHandles);
+            }
+            return false;
+        }
+        // Vulkan consumes the fd on a successful import. Import a duplicate so
+        // an unexpected handle cannot close a descriptor owned by vrserver.
+        int semaphoreFd = ::dup(syncFd);
+        if (semaphoreFd < 0) return false;
         VkSemaphoreCreateInfo sci = {};
         sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
         VkImportSemaphoreFdInfoKHR import = {};
         import.sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR;
         import.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT_KHR;
-        import.fd = (int)syncTexture;
+        import.fd = semaphoreFd;
         sci.pNext = &import;
         VkSemaphore sem = VK_NULL_HANDLE;
         VkResult res = ((PFN_vkCreateSemaphore)m_vulkan.GetDeviceProc("vkCreateSemaphore"))(
             m_vulkan.Device(), &sci, nullptr, &sem);
         if (res != VK_SUCCESS) {
+            ::close(semaphoreFd);
             DriverLog("AcquireSyncTexture: sync semaphore import failed (%d)", res);
             return false;
         }
-        (void)getFd;
         m_syncSemaphore = sem;
         m_cachedSyncHandle = (uint64_t)syncTexture;
     }
@@ -445,8 +457,9 @@ void HmdDriver::ReleaseSyncTexture()
 // from recycling a texture the encoder is still importing.
 void HmdDriver::WaitEncoderIdle()
 {
+    // Bounded so a stalled encode thread cannot hold the compositor during teardown.
     std::unique_lock<std::mutex> lock(m_encodeDoneMutex);
-    m_encodeDoneCv.wait(lock, [this] { return m_encodeDone; });
+    m_encodeDoneCv.wait_for(lock, std::chrono::milliseconds(250), [this] { return m_encodeDone; });
 }
 
 void HmdDriver::GetFrameTiming(DriverDirectMode_FrameTiming* pFrameTiming)
