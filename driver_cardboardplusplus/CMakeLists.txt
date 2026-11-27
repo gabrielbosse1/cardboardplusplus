@@ -147,8 +147,20 @@ target_compile_definitions(driver_cardboardplusplus PRIVATE
 target_compile_options(driver_cardboardplusplus PRIVATE
     -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
 
+# CMake may turn a full path to a SONAME-less shared object into -lopenvr_api,
+# which cannot find SteamVR's unprefixed openvr_api.so. Ask the ELF linker for
+# the exact filename in that case; keep the normal path for libopenvr_api.so.
+get_filename_component(CBPP_OPENVR_NAME "${OPENVR_API_LIB}" NAME)
+if(CBPP_OPENVR_NAME STREQUAL "openvr_api.so")
+    get_filename_component(CBPP_OPENVR_LIBDIR "${OPENVR_API_LIB}" DIRECTORY)
+    target_link_directories(driver_cardboardplusplus PRIVATE "${CBPP_OPENVR_LIBDIR}")
+    set(CBPP_OPENVR_LINK "-Wl,-l:openvr_api.so")
+else()
+    set(CBPP_OPENVR_LINK "${OPENVR_API_LIB}")
+endif()
+
 target_link_libraries(driver_cardboardplusplus PRIVATE
-    ${OPENVR_API_LIB}
+    ${CBPP_OPENVR_LINK}
     PkgConfig::FFMPEG
     PkgConfig::VULKAN
     PkgConfig::X11
