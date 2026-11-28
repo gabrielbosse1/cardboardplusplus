@@ -423,7 +423,6 @@ bool VulkanCompose::Setup(uint32_t width, uint32_t height) {
         dynInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
         dynInfo.dynamicStateCount = 1;
         dynInfo.pDynamicStates = &kDynScissor;
-        vp.pDynamicState = &dynInfo;
         VkPipelineRasterizationStateCreateInfo rs = {};
         rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
         rs.polygonMode = VK_POLYGON_MODE_FILL;
