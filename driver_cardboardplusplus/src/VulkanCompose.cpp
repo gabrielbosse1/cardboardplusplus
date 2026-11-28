@@ -415,6 +415,15 @@ bool VulkanCompose::Setup(uint32_t width, uint32_t height) {
         vp.pViewports = &viewport;
         vp.scissorCount = 1;
         vp.pScissors = &scissor;
+        // Scissor is dynamic so a layer with one degenerate eye can draw only
+        // its valid half (C18): the degenerate half must keep showing the
+        // lower layers, not smear or paint black over them.
+        const VkDynamicState kDynScissor = VK_DYNAMIC_STATE_SCISSOR;
+        VkPipelineDynamicStateCreateInfo dynInfo = {};
+        dynInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+        dynInfo.dynamicStateCount = 1;
+        dynInfo.pDynamicStates = &kDynScissor;
+        vp.pDynamicState = &dynInfo;
         VkPipelineRasterizationStateCreateInfo rs = {};
         rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
         rs.polygonMode = VK_POLYGON_MODE_FILL;
@@ -449,6 +458,7 @@ bool VulkanCompose::Setup(uint32_t width, uint32_t height) {
         gpci.pVertexInputState = &vi;
         gpci.pInputAssemblyState = &ia;
         gpci.pViewportState = &vp;
+        gpci.pDynamicState = &dynInfo;
         gpci.pRasterizationState = &rs;
         gpci.pMultisampleState = &ms;
         gpci.pDepthStencilState = &ds;
@@ -1047,11 +1057,12 @@ bool VulkanCompose::Compose(const std::vector<GpuImage>& lefts,
     auto bindPipe = (PFN_vkCmdBindPipeline)m_pCtx->GetDeviceProc("vkCmdBindPipeline");
     auto bindSets = (PFN_vkCmdBindDescriptorSets)m_pCtx->GetDeviceProc("vkCmdBindDescriptorSets");
     auto cmdDraw = (PFN_vkCmdDraw)m_pCtx->GetDeviceProc("vkCmdDraw");
+    auto cmdSetScissor = (PFN_vkCmdSetScissor)m_pCtx->GetDeviceProc("vkCmdSetScissor");
     auto submitQ = (PFN_vkQueueSubmit)m_pCtx->GetDeviceProc("vkQueueSubmit");
     auto waitFences = (PFN_vkWaitForFences)m_pCtx->GetDeviceProc("vkWaitForFences");
     auto resetFences = (PFN_vkResetFences)m_pCtx->GetDeviceProc("vkResetFences");
     if (!beginCmd || !endCmd || !barrier || !updateSets || !beginRender || !endRender ||
-        !bindPipe || !bindSets || !cmdDraw || !submitQ || !waitFences || !resetFences) {
+        !bindPipe || !bindSets || !cmdDraw || !cmdSetScissor || !submitQ || !waitFences || !resetFences) {
         Fail("compose commands missing");
         return false;
     }
@@ -1180,20 +1191,31 @@ bool VulkanCompose::Compose(const std::vector<GpuImage>& lefts,
     rpi.clearValueCount = 1;
     rpi.pClearValues = &cv;
     beginRender(m_cmd, &rpi, VK_SUBPASS_CONTENTS_INLINE);
+    const VkRect2D kFullScissor = { { 0, 0 }, { m_width, m_height } };
+    const VkRect2D kRightHalf = { { (int32_t)m_width / 2, 0 },
+                                  { (uint32_t)m_width - (uint32_t)m_width / 2, (uint32_t)m_height } };
+    const VkRect2D kLeftHalf = { { 0, 0 }, { (uint32_t)m_width / 2, (uint32_t)m_height } };
     for (size_t i = 0; i < n; i++) {
         // A layer whose bounds have no extent would sample a single texel row
         // or column and stretch it across that half of the target (seen as a
-        // horizontal smear when SteamVR submits such layers at startup). Skip
-        // the layer when EITHER eye's rect is degenerate: a one-sided
-        // zero-area rect previously smeared its half of the frame.
+        // horizontal smear when SteamVR submits such layers at startup).
+        // Policy: skip the layer only when BOTH eyes are degenerate; when ONE
+        // eye is degenerate, scissor the draw to the valid half so the valid
+        // eye still composes and the degenerate half keeps showing whatever
+        // the lower layers put there (C18). Skipping the whole layer used to
+        // black out a perfectly good eye whenever its partner glitched.
         const bool degenerateL =
             m_bounds[i].map[2] <= 0.0f || m_bounds[i].map[3] <= 0.0f;
         const bool degenerateR =
             m_bounds[i].map[6] <= 0.0f || m_bounds[i].map[7] <= 0.0f;
-        if (degenerateL || degenerateR) continue;
+        if (degenerateL && degenerateR) continue;
         bindPipe(m_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, (i == 0) ? m_pipelineOpaque : m_pipelineAlpha);
         VkDescriptorSet set = m_descSets[i];
         bindSets(m_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &set, 0, nullptr);
+        const VkRect2D& sc = (degenerateL && !degenerateR) ? kRightHalf
+                            : (degenerateR && !degenerateL) ? kLeftHalf
+                            : kFullScissor;
+        cmdSetScissor(m_cmd, 0, 1, &sc);
         cmdDraw(m_cmd, 3, 1, 0, 0);
     }
     endRender(m_cmd);
@@ -1346,7 +1368,12 @@ bool VulkanCompose::ToNv12(const uint8_t** outData, size_t* outSize) {
             0, 0, nullptr, 0, nullptr, 1, &imb);
     bindPipe(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_csPipe);
     bindSets(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_csPipeLayout, 0, 1, &m_csSet, 0, nullptr);
-    dispatch(m_cmd, (m_width / 8 + 7) / 8, (m_height + 7) / 8, 1);
+    // Each workgroup covers 8x8 threads x 8 pixels = 64 columns; the X count
+    // must be ceil(w/64). The old floor-of-floor math (w/8+7)/8 dropped the
+    // remainder whenever w%64 was in [1,7] (e.g. 516 wide covered only 512
+    // columns), leaving an unconverted stripe of stale/zero pixels on the
+    // right edge of every frame (found by the C16 resolution matrix).
+    dispatch(m_cmd, (m_width + 63) / 64, (m_height + 7) / 8, 1);
     VkImageMemoryBarrier back = imb;
     back.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
     back.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;

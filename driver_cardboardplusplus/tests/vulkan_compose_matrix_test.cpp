@@ -372,10 +372,15 @@ int main() {
             Check(yR > 140.6f && yR < 148.6f, "C16 Y right green ~144.6");
             // No poison: every sampled Y byte inside the pl BT.601 range.
             bool inRange = true;
+            size_t badIdx = 0; int badVal = 0;
             for (size_t i = 0; i < (size_t)c.w * c.h; i += 997) {
-                if (nv12[i] < 8 || nv12[i] > 250) { inRange = false; break; }
+                if (nv12[i] < 8 || nv12[i] > 250) { inRange = false; badIdx = i; badVal = nv12[i]; break; }
             }
-            Check(inRange, "C16 NV12 samples in the legal Y range");
+            char msg[160];
+            snprintf(msg, sizeof(msg),
+                     "C16 NV12 samples in the legal Y range (%ux%u firstBad=%zu val=%d)",
+                     c.w, c.h, badIdx, badVal);
+            Check(inRange, msg);
         } else {
             cc.compose.CopyToHost();
             const uint8_t* host = cc.compose.HostData();
@@ -395,10 +400,12 @@ int main() {
         ComposeCase cc = MakeComposer(512, 256);
         Check(cc.ready, "C17 composer setup");
         if (cc.ready) {
-            auto [lb, rb] = fullRects();
-            // Overlay with a subrect window (center half of each eye).
-            std::vector<LayerRect> obL{ LayerRect{ 0.25f, 0.25f, 0.75f, 0.75f } };
-            std::vector<LayerRect> obR{ LayerRect{ 0.25f, 0.25f, 0.75f, 0.75f } };
+            // Bounds are PER LAYER: base full-frame, overlay with a subrect
+            // window (center half of each eye). (Passing only the base rects
+            // here made layer 1 fall back to a default full rect and covered
+            // the whole frame - found by this suite's first CI run.)
+            std::vector<LayerRect> lb{ LayerRect{ 0, 0, 1, 1 }, LayerRect{ 0.25f, 0.25f, 0.75f, 0.75f } };
+            std::vector<LayerRect> rb{ LayerRect{ 0, 0, 1, 1 }, LayerRect{ 0.25f, 0.25f, 0.75f, 0.75f } };
             bool two = cc.compose.Compose({ gRed, gGrad }, { gGreen, gGreen }, lb, rb);
             Check(two, "C17 2-layer compose (base opaque + overlay) accepted");
             const uint8_t* nv12 = nullptr;
@@ -412,10 +419,15 @@ int main() {
                 float baseL = (float)nv12[(size_t)16 * 512 + 16];
                 // Overlay window on the left half: x in [64..191]; at the
                 // center x=128 the gradient eye is sampled at u=0.5 (red=128).
+                // Luma path: linear 128/255 -> sRGB ~0.74 (188) -> BT.601
+                // limited Y ~16 + 65.5*0.737 = 64.3.
                 float overL = (float)nv12[(size_t)128 * 512 + 128];
                 Check(baseL > 77.0f && baseL < 86.0f, "C17 outside the overlay window the base shows (red)");
-                Check(overL > 38.0f && overL < 62.0f,
-                      "C17 overlay region shows the gradient (center window replaced the base)");
+                char msg[160];
+                snprintf(msg, sizeof(msg),
+                         "C17 overlay region shows the gradient (center window replaced the base, overL=%.1f)",
+                         overL);
+                Check(overL > 56.0f && overL < 72.0f, msg);
             }
             // kMaxLayers = 4 accepted.
             bool four = cc.compose.Compose(
@@ -449,9 +461,10 @@ int main() {
         ComposeCase cc = MakeComposer(512, 256);
         Check(cc.ready, "C18 composer setup");
         if (cc.ready) {
-            // LEFT degenerate (zero-width window), RIGHT valid: the layer must
-            // be skipped entirely — drawing it stretches a single texel column
-            // across the left half (the startup smear this regression guards).
+            // LEFT degenerate (zero-width window), RIGHT valid: the layer's
+            // valid half must still compose and the degenerate half must
+            // neither smear (the startup bug) nor black out — lower layers
+            // (here: the render clear) show through it.
             bool composed = cc.compose.Compose(
                 { gRed }, { gGreen },
                 { LayerRect{ 0.4f, 0.4f, 0.4f, 0.6f } },   // left: zero width

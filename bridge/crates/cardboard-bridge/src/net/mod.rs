@@ -44,7 +44,7 @@ pub fn set_recv_buffer_size(sock: &std::net::UdpSocket, bytes: i32) -> Option<i3
             fn setsockopt(s: usize, level: i32, name: i32, value: *const u8, len: i32) -> i32;
         }
         let rc = unsafe {
-            setsockopt(sock.as_raw_socket(), SOL_SOCKET, SO_RCVBUF, &bytes as *const i32 as *const u8, 4)
+            setsockopt(sock.as_raw_socket() as usize, SOL_SOCKET, SO_RCVBUF, &bytes as *const i32 as *const u8, 4)
         };
         if rc != 0 {
             return None;
@@ -92,7 +92,7 @@ pub fn get_recv_buffer_size(sock: &std::net::UdpSocket) -> Option<i32> {
         let mut out: i32 = 0;
         let mut len: i32 = 4;
         let rc = unsafe {
-            getsockopt(sock.as_raw_socket(), SOL_SOCKET, SO_RCVBUF, &mut out as *mut i32 as *mut u8, &mut len)
+            getsockopt(sock.as_raw_socket() as usize, SOL_SOCKET, SO_RCVBUF, &mut out as *mut i32 as *mut u8, &mut len)
         };
         if rc == 0 { Some(out) } else { None }
     }
