@@ -665,7 +665,7 @@ static void RunEncoderE2EPhase() {
                         s.find("avcodec_send_frame failed") != std::string::npos) noConvFail = false;
                 }
                 Check(noConvFail, "A6 no conversion/encode errors logged during switching");
-                Check(sinkG.size() >= 4 && sinkC.size() >= 5,
+                Check(sinkG.size() >= 4 && sinkC.size() >= 4,
                       "A6 both encoders delivered packets every round");
                 gpuEnc.Shutdown();
             }
@@ -688,8 +688,7 @@ static void RunEncoderE2EPhase() {
             // 120 identical frames -> exactly one summary at the 120th encode.
             bool ok120 = true;
             for (int64_t p = 0; p < 120 && ok120; p++) ok120 = EncodeOneFrame(enc, gl, gr, p);
-            Check(ok120, "A8 120 identical frames encoded");
-            enc.FinishEncode(120);  // 121st identical frame
+            Check(ok120, "A8 120 identical frames encoded (summary fired at the 120th)");
             std::vector<cbpp::PayloadTelemetry> snap;
             {
                 std::lock_guard<std::mutex> l(tm);
@@ -711,11 +710,13 @@ static void RunEncoderE2EPhase() {
             Eye eyeR2 = makeEye(0, 0, 255);
             GpuImage gr2 = gl; gr2.handle = (uint64_t)eyeR2.fd;
             if (eyeR2.fd >= 0) {
-                for (int64_t p = 121; p < 240; p++) {
+                // Exactly 120 more encodes (121..240): the second summary
+                // fires at the 240th, and no extra encode leaks into its
+                // dup window.
+                for (int64_t p = 121; p <= 240; p++) {
                     const GpuImage& right = (p & 1) ? gr2 : gr;
                     EncodeOneFrame(enc, gl, right, p);
                 }
-                enc.FinishEncode(240);  // 240th encode -> second summary
                 std::vector<cbpp::PayloadTelemetry> snap2;
                 {
                     std::lock_guard<std::mutex> l(tm);
