@@ -78,12 +78,12 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release \
           -DCBPP_OPENVR_DIR=/tmp/openvr_stub > /tmp/cbpp_build.log 2>&1; then
           tail -30 /tmp/cbpp_build.log
-          grep -E "CMake Error|error:" /tmp/cbpp_build.log | head -8 | while IFS= read -r line; do echo "::error::configure: $line"; done
+          grep -iE "CMake Error|error|unknown|warning" /tmp/cbpp_build.log | head -8 | while IFS= read -r line; do echo "::error::configure: ${line:0:230}"; done
           exit 1
         fi
         if ! cmake --build driver_cardboardplusplus/build --parallel "$(nproc)" >> /tmp/cbpp_build.log 2>&1; then
           tail -40 /tmp/cbpp_build.log
-          grep -E "error:" /tmp/cbpp_build.log | head -8 | while IFS= read -r line; do echo "::error::build: $line"; done
+          grep -iE "error|unknown|failed|dxc" /tmp/cbpp_build.log | head -8 | while IFS= read -r line; do echo "::error::build: ${line:0:230}"; done
           exit 1
         fi
         tail -3 /tmp/cbpp_build.log
