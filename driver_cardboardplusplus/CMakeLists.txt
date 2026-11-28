@@ -99,16 +99,24 @@ foreach(shader compose_vs compose_ps nv12_cs)
     set(_hdr ${CBPP_SPIRV_DIR}/${shader}.spv.h)
     if(shader STREQUAL "compose_vs")
         set(_profile "vs_6_0")
+        set(_shifts "")
     elseif(shader STREQUAL "compose_ps")
         set(_profile "ps_6_0")
+        # Register-class -> binding shifts for the single descriptor set:
+        # b0->0, s0->1, t0->2, t1->3. -fvk-*-shift is stable across dxc
+        # releases; the one-argument [[vk::binding(n)]] attribute is not (newer
+        # dxc reads it as a descriptor SET, which detached every resource).
+        set(_shifts "-fvk-b-shift 0 0 -fvk-s-shift 1 0 -fvk-t-shift 2 0")
     else()
         set(_profile "cs_6_0")
+        # b0->0 (params), t0->1 (src image), u0->2 (output storage buffer).
+        set(_shifts "-fvk-b-shift 0 0 -fvk-t-shift 1 0 -fvk-u-shift 2 0")
     endif()
     add_custom_command(
         OUTPUT ${_hdr}
         COMMAND ${CMAKE_COMMAND} -E make_directory ${CBPP_SPIRV_DIR}
         COMMAND ${CBPP_DXC_EXE} -spirv -T ${_profile} -E main -fspv-target-env=vulkan1.1
-                -D CBPP_VK_BINDINGS=1 -O3 ${_hlsl} -Fo ${_spv}
+                ${_shifts} -O3 ${_hlsl} -Fo ${_spv}
         COMMAND ${CMAKE_COMMAND}
                 -DSPV=${_spv} -DHDR=${_hdr} -DNAME=CBPPSpirv_${shader}
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedSpirv.cmake

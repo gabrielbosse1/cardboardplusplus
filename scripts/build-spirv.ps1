@@ -79,8 +79,19 @@ if (-not $dxcExe) {
 if (-not (Test-Path $dxcExe)) { Fail "dxc.exe not found: $dxcExe" }
 Write-Host "dxc: $dxcExe"
 
-# Same profiles as the CMake foreach loop.
-$profiles = [ordered]@{ compose_vs = "vs_6_0"; compose_ps = "ps_6_0"; nv12_cs = "cs_6_0" }
+# Same profiles and register-shift mapping as the CMake foreach loop. The
+# -fvk-*-shift flags are stable across dxc releases; the one-argument
+# [[vk::binding(n)]] attribute is not (newer dxc reads it as a SET number).
+$profiles = [ordered]@{
+    compose_vs = "vs_6_0"
+    compose_ps = "ps_6_0"
+    nv12_cs = "cs_6_0"
+}
+$shifts = @{
+    compose_vs = ""
+    compose_ps = "-fvk-b-shift 0 0 -fvk-s-shift 1 0 -fvk-t-shift 2 0"
+    nv12_cs = "-fvk-b-shift 0 0 -fvk-t-shift 1 0 -fvk-u-shift 2 0"
+}
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $tmp = Join-Path $env:TEMP "cbpp_spirv_build"
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
@@ -107,7 +118,7 @@ foreach ($name in $profiles.Keys) {
     # a log file, sidestepping that entirely. Exit code is cmd's = dxc's.
     $dxcLog = Join-Path $tmp "$name.dxc.log"
     $dxcCmd = "`"$dxcExe`" -spirv -T $($profiles[$name]) -E main -fspv-target-env=vulkan1.1" +
-              " -D CBPP_VK_BINDINGS=1 -O3 `"$hlslFile`" -Fo `"$spvFile`" > `"$dxcLog`" 2>&1"
+              " $($shifts[$name]) -O3 `"$hlslFile`" -Fo `"$spvFile`" > `"$dxcLog`" 2>&1"
     cmd /c $dxcCmd
     $dxcExit = $LASTEXITCODE
     if (Test-Path $dxcLog) {

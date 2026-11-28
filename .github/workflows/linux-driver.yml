@@ -136,8 +136,9 @@ jobs:
           -o /tmp/vk_smoke driver_cardboardplusplus/tests/vulkan_pipeline_smoke.cpp -lvulkan \
           > /tmp/smoke_build.log 2>&1
         echo "::error::SMOKE compile rc=$? err=$(grep -m1 'error' /tmp/smoke_build.log | head -c 140)"
-        VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json \
-        VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json \
+        ICD=$(find /usr/share/vulkan /etc/vulkan -name 'lvp_icd*.json' -o -name 'swiftshader*.json' 2>/dev/null | head -1)
+        echo "::error::SMOKE icd=$ICD"
+        VK_ICD_FILENAMES="$ICD" VK_DRIVER_FILES="$ICD" \
         /tmp/vk_smoke > /tmp/smoke.log 2>&1
         echo "::error::SMOKE run rc=$? checks=$(grep -c '^== ' /tmp/smoke.log)"
         L=$(grep '^== ' /tmp/smoke.log | tr '\n' '|')

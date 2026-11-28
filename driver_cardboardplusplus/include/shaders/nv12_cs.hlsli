@@ -4,14 +4,11 @@
 // because RWByteAddressBuffer.Store would write 32 bits per store and make
 // neighbouring pixel writes overlap.
 static const char* kNv12CSSource = R"(
-#ifdef CBPP_VK_BINDINGS
-#define VK_BIND(n) [[vk::binding(n)]]
-#else
-#define VK_BIND(n)
-#endif
-VK_BIND(1) Texture2D<float4> srcTex : register(t0);
-VK_BIND(0) cbuffer Params : register(b0) { int4 dims; };  // x=width y=height z=uv plane byte offset
-VK_BIND(2) RWStructuredBuffer<uint> outBuf : register(u0);
+// Descriptor layout (set 0): binding 0 = params cbuffer, 1 = src image,
+// 2 = output storage buffer; mapped with -fvk-*-shift flags by the build.
+Texture2D<float4> srcTex : register(t0);
+cbuffer Params : register(b0) { int4 dims; };  // x=width y=height z=uv plane byte offset
+RWStructuredBuffer<uint> outBuf : register(u0);
 
 float RgbToY(float3 c) {
     return 16.0f + 65.481f * c.r + 128.553f * c.g + 24.966f * c.b;
