@@ -32,33 +32,22 @@ jobs:
       # layouts never matched, and crashed on the NV12 compute shader).
       shell: pwsh
       run: |
-        $summary = $env:GITHUB_STEP_SUMMARY
         # Syntax-check the script first: a parse error would otherwise fail the
         # step before any diagnostic output exists.
         $parseErrors = $null
         [System.Management.Automation.Language.Parser]::ParseFile(
           (Join-Path $PWD "scripts\build-spirv.ps1"), [ref]$null, [ref]$parseErrors) | Out-Null
         if ($parseErrors) {
-          $msgs = $parseErrors | ForEach-Object { "PARSE line $($_.Extent.StartLineNumber): $($_.Message)" }
-          $msgs | Add-Content $summary
-          $msgs | Select-Object -First 8 | ForEach-Object { "::error::$_" }
+          $parseErrors | Select-Object -First 8 |
+            ForEach-Object { "::error::PARSE line $($_.Extent.StartLineNumber): $($_.Message)" }
           exit 1
         }
-        $ErrorActionPreference = "Continue"
-        $log = New-Object System.Collections.Generic.List[string]
-        $stepExit = 0
         try {
-          & ./scripts/build-spirv.ps1 2>&1 | ForEach-Object { $log.Add($_.ToString()) }
-          if ($LASTEXITCODE -ne 0) { $stepExit = $LASTEXITCODE }
+          & ./scripts/build-spirv.ps1
         } catch {
-          $log.Add("THROWN: $($_.Exception.GetType().FullName): $($_.Exception.Message)")
-          $log.Add($_.ScriptStackTrace)
-          $stepExit = 1
-        }
-        $log | ForEach-Object { Write-Host $_ }
-        $log | Add-Content $summary
-        if ($stepExit -ne 0) {
-          @($log | Select-Object -First 8) | ForEach-Object { "::error::$_" }
+          "::error::build-spirv threw: $($_.Exception.Message)"
+          $stack = ($_.ScriptStackTrace -split "`n")[0]
+          if ($stack) { "::error::$stack" }
           exit 1
         }
 

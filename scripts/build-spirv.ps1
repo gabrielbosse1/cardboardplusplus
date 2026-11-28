@@ -93,20 +93,19 @@ foreach ($name in $profiles.Keys) {
     $spvFile = Join-Path $tmp "$name.spv"
 
     Write-Host "dxc $name ($($profiles[$name])) -> SPIR-V"
-    $dxcArgs = @("-spirv", "-T", $profiles[$name], "-E", "main",
-                 "-fspv-target-env=vulkan1.1", "-D", "CBPP_VK_BINDINGS=1", "-O3",
-                 $hlslFile, "-Fo", $spvFile)
-    # GH Actions pwsh quirk: launching a native exe while the step redirects
-    # output throws "StandardOutputEncoding is only supported when standard
-    # output is redirected" unless the invocation itself captures stdout. Also
-    # relax EAP so dxc's stderr warnings (2>&1) cannot become terminating
-    # errors; the exit code is the real failure signal.
-    $eap = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    $dxcOut = & $dxcExe @dxcArgs 2>&1
+    # Launch dxc through cmd.exe with file redirection. PowerShell's native
+    # launcher on GH Actions runners throws "StandardOutputEncoding is only
+    # supported when standard output is redirected" when a script's output is
+    # piped; cmd.exe performs the launch natively and captures dxc's output to
+    # a log file, sidestepping that entirely. Exit code is cmd's = dxc's.
+    $dxcLog = Join-Path $tmp "$name.dxc.log"
+    $dxcCmd = "`"$dxcExe`" -spirv -T $($profiles[$name]) -E main -fspv-target-env=vulkan1.1" +
+              " -D CBPP_VK_BINDINGS=1 -O3 `"$hlslFile`" -Fo `"$spvFile`" > `"$dxcLog`" 2>&1"
+    cmd /c $dxcCmd
     $dxcExit = $LASTEXITCODE
-    $ErrorActionPreference = $eap
-    foreach ($line in @($dxcOut)) { if ($line) { Write-Host "dxc: $line" } }
+    if (Test-Path $dxcLog) {
+        Get-Content $dxcLog | ForEach-Object { if ($_) { Write-Host "dxc: $_" } }
+    }
     if ($dxcExit -ne 0) { Fail "dxc failed for $name (exit $dxcExit)" }
 
     # Embed as a C header with little-endian uint32 words, the same layout
