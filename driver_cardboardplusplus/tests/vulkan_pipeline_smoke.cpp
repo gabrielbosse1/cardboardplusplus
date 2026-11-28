@@ -27,6 +27,7 @@
 // encode -> Annex-B packets.
 #include "VulkanContext.h"
 #include "VulkanCompose.h"
+#include "openvr_driver.h"
 #ifdef CBPP_ENCODER_E2E_TEST
 #include "VideoEncoder.h"
 #include <mutex>
@@ -120,9 +121,20 @@ static BufRes MakeHostBuffer(VkDevice dev, VkPhysicalDevice phys, VkDeviceSize s
 // ===== Phase B: real driver components (production VulkanContext + VulkanCompose) =====
 // The phase above replays the pipeline with a raw-Vulkan replica; this phase
 // links the actual production code paths, so whatever ships is what is tested.
-// The production DriverLog.cpp is NOT linked: its first call would dereference
-// SteamVR's uninitialized driver context (vr::VRDriverContext() is null
-// outside SteamVR) and segfault. This standalone sink replaces it.
+//
+// Outside SteamVR the OpenVR driver context is a null static pointer, and the
+// inline vr::VRDriverLog()/VRSettings()/... accessors dereference it before
+// their own null checks can help — the first log call would segfault. Install
+// a stub context whose GetGenericInterface always returns null: every accessor
+// then resolves to null and the code paths fall back to stderr logging, which
+// is exactly the "log host unavailable" state drivers run in at startup.
+namespace {
+struct StubDriverContext final : vr::IVRDriverContext {
+    void* GetGenericInterface(const char*, EVRInitError*) override { return nullptr; }
+    vr::DriverHandle_t GetDriverHandle() override { return 0; }
+};
+StubDriverContext g_stubContext;
+}  // namespace
 void DriverLog(const char* pFormat, ...) {
     va_list ap;
     va_start(ap, pFormat);
@@ -131,6 +143,7 @@ void DriverLog(const char* pFormat, ...) {
     fputc('\n', stderr);
 }
 static void RunRealComponentPhase() {
+    vr::VRDriverContext() = &g_stubContext;
     printf("== PHASE B: real VulkanContext + VulkanCompose ==\n");
 
     VulkanContext ctx;
