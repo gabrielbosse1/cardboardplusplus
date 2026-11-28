@@ -272,8 +272,11 @@ jobs:
         if ! cargo test --manifest-path bridge/Cargo.toml -- --test-threads=1 \
             > /tmp/bridge_test.log 2>&1; then
           tail -40 /tmp/bridge_test.log
-          grep -E "^error" /tmp/bridge_test.log | head -8 | while IFS= read -r line; do echo "::error::bridge: $line"; done
-          grep -E "^test .* FAILED|panicked at" /tmp/bridge_test.log | head -8 | while IFS= read -r line; do echo "::error::bridge: $line"; done
+          grep -E "^error" /tmp/bridge_test.log | head -8 | while IFS= read -r line; do echo "::error::bridge: ${line:0:220}"; done
+          grep -E "^test .* FAILED|panicked at" /tmp/bridge_test.log | head -8 | while IFS= read -r line; do echo "::error::bridge: ${line:0:220}"; done
+          # Fall back to raw tail lines so non-standard failures (aborts,
+          # kills, harness exits) are visible through annotations too.
+          tail -12 /tmp/bridge_test.log | while IFS= read -r line; do echo "::error::tail: ${line:0:220}"; done
           exit 1
         fi
         tail -5 /tmp/bridge_test.log
