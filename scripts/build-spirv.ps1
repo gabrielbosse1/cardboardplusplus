@@ -106,7 +106,13 @@ foreach ($name in $profiles.Keys) {
     if (Test-Path $dxcLog) {
         Get-Content $dxcLog | ForEach-Object { if ($_) { Write-Host "dxc: $_" } }
     }
-    if ($dxcExit -ne 0) { Fail "dxc failed for $name (exit $dxcExit)" }
+    if ($dxcExit -ne 0) {
+        if (Test-Path $dxcLog) {
+            Get-Content $dxcLog | Select-Object -First 8 |
+                ForEach-Object { if ($_) { "::error::dxc ${name}: $_" } }
+        }
+        Fail "dxc failed for $name (exit $dxcExit)"
+    }
 
     # Embed as a C header with little-endian uint32 words, the same layout
     # cmake/EmbedSpirv.cmake produces for the Linux build.
