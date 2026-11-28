@@ -9,7 +9,6 @@
 using namespace vr;
 // The chunker/pacing/resync helpers live in include/UdpSend.h (shared with the
 // transport unit tests, which exercise them against real loopback sockets).
-}
 // Starts the socket layer plus the non-blocking video socket; preview points at localhost, the phone target waits for discovery.
 bool HmdDriver::InitializeUDP()
 {
@@ -110,7 +109,7 @@ void HmdDriver::SendFannedOut(const uint8_t* raw, int rawSize,
 {
     bool allSent = true;
     if (m_previewEnabled.load(std::memory_order_relaxed)) {
-        allSent = SendFramedUdp(m_udpSocket, &m_previewAddr, raw, rawSize, &m_udpDroppedPreview) && allSent;
+        allSent = udp::SendFramedUdp(m_udpSocket, &m_previewAddr, raw, rawSize, &m_udpDroppedPreview) && allSent;
     }
     sockaddr_in phoneTarget{};
     bool hasTarget = false;
@@ -128,7 +127,7 @@ void HmdDriver::SendFannedOut(const uint8_t* raw, int rawSize,
                       phoneIp, ntohs(phoneTarget.sin_port),
                       (unsigned long long)phoneLogCounter, rawSize, framedSize);
         }
-        allSent = SendFramedUdp(m_udpSocket, &phoneTarget, framed, framedSize, &m_udpDroppedPhone) && allSent;
+        allSent = udp::SendFramedUdp(m_udpSocket, &phoneTarget, framed, framedSize, &m_udpDroppedPhone) && allSent;
     } else {
         static uint64_t noTargetCounter = 0;
         if (++noTargetCounter % 300 == 1) {

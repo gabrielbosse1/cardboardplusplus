@@ -103,26 +103,6 @@ pub fn get_recv_buffer_size(sock: &std::net::UdpSocket) -> Option<i32> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // The bridge's defense against frame-tail loss: the bump must succeed and
-    // be readable back. Linux clamps to net.core.rmem_max (~208 KB default,
-    // reported doubled), Windows does not clamp — both must apply the request.
-    #[test]
-    fn recv_buffer_bump_applies_and_reads_back() {
-        let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let before = get_recv_buffer_size(&s);
-        let after = set_recv_buffer_size(&s, 4 << 20);
-        assert!(after.is_some(), "setsockopt(SO_RCVBUF) must succeed on this OS");
-        let got = get_recv_buffer_size(&s).expect("SO_RCVBUF readable back");
-        assert!(got > 0, "SO_RCVBUF must be positive");
-        if let Some(b) = before {
-            assert!(got >= b, "bump must not shrink the buffer (before={b}, after={got})");
-        }
-    }
-}
 // UDP/TCP plane (mirrors CardboardWire.h): video, discovery/control,
 // telemetry, camera, MediaPipe sidecar, and sensor forward.
 pub const VIDEO_PORT: u16 = 42069;
@@ -215,5 +195,21 @@ mod tests {
         assert_eq!(EncoderChoice::Auto.as_str(), "auto");
         assert_eq!(EncoderChoice::Gpu.as_str(), "gpu");
         assert_eq!(EncoderChoice::Cpu.as_str(), "cpu");
+    }
+
+    // The bridge's defense against frame-tail loss: the bump must succeed and
+    // be readable back. Linux clamps to net.core.rmem_max (~208 KB default,
+    // reported doubled), Windows does not clamp — both must apply the request.
+    #[test]
+    fn recv_buffer_bump_applies_and_reads_back() {
+        let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let before = get_recv_buffer_size(&s);
+        let after = set_recv_buffer_size(&s, 4 << 20);
+        assert!(after.is_some(), "setsockopt(SO_RCVBUF) must succeed on this OS");
+        let got = get_recv_buffer_size(&s).expect("SO_RCVBUF readable back");
+        assert!(got > 0, "SO_RCVBUF must be positive");
+        if let Some(b) = before {
+            assert!(got >= b, "bump must not shrink the buffer (before={b}, after={got})");
+        }
     }
 }
