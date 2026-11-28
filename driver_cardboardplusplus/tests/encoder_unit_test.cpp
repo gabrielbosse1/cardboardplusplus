@@ -12,6 +12,7 @@
 // Build (e2e):  same + -DCBPP_ENCODER_E2E_TEST and the real encoder sources
 //               (wired in CI like the phase C compile).
 #include "H264Utils.h"
+#include "EncoderSettings.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -196,10 +197,66 @@ static void TestBuildLengthPrefixedPacket() {
     }
 }
 
+// Phase P3: SanitizeEncoderDims / ValidateEncoderSettings matrix --------------
+// The rules live in EncoderSettings.h (single source of truth with the
+// driver). Dimensions are floored to multiples of 16 — in particular the
+// 1920x1080 default becomes 1920x1072, and a request of 1081 floors to 1072
+// (NOT 1080: 1080 is not 16-aligned). The tests pin what actually ships.
+static void TestEncoderSettingsMatrix() {
+    printf("--- A7: encoder dims/settings validation matrix ---\n");
+    struct DimsCase { int w, h; bool pass; int outW, outH; const char* what; };
+    DimsCase dc[] = {
+        { 319, 1080, false,   0,    0,   "A7 319 wide -> reject" },
+        { 320, 1080, true,  320, 1072,   "A7 320 wide -> pass" },
+        { 320,  179, false,   0,    0,   "A7 179 high -> reject (below 180)" },
+        { 320,  180, true,  320,  176,   "A7 180 high floors to 176 (still >= 160)" },
+        {1081, 1080, true, 1072, 1072,   "A7 1081 floors to 1072 (16-aligned; not 1080)" },
+        {1920, 1080, true, 1920, 1072,   "A7 production default 1920x1080 -> 1920x1072" },
+        {7680, 7680, true, 7680, 7680,   "A7 7680 upper bound passes unchanged" },
+        {7681, 1080, false,   0,    0,   "A7 7681 wide -> reject" },
+        {1080, 7681, false,   0,    0,   "A7 7681 high -> reject" },
+        {   0, 1080, false,   0,    0,   "A7 zero width -> reject" },
+        {  -1,  540, false,   0,    0,   "A7 negative width -> reject" },
+        {  335, 2160, true,  320, 2160,  "A7 335 floors to 320 (2160 stays, 16-aligned)" },
+    };
+    for (const DimsCase& c : dc) {
+        int w = c.w, h = c.h;
+        bool ok = cbpp::SanitizeEncoderDims(w, h);
+        Check(ok == c.pass && (!c.pass || (w == c.outW && h == c.outH)), c.what);
+    }
+    // Settings validation: malformed values keep the live encoder values
+    // (ApplyEncoderSettings logs and stores the kept ones; the running encoder
+    // is only rebuilt for meaningful CHANGES, so a garbage datagram is inert).
+    {
+        const int curW = 1920, curH = 1072, curFps = 60, curBps = 20000000;
+        auto v = cbpp::ValidateEncoderSettings(0, 0, 0, 0, curW, curH, curFps, curBps);
+        Check(!v.dimsValid && v.width == curW && v.height == curH &&
+              v.fps == curFps && v.bitrateBps == curBps,
+              "A7 all-invalid request keeps every live value");
+        v = cbpp::ValidateEncoderSettings(2880, 1632, 90, 30000000, curW, curH, curFps, curBps);
+        Check(v.dimsValid && v.width == 2880 && v.height == 1632 &&
+              v.fps == 90 && v.bitrateBps == 30000000,
+              "A7 valid request passes through untouched");
+        v = cbpp::ValidateEncoderSettings(curW, curH, 121, 500, curW, curH, curFps, curBps);
+        Check(v.fps == curFps && v.bitrateBps == curBps && v.fpsAdjusted && v.bitrateAdjusted,
+              "A7 fps 121 and bitrate 500 bps fall back to live values");
+        v = cbpp::ValidateEncoderSettings(curW, curH, 1, 1000, curW, curH, curFps, curBps);
+        Check(v.fps == 1 && v.bitrateBps == 1000 && !v.fpsAdjusted && !v.bitrateAdjusted,
+              "A7 fps 1 and bitrate 1 kbps are the accepted lower bounds");
+        v = cbpp::ValidateEncoderSettings(curW, curH, 120, 100 * 1000 * 1000, curW, curH, curFps, curBps);
+        Check(v.fps == 120 && v.bitrateBps == 100 * 1000 * 1000,
+              "A7 fps 120 and bitrate 100 Mbps are the accepted upper bounds");
+        v = cbpp::ValidateEncoderSettings(curW, curH, curFps, -1, curW, curH, curFps, curBps);
+        Check(v.bitrateBps == curBps && !v.bitrateAdjusted,
+              "A7 negative bitrate means 'keep' (BRIDGE_CFG omission), not an error");
+    }
+}
+
 int main() {
     printf("=== Encoder unit tests (phase P: pure helpers) ===\n");
     TestFindIdrInsertionPoint();
     TestBuildLengthPrefixedPacket();
+    TestEncoderSettingsMatrix();
 #ifdef CBPP_ENCODER_E2E_TEST
     RunEncoderE2EPhase();
 #endif

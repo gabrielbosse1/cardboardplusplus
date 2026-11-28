@@ -1,6 +1,7 @@
 #include "HmdDriver.h"
 #include "DriverLog.h"
 #include "DebugLog.h"
+#include "EncoderSettings.h"
 #include <cstring>
 using namespace vr;
 // Creates VideoEncoder at the default 1920x1080@60 with stored caps applied; called from HmdDriver::Activate.
@@ -92,13 +93,10 @@ void HmdDriver::ClampEncoderToCap()
     }
 }
 // Validates w/h against the 320x180..7680 range and rounds down to multiples of 16 for the H.264 encoder.
+// Rules live in EncoderSettings.h so the unit tests pin exactly what ships.
 bool HmdDriver::SanitizeEncoderDims(int& w, int& h)
 {
-    if (w < 320 || h < 180 || w > 7680 || h > 7680)
-        return false;
-    w = (w / 16) * 16;
-    h = (h / 16) * 16;
-    return w >= 320 && h >= 160;
+    return cbpp::SanitizeEncoderDims(w, h);
 }
 // Routes encoded packets to OnEncodedPacket (UDP fan-out) and telemetry to the bridge SHM publisher.
 void HmdDriver::RegisterEncoderCallbacks(VideoEncoder* enc)
@@ -121,16 +119,17 @@ bool HmdDriver::ApplyEncoderSettings(int w, int h, int fps, int bitrateBps, bool
     DebugLog("%s: request %dx%d @%d fps, %d bps, gpu=%d (current %dx%d @%d, %d bps, gpu=%d)",
              reason, w, h, fps, bitrateBps, useGpu ? 1 : 0,
              m_encoderW, m_encoderH, m_encoderFps, m_encoderBitrate, m_encoderUseGpu ? 1 : 0);
-    int newW = w, newH = h;
-    if (!SanitizeEncoderDims(newW, newH)) {
+    const cbpp::ValidatedEncoderSettings v =
+        cbpp::ValidateEncoderSettings(w, h, fps, bitrateBps,
+                                      m_encoderW, m_encoderH, m_encoderFps, m_encoderBitrate);
+    int newW = v.width, newH = v.height;
+    if (!v.dimsValid) {
         DriverLog("%s: rejecting bad dims %dx%d, keeping %dx%d",
                   reason, w, h, m_encoderW, m_encoderH);
-        newW = m_encoderW;
-        newH = m_encoderH;
     }
-    int newFps = (fps >= 1 && fps <= 120) ? fps : m_encoderFps;
-    int newBitrate = (bitrateBps >= 1000 && bitrateBps <= 100 * 1000 * 1000) ? bitrateBps : m_encoderBitrate;
-    if (newFps != fps || (bitrateBps >= 0 && newBitrate != bitrateBps)) {
+    int newFps = v.fps;
+    int newBitrate = v.bitrateBps;
+    if (v.fpsAdjusted || v.bitrateAdjusted) {
         DebugLog("%s: out-of-range values dropped -> fps=%d bps=%d", reason, newFps, newBitrate);
     }
     bool newGpu = useGpu;
