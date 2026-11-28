@@ -6,6 +6,9 @@
 #include "H264Utils.h"
 #include <cstdlib>
 #include <cstring>
+#ifdef _WIN32
+#include <mswsock.h>  // SIO_UDP_CONNRESET
+#endif
 using namespace vr;
 // The chunker/pacing/resync helpers live in include/UdpSend.h (shared with the
 // transport unit tests, which exercise them against real loopback sockets).
@@ -25,6 +28,22 @@ bool HmdDriver::InitializeUDP()
     }
     int bufSize = 4 * 1024 * 1024;
     setsockopt(m_udpSocket, SOL_SOCKET, SO_SNDBUF, (const char*)&bufSize, sizeof(bufSize));
+#ifdef _WIN32
+    // Disable WSAECONNRESET delivery on this unconnected send socket. The
+    // loopback preview target (127.0.0.1:42069) legitimately disappears when
+    // the bridge's ffmpeg pump restarts or the bridge exits, and Windows then
+    // reports the ICMP port-unreachable as a hard error on the NEXT sendto —
+    // which abandoned the frame mid-send for BOTH targets (they share this
+    // socket) and armed IDR resync against a dead buffer. With
+    // SIO_UDP_CONNRESET off, datagrams to a vanished target are simply lost;
+    // UdpSend.h additionally classifies reset-class errors as drops.
+    {
+        BOOL disable = FALSE;
+        DWORD bytesReturned = 0;
+        WSAIoctl(m_udpSocket, SIO_UDP_CONNRESET, &disable, sizeof(disable),
+                 nullptr, 0, &bytesReturned, nullptr, nullptr);
+    }
+#endif
     cbpp::PlatformSetNonBlocking(m_udpSocket);
     m_previewAddr.sin_family = AF_INET;
     m_previewAddr.sin_port = htons(wire::kDataPort);

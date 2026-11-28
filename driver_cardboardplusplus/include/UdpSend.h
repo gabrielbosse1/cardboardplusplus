@@ -26,6 +26,57 @@ static constexpr int kUdpChunkBytes = 1400;
 static constexpr int kPaceBurstDatagrams = 12;
 static constexpr int kPaceSleepUs = 250;
 
+// Classifies a sendto error after the would-block family was already handled:
+// false = transient (abandon this frame, count a drop, keep the sender alive),
+// true = fatal (log and break; the frame is abandoned as well, but the error
+// signals real breakage like an oversized datagram or a dead socket).
+//
+// Windows reports ICMP port-unreachable from a vanished UDP target as
+// WSAECONNRESET on the NEXT sendto. The loopback preview target
+// (127.0.0.1:42069) legitimately disappears whenever the bridge's ffmpeg pump
+// restarts or the bridge exits, so classifying that as fatal abandoned the
+// frame mid-send for BOTH targets (they share one socket: the phone send runs
+// after the preview send), and the resulting allSent=false streak kept arming
+// forced IDRs into the same dead buffer — the long black/starved window seen
+// on Windows when the preview "gags". Reset-class errors are drops now; the
+// phone send on the same socket still runs its own loop. Linux keeps its
+// baseline: an unconnected socket never reports conn-reset, so every error
+// reaching this function is fatal there.
+static inline bool IsFatalSendError(int err)
+{
+#ifdef _WIN32
+    switch (err) {
+        case WSAECONNRESET:
+        case WSAETIMEDOUT:
+        case WSAENETRESET:
+        case WSAECONNABORTED:
+        case WSAEHOSTUNREACH:
+        case WSAENETUNREACH:
+        case WSAEADDRNOTAVAIL:
+        case WSAEINTR:
+            return false;
+        default:
+            return true;
+    }
+#else
+    // Linux baseline: the would-block family is handled by PlatformWouldBlock
+    // before this function runs; keeping them false here is defensive only (an
+    // EINTR stays fatal, exactly as the Linux baseline has always behaved).
+    return err != EAGAIN && err != EWOULDBLOCK;
+#endif
+}
+
+#ifdef _WIN32
+// Compile-time pins (proven by the Windows build workflow): a vanished
+// preview/phone target must classify as a drop, never as a hard error.
+static_assert(!IsFatalSendError(WSAECONNRESET),
+              "WSAECONNRESET (vanished UDP target) must be a drop, not a hard error");
+static_assert(!IsFatalSendError(WSAEHOSTUNREACH),
+              "WSAEHOSTUNREACH (phone left the network) must be a drop, not a hard error");
+static_assert(IsFatalSendError(WSAEMSGSIZE),
+              "WSAEMSGSIZE is a real configuration bug and must stop the send loop");
+#endif
+
 // Sends `framedSize` bytes as fixed-size datagrams (last chunk may be short).
 // Returns true only when every chunk was accepted by the OS. A false return
 // means the receiver lost the frame's tail mid-stream and will decode it with
@@ -49,12 +100,22 @@ static inline bool SendFramedUdp(cbpp::PlatformSocket socket, const sockaddr_in*
                     DriverLog("[UDP] Send buffer full, dropping frame (dropped=%d)", (int)*droppedCounter);
                 }
                 return false;
-            } else {
-                char targetIp[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, &addr->sin_addr, targetIp, sizeof(targetIp));
-                DriverLog("[UDP] sendto error %d to %s:%d (size=%d)", err,
-                          targetIp, ntohs(addr->sin_port), chunkSize);
             }
+            if (!IsFatalSendError(err)) {
+                // Transient reset/unreach class (see IsFatalSendError): same
+                // handling as a would-block drop so the phone target's send
+                // still runs and the resync policy sees a normal failure.
+                (*droppedCounter)++;
+                if (*droppedCounter % 30 == 1) {
+                    DriverLog("[UDP] transient send error %d, dropping frame (dropped=%d)",
+                              err, (int)*droppedCounter);
+                }
+                return false;
+            }
+            char targetIp[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &addr->sin_addr, targetIp, sizeof(targetIp));
+            DriverLog("[UDP] sendto error %d to %s:%d (size=%d)", err,
+                      targetIp, ntohs(addr->sin_port), chunkSize);
             break;
         }
         offset += chunkSize;

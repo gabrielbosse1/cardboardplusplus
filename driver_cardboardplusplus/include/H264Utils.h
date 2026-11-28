@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 // Inline H.264 helpers shared by the encoder and UDP paths plus the wire-protocol tests.

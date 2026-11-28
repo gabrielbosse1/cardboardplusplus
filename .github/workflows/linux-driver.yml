@@ -208,6 +208,13 @@ jobs:
           -o driver_cardboardplusplus/build/udp_tests \
           driver_cardboardplusplus/tests/udp_transport_test.cpp
         ./driver_cardboardplusplus/build/udp_tests
+        # Encoder unit tests: H.264 helper matrix (IDR insertion points, BE
+        # framing) — pure phase; the CBPP_ENCODER_E2E_TEST phase links the real
+        # encoder sources in the smoke step below.
+        g++ -std=c++17 -O2 -Wall -Wextra -I driver_cardboardplusplus/include \
+          -o driver_cardboardplusplus/build/encoder_unit_tests \
+          driver_cardboardplusplus/tests/encoder_unit_test.cpp
+        ./driver_cardboardplusplus/build/encoder_unit_tests
 
     - name: Validate driver manifest and profile
       run: |
