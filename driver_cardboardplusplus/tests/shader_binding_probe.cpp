@@ -78,7 +78,7 @@ int main() {
         ID3DBlob* code = nullptr;
         ID3DBlob* err = nullptr;
         HRESULT hr = D3DCompile(s.src, strlen(s.src), s.name, nullptr, nullptr,
-                                "main", s.target, 0, 0, &code, &err);
+                                "main", s.target, D3DCOMPILE_OPTIMIZATION_LEVEL2, 0, &code, &err);
         if (FAILED(hr)) {
             printf("== %s: D3DCompile failed hr=0x%08lx\n%s\n", s.name,
                    (unsigned long)hr,
