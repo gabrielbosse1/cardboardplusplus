@@ -106,11 +106,12 @@ foreach(shader compose_vs compose_ps nv12_cs)
         # b0->0, s0->1, t0->2, t1->3. -fvk-*-shift is stable across dxc
         # releases; the one-argument [[vk::binding(n)]] attribute is not (newer
         # dxc reads it as a descriptor SET, which detached every resource).
-        set(_shifts "-fvk-b-shift 0 0 -fvk-s-shift 1 0 -fvk-t-shift 2 0")
+        # Unquoted: each token must expand to its own command-line argument.
+        set(_shifts -fvk-b-shift 0 0 -fvk-s-shift 1 0 -fvk-t-shift 2 0)
     else()
         set(_profile "cs_6_0")
         # b0->0 (params), t0->1 (src image), u0->2 (output storage buffer).
-        set(_shifts "-fvk-b-shift 0 0 -fvk-t-shift 1 0 -fvk-u-shift 2 0")
+        set(_shifts -fvk-b-shift 0 0 -fvk-t-shift 1 0 -fvk-u-shift 2 0)
     endif()
     add_custom_command(
         OUTPUT ${_hdr}
