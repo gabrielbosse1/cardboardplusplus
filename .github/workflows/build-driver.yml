@@ -25,6 +25,14 @@ jobs:
       run: ./scripts/bake-driver-version.ps1
       shell: pwsh
 
+    - name: Compile SPIR-V shaders (dxc)
+      # Generates include/shaders/spirv/*.spv.h with the same dxc flags as the
+      # Linux build; VulkanCompose embeds these instead of runtime-translating
+      # DXBC through dxil-spirv (which emitted descriptor sets the pipeline
+      # layouts never matched, and crashed on the NV12 compute shader).
+      run: ./scripts/build-spirv.ps1
+      shell: pwsh
+
     - name: Build Driver
       run: msbuild driver_cardboardplusplus\driver_cardboardplusplus.sln /p:Configuration=${{ matrix.configuration }} /p:Platform=x64 /p:PlatformToolset=v143
 
