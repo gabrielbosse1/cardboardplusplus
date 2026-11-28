@@ -36,11 +36,10 @@ jobs:
         $devCmd = Join-Path $vsRoot "Common7\Tools\VsDevCmd.bat"
         cmd /c "`"$devCmd`" -arch=x64 >nul && cl /nologo /EHsc /std:c++17 /wd4146 /wd4297 /wd4245 /wd4389 /wd4324 /I driver_cardboardplusplus\include /I driver_cardboardplusplus\include\dxil-spirv\dxbc-spirv /Fe:shader_probe.exe /Fo:shader_probe_ driver_cardboardplusplus\tests\shader_binding_probe.cpp driver_cardboardplusplus\src\SpirvCompiler.cpp driver_cardboardplusplus\src\DriverLog.cpp /link /LIBPATH:driver_cardboardplusplus\lib\dxil-spirv dxbc-spirv.lib dxil-spirv-sbv.lib /LIBPATH:driver_cardboardplusplus\lib openvr_api.lib"
         .\shader_probe.exe *> shader-bindings.txt
-        git config user.name "ci-log-bot"
-        git config user.email "ci-log-bot@users.noreply.github.com"
-        git add -f shader-bindings.txt
-        git commit -m "TEMP: record shader binding probe [skip ci]"
-        git push origin HEAD:arena/ad49431b-cardboardplusplus
+        Write-Host "--- probe output start ---"
+        Get-Content shader-bindings.txt | Select-Object -First 40
+        Write-Host "--- probe output end ---"
+        Get-Content shader-bindings.txt | Select-Object -First 40 | ForEach-Object { "::error::$_" }
 
     - name: Build Driver
       run: msbuild driver_cardboardplusplus\driver_cardboardplusplus.sln /p:Configuration=${{ matrix.configuration }} /p:Platform=x64 /p:PlatformToolset=v143
