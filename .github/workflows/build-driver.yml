@@ -38,7 +38,7 @@ jobs:
           $vsRoot = & $vswhere -latest -property installationPath
           $devCmd = Join-Path $vsRoot "Common7\Tools\VsDevCmd.bat"
           "vsRoot=$vsRoot" | Add-Content $log
-          cmd /c "`"$devCmd`" -arch=x64 >nul && cl /nologo /EHsc /std:c++17 /wd4146 /wd4297 /wd4245 /wd4389 /wd4324 /I driver_cardboardplusplus\include /I driver_cardboardplusplus\include\dxil-spirv\dxbc-spirv /Fe:shader_probe.exe /Fo:shader_probe_ driver_cardboardplusplus\tests\shader_binding_probe.cpp driver_cardboardplusplus\src\SpirvCompiler.cpp driver_cardboardplusplus\src\DriverLog.cpp /link /LIBPATH:driver_cardboardplusplus\lib\dxil-spirv dxbc-spirv.lib dxil-spirv-sbv.lib /LIBPATH:driver_cardboardplusplus\lib openvr_api.lib" *>> $log
+          cmd /c "`"$devCmd`" -arch=x64 >nul && if not exist probeobj mkdir probeobj && cl /nologo /EHsc /std:c++17 /wd4146 /wd4297 /wd4245 /wd4389 /wd4324 /I driver_cardboardplusplus\include /I driver_cardboardplusplus\include\dxil-spirv\dxbc-spirv /Fe:shader_probe.exe /Foprobeobj\ driver_cardboardplusplus\tests\shader_binding_probe.cpp driver_cardboardplusplus\src\SpirvCompiler.cpp driver_cardboardplusplus\src\DriverLog.cpp /link /LIBPATH:driver_cardboardplusplus\lib\dxil-spirv dxbc-spirv.lib dxil-spirv-sbv.lib /LIBPATH:driver_cardboardplusplus\lib openvr_api.lib" *>> $log
           "cl exit=$LASTEXITCODE" | Add-Content $log
           if (Test-Path .\shader_probe.exe) {
             .\shader_probe.exe *>> $log
