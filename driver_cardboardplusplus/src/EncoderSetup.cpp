@@ -1,6 +1,7 @@
 #include "HmdDriver.h"
 #include "DriverLog.h"
 #include "DebugLog.h"
+#include "EncoderSettings.h"
 #include <cstring>
 using namespace vr;
 // Creates VideoEncoder at the default 1920x1080@60 with stored caps applied; called from HmdDriver::Activate.
@@ -23,6 +24,7 @@ bool HmdDriver::InitializeVideoEncoder()
     m_encoderFps = 60;
     m_encoderBitrate = 20000000;
     m_encoderUseGpu = false;
+    m_encoderChoice = "cpu";
     SanitizeEncoderDims(m_encoderW, m_encoderH);
     ClampEncoderToCap();
     int width = m_encoderW;
@@ -91,13 +93,10 @@ void HmdDriver::ClampEncoderToCap()
     }
 }
 // Validates w/h against the 320x180..7680 range and rounds down to multiples of 16 for the H.264 encoder.
+// Rules live in EncoderSettings.h so the unit tests pin exactly what ships.
 bool HmdDriver::SanitizeEncoderDims(int& w, int& h)
 {
-    if (w < 320 || h < 180 || w > 7680 || h > 7680)
-        return false;
-    w = (w / 16) * 16;
-    h = (h / 16) * 16;
-    return w >= 320 && h >= 160;
+    return cbpp::SanitizeEncoderDims(w, h);
 }
 // Routes encoded packets to OnEncodedPacket (UDP fan-out) and telemetry to the bridge SHM publisher.
 void HmdDriver::RegisterEncoderCallbacks(VideoEncoder* enc)
@@ -112,23 +111,25 @@ void HmdDriver::RegisterEncoderCallbacks(VideoEncoder* enc)
     });
 }
 // Validates and stores w/h/fps/bitrate/gpu choice labeled by reason, then rebuilds the encoder when values change meaningfully.
-bool HmdDriver::ApplyEncoderSettings(int w, int h, int fps, int bitrateBps, bool useGpu, const char* reason)
+bool HmdDriver::ApplyEncoderSettings(int w, int h, int fps, int bitrateBps, bool useGpu, const char* reason,
+                                     const char* codec)
 {
     WaitEncoderIdle();
     std::lock_guard<std::mutex> lock(m_encoderMutex);
     DebugLog("%s: request %dx%d @%d fps, %d bps, gpu=%d (current %dx%d @%d, %d bps, gpu=%d)",
              reason, w, h, fps, bitrateBps, useGpu ? 1 : 0,
              m_encoderW, m_encoderH, m_encoderFps, m_encoderBitrate, m_encoderUseGpu ? 1 : 0);
-    int newW = w, newH = h;
-    if (!SanitizeEncoderDims(newW, newH)) {
+    const cbpp::ValidatedEncoderSettings v =
+        cbpp::ValidateEncoderSettings(w, h, fps, bitrateBps,
+                                      m_encoderW, m_encoderH, m_encoderFps, m_encoderBitrate);
+    int newW = v.width, newH = v.height;
+    if (!v.dimsValid) {
         DriverLog("%s: rejecting bad dims %dx%d, keeping %dx%d",
                   reason, w, h, m_encoderW, m_encoderH);
-        newW = m_encoderW;
-        newH = m_encoderH;
     }
-    int newFps = (fps >= 1 && fps <= 120) ? fps : m_encoderFps;
-    int newBitrate = (bitrateBps >= 1000 && bitrateBps <= 100 * 1000 * 1000) ? bitrateBps : m_encoderBitrate;
-    if (newFps != fps || (bitrateBps >= 0 && newBitrate != bitrateBps)) {
+    int newFps = v.fps;
+    int newBitrate = v.bitrateBps;
+    if (v.fpsAdjusted || v.bitrateAdjusted) {
         DebugLog("%s: out-of-range values dropped -> fps=%d bps=%d", reason, newFps, newBitrate);
     }
     bool newGpu = useGpu;
@@ -137,6 +138,9 @@ bool HmdDriver::ApplyEncoderSettings(int w, int h, int fps, int bitrateBps, bool
     int oldFps = m_encoderFps;
     int oldBitrate = m_encoderBitrate;
     bool oldGpu = m_encoderUseGpu;
+    std::string oldChoice = m_encoderChoice;
+    if (codec) m_encoderChoice = codec;
+    else if (useGpu != oldGpu) m_encoderChoice = useGpu ? "gpu" : "cpu";
     m_encoderW = newW;
     m_encoderH = newH;
     m_encoderFps = newFps;
@@ -150,7 +154,7 @@ bool HmdDriver::ApplyEncoderSettings(int w, int h, int fps, int bitrateBps, bool
         return true;
     }
     bool meaningful = (m_encoderW != oldW || m_encoderH != oldH || m_encoderFps != oldFps ||
-                       m_encoderBitrate != oldBitrate || m_encoderUseGpu != oldGpu);
+                       m_encoderBitrate != oldBitrate || m_encoderUseGpu != oldGpu || m_encoderChoice != oldChoice);
     if (!meaningful)
         return false;
     DriverLog("Re-initializing encoder from %s: %dx%d @%d fps, %d kbps, gpu=%d",
@@ -166,7 +170,7 @@ bool HmdDriver::ApplyEncoderSettings(int w, int h, int fps, int bitrateBps, bool
     }
     RegisterEncoderCallbacks(m_pVideoEncoder);
     if (!m_pVideoEncoder->Initialize(m_encoderW, m_encoderH, m_encoderFps, m_encoderBitrate, m_encoderUseGpu,
-                                     &m_vulkan)) {
+                                     &m_vulkan, m_encoderChoice.c_str())) {
         DriverLog("VideoEncoder re-init failed under %s!", reason);
         delete m_pVideoEncoder;
         m_pVideoEncoder = nullptr;
@@ -177,17 +181,18 @@ bool HmdDriver::ApplyEncoderSettings(int w, int h, int fps, int bitrateBps, bool
     DriverLog("Encoder re-initialized at %dx%d @%d fps from %s", m_encoderW, m_encoderH, m_encoderFps, reason);
     return true;
 }
-// Maps BRIDGE_CFG fps/bitrate/codec onto the encoder settings path; codec names select the GPU or CPU encoder.
+// Maps BRIDGE_CFG onto the encoder path. Named codecs are attempted explicitly.
 bool HmdDriver::ApplyBridgeCfg(int fps, int bitrateKbps, const char* codec)
 {
-    bool newGpu = m_encoderUseGpu;
-    if (codec) {
-        if (strcmp(codec, "libx264") == 0 || strcmp(codec, "cpu") == 0) newGpu = false;
-        else if (strcmp(codec, "h264_amf") == 0 || strcmp(codec, "h264_nvenc") == 0
-                 || strcmp(codec, "h264_qsv") == 0 || strcmp(codec, "gpu") == 0) newGpu = true;
-    }
+    if (!codec) return false;
+    bool newGpu;
+    if (strcmp(codec, "libx264") == 0 || strcmp(codec, "cpu") == 0) newGpu = false;
+    else if (strcmp(codec, "h264_amf") == 0 || strcmp(codec, "h264_nvenc") == 0 ||
+             strcmp(codec, "h264_qsv") == 0 || strcmp(codec, "h264_vaapi") == 0 ||
+             strcmp(codec, "gpu") == 0 || strcmp(codec, "auto") == 0) newGpu = true;
+    else { DriverLog("Unknown encoder choice: %s", codec); return false; }
     int bps = (bitrateKbps >= 1 && bitrateKbps <= 100000) ? bitrateKbps * 1000 : -1;
-    return ApplyEncoderSettings(m_encoderW, m_encoderH, fps, bps, newGpu, "BRIDGE_CFG");
+    return ApplyEncoderSettings(m_encoderW, m_encoderH, fps, bps, newGpu, "BRIDGE_CFG", codec);
 }
 // Stores the phone CARDBOARD_CAP size and clamps the running encoder to it; held for init when the encoder is absent.
 bool HmdDriver::ApplyHardwareCap(int capW, int capH)

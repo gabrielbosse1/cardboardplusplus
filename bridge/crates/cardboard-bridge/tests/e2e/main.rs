@@ -1,4 +1,4 @@
-﻿//! Windows end-to-end suite: real bridge binary + fake driver/phone/sidecar,
+//! Windows end-to-end suite: real bridge binary + fake driver/phone/sidecar,
 //! verifying every control-plane path on the actual wire before the Linux
 //! port. Fake-mode tests share one mutex (fixed UDP ports); run with
 //! --test-threads=1 (scripts/e2e.ps1 does). CBPP_E2E_LIVE=1 switches to
@@ -100,6 +100,32 @@ fn driver_stats_reach_status_and_preview() {
     assert_eq!(preview["driver"]["drops"], serde_json::json!(3));
 }
 #[test]
+fn preview_survives_bursty_stream_and_decodes() {
+    let _gate = serial();
+    if live_mode() || !ffmpeg_available() {
+        return;
+    }
+    let bridge = start_bridge();
+    let driver = FakeDriver::new();
+    bridge.wait_log("embedded preview started", Duration::from_secs(10));
+    let dir = std::env::temp_dir().join("cbpp_e2e_burst");
+    let _ = std::fs::create_dir_all(&dir);
+    let stream = dir.join("burst.h264");
+    assert!(make_test_stream(&stream), "test stream built");
+    let data = std::fs::read(&stream).expect("test stream readable");
+    let aus = split_access_units(&data);
+    assert!(!aus.is_empty(), "test stream splits into access units");
+    // Production-worse send shape: every access unit is blasted as an instant
+    // burst (the driver used to overflow receivers exactly this way). The
+    // preview pump must absorb it and produce decoded frames.
+    driver.stream_h264(&aus);
+    bridge.wait_log("decoded 1 preview frames", Duration::from_secs(25));
+    // The heartbeat counter proves frames keep decoding over the whole burst,
+    // not just the first IDR.
+    bridge.wait_log("decoded 60 preview frames", Duration::from_secs(25));
+}
+
+#[test]
 fn settings_post_lands_on_the_driver_wire() {
     let _gate = serial();
     if live_mode() {
@@ -122,6 +148,30 @@ fn settings_post_lands_on_the_driver_wire() {
     assert_eq!(sent["sent"]["width"], serde_json::json!(1920), "partial POST must merge live width");
     driver.wait_capture("BRIDGE_CFG 72 12000 h264_nvenc", Duration::from_secs(3));
     assert_eq!(bridge.http.post("/settings", "not json").0, 400);
+}
+#[test]
+fn unknown_encoder_name_falls_back_on_the_wire() {
+    // E17: a config/REST typo must degrade gracefully on the BRIDGE_CFG wire
+    // (auto fallback), and case/whitespace variants must resolve correctly.
+    let _gate = serial();
+    if live_mode() {
+        return;
+    }
+    let bridge = start_bridge();
+    let driver = FakeDriver::new();
+    bridge.wait_status("driver_connected", serde_json::json!(true), Duration::from_secs(5));
+    let (code, sent) = bridge.http.post_json("/settings", r#"{"encoder":"nonsense-codec"}"#);
+    assert_eq!(code, 200);
+    assert_eq!(
+        sent["sent"]["encoder"],
+        serde_json::json!("auto"),
+        "unknown encoder name must resolve to auto, never panic or drop the push"
+    );
+    driver.wait_capture("BRIDGE_CFG 60 20000 auto", Duration::from_secs(3));
+    let (code, sent) = bridge.http.post_json("/settings", r#"{"encoder":" H264_NVENC "}"#);
+    assert_eq!(code, 200);
+    assert_eq!(sent["sent"]["encoder"], serde_json::json!("h264_nvenc"), "ffmpeg spelling + trim must resolve");
+    driver.wait_capture("BRIDGE_CFG 60 20000 h264_nvenc", Duration::from_secs(3));
 }
 #[test]
 fn camera_frames_drive_hand_detection_and_skeleton_forward() {

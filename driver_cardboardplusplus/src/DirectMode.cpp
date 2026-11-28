@@ -53,6 +53,11 @@ void HmdDriver::CreateSwapTextureSet(uint32_t unPid, const SwapTextureSetDesc_t*
     if (pOutSwapTextureSet) {
         std::memset(pOutSwapTextureSet, 0, sizeof(*pOutSwapTextureSet));
     }
+    if (!pSwapTextureSetDesc || !pOutSwapTextureSet) return;
+    if (pSwapTextureSetDesc->nSampleCount > 1) {
+        DriverLog("CreateSwapTextureSet: unsupported sample count %u", pSwapTextureSetDesc->nSampleCount);
+        return;
+    }
     StallScope stall("CreateSwapTextureSet");
     DriverLog("CreateSwapTextureSet called: width=%d, height=%d, format=%d, samples=%d",
         pSwapTextureSetDesc->nWidth, pSwapTextureSetDesc->nHeight, pSwapTextureSetDesc->nFormat, pSwapTextureSetDesc->nSampleCount);
@@ -327,20 +332,37 @@ void HmdDriver::Present(vr::SharedTextureHandle_t syncTexture)
             ReleaseSyncTexture();
             return;
         }
-        for (size_t i = 0; i < resolved.size() && i < m_layerCopies.size(); i++) {
+        // Acquire every eye before issuing any copy. WAIT_TIMEOUT and
+        // WAIT_ABANDONED are positive HRESULTs, but do not grant the mutex.
+        bool acquired = true;
+        for (size_t i = 0; i < resolved.size() && acquired; i++) {
             LayerCopy& c = m_layerCopies[i];
-            // Keyed handoff: acquire for the copy, release right after the Flush
-            // so the composer can import the copy.
-            if (c.syncLeft && !c.leftSyncHeld) {
-                if (SUCCEEDED(c.syncLeft->AcquireSync(0, 200))) c.leftSyncHeld = true;
+            HRESULT left = c.syncLeft ? c.syncLeft->AcquireSync(0, 200) : E_FAIL;
+            c.leftSyncHeld = left == S_OK;
+            HRESULT right = c.leftSyncHeld && c.syncRight ? c.syncRight->AcquireSync(0, 200) : E_FAIL;
+            c.rightSyncHeld = right == S_OK;
+            if (!c.leftSyncHeld || !c.rightSyncHeld) {
+                DriverLog("Eye copy mutex acquisition failed: left=0x%x right=0x%x", left, right);
+                acquired = false;
+                // Force the affected copy to be recreated on the next frame if
+                // either keyed mutex reports an abandoned resource.
+                if (left == WAIT_ABANDONED || right == WAIT_ABANDONED) c.width = 0;
             }
-            if (c.syncRight && !c.rightSyncHeld) {
-                if (SUCCEEDED(c.syncRight->AcquireSync(0, 200))) c.rightSyncHeld = true;
+        }
+        if (!acquired) {
+            for (auto& c : m_layerCopies) {
+                if (c.leftSyncHeld && c.syncLeft) { c.syncLeft->ReleaseSync(0); c.leftSyncHeld = false; }
+                if (c.rightSyncHeld && c.syncRight) { c.syncRight->ReleaseSync(0); c.rightSyncHeld = false; }
             }
+            ReleaseSyncTexture();
+            return;
+        }
+        for (size_t i = 0; i < resolved.size(); i++) {
+            LayerCopy& c = m_layerCopies[i];
             m_pHostContext->CopySubresourceRegion(c.pLeft, 0, 0, 0, 0,
-                                                       resolved[i].first, 0, nullptr);
+                                                 resolved[i].first, 0, nullptr);
             m_pHostContext->CopySubresourceRegion(c.pRight, 0, 0, 0, 0,
-                                                       resolved[i].second, 0, nullptr);
+                                                 resolved[i].second, 0, nullptr);
         }
         m_pHostContext->Flush();
         for (size_t i = 0; i < resolved.size() && i < m_layerCopies.size(); i++) {
@@ -371,13 +393,15 @@ void HmdDriver::Present(vr::SharedTextureHandle_t syncTexture)
             pl.boundsRight = validLayers[i].boundsRight;
             m_pendingFrame.layers.push_back(pl);
         }
+        // Publish busy before waking the worker: it may otherwise finish and
+        // signal completion before Present resets the flag.
+        {
+            std::lock_guard<std::mutex> doneLock(m_encodeDoneMutex);
+            m_encodeDone = false;
+        }
         m_frameQueued = true;
     }
     m_encodeCv.notify_one();
-    {
-        std::lock_guard<std::mutex> lock(m_encodeDoneMutex);
-        m_encodeDone = false;
-    }
     ReleaseSyncTexture();
 }
 // Post-present hook (no-op); the compositor calls it after Present returns.
@@ -450,8 +474,8 @@ bool HmdDriver::EnsureLayerCopies(const std::vector<SubmitLayerInfo>& layers)
         if (!needRecreate) continue;
         if (c.pLeft) { c.pLeft->Release(); c.pLeft = nullptr; }
         if (c.pRight) { c.pRight->Release(); c.pRight = nullptr; }
-        if (c.hLeft) { CloseHandle(c.hLeft); c.hLeft = nullptr; }
-        if (c.hRight) { CloseHandle(c.hRight); c.hRight = nullptr; }
+        c.hLeft = nullptr; // GetSharedHandle returns a non-owning KMT handle.
+        c.hRight = nullptr; // KMT handles are not closed with CloseHandle.
         if (c.leftSyncHeld && c.syncLeft) c.syncLeft->ReleaseSync(0);
         if (c.rightSyncHeld && c.syncRight) c.syncRight->ReleaseSync(0);
         if (c.syncLeft) { c.syncLeft->Release(); c.syncLeft = nullptr; }
@@ -482,11 +506,12 @@ bool HmdDriver::EnsureLayerCopies(const std::vector<SubmitLayerInfo>& layers)
                 (*ppOut)->Release(); *ppOut = nullptr;
                 return false;
             }
-            // Device starts holding key 0; hand it off so the per-frame copy
-            // can acquire it and Vulkan compose can sync reads.
+            // A newly created keyed-mutex resource starts owned by the creator.
+            // Release it so Present can acquire it for the D3D copy.
             IDXGIKeyedMutex* pMutex = nullptr;
             if (SUCCEEDED((*ppOut)->QueryInterface(__uuidof(IDXGIKeyedMutex), (void**)&pMutex))) {
                 pMutex->ReleaseSync(0);
+                pMutex->Release();
             }
             *phOut = h;
             return true;
@@ -494,7 +519,7 @@ bool HmdDriver::EnsureLayerCopies(const std::vector<SubmitLayerInfo>& layers)
         if (!makeCopy(itL->second, dL, &c.pLeft, &c.hLeft)) return false;
         if (!makeCopy(itR->second, dR, &c.pRight, &c.hRight)) {
             if (c.pLeft) { c.pLeft->Release(); c.pLeft = nullptr; }
-            if (c.hLeft) { CloseHandle(c.hLeft); c.hLeft = nullptr; }
+            c.hLeft = nullptr; // GetSharedHandle returns a non-owning KMT handle.
             return false;
         }
         if (c.pLeft) c.pLeft->QueryInterface(__uuidof(IDXGIKeyedMutex), (void**)&c.syncLeft);

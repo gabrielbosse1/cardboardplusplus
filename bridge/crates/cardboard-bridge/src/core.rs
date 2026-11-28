@@ -733,7 +733,7 @@ impl AppCore {
     /// Restarts automatically when ffmpeg exits; a held port logs its PID.
     /// Called once from new(); the pump threads never touch bridge memory
     /// beyond the single latest-frame slot.
-    fn start_preview_decode(&self) {
+    fn start_preview_decode(self: &Arc<Self>) {
         {
             let mut decode = self.preview_decode.lock().expect("preview decode lock");
             if let Some(handle) = decode.as_mut() {
@@ -775,6 +775,14 @@ impl AppCore {
             bound.expect("preview socket bound above")
         };
         socket.set_nonblocking(true).ok();
+        // The driver bursts a whole frame (~30+ datagrams, up to several
+        // hundred KB on IDRs) within a millisecond; OS-default receive buffers
+        // overflow, the kernel silently drops mid-frame datagrams and ffmpeg
+        // decodes with concealment stripes. Size the buffer for the burst.
+        match crate::net::set_recv_buffer_size(&socket, 4 << 20) {
+            Some(actual) => self.push_log(format!("preview recv buffer set to {actual} bytes")),
+            None => self.push_log("preview recv buffer bump unsupported (using OS default)".into()),
+        }
         let vf = format!("scale={PREVIEW_W}:{PREVIEW_H}");
         let mut child = match Command::new("ffmpeg")
             .args([
@@ -824,9 +832,14 @@ impl AppCore {
             }
         });
         let preview_decode_cleanup = self.preview_decode.clone();
+        let preview_log = self.clone();
         thread::spawn(move || {
             let mut rgba = vec![0u8; frame_bytes];
             let mut off = 0usize;
+            // Decoded-frame observability: surfaced through the log so tests
+            // (and users) can tell a healthy preview decode from a stalled
+            // pipe without touching the UI slot.
+            let decoded_frames = std::sync::atomic::AtomicU64::new(0);
             loop {
                 if rgba.len() < frame_bytes {
                     rgba.resize(frame_bytes, 0);
@@ -837,6 +850,11 @@ impl AppCore {
                         off += n;
                         if off >= frame_bytes {
                             off = 0;
+                            let decoded =
+                                decoded_frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                            if decoded == 1 || decoded % 60 == 0 {
+                                preview_log.push_log(format!("[preview] decoded {decoded} preview frames"));
+                            }
                             if let Ok(mut slot) = frame_slot.lock() {
                                 match slot.as_mut() {
                                     Some((_, _, old)) => std::mem::swap(&mut rgba, old),
@@ -865,10 +883,20 @@ impl AppCore {
             *decode = Some(PreviewDecodeHandle { child });
         }
         self.push_log("embedded preview started (UDP 42069 → ffmpeg → UI)".into());
-        let weak = Arc::downgrade(&{
-            let this = self.clone();
-            Arc::new(this)
-        });
+        self.spawn_preview_watchdog();
+    }
+    /// Watchdog that restarts the preview pipeline once ffmpeg exits: the
+    /// pump thread clears the decode handle, this thread notices the cleared
+    /// slot, waits out any in-flight restart, then re-enters
+    /// start_preview_decode.
+    ///
+    /// E28: the Weak MUST be captured from the live Arc. The previous
+    /// `Arc::downgrade(&{ Arc::new(self.clone()) })` built a temporary that
+    /// dropped at the end of the statement — strong count hit zero at once,
+    /// upgrade() stayed None forever, and a single ffmpeg death permanently
+    /// killed the preview (black UI video until the bridge restarted).
+    fn spawn_preview_watchdog(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
         let preview_decode = self.preview_decode.clone();
         thread::spawn(move || {
             let child_exited = {
@@ -1345,5 +1373,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         assert!(result.is_ok(), "install failed: {result:?}");
         assert!(installed, "driver .so was not installed without a checkout");
+    }
+    #[test]
+    fn preview_watchdog_restarts_after_decode_handle_clears() {
+        // E28 regression: the watchdog held a Weak to a *temporary* Arc, so
+        // upgrade() was always None and one ffmpeg death permanently killed
+        // the preview (black UI video). Once the decode handle clears, the
+        // "preview auto-restarting..." log MUST appear.
+        let core = AppCore::new();
+        let sleeper = if cfg!(windows) {
+            std::process::Command::new("cmd")
+                .args(["/C", "ping", "-n", "30", "127.0.0.1", ">NUL"])
+                .spawn()
+        } else {
+            std::process::Command::new("sleep").arg("30").spawn()
+        }
+        .expect("sleeper child spawned");
+        {
+            let mut decode = core.preview_decode.lock().expect("preview decode lock");
+            // Occupy the slot with our own child so the watchdog deterministically
+            // captures its PID (on ffmpeg machines a real handle may already sit
+            // there; the extra restart is harmless and still logs the same line).
+            *decode = Some(PreviewDecodeHandle { child: sleeper });
+        }
+        core.spawn_preview_watchdog();
+        std::thread::sleep(std::time::Duration::from_millis(700)); // watchdog captures the pid first
+        {
+            let mut decode = core.preview_decode.lock().expect("preview decode lock");
+            *decode = None; // simulate the pump thread clearing the dead ffmpeg handle
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut restarted = false;
+        while std::time::Instant::now() < deadline {
+            if core
+                .state
+                .lock()
+                .expect("state lock")
+                .log
+                .iter()
+                .any(|l| l.contains("preview auto-restarting"))
+            {
+                restarted = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        assert!(
+            restarted,
+            "watchdog never restarted the preview (Weak dead -- E28 regression)"
+        );
     }
 }

@@ -16,6 +16,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <memory>
+#include <string>
 using namespace vr;
 // Triple-buffered eye textures shared with the SteamVR compositor; nextIndex rotates the write slot.
 struct SwapTextureSet {
@@ -95,7 +96,8 @@ private:
     void ClampEncoderToCap();
     bool ApplyBridgeCfg(int fps, int bitrateKbps, const char* codec);
     void ApplyStreamSettings(const cbpp::PayloadSettingsChange& settings);
-    bool ApplyEncoderSettings(int w, int h, int fps, int bitrateBps, bool useGpu, const char* reason);
+    bool ApplyEncoderSettings(int w, int h, int fps, int bitrateBps, bool useGpu, const char* reason,
+                              const char* codec = nullptr);
     static bool SanitizeEncoderDims(int& w, int& h);
     void RegisterEncoderCallbacks(VideoEncoder* enc);
     void RunBridgeHeartbeat();
@@ -114,6 +116,7 @@ private:
 // Frame pipeline helpers; the encoding thread runs EncodingThreadFunc/EncodePendingFrame, Present uses the sync/copy helpers.
     void EncodingThreadFunc();
     void EncodePendingFrame(const PendingFrame& frame);
+    void HeartbeatEncode();
     bool AcquireSyncTexture(vr::SharedTextureHandle_t syncTexture);
     void ReleaseSyncTexture();
     void WaitEncoderIdle();
@@ -151,6 +154,7 @@ private:
     std::condition_variable m_encodeCv;
     bool m_frameQueued;
     PendingFrame m_pendingFrame;
+    long long m_lastFramePts = 0; // pts of the last successfully encoded frame
     std::mutex m_encodeDoneMutex;
     std::condition_variable m_encodeDoneCv;
     bool m_encodeDone;
@@ -162,6 +166,7 @@ private:
     int m_encoderFps = 60;
     int m_encoderBitrate = 20000000;
     bool m_encoderUseGpu = false;
+    std::string m_encoderChoice = "cpu";
     int m_pendingCapW = 0;
     int m_pendingCapH = 0;
     std::mutex m_encoderMutex;
@@ -203,6 +208,9 @@ private:
     bool m_udpInitialized;
     uint32_t m_udpDroppedPreview;
     uint32_t m_udpDroppedPhone;
+    // Consecutive frames abandoned mid-send by a full socket buffer; drives
+    // the automatic IDR resync (see SendFannedOut).
+    unsigned m_udpConsecutiveDrops = 0;
     std::atomic<uint64_t> m_udpFramesSent{0};
     std::vector<uint8_t> m_scratchFixed;
     std::vector<uint8_t> m_scratchFramed;

@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 // Inline H.264 helpers shared by the encoder and UDP paths plus the wire-protocol tests.
@@ -20,36 +21,41 @@ static inline uint8_t* BuildLengthPrefixedPacket(const uint8_t* data, int size, 
     return framed;
 }
 // Scans a keyframe for the PPS end so OnEncodedPacket can insert a missing IDR marker; returns the offset or -1 when no insert applies.
+// Only the true quirk qualifies: a type-5 slice header byte with no start code after the PPS NAL. When a start code follows PPS the
+// packet has proper NAL boundaries (SEI, AUD, filler, IDR all included), so inserting a bare "00 00 00 01 65" there would add an
+// empty IDR NAL mid-access-unit and corrupt every keyframe — decoder error concealment then shows misplaced blocks.
 static inline int FindIdrInsertionPoint(const uint8_t* data, int size, bool keyframe)
 {
     if (!keyframe || size <= 10) return -1;
-    int ppsDataEnd = -1;
-    for (int i = 0; i < size - 5; i++) {
-        if (data[i] == 0x00 && data[i+1] == 0x00 && data[i+2] == 0x00 &&
-            data[i+3] == 0x01 && (data[i+4] & 0x1F) == 8) {
-            for (int j = i + 5; j < size - 3; j++) {
-                if (data[j] == 0x00 && data[j+1] == 0x00 &&
-                    ((data[j+2] == 0x01) || (data[j+2] == 0x00 && data[j+3] == 0x01))) {
-                    ppsDataEnd = j;
-                    break;
-                }
+    for (int i = 0; i + 4 < size; i++) {
+        if (!(data[i] == 0x00 && data[i+1] == 0x00 && data[i+2] == 0x00 &&
+              data[i+3] == 0x01 && (data[i+4] & 0x1F) == 8)) continue;
+        // PPS NAL found at i. If any start code follows it, the access unit is
+        // already structured — never insert (a non-IDR NAL like SEI sitting
+        // between PPS and the slice must not be split by a fake IDR header).
+        for (int j = i + 5; j + 3 < size; j++) {
+            if (data[j] == 0x00 && data[j+1] == 0x00 &&
+                ((data[j+2] == 0x01) || (data[j+2] == 0x00 && data[j+3] == 0x01))) {
+                return -1;
             }
-            if (ppsDataEnd < 0) ppsDataEnd = i + 5 + 4;
-            bool idrScPresent = false;
-            if (ppsDataEnd + 3 < size &&
-                data[ppsDataEnd] == 0x00 && data[ppsDataEnd+1] == 0x00 &&
-                data[ppsDataEnd+2] == 0x01 &&
-                (data[ppsDataEnd+3] & 0x1F) == 5) {
-                idrScPresent = true;
-            } else if (ppsDataEnd + 4 < size &&
-                data[ppsDataEnd] == 0x00 && data[ppsDataEnd+1] == 0x00 &&
-                data[ppsDataEnd+2] == 0x00 && data[ppsDataEnd+3] == 0x01 &&
-                (data[ppsDataEnd+4] & 0x1F) == 5) {
-                idrScPresent = true;
-            }
-            if (idrScPresent) return -1;
-            return ppsDataEnd;
         }
+        // No start code after PPS: the historical quirk emitted the IDR slice
+        // header directly after PPS data. Insert immediately before the first
+        // byte in a bounded window that reads as a type-5 slice header with a
+        // nonzero nal_ref_idc and no start code in front of it.
+        int limit = i + 5 + 32;
+        if (limit > size) limit = size;
+        for (int j = i + 5; j < limit; j++) {
+            uint8_t b = data[j];
+            if ((b & 0x1F) == 5 && (b & 0x60) != 0) {
+                bool precededBySc =
+                    (j >= 3 && data[j-3] == 0x00 && data[j-2] == 0x00 && data[j-1] == 0x01) ||
+                    (j >= 4 && data[j-4] == 0x00 && data[j-3] == 0x00 &&
+                     data[j-2] == 0x00 && data[j-1] == 0x01);
+                if (!precededBySc) return j;
+            }
+        }
+        return -1;
     }
     return -1;
 }

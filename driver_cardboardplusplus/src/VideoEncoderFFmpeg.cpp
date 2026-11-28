@@ -17,8 +17,13 @@ bool VideoEncoder::InitializeFFmpeg()
     const int hwCandidateCount = 4;
 #endif
     const char* swCandidates[] = { "libx264" };
-    const char** codecNames = m_useGpuEncoding ? hwCandidates : swCandidates;
-    const int codecNameCount = m_useGpuEncoding ? hwCandidateCount : 1;
+    const char* explicitCandidates[] = { m_codecChoice.c_str() };
+    const bool explicitCodec = m_codecChoice == "h264_amf" || m_codecChoice == "h264_nvenc" ||
+                               m_codecChoice == "h264_qsv" || m_codecChoice == "h264_vaapi" ||
+                               m_codecChoice == "libx264";
+    const char** codecNames = explicitCodec ? explicitCandidates : (m_useGpuEncoding ? hwCandidates : swCandidates);
+    const int codecNameCount = explicitCodec ? 1 : (m_useGpuEncoding ? hwCandidateCount : 1);
+    ENCODER_LOG("Requested encoder: %s", m_codecChoice.c_str());
     const AVCodec* codec = nullptr;
     for (int n = 0; n < codecNameCount; n++) {
         const char* name = codecNames[n];
@@ -43,7 +48,12 @@ bool VideoEncoder::InitializeFFmpeg()
         m_pCodecContext->bit_rate = m_bitrate;
         m_pCodecContext->rc_min_rate = m_bitrate;
         m_pCodecContext->rc_max_rate = m_bitrate;
-        m_pCodecContext->rc_buffer_size = m_bitrate / 2;
+        // Keep single-frame peaks well under the UDP send buffer: the stream is
+        // chunked into datagrams, and a burst bigger than the socket buffer
+        // forces mid-frame abandonment (lost trailing slices -> decoder
+        // concealment smears). bitrate/6 caps a peak frame around ~420 KB at
+        // the default 20 Mbps instead of the former 1.25 MB.
+        m_pCodecContext->rc_buffer_size = m_bitrate / 6;
         m_pCodecContext->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
         bool isLibx264 = (strcmp(name, "libx264") == 0);
         bool isAmf     = (strcmp(name, "h264_amf") == 0);
@@ -66,6 +76,7 @@ bool VideoEncoder::InitializeFFmpeg()
                 if (av_hwdevice_ctx_init(hwdev) == 0) {
                     m_pHwDeviceCtx = hwdev;
                     m_pCodecContext->hw_device_ctx = av_buffer_ref(hwdev);
+                    hostDevice->Release();
                     ENCODER_LOG("AMF running on a private host device");
                 } else {
                     ENCODER_ERROR("Failed to init the AMF hardware device context");
@@ -83,21 +94,39 @@ bool VideoEncoder::InitializeFFmpeg()
         } else
 #else
         if (isVaapi) {
-            // VAAPI takes the DRM render node and uploads the host-visible NV12 the
-            // Vulkan compute pass already produced. av_hwdevice_ctx_create passes the
-            // node path straight to the VAAPI backend.
+            // VAAPI consumes hardware surfaces. Try accessible DRM render nodes;
+            // the software NV12 frame is uploaded into the selected device.
             AVBufferRef* hwdev = nullptr;
-            int hwret = av_hwdevice_ctx_create(&hwdev, AV_HWDEVICE_TYPE_VAAPI,
-                                               "/dev/dri/renderD128", nullptr, 0);
-            if (hwret == 0 && hwdev) {
-                m_pHwDeviceCtx = hwdev;
-                m_pCodecContext->hw_device_ctx = av_buffer_ref(hwdev);
-                m_pCodecContext->pix_fmt = AV_PIX_FMT_VAAPI;
-                ENCODER_LOG("VAAPI device /dev/dri/renderD128 ready");
-            } else {
-                ENCODER_ERROR("Failed to init VAAPI hw device (ret=%d)", hwret);
+            for (int node = 128; node < 144 && !hwdev; node++) {
+                char path[64];
+                snprintf(path, sizeof(path), "/dev/dri/renderD%d", node);
+                if (av_hwdevice_ctx_create(&hwdev, AV_HWDEVICE_TYPE_VAAPI,
+                                           path, nullptr, 0) >= 0 && hwdev) {
+                    ENCODER_LOG("VAAPI device %s ready", path);
+                    break;
+                }
                 if (hwdev) av_buffer_unref(&hwdev);
             }
+            AVBufferRef* frames = hwdev ? av_hwframe_ctx_alloc(hwdev) : nullptr;
+            if (frames) {
+                AVHWFramesContext* hwframes = (AVHWFramesContext*)frames->data;
+                hwframes->format = AV_PIX_FMT_VAAPI;
+                hwframes->sw_format = AV_PIX_FMT_NV12;
+                hwframes->width = m_width;
+                hwframes->height = m_height;
+                hwframes->initial_pool_size = 4;
+                if (av_hwframe_ctx_init(frames) < 0) av_buffer_unref(&frames);
+            }
+            if (!frames) {
+                ENCODER_ERROR("VAAPI frame pool unavailable; trying next encoder");
+                if (hwdev) av_buffer_unref(&hwdev);
+                avcodec_free_context(&m_pCodecContext);
+                continue;
+            }
+            m_pHwDeviceCtx = hwdev;
+            m_pCodecContext->hw_device_ctx = av_buffer_ref(hwdev);
+            m_pCodecContext->hw_frames_ctx = frames;
+            m_pCodecContext->pix_fmt = AV_PIX_FMT_VAAPI;
             av_opt_set(m_pCodecContext->priv_data, "rc_mode", "CBR", 0);
             av_opt_set(m_pCodecContext->priv_data, "profile", "constrained_baseline", 0);
         } else
@@ -273,6 +302,15 @@ bool VideoEncoder::ConvertFrame()
     m_pFrame->data[1] = (uint8_t*)m_pGpuNv12 + (size_t)m_width * m_height;
     return true;
 }
+// Re-encodes the last produced frame (see header). No dumps, no telemetry
+// stage notes: this is the idle heartbeat, not a fresh frame.
+bool VideoEncoder::ReencodeLastFrame(int64_t pts)
+{
+    if (!m_initialized) return false;
+    if (!m_pGpuNv12 && !m_pSwsSrc) return false;
+    if (!ConvertFrame()) return false;
+    return FinishEncode(pts);
+}
 // Converts the BGRA frame source (Vulkan host copy map or D3D staging readback) to
 // the NV12 software frame; runs on the encoding thread before FinishEncode.
 bool VideoEncoder::SwsConvert()
@@ -374,7 +412,26 @@ bool VideoEncoder::SendFrameToEncoder()
     if (m_forceKeyframe.exchange(false, std::memory_order_relaxed) && m_pFrame) {
         m_pFrame->pict_type = AV_PICTURE_TYPE_I;
     }
-    int ret = avcodec_send_frame(m_pCodecContext, m_pFrame);
+    AVFrame* input = m_pFrame;
+    AVFrame* hwFrame = nullptr;
+#ifndef _WIN32
+    if (m_pCodecContext->pix_fmt == AV_PIX_FMT_VAAPI) {
+        hwFrame = av_frame_alloc();
+        if (!hwFrame) return false;
+        int upload = av_hwframe_get_buffer(m_pCodecContext->hw_frames_ctx, hwFrame, 0);
+        if (upload >= 0) upload = av_hwframe_transfer_data(hwFrame, m_pFrame, 0);
+        if (upload >= 0) upload = av_frame_copy_props(hwFrame, m_pFrame);
+        if (upload < 0) {
+            LogFFmpegError("VAAPI frame upload", upload);
+            av_frame_free(&hwFrame);
+            return false;
+        }
+        input = hwFrame;
+    }
+#endif
+    int ret = avcodec_send_frame(m_pCodecContext, input);
+    av_frame_free(&hwFrame);
+    m_pFrame->pict_type = AV_PICTURE_TYPE_NONE;
     if (ret < 0) {
         ENCODER_ERROR("avcodec_send_frame failed! Error code: %d", ret);
         char errbuf[AV_ERROR_MAX_STRING_SIZE];

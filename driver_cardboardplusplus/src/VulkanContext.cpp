@@ -66,12 +66,33 @@ bool VulkanContext::Initialize(const PlatformAdapterId* adapterId)
     app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     app.pApplicationName = "cardboardplusplus-driver";
     app.apiVersion = apiVersion;
-    const char* instanceExts[] = { VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME };
+    // External-memory capabilities is the load-bearing extension; debug-utils
+    // is added when the loader offers it so the test suite can attach a
+    // validation messenger (multi-hardware API-misuse proxy). Harmless without
+    // a validation layer installed.
+    std::vector<const char*> instanceExts;
+    instanceExts.push_back(VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME);
+    auto vkEnumerateInstanceExtensionProperties = (PFN_vkEnumerateInstanceExtensionProperties)
+        m_vkGetInstanceProcAddr(VK_NULL_HANDLE, "vkEnumerateInstanceExtensionProperties");
+    if (vkEnumerateInstanceExtensionProperties) {
+        uint32_t n = 0;
+        if (vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr) == VK_SUCCESS && n > 0) {
+            std::vector<VkExtensionProperties> props(n);
+            if (vkEnumerateInstanceExtensionProperties(nullptr, &n, props.data()) == VK_SUCCESS) {
+                for (const auto& e : props) {
+                    if (strcmp(e.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0) {
+                        instanceExts.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+                        break;
+                    }
+                }
+            }
+        }
+    }
     VkInstanceCreateInfo ici = {};
     ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     ici.pApplicationInfo = &app;
-    ici.enabledExtensionCount = 1;
-    ici.ppEnabledExtensionNames = instanceExts;
+    ici.enabledExtensionCount = (uint32_t)instanceExts.size();
+    ici.ppEnabledExtensionNames = instanceExts.data();
     VkResult res = vkCreateInstance(&ici, nullptr, &m_instance);
     if (res != VK_SUCCESS) {
         DriverLog("Vulkan: vkCreateInstance failed (%d)", res);
@@ -133,10 +154,17 @@ bool VulkanContext::Initialize(const PlatformAdapterId* adapterId)
         }
     }
     if (!m_physical) {
-        DriverLog("Vulkan: no device matches the adapter LUID; using first device (import disabled)");
-        m_physical = devices[0];
-        m_luidMatched = false;
+        DriverLog("Vulkan: no physical device matches the graphics adapter");
+        Destroy();
+        return false;
     }
+#ifdef _WIN32
+    if (!m_luidMatched) {
+        DriverLog("Vulkan: a matching D3D11 adapter LUID is required for eye imports");
+        Destroy();
+        return false;
+    }
+#endif
     // Record extension support and build the enabled-device-extension list in
     // one pass; only request what the device exposes or vkCreateDevice fails.
     // Windows imports shared textures by KMT handle; Linux imports dma-buf
@@ -205,12 +233,7 @@ bool VulkanContext::Initialize(const PlatformAdapterId* adapterId)
         }
     }
     if (picked < 0) {
-        for (uint32_t i = 0; i < qCount; i++) {
-            if (queues[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) { picked = (int)i; break; }
-        }
-    }
-    if (picked < 0) {
-        DriverLog("Vulkan: no graphics queue");
+        DriverLog("Vulkan: no queue supports both graphics and compute");
         Destroy();
         return false;
     }
@@ -255,6 +278,13 @@ bool VulkanContext::Initialize(const PlatformAdapterId* adapterId)
                   fMemModel.vulkanMemoryModel, fMemModel.vulkanMemoryModelDeviceScope,
                   fDrawParams.shaderDrawParameters, fBda.bufferDeviceAddress, use12);
     }
+#ifdef _WIN32
+    if (!use12 || !fMemModel.vulkanMemoryModelDeviceScope) {
+        DriverLog("Vulkan: required SPIR-V 1.5 features are unavailable");
+        Destroy();
+        return false;
+    }
+#endif
     VkDeviceCreateInfo dci = {};
     dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     dci.pNext = use12 ? (void*)&fMemModel : nullptr;

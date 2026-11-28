@@ -25,8 +25,100 @@ jobs:
       run: ./scripts/bake-driver-version.ps1
       shell: pwsh
 
+    - name: Compile SPIR-V shaders (dxc)
+      # Generates include/shaders/spirv/*.spv.h with the same dxc flags as the
+      # Linux build; VulkanCompose embeds these instead of runtime-translating
+      # DXBC through dxil-spirv (which emitted descriptor sets the pipeline
+      # layouts never matched, and crashed on the NV12 compute shader).
+      shell: pwsh
+      run: |
+        # Syntax-check the script first: a parse error would otherwise fail the
+        # step before any diagnostic output exists.
+        $parseErrors = $null
+        [System.Management.Automation.Language.Parser]::ParseFile(
+          (Join-Path $PWD "scripts\build-spirv.ps1"), [ref]$null, [ref]$parseErrors) | Out-Null
+        if ($parseErrors) {
+          $parseErrors | Select-Object -First 8 |
+            ForEach-Object { "::error::PARSE line $($_.Extent.StartLineNumber): $($_.Message)" }
+          exit 1
+        }
+        try {
+          & ./scripts/build-spirv.ps1
+        } catch {
+          "::error::build-spirv threw: $($_.Exception.Message)"
+          $stack = ($_.ScriptStackTrace -split "`n")[0]
+          if ($stack) { "::error::$stack" }
+          exit 1
+        }
+
+    - name: SPIR-V facts (TEMP diagnostics)
+      if: always()
+      shell: pwsh
+      run: |
+        foreach ($name in @("compose_vs", "compose_ps", "nv12_cs")) {
+          $p = "driver_cardboardplusplus\include\shaders\spirv\$name.spv"
+          if (-not (Test-Path $p)) { "::error::MISSING $p"; continue }
+          $bytes = [IO.File]::ReadAllBytes($p)
+          $n = [math]::Floor($bytes.Length / 4)
+          $ver = '{0:x4}' -f [BitConverter]::ToUInt32($bytes, 4)
+          $rows = @()
+          $names2 = @{}
+          $i = 5
+          while ($i + 1 -lt $n) {
+            $w = [BitConverter]::ToUInt32($bytes, $i*4)
+            $wc = $w -shr 16; $op = $w -band 0xFFFF
+            if ($wc -eq 0) { break }
+            if ($i + $wc -gt $n) { break }
+            if ($op -eq 5 -and $wc -ge 2) {
+              $t = [BitConverter]::ToUInt32($bytes, ($i+1)*4)
+              $sb = New-Object System.Text.StringBuilder
+              for ($j = $i + 2; $j -lt ($i + $wc); $j++) {
+                $w4 = [BitConverter]::ToUInt32($bytes, $j*4)
+                foreach ($b in 0..3) {
+                  $c = ($w4 -shr (8*$b)) -band 0xFF
+                  if ($c -eq 0) { $j = $i + $wc; break }
+                  [void]$sb.Append([char]$c)
+                }
+              }
+              $names2[$t] = $sb.ToString()
+            } elseif ($op -eq 71 -and $wc -ge 3) {
+              $t = [BitConverter]::ToUInt32($bytes, ($i+1)*4)
+              $d = [BitConverter]::ToUInt32($bytes, ($i+2)*4)
+              $lit = 0
+              if ($wc -ge 4) { $lit = [BitConverter]::ToUInt32($bytes, ($i+3)*4) }
+              if ($d -in 11, 30, 33, 34) {
+                # Binding=33, DescriptorSet=34, Location=30 (vendored spirv.hpp).
+                $kind = @{11 = "builtin"; 30 = "loc"; 33 = "bind"; 34 = "set"}[[int]$d]
+                $rows += "$($names2[$t]):$kind=$lit"
+              }
+            } elseif ($op -eq 59 -and $wc -ge 4) {
+              $t = [BitConverter]::ToUInt32($bytes, ($i+2)*4)
+              $sc = [BitConverter]::ToUInt32($bytes, ($i+3)*4)
+              if ($sc -in 0, 1) {
+                $rows += "$($names2[$t]):st=$sc"
+              }
+            }
+            $i += $wc
+          }
+          $line = "F $name ver=$ver words=$n " + ($rows -join " ")
+          Write-Host $line
+          "::error::$($line.Substring(0, [Math]::Min(230, $line.Length)))"
+          if ($line.Length -gt 230) { "::error::.. $($line.Substring(230, [Math]::Min(230, $line.Length - 230)))" }
+        }
+
     - name: Build Driver
-      run: msbuild driver_cardboardplusplus\driver_cardboardplusplus.sln /p:Configuration=${{ matrix.configuration }} /p:Platform=x64 /p:PlatformToolset=v143
+      shell: pwsh
+      run: |
+        # Capture the output so compile errors reach the annotation budget
+        # (job logs themselves are not retrievable from this setup).
+        $out = msbuild driver_cardboardplusplus\driver_cardboardplusplus.sln /p:Configuration=${{ matrix.configuration }} /p:Platform=x64 /p:PlatformToolset=v143 /m 2>&1
+        $code = $LASTEXITCODE
+        $text = @($out | ForEach-Object { $_.ToString() })
+        $text | Select-Object -Last 10 | ForEach-Object { Write-Host $_ }
+        $errs = $text | Where-Object { $_ -match ': (error|fatal error) ' } | Select-Object -First 8
+        foreach ($e in $errs) { "::error::$($e.Substring(0, [Math]::Min(220, $e.Length)))" }
+        if ($code -ne 0) { exit $code }
+
 
     - name: Driver unit tests
       shell: pwsh
@@ -40,3 +132,13 @@ jobs:
         if ($LASTEXITCODE -ne 0) { throw "driver test compile failed (cl exit $LASTEXITCODE)" }
         .\driver_tests.exe
         if ($LASTEXITCODE -ne 0) { throw "driver tests failed" }
+        cmd /c "`"$devCmd`" -arch=x64 >nul && cl /nologo /EHsc /std:c++14 /I driver_cardboardplusplus\include /Fe:eye_format_tests.exe /Fo:eye_format_tests_ driver_cardboardplusplus\tests\test_eye_format.cpp"
+        if ($LASTEXITCODE -ne 0) { throw "eye format test compile failed (cl exit $LASTEXITCODE)" }
+        .\eye_format_tests.exe
+        if ($LASTEXITCODE -ne 0) { throw "eye format tests failed" }
+        # Pure encoder unit tests (H.264 helper matrix + settings validation):
+        # no FFmpeg/Vulkan needed; the lavapipe-linked phases run on Linux CI.
+        cmd /c "`"$devCmd`" -arch=x64 >nul && cl /nologo /EHsc /std:c++17 /I driver_cardboardplusplus\include /Fe:encoder_unit_tests.exe /Fo:encoder_unit_tests_ driver_cardboardplusplus\tests\encoder_unit_test.cpp"
+        if ($LASTEXITCODE -ne 0) { throw "encoder unit test compile failed (cl exit $LASTEXITCODE)" }
+        .\encoder_unit_tests.exe
+        if ($LASTEXITCODE -ne 0) { throw "encoder unit tests failed" }

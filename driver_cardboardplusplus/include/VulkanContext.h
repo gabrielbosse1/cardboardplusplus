@@ -34,6 +34,9 @@ public:
     VkPhysicalDevice Physical() const { return m_physical; }
     VkDevice Device() const { return m_device; }
     VkQueue Queue() const { return m_queue; }
+    // Instance handle for test instrumentation only (validation messenger);
+    // null when Vulkan failed to initialize.
+    VkInstance Instance() const { return m_instance; }
     // Device-level command lookup; null when Vulkan failed to initialize.
     void* GetDeviceProc(const char* name);
     // Instance-level command lookup (physical-device commands); null when Vulkan failed.
