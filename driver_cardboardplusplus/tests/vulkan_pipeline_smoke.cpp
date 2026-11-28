@@ -7,6 +7,7 @@
 // Build (Linux CI): g++ -std=c++17 -I driver_cardboardplusplus/build/spirv \
 //   -o vk_smoke tests/vulkan_pipeline_smoke.cpp -lvulkan
 // Run with lavapipe: VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json ./vk_smoke
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -119,6 +120,16 @@ static BufRes MakeHostBuffer(VkDevice dev, VkPhysicalDevice phys, VkDeviceSize s
 // ===== Phase B: real driver components (production VulkanContext + VulkanCompose) =====
 // The phase above replays the pipeline with a raw-Vulkan replica; this phase
 // links the actual production code paths, so whatever ships is what is tested.
+// The production DriverLog.cpp is NOT linked: its first call would dereference
+// SteamVR's uninitialized driver context (vr::VRDriverContext() is null
+// outside SteamVR) and segfault. This standalone sink replaces it.
+void DriverLog(const char* pFormat, ...) {
+    va_list ap;
+    va_start(ap, pFormat);
+    vfprintf(stderr, pFormat, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+}
 static void RunRealComponentPhase() {
     printf("== PHASE B: real VulkanContext + VulkanCompose ==\n");
 
@@ -360,6 +371,7 @@ static void RunRealComponentPhase() {
 }
 
 int main() {
+    setvbuf(stdout, nullptr, _IONBF, 0);  // survive crashes: no lost buffer
     printf("== SPIR-V words: vs=%zu ps=%zu cs=%zu\n",
            sizeof(CBPPSpirv_compose_vs) / 4, sizeof(CBPPSpirv_compose_ps) / 4,
            sizeof(CBPPSpirv_nv12_cs) / 4);

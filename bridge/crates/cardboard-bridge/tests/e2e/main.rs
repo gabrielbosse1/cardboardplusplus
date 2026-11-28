@@ -119,7 +119,7 @@ fn preview_survives_bursty_stream_and_decodes() {
     // burst (the driver used to overflow receivers exactly this way). The
     // preview pump must absorb it and produce decoded frames.
     driver.stream_h264(&aus);
-    bridge.wait_log("preview decoded", Duration::from_secs(25));
+    bridge.wait_log("decoded 1 preview frames", Duration::from_secs(25));
     // The heartbeat counter proves frames keep decoding over the whole burst,
     // not just the first IDR.
     bridge.wait_log("decoded 60 preview frames", Duration::from_secs(25));

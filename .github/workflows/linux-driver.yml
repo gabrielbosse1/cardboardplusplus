@@ -137,19 +137,18 @@ jobs:
         if [ -n "$PYE" ]; then echo "::error::PYERR $PYE"; fi
         # Phase B/C link the REAL production components (VulkanContext,
         # VulkanCompose, VideoEncoder + FFmpeg) on top of the SPIR-V replica,
-        # so the shipped code paths run under test on lavapipe.
-        STUB=""
-        [ -f /tmp/openvr_stub/openvr_api.so ] && STUB=/tmp/openvr_stub/openvr_api.so
+        # so the shipped code paths run under test on lavapipe. DriverLog.cpp
+        # is NOT linked: outside SteamVR the driver context is null and its
+        # first call would crash — the test provides a stderr sink instead.
         g++ -std=c++17 -O1 -DCBPP_ENCODER_E2E_TEST \
           -I driver_cardboardplusplus/include -I driver_cardboardplusplus/build/spirv \
           -o /tmp/vk_smoke driver_cardboardplusplus/tests/vulkan_pipeline_smoke.cpp \
           driver_cardboardplusplus/src/VulkanContext.cpp \
           driver_cardboardplusplus/src/VulkanCompose.cpp \
-          driver_cardboardplusplus/src/DriverLog.cpp \
           driver_cardboardplusplus/src/VideoEncoder.cpp \
           driver_cardboardplusplus/src/VideoEncoderFFmpeg.cpp \
           driver_cardboardplusplus/src/VideoEncoderShaders.cpp \
-          $STUB -lvulkan -lavcodec -lavutil -lswscale -lavformat \
+          -lvulkan -lavcodec -lavutil -lswscale -lavformat \
           > /tmp/smoke_build.log 2>&1
         BUILDRC=$?
         echo "SMOKE compile rc=$BUILDRC"
