@@ -30,13 +30,21 @@ $DxcZip = "dxc_2026_09_29.zip"
 $DxcUrl = "https://github.com/microsoft/DirectXShaderCompiler/releases/download/$DxcVersion/$DxcZip"
 
 # Locate dxc.exe: explicit -DxcDir, then PATH, then the TEMP download cache.
+# Prefer the x64 build: the dxc release zip ships arm/arm64/x64/x86 side by
+# side, and an arm64 dxc.exe refuses to run on x64 Windows.
+function Find-DxcExe([string]$dir) {
+    if (-not $dir -or -not (Test-Path $dir)) { return $null }
+    if (Test-Path (Join-Path $dir "dxc.exe") -PathType Leaf) { return (Join-Path $dir "dxc.exe") }
+    $all = Get-ChildItem -Path $dir -Recurse -Filter dxc.exe -ErrorAction SilentlyContinue
+    $x64 = $all | Where-Object { $_.FullName -match '\\x64\\' } | Select-Object -First 1
+    if ($x64) { return $x64.FullName }
+    return ($all | Select-Object -First 1).FullName
+}
 $dxcExe = $null
 $candidateDirs = @($DxcDir, (Join-Path $env:TEMP "cbpp_dxc"))
 foreach ($dir in $candidateDirs) {
-    if (-not $dir) { continue }
-    if (Test-Path (Join-Path $dir "dxc.exe")) { $dxcExe = Join-Path $dir "dxc.exe"; break }
-    $found = Get-ChildItem -Path $dir -Recurse -Filter dxc.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($found) { $dxcExe = $found.FullName; break }
+    $dxcExe = Find-DxcExe $dir
+    if ($dxcExe) { break }
 }
 if (-not $dxcExe) {
     $onPath = Get-Command dxc.exe -ErrorAction SilentlyContinue
@@ -65,9 +73,8 @@ if (-not $dxcExe) {
     } catch {
         Fail "Expand-Archive failed: $($_.Exception.Message)"
     }
-    $found = Get-ChildItem -Path $cache -Recurse -Filter dxc.exe | Select-Object -First 1
-    if (-not $found) { Fail "dxc.exe not found in the downloaded archive" }
-    $dxcExe = $found.FullName
+    $dxcExe = Find-DxcExe $cache
+    if (-not $dxcExe) { Fail "dxc.exe not found in the downloaded archive" }
 }
 if (-not (Test-Path $dxcExe)) { Fail "dxc.exe not found: $dxcExe" }
 Write-Host "dxc: $dxcExe"
