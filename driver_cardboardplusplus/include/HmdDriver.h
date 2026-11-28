@@ -208,6 +208,9 @@ private:
     bool m_udpInitialized;
     uint32_t m_udpDroppedPreview;
     uint32_t m_udpDroppedPhone;
+    // Consecutive frames abandoned mid-send by a full socket buffer; drives
+    // the automatic IDR resync (see SendFannedOut).
+    unsigned m_udpConsecutiveDrops = 0;
     std::atomic<uint64_t> m_udpFramesSent{0};
     std::vector<uint8_t> m_scratchFixed;
     std::vector<uint8_t> m_scratchFramed;

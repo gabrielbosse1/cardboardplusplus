@@ -48,7 +48,12 @@ bool VideoEncoder::InitializeFFmpeg()
         m_pCodecContext->bit_rate = m_bitrate;
         m_pCodecContext->rc_min_rate = m_bitrate;
         m_pCodecContext->rc_max_rate = m_bitrate;
-        m_pCodecContext->rc_buffer_size = m_bitrate / 2;
+        // Keep single-frame peaks well under the UDP send buffer: the stream is
+        // chunked into datagrams, and a burst bigger than the socket buffer
+        // forces mid-frame abandonment (lost trailing slices -> decoder
+        // concealment smears). bitrate/6 caps a peak frame around ~420 KB at
+        // the default 20 Mbps instead of the former 1.25 MB.
+        m_pCodecContext->rc_buffer_size = m_bitrate / 6;
         m_pCodecContext->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
         bool isLibx264 = (strcmp(name, "libx264") == 0);
         bool isAmf     = (strcmp(name, "h264_amf") == 0);

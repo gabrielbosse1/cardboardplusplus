@@ -13,7 +13,11 @@ static constexpr int kUdpChunkBytes = 1400;
 // abandons the whole buffer rather than its tail: the phone parses the stream as
 // 4-byte length-prefixed frames, so a partial frame would leave its declared
 // length unfulfilled and desync the reassembler for the rest of the stream.
-static void SendFramedUdp(cbpp::PlatformSocket socket, const sockaddr_in* addr,
+// Returns true when every chunk was accepted by the OS; false when the frame
+// was abandoned mid-way (send buffer full or hard error) — the caller tracks
+// that to trigger an IDR resync, since Annex-B consumers lose that frame's
+// trailing slices and decode with concealment artifacts until the next IDR.
+static bool SendFramedUdp(cbpp::PlatformSocket socket, const sockaddr_in* addr,
                           const uint8_t* framed, int framedSize,
                           uint32_t* droppedCounter)
 {
@@ -29,7 +33,7 @@ static void SendFramedUdp(cbpp::PlatformSocket socket, const sockaddr_in* addr,
                 if (*droppedCounter % 30 == 1) {
                     DriverLog("[UDP] Send buffer full, dropping frame (dropped=%d)", (int)*droppedCounter);
                 }
-                return;
+                return false;
             } else {
                 char targetIp[INET_ADDRSTRLEN];
                 inet_ntop(AF_INET, &addr->sin_addr, targetIp, sizeof(targetIp));
@@ -40,6 +44,7 @@ static void SendFramedUdp(cbpp::PlatformSocket socket, const sockaddr_in* addr,
         }
         offset += chunkSize;
     }
+    return offset >= framedSize;
 }
 }
 // Starts the socket layer plus the non-blocking video socket; preview points at localhost, the phone target waits for discovery.
@@ -56,7 +61,7 @@ bool HmdDriver::InitializeUDP()
         cbpp::PlatformShutdownNetworking();
         return false;
     }
-    int bufSize = 1024 * 1024;
+    int bufSize = 4 * 1024 * 1024;
     setsockopt(m_udpSocket, SOL_SOCKET, SO_SNDBUF, (const char*)&bufSize, sizeof(bufSize));
     cbpp::PlatformSetNonBlocking(m_udpSocket);
     m_previewAddr.sin_family = AF_INET;
@@ -140,8 +145,9 @@ void HmdDriver::OnEncodedPacket(uint8_t* data, int size, int64_t pts, bool keyfr
 void HmdDriver::SendFannedOut(const uint8_t* raw, int rawSize,
                                const uint8_t* framed, int framedSize)
 {
+    bool allSent = true;
     if (m_previewEnabled.load(std::memory_order_relaxed)) {
-        SendFramedUdp(m_udpSocket, &m_previewAddr, raw, rawSize, &m_udpDroppedPreview);
+        allSent = SendFramedUdp(m_udpSocket, &m_previewAddr, raw, rawSize, &m_udpDroppedPreview) && allSent;
     }
     sockaddr_in phoneTarget{};
     bool hasTarget = false;
@@ -159,11 +165,29 @@ void HmdDriver::SendFannedOut(const uint8_t* raw, int rawSize,
                       phoneIp, ntohs(phoneTarget.sin_port),
                       (unsigned long long)phoneLogCounter, rawSize, framedSize);
         }
-        SendFramedUdp(m_udpSocket, &phoneTarget, framed, framedSize, &m_udpDroppedPhone);
+        allSent = SendFramedUdp(m_udpSocket, &phoneTarget, framed, framedSize, &m_udpDroppedPhone) && allSent;
     } else {
         static uint64_t noTargetCounter = 0;
         if (++noTargetCounter % 300 == 1) {
             DriverLog("[UDP] No phone target set (skipped phone send, frames=%llu)", (unsigned long long)noTargetCounter);
+        }
+    }
+    // IDR resync: a frame abandoned mid-send leaves its trailing slices lost;
+    // Annex-B decoders (bridge preview ffmpeg, phone) conceal those rows with
+    // smear artifacts until the next IDR. After a few consecutive failed
+    // sends, arm a keyframe so the stream snaps back to a decodable state as
+    // soon as capacity recovers.
+    if (rawSize > 0) {
+        if (!allSent) {
+            m_udpConsecutiveDrops++;
+            if (m_udpConsecutiveDrops == 3) {
+                DriverLog("[UDP] %u consecutive dropped frames -> forcing IDR resync", m_udpConsecutiveDrops);
+            }
+            if (m_udpConsecutiveDrops >= 3 && m_pVideoEncoder) {
+                m_pVideoEncoder->RequestKeyframe();
+            }
+        } else {
+            m_udpConsecutiveDrops = 0;
         }
     }
 }

@@ -775,6 +775,13 @@ impl AppCore {
             bound.expect("preview socket bound above")
         };
         socket.set_nonblocking(true).ok();
+        // The driver bursts a whole frame (~30+ datagrams, up to several
+        // hundred KB on IDRs) within a millisecond; the OS default receive
+        // buffer is far smaller, so bursts overflowed, the driver saw a full
+        // send buffer and abandoned frames mid-way — trailing slices were
+        // lost and ffmpeg decoded the next frames with concealment smears
+        // (bottom-of-frame stripe artifacts). Size the buffer for the burst.
+        socket.set_recv_buffer_size(4 << 20).ok();
         let vf = format!("scale={PREVIEW_W}:{PREVIEW_H}");
         let mut child = match Command::new("ffmpeg")
             .args([
