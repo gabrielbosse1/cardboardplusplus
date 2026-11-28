@@ -42,7 +42,9 @@ static constexpr int kPaceSleepUs = 250;
 // phone send on the same socket still runs its own loop. Linux keeps its
 // baseline: an unconnected socket never reports conn-reset, so every error
 // reaching this function is fatal there.
-static inline bool IsFatalSendError(int err)
+// constexpr so the compile-time pins below can evaluate it (MSVC rejects a
+// non-constexpr call in static_assert with C2131; found by the Windows CI leg).
+static constexpr bool IsFatalSendError(int err)
 {
 #ifdef _WIN32
     switch (err) {

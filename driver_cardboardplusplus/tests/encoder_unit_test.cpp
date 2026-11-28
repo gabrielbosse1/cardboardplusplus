@@ -706,16 +706,19 @@ static void RunEncoderE2EPhase() {
                               t.max_encode_us > 0 && t.max_interval_us > 0;
                 Check(bounds, "A8 telemetry arithmetic invariants (avg <= max, all sampled)");
             }
-            // Alternating content: red/green swap each frame -> no dups.
-            Eye eyeR2 = makeEye(0, 0, 255);
-            GpuImage gr2 = gl; gr2.handle = (uint64_t)eyeR2.fd;
-            if (eyeR2.fd >= 0) {
+            // Alternating content: swap each frame -> no dups. The dup hash
+            // samples the NV12 buffer every 1024 bytes; at this test's
+            // 256-wide SBS that is always column 0 (left eye), so the LEFT
+            // eye must alternate for the sampled hash to see the change.
+            Eye eyeL2 = makeEye(0, 0, 255);
+            GpuImage gl2 = gl; gl2.handle = (uint64_t)eyeL2.fd;
+            if (eyeL2.fd >= 0) {
                 // Exactly 120 more encodes (121..240): the second summary
                 // fires at the 240th, and no extra encode leaks into its
                 // dup window.
                 for (int64_t p = 121; p <= 240; p++) {
-                    const GpuImage& right = (p & 1) ? gr2 : gr;
-                    EncodeOneFrame(enc, gl, right, p);
+                    const GpuImage& left = (p & 1) ? gl2 : gl;
+                    EncodeOneFrame(enc, left, gr, p);
                 }
                 std::vector<cbpp::PayloadTelemetry> snap2;
                 {
@@ -731,7 +734,7 @@ static void RunEncoderE2EPhase() {
                           "A8 per-summary counters reset after each summary");
                 }
             } else {
-                Check(false, "A8 blue eye created for the alternating-content test");
+                Check(false, "A8 blue left eye created for the alternating-content test");
             }
             enc.Shutdown();
         }

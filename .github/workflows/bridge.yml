@@ -28,7 +28,7 @@ jobs:
       shell: pwsh
       run: |
         Get-Content cargo-test.log -ErrorAction SilentlyContinue |
-          Select-String -Pattern 'panicked at|assertion|error\[E|error:|test result: FAILED|failures:' |
+          Select-String -Pattern 'panicked at|assertion|error\[E|error:| --> |test result: FAILED|failures:' |
           Select-Object -First 8 |
           ForEach-Object { $m = $_.ToString().Trim(); if ($m.Length -gt 220) { $m = $m.Substring(0, 220) }; "::error::$m" }
 

@@ -321,10 +321,12 @@ mod tests {
     fn consumer_reads_messages_in_order_and_decodes_payloads() {
         let _g = RING_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut prod = TestProducer::create(128, 4);
+        // Open BEFORE the writes: open() snaps `next` to the live cursor, so
+        // messages written first would be skipped as stale.
+        let mut c = BridgeConsumer::open(HEADER_SIZE + 128 * 4).expect("consumer open");
         prod.write_pose(1.0);
         prod.write_pose(2.0);
         prod.write_pose(3.0);
-        let mut c = BridgeConsumer::open(HEADER_SIZE + 128 * 4).expect("consumer open");
         assert_eq!(c.pending(), 3);
         let mut seen = Vec::new();
         while let Some(msg) = c.try_consume() {
