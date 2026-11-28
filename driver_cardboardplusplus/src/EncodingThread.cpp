@@ -15,8 +15,26 @@ void HmdDriver::EncodingThreadFunc()
 {
     while (m_encodingRunning) {
         std::unique_lock<std::mutex> lock(m_encodeMutex);
+#ifdef _WIN32
+        // Windows-only idle heartbeat: when SteamVR stops presenting (no app,
+        // dashboard idle), no new frames reach this thread and the UDP stream
+        // freezes on the last picture — a late-joining bridge or phone then
+        // never sees an IDR and shows nothing. Re-encode the last composed
+        // NV12 every 100 ms so the stream stays decodable while idle (the
+        // encoder's short GOP turns every 10th re-send into an IDR). Linux
+        // keeps the original blocking wait (protected baseline).
+        bool queued = m_encodeCv.wait_for(lock, std::chrono::milliseconds(100),
+                                          [this] { return m_frameQueued || !m_encodingRunning; });
+        if (!m_encodingRunning) break;
+        if (!queued) {
+            lock.unlock();
+            HeartbeatEncode();
+            continue;
+        }
+#else
         m_encodeCv.wait(lock, [this] { return m_frameQueued || !m_encodingRunning; });
         if (!m_encodingRunning) break;
+#endif
         m_frameQueued = false;
         PendingFrame frame = m_pendingFrame;
         lock.unlock();
@@ -27,6 +45,18 @@ void HmdDriver::EncodingThreadFunc()
         }
         m_encodeDoneCv.notify_all();
     }
+}
+
+// Re-encodes the last produced frame while SteamVR is idle (see
+// EncodingThreadFunc). Runs on the encoding thread; the encoder lock is the
+// same one EncodePendingFrame holds, so the frame source cannot change under
+// us. Done-flag bookkeeping is deliberately skipped: no Present queued a frame.
+void HmdDriver::HeartbeatEncode()
+{
+    std::lock_guard<std::mutex> lock(m_encoderMutex);
+    if (!m_encoderInitialized || !m_pVideoEncoder) return;
+    if (!m_pVideoEncoder->ReencodeLastFrame(m_lastFramePts + 1)) return;
+    m_lastFramePts++;
 }
 // Runs the full GPU compose + readback + NV12 convert + FFmpeg encode chain for one queued frame.
 void HmdDriver::EncodePendingFrame(const PendingFrame& frame)
@@ -95,6 +125,8 @@ void HmdDriver::EncodePendingFrame(const PendingFrame& frame)
     noteStage("ConvertFrame");
     if (!m_pVideoEncoder->FinishEncode(frame.pts)) {
         DriverLog("FinishEncode failed for pts=%lld", (long long)frame.pts);
+    } else {
+        m_lastFramePts = frame.pts;
     }
     static bool loggedFinish = false;
     if (!loggedFinish) { loggedFinish = true; DriverLog("Encode: finish ok"); }

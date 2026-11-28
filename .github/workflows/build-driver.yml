@@ -86,8 +86,9 @@ jobs:
               $d = [BitConverter]::ToUInt32($bytes, ($i+2)*4)
               $lit = 0
               if ($wc -ge 4) { $lit = [BitConverter]::ToUInt32($bytes, ($i+3)*4) }
-              if ($d -in 11, 32, 33, 34) {
-                $kind = @{11 = "builtin"; 32 = "loc"; 33 = "set"; 34 = "bind"}[$d]
+              if ($d -in 11, 30, 33, 34) {
+                # Binding=33, DescriptorSet=34, Location=30 (vendored spirv.hpp).
+                $kind = @{11 = "builtin"; 30 = "loc"; 33 = "bind"; 34 = "set"}[[int]$d]
                 $rows += "$($names2[$t]):$kind=$lit"
               }
             } elseif ($op -eq 59 -and $wc -ge 4) {

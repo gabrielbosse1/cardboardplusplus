@@ -116,6 +116,7 @@ private:
 // Frame pipeline helpers; the encoding thread runs EncodingThreadFunc/EncodePendingFrame, Present uses the sync/copy helpers.
     void EncodingThreadFunc();
     void EncodePendingFrame(const PendingFrame& frame);
+    void HeartbeatEncode();
     bool AcquireSyncTexture(vr::SharedTextureHandle_t syncTexture);
     void ReleaseSyncTexture();
     void WaitEncoderIdle();
@@ -153,6 +154,7 @@ private:
     std::condition_variable m_encodeCv;
     bool m_frameQueued;
     PendingFrame m_pendingFrame;
+    long long m_lastFramePts = 0; // pts of the last successfully encoded frame
     std::mutex m_encodeDoneMutex;
     std::condition_variable m_encodeDoneCv;
     bool m_encodeDone;

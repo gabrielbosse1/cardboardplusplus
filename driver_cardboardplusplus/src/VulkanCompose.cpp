@@ -486,6 +486,14 @@ static bool PickCoherentHostType(const VkMemoryRequirements& req,
 
 bool VulkanCompose::SetupNv12() {
     auto fail = [](const char* why) { DriverLog("VK-NV12 setup failed: %s", why); return false; };
+    // The compute shader packs 4 pixels per uint word with row strides of
+    // (w>>2) words; odd widths would drift every row and corrupt the bottom of
+    // the picture. The CPU swscale fallback handles any dimensions.
+    if ((m_width % 4) != 0 || (m_height % 2) != 0) {
+        DriverLog("VK-NV12 unavailable: %ux%u is not compatible with the uint-packed compute conversion (needs w%%4==0 and h%%2==0); staying on CPU swscale",
+                  m_width, m_height);
+        return false;
+    }
     m_nv12Size = (size_t)m_width * m_height * 3 / 2;
     auto createShaderModule = (PFN_vkCreateShaderModule)m_pCtx->GetDeviceProc("vkCreateShaderModule");
     auto createSetLayout = (PFN_vkCreateDescriptorSetLayout)m_pCtx->GetDeviceProc("vkCreateDescriptorSetLayout");
@@ -1161,6 +1169,14 @@ bool VulkanCompose::Compose(const std::vector<GpuImage>& lefts,
     rpi.pClearValues = &cv;
     beginRender(m_cmd, &rpi, VK_SUBPASS_CONTENTS_INLINE);
     for (size_t i = 0; i < n; i++) {
+        // A layer whose bounds have no extent would sample a single texel row
+        // or column and stretch it across the whole target (seen as a
+        // horizontal smear when SteamVR submits such layers at startup). Skip
+        // layers whose rects are degenerate on both eyes.
+        const bool degenerate =
+            (m_bounds[i].map[2] <= 0.0f || m_bounds[i].map[3] <= 0.0f) &&
+            (m_bounds[i].map[6] <= 0.0f || m_bounds[i].map[7] <= 0.0f);
+        if (degenerate) continue;
         bindPipe(m_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, (i == 0) ? m_pipelineOpaque : m_pipelineAlpha);
         VkDescriptorSet set = m_descSets[i];
         bindSets(m_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &set, 0, nullptr);

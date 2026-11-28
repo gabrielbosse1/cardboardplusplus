@@ -42,6 +42,11 @@ public:
     bool SwsConvert();
     bool FinishEncode(int64_t pts);
     bool ReadbackToBuffer();
+    // Idle heartbeat: re-encodes the last produced frame source (GPU NV12 map
+    // or CPU swscale source) without recomposing; false when nothing was ever
+    // produced. Keeps the stream decodable for late joiners while SteamVR is
+    // not presenting new layers.
+    bool ReencodeLastFrame(int64_t pts);
     void SetEncodedPacketCallback(EncodedPacketCallback callback);
     void SetTelemetryCallback(TelemetryCallback callback);
     void RequestKeyframe();

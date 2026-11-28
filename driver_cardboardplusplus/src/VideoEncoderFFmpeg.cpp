@@ -297,6 +297,15 @@ bool VideoEncoder::ConvertFrame()
     m_pFrame->data[1] = (uint8_t*)m_pGpuNv12 + (size_t)m_width * m_height;
     return true;
 }
+// Re-encodes the last produced frame (see header). No dumps, no telemetry
+// stage notes: this is the idle heartbeat, not a fresh frame.
+bool VideoEncoder::ReencodeLastFrame(int64_t pts)
+{
+    if (!m_initialized) return false;
+    if (!m_pGpuNv12 && !m_pSwsSrc) return false;
+    if (!ConvertFrame()) return false;
+    return FinishEncode(pts);
+}
 // Converts the BGRA frame source (Vulkan host copy map or D3D staging readback) to
 // the NV12 software frame; runs on the encoding thread before FinishEncode.
 bool VideoEncoder::SwsConvert()

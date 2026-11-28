@@ -95,7 +95,11 @@ jobs:
         sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers > /dev/null 2>&1
         python3 - <<'EOF' > /tmp/facts.txt 2> /tmp/facts.err
         import struct
-        DEC = {2: "block", 11: "builtin", 25: "nonwritable", 32: "loc", 33: "set", 34: "bind"}
+        # SPIR-V decoration ids per the vendored spirv.hpp: Binding=33,
+        # DescriptorSet=34, Location=30 (an earlier revision swapped bind/set,
+        # which misread every dump and briefly pointed the investigation at a
+        # descriptor mismatch that does not exist).
+        DEC = {2: "block", 11: "builtin", 25: "nonwritable", 30: "loc", 33: "bind", 34: "set"}
         STOR = {0: "in", 1: "out"}
         for name in ["compose_vs", "compose_ps", "nv12_cs"]:
             data = open(f"driver_cardboardplusplus/build/spirv/{name}.spv", "rb").read()
