@@ -162,22 +162,12 @@ jobs:
         /tmp/vk_smoke > /tmp/smoke.log 2>&1
         SMOKERC=$?
         echo "SMOKE run rc=$SMOKERC checks=$(grep -c '^== ' /tmp/smoke.log)"
-        L=$(grep '^== ' /tmp/smoke.log | tr '\n' '|')
-        # Compact result lines on the annotation channel (chunked, newest-first).
-        echo "::error::A ${L:0:225}"
-        echo "::error::B ${L:225:225}"
-        echo "::error::C ${L:450:225}"
-        echo "::error::D ${L:675:225}"
-        echo "::error::E ${L:900:225}"
-        echo "::error::F ${L:1125:225}"
-        echo "::error::G ${L:1350:225}"
-        echo "::error::H ${L:1575:225}"
-        echo "::error::I ${L:1800:225}"
-        echo "::error::J ${L:2025:225}"
+        # GitHub keeps only the first 10 error annotations per check run, so on
+        # failure emit exactly what pinpoints the problem: FAIL lines and the
+        # raw log tail (a segfault leaves no FAIL/RESULT line behind).
         if [ $SMOKERC -ne 0 ]; then
-          grep '^== FAIL' /tmp/smoke.log | head -6 | while IFS= read -r line; do echo "::error::smoke: ${line:0:220}"; done
-          # Raw tail: pinpoints a crash (segfault leaves no FAIL/RESULT line).
-          tail -8 /tmp/smoke.log | while IFS= read -r line; do echo "::error::tail: ${line:0:220}"; done
+          grep '^== FAIL' /tmp/smoke.log | head -4 | while IFS= read -r line; do echo "::error::smoke: ${line:0:200}"; done
+          tail -6 /tmp/smoke.log | while IFS= read -r line; do echo "::error::tail: ${line:0:200}"; done
         fi
         exit $SMOKERC
 
