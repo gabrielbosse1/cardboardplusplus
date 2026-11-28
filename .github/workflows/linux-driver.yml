@@ -145,12 +145,12 @@ jobs:
         [ -f "$RES/controller_profile.json" ] || { echo "missing controller_profile.json"; find "$RES" -type f 2>/dev/null; exit 1; }
         echo "install script copied resources (incl. controller_profile.json)"
         # Verify the manifest is valid JSON with the expected name.
-        python3 -c "
-import json, sys
-m = json.load(open('$MANIFEST'))
-assert m['name'] == 'cardboardplusplus', m
-print('installed manifest valid')
-"
+        python3 - <<EOF
+        import json, sys
+        m = json.load(open('$MANIFEST'))
+        assert m['name'] == 'cardboardplusplus', m
+        print('installed manifest valid')
+        EOF
         # Verify the bridge app desktop entry + icon are installed for the launcher.
         DESKTOP="$TMPHOME/.local/share/applications/cardboardplusplus.desktop"
         [ -f "$DESKTOP" ] || { echo "missing desktop entry $DESKTOP"; exit 1; }
