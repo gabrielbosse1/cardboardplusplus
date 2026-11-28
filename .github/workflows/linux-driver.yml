@@ -61,8 +61,11 @@ jobs:
          * SteamVR provides the context when it loads the driver .so at runtime. */
         int __cbpp_openvr_stub(void) { return 0; }
         EOF
-        gcc -shared -fPIC -o /tmp/openvr_stub/openvr_api.so /tmp/openvr_stub/stub.c
-        ls -la /tmp/openvr_stub/openvr_api.so
+        gcc -shared -fPIC -o /tmp/openvr_stub/libopenvr_api.so /tmp/openvr_stub/stub.c
+        cp /tmp/openvr_stub/libopenvr_api.so /tmp/openvr_stub/openvr_api.so
+        # Both names: find_library(NAMES openvr_api) matches the lib-prefixed
+        # convention, while the SteamVR-style name documents the runtime shape.
+        ls -la /tmp/openvr_stub
 
     - name: Bake commit count into DriverVersion.h
       run: bash scripts/bake-driver-version.sh
@@ -193,8 +196,10 @@ jobs:
     - name: Set up Rust
       uses: dtolnay/rust-toolchain@stable
 
-    - name: Install ffmpeg (e2e image decode)
-      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+    - name: Install ffmpeg and fontconfig dev (e2e image decode, font crates)
+      # yeslogic-fontconfig-sys (via the UI font stack) panics in build.rs when
+      # pkg-config cannot find fontconfig; the e2e suite shells out to ffmpeg.
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg pkg-config libfontconfig1-dev
 
     - name: Run bridge tests and e2e suite
       run: |
