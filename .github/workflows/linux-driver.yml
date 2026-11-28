@@ -53,7 +53,8 @@ jobs:
       # real openvr_api.so at load time; for a CI link a stub is sufficient and
       # proves the driver does not depend on any OpenVR symbol at link time.
       run: |
-        sudo mkdir -p /tmp/openvr_stub
+        # No sudo: a root-owned stub dir would reject the non-root cat below.
+        mkdir -p /tmp/openvr_stub
         cat > /tmp/openvr_stub/stub.c <<'EOF'
         /* CI stub: the driver's OpenVR driver-API calls are inline accessors
          * (openvr_driver.h), so no real OpenVR symbols are needed at link time.
@@ -68,10 +69,21 @@ jobs:
 
     - name: Configure and build the driver
       run: |
-        cmake -S driver_cardboardplusplus -B driver_cardboardplusplus/build \
+        # Output goes to a log so failures can be surfaced as annotations
+        # (job logs themselves are not retrievable from this setup).
+        if ! cmake -S driver_cardboardplusplus -B driver_cardboardplusplus/build \
           -DCMAKE_BUILD_TYPE=Release \
-          -DCBPP_OPENVR_DIR=/tmp/openvr_stub
-        cmake --build driver_cardboardplusplus/build --parallel "$(nproc)"
+          -DCBPP_OPENVR_DIR=/tmp/openvr_stub > /tmp/cbpp_build.log 2>&1; then
+          tail -30 /tmp/cbpp_build.log
+          grep -E "CMake Error|error:" /tmp/cbpp_build.log | head -8 | while IFS= read -r line; do echo "::error::configure: $line"; done
+          exit 1
+        fi
+        if ! cmake --build driver_cardboardplusplus/build --parallel "$(nproc)" >> /tmp/cbpp_build.log 2>&1; then
+          tail -40 /tmp/cbpp_build.log
+          grep -E "error:" /tmp/cbpp_build.log | head -8 | while IFS= read -r line; do echo "::error::build: $line"; done
+          exit 1
+        fi
+        tail -3 /tmp/cbpp_build.log
 
     - name: Verify the shared object
       run: |
@@ -185,4 +197,13 @@ jobs:
       run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
 
     - name: Run bridge tests and e2e suite
-      run: cargo test --manifest-path bridge/Cargo.toml -- --test-threads=1
+      run: |
+        # Same annotation-diagnostics pattern as the driver build step.
+        if ! cargo test --manifest-path bridge/Cargo.toml -- --test-threads=1 \
+            > /tmp/bridge_test.log 2>&1; then
+          tail -40 /tmp/bridge_test.log
+          grep -E "^error" /tmp/bridge_test.log | head -8 | while IFS= read -r line; do echo "::error::bridge: $line"; done
+          grep -E "^test .* FAILED|panicked at" /tmp/bridge_test.log | head -8 | while IFS= read -r line; do echo "::error::bridge: $line"; done
+          exit 1
+        fi
+        tail -5 /tmp/bridge_test.log
