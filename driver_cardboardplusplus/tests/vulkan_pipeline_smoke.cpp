@@ -130,7 +130,7 @@ static BufRes MakeHostBuffer(VkDevice dev, VkPhysicalDevice phys, VkDeviceSize s
 // is exactly the "log host unavailable" state drivers run in at startup.
 namespace {
 struct StubDriverContext final : vr::IVRDriverContext {
-    void* GetGenericInterface(const char*, EVRInitError*) override { return nullptr; }
+    void* GetGenericInterface(const char*, vr::EVRInitError*) override { return nullptr; }
     vr::DriverHandle_t GetDriverHandle() override { return 0; }
 };
 StubDriverContext g_stubContext;
