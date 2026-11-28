@@ -1,4 +1,4 @@
-﻿//! Windows end-to-end suite: real bridge binary + fake driver/phone/sidecar,
+//! Windows end-to-end suite: real bridge binary + fake driver/phone/sidecar,
 //! verifying every control-plane path on the actual wire before the Linux
 //! port. Fake-mode tests share one mutex (fixed UDP ports); run with
 //! --test-threads=1 (scripts/e2e.ps1 does). CBPP_E2E_LIVE=1 switches to
@@ -99,6 +99,32 @@ fn driver_stats_reach_status_and_preview() {
     assert_eq!(preview["driver"]["fps"], serde_json::json!(42));
     assert_eq!(preview["driver"]["drops"], serde_json::json!(3));
 }
+#[test]
+fn preview_survives_bursty_stream_and_decodes() {
+    let _gate = serial();
+    if live_mode() || !ffmpeg_available() {
+        return;
+    }
+    let bridge = start_bridge();
+    let driver = FakeDriver::new();
+    bridge.wait_log("embedded preview started", Duration::from_secs(10));
+    let dir = std::env::temp_dir().join("cbpp_e2e_burst");
+    let _ = std::fs::create_dir_all(&dir);
+    let stream = dir.join("burst.h264");
+    assert!(make_test_stream(&stream), "test stream built");
+    let data = std::fs::read(&stream).expect("test stream readable");
+    let aus = split_access_units(&data);
+    assert!(!aus.is_empty(), "test stream splits into access units");
+    // Production-worse send shape: every access unit is blasted as an instant
+    // burst (the driver used to overflow receivers exactly this way). The
+    // preview pump must absorb it and produce decoded frames.
+    driver.stream_h264(&aus);
+    bridge.wait_log("preview decoded", Duration::from_secs(25));
+    // The heartbeat counter proves frames keep decoding over the whole burst,
+    // not just the first IDR.
+    bridge.wait_log("decoded 60 preview frames", Duration::from_secs(25));
+}
+
 #[test]
 fn settings_post_lands_on_the_driver_wire() {
     let _gate = serial();

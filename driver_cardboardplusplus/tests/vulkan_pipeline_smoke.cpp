@@ -18,6 +18,24 @@
 #include "compose_ps.spv.h"
 #include "nv12_cs.spv.h"
 
+// Real driver components: phase B links the production translation units
+// (not the raw-Vulkan replica above) so the actual Setup/Compose/ToNv12 code
+// ships under test, including the degenerate-bounds skip and the NV12 dims
+// guard. Phase C (guarded by CBPP_ENCODER_E2E_TEST, wired in CI) runs the
+// full VideoEncoder chain on top: compose -> readback -> convert -> FFmpeg
+// encode -> Annex-B packets.
+#include "VulkanContext.h"
+#include "VulkanCompose.h"
+#ifdef CBPP_ENCODER_E2E_TEST
+#include "VideoEncoder.h"
+#include <mutex>
+#endif
+
+#include <unistd.h>
+#include <cstring>
+#include <string>
+#include <vector>
+
 static int g_failures = 0;
 
 static void Check(bool ok, const char* what) {
@@ -96,6 +114,249 @@ static BufRes MakeHostBuffer(VkDevice dev, VkPhysicalDevice phys, VkDeviceSize s
     vkBindBufferMemory(dev, r.buf, r.mem, 0);
     vkMapMemory(dev, r.mem, 0, size, 0, &r.map);
     return r;
+}
+
+// ===== Phase B: real driver components (production VulkanContext + VulkanCompose) =====
+// The phase above replays the pipeline with a raw-Vulkan replica; this phase
+// links the actual production code paths, so whatever ships is what is tested.
+static void RunRealComponentPhase() {
+    printf("== PHASE B: real VulkanContext + VulkanCompose ==\n");
+
+    VulkanContext ctx;
+    bool ctxOk = ctx.Initialize(nullptr);  // headless: first device with a graphics queue
+    Check(ctxOk, "real VulkanContext::Initialize(nullptr) on lavapipe");
+    if (!ctxOk) return;
+    VkDevice dev = ctx.Device();
+    VkPhysicalDevice phys = ctx.Physical();
+
+    auto getMemFd = (PFN_vkGetMemoryFdKHR)ctx.GetDeviceProc("vkGetMemoryFdKHR");
+    Check(getMemFd != nullptr, "vkGetMemoryFdKHR available (external fd export)");
+    if (!getMemFd) return;
+
+    // Exportable eye images mirroring the SteamVR IPC image contract: BGRA8
+    // with MUTABLE_FORMAT, dedicated allocation, opaque-fd export.
+    struct EyeRes {
+        VkImage img = VK_NULL_HANDLE;
+        VkDeviceMemory mem = VK_NULL_HANDLE;
+        int fd = -1;
+    };
+    auto makeEye = [&](uint8_t r, uint8_t g, uint8_t b) -> EyeRes {
+        EyeRes e = {};
+        VkExternalMemoryImageCreateInfo ext = {};
+        ext.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+        ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+        VkImageCreateInfo ici = {};
+        ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        ici.pNext = &ext;
+        ici.imageType = VK_IMAGE_TYPE_2D;
+        ici.format = VK_FORMAT_B8G8R8A8_UNORM;
+        ici.extent = { 128, 128, 1 };
+        ici.mipLevels = 1;
+        ici.arrayLayers = 1;
+        ici.samples = VK_SAMPLE_COUNT_1_BIT;
+        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        ici.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+        if (vkCreateImage(dev, &ici, nullptr, &e.img) != VK_SUCCESS) return e;
+        VkMemoryRequirements req = {};
+        vkGetImageMemoryRequirements(dev, e.img, &req);
+        VkExportMemoryAllocateInfo exp = {};
+        exp.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
+        exp.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+        VkMemoryDedicatedAllocateInfo ded = {};
+        ded.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+        ded.image = e.img;
+        ded.pNext = &exp;
+        VkMemoryAllocateInfo ai = {};
+        ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        ai.pNext = &ded;
+        ai.allocationSize = req.size;
+        ai.memoryTypeIndex = FindMemType(phys, req.memoryTypeBits,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+        if (ai.memoryTypeIndex == 0xFFFFFFFFu)
+            ai.memoryTypeIndex = FindMemType(phys, req.memoryTypeBits, 0);
+        if (vkAllocateMemory(dev, &ai, nullptr, &e.mem) != VK_SUCCESS) { e.img = VK_NULL_HANDLE; return e; }
+        if (vkBindImageMemory(dev, e.img, e.mem, 0) != VK_SUCCESS) { e.img = VK_NULL_HANDLE; return e; }
+        // Fill the exported memory with a solid color through a staging copy.
+        BufRes stage = MakeHostBuffer(dev, phys, (VkDeviceSize)128 * 128 * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        for (int i = 0; i < 128 * 128; i++) {
+            uint8_t* px = (uint8_t*)stage.map + (size_t)i * 4;
+            px[0] = b; px[1] = g; px[2] = r; px[3] = 255;  // BGRA
+        }
+        VkCommandPoolCreateInfo pci = {};
+        pci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        pci.queueFamilyIndex = ctx.GetQueueFamily();
+        VkCommandPool pool = VK_NULL_HANDLE;
+        vkCreateCommandPool(dev, &pci, nullptr, &pool);
+        VkCommandBufferAllocateInfo cai = {};
+        cai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cai.commandPool = pool;
+        cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cai.commandBufferCount = 1;
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        vkAllocateCommandBuffers(dev, &cai, &cmd);
+        VkCommandBufferBeginInfo bi = {};
+        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        vkBeginCommandBuffer(cmd, &bi);
+        VkImageMemoryBarrier imb = {};
+        imb.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        imb.srcAccessMask = 0;
+        imb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        imb.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        imb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        imb.image = e.img;
+        imb.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &imb);
+        VkBufferImageCopy region = {};
+        region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        region.imageExtent = { 128, 128, 1 };
+        vkCmdCopyBufferToImage(cmd, stage.buf, e.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        vkEndCommandBuffer(cmd);
+        VkSubmitInfo si = {};
+        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &cmd;
+        vkQueueSubmit(ctx.Queue(), 1, &si, VK_NULL_HANDLE);
+        vkQueueWaitIdle(ctx.Queue());
+        vkDestroyCommandPool(dev, pool, nullptr);
+        vkDestroyBuffer(dev, stage.buf, nullptr);
+        vkFreeMemory(dev, stage.mem, nullptr);
+        // Export the fd (ownership transferred; dup'd later by the importer).
+        e.fd = -1;
+        VkMemoryGetFdInfoKHR fdInfo = {};
+        fdInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
+        fdInfo.memory = e.mem;
+        fdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+        if (getMemFd(dev, &fdInfo, &e.fd) != VK_SUCCESS)
+            e.fd = -1;
+        return e;
+    };
+
+    EyeRes eyeL = makeEye(255, 0, 0);    // red, BGRA bytes set as (r,g,b)
+    EyeRes eyeR = makeEye(0, 255, 0);    // green
+    Check(eyeL.img != VK_NULL_HANDLE && eyeL.fd >= 0, "exportable left eye created + fd exported");
+    Check(eyeR.img != VK_NULL_HANDLE && eyeR.fd >= 0, "exportable right eye created + fd exported");
+    if (eyeL.fd < 0 || eyeR.fd < 0) return;
+
+    VulkanCompose compose;
+    compose.Init(&ctx);
+    Check(compose.Setup(512, 256), "real VulkanCompose::Setup(512,256)");
+    if (!compose.IsReady()) return;
+
+    GpuImage gl = {}; gl.handle = (uint64_t)eyeL.fd; gl.width = 128; gl.height = 128;
+    gl.format = (uint32_t)VK_FORMAT_B8G8R8A8_UNORM;
+    GpuImage gr = gl; gr.handle = (uint64_t)eyeR.fd;
+    bool composed = compose.Compose({ gl }, { gr },
+                                    { LayerRect{ 0, 0, 1, 1 } }, { LayerRect{ 0, 0, 1, 1 } });
+    Check(composed, "real VulkanCompose::Compose (production fd import + draw)");
+    if (!composed) return;
+
+    const uint8_t* nv12 = nullptr;
+    size_t nv12Size = 0;
+    bool nv12Ok = compose.ToNv12(&nv12, &nv12Size);
+    Check(nv12Ok && nv12 != nullptr, "real VulkanCompose::ToNv12 (production compute pass)");
+    if (nv12Ok) {
+        // Same BT.601 oracle as the replica phase: red left / green right.
+        float yL = (float)nv12[16 * 512 + 16];
+        float yR = (float)nv12[16 * 512 + 480];
+        Check(yL > 77.5f && yL < 85.5f, "phase B Y(16,16) red ~81.5");
+        Check(yR > 140.6f && yR < 148.6f, "phase B Y(480,16) green ~144.6");
+    }
+
+    compose.CopyToHost();
+    const uint8_t* host = compose.HostData();
+    Check(host != nullptr, "real VulkanCompose::CopyToHost + HostData");
+    if (host) {
+        // BGRA corners: bottom-left red, bottom-right green (top-down rows).
+        const uint8_t* bl = host + ((size_t)255 * 512 + 16) * 4;
+        const uint8_t* br = host + ((size_t)255 * 512 + 496) * 4;
+        Check(bl[2] > 200 && bl[1] < 60 && br[1] > 200 && br[2] < 60,
+              "phase B host copy corners: left red / right green");
+    }
+
+    // Degenerate-bounds regression: the startup smear. A layer with zero-area
+    // rects must be skipped, leaving the cleared target (Y ~ 16 for BT.601
+    // black) instead of a stretched texel row.
+    bool composedDeg = compose.Compose({ gl }, { gr },
+                                       { LayerRect{ 0, 0, 0, 0 } }, { LayerRect{ 0, 0, 0, 0 } });
+    const uint8_t* nv12d = nullptr;
+    size_t nv12dSize = 0;
+    bool nv12dOk = composedDeg && compose.ToNv12(&nv12d, &nv12dSize);
+    Check(nv12dOk && nv12d != nullptr, "compose accepts degenerate-only layer set");
+    if (nv12dOk) {
+        bool flatBlack = true;
+        for (uint32_t yy = 8; yy < 256 && flatBlack; yy += 24) {
+            for (uint32_t xx = 8; xx < 512 && flatBlack; xx += 24) {
+                float y = (float)nv12d[yy * 512 + xx];
+                if (y < 12.0f || y > 20.0f) flatBlack = false;
+            }
+        }
+        Check(flatBlack, "degenerate layer skipped: target stays cleared (no smear)");
+    }
+
+    // NV12 dims guard: the uint-packed compute path needs w%4==0 and h%2==0;
+    // Setup must stay ready for compose but refuse the GPU NV12 conversion.
+    VulkanCompose odd;
+    odd.Init(&ctx);
+    odd.Setup(514, 256);  // 514 % 4 == 2
+    Check(odd.IsReady(), "odd-width compose stays ready (CPU fallback path)");
+    const uint8_t* nv12Odd = nullptr;
+    size_t nv12OddSize = 0;
+    Check(!odd.ToNv12(&nv12Odd, &nv12OddSize),
+          "odd-width NV12 compute refused by the dims guard (no row drift)");
+
+    // Phase C: the full production encode chain (CI-only, links FFmpeg).
+#ifdef CBPP_ENCODER_E2E_TEST
+    printf("== PHASE C: real VideoEncoder encode chain ==\n");
+    VideoEncoder enc;
+    bool encOk = enc.Initialize(512, 256, 30, 4000000, false, &ctx, "libx264");
+    Check(encOk, "VideoEncoder::Initialize (lavapipe compose + libx264)");
+    if (encOk) {
+        std::mutex pktLock;
+        std::vector<std::vector<uint8_t>> packets;
+        std::vector<bool> keyflags;
+        enc.SetEncodedPacketCallback([&](uint8_t* d, int s, int64_t, bool kf) {
+            std::lock_guard<std::mutex> l(pktLock);
+            packets.emplace_back(d, d + s);
+            keyflags.push_back(kf);
+        });
+        Check(enc.ComposeSBSGPU({ gl }, { gr },
+                                { VideoEncoder::LayerBounds{ 0, 0, 1, 1 } },
+                                { VideoEncoder::LayerBounds{ 0, 0, 1, 1 } }),
+              "encoder ComposeSBSGPU over imported fd eyes");
+        Check(enc.ReadbackToBuffer(), "encoder ReadbackToBuffer (GPU NV12 or CPU fallback)");
+        Check(enc.ConvertFrame(), "encoder ConvertFrame");
+        Check(enc.FinishEncode(0), "encoder FinishEncode(0)");
+        // Idle heartbeat path: re-encode the last produced frame without a
+        // new compose; keeps late joiners decodable while SteamVR idles.
+        Check(enc.ReencodeLastFrame(1), "ReencodeLastFrame(1) idle heartbeat");
+
+        size_t nPkts = 0;
+        bool sawIdr = false, sawNonIdr = false, annexb = false;
+        {
+            std::lock_guard<std::mutex> l(pktLock);
+            nPkts = packets.size();
+            for (const auto& p : packets) {
+                if (p.size() >= 5 && p[0] == 0 && p[1] == 0 && p[2] == 0 && p[3] == 1) annexb = true;
+                for (size_t i = 0; i + 4 < p.size(); i++) {
+                    if (p[i] == 0 && p[i + 1] == 0 && (p[i + 2] == 1 || (p[i + 2] == 0 && p[i + 3] == 1))) {
+                        size_t nal = i + (p[i + 2] == 1 ? 3 : 4);
+                        uint8_t t = (uint8_t)(p[nal] & 0x1F);
+                        if (t == 5) sawIdr = true;
+                        if (t == 1 || t == 7 || t == 8) sawNonIdr = true;
+                    }
+                }
+            }
+        }
+        Check(nPkts >= 2, "encode chain produced >=2 packets (frame + heartbeat)");
+        Check(annexb, "packets are Annex-B (start codes present)");
+        Check(sawIdr, "first frame encoded an IDR");
+        Check(sawNonIdr, "SPS/PPS/slice NALs present");
+    }
+#endif
 }
 
 int main() {
@@ -575,6 +836,8 @@ int main() {
     printf("== unwritten Y bytes=%d uv bytes=%d %s\n", poisonY, poisonUv,
            (poisonY == 0 && poisonUv == 0) ? "PASS" : "FAIL");
     if (poisonY != 0 || poisonUv != 0) g_failures++;
+
+    RunRealComponentPhase();
 
     printf("== RESULT: %s (%d failures)\n", g_failures == 0 ? "ALL PASS" : "FAILURES", g_failures);
     return g_failures == 0 ? 0 : 1;

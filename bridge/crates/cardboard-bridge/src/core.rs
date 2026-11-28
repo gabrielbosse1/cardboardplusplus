@@ -775,6 +775,14 @@ impl AppCore {
             bound.expect("preview socket bound above")
         };
         socket.set_nonblocking(true).ok();
+        // The driver bursts a whole frame (~30+ datagrams, up to several
+        // hundred KB on IDRs) within a millisecond; OS-default receive buffers
+        // overflow, the kernel silently drops mid-frame datagrams and ffmpeg
+        // decodes with concealment stripes. Size the buffer for the burst.
+        match crate::net::set_recv_buffer_size(&socket, 4 << 20) {
+            Some(actual) => self.push_log(format!("preview recv buffer set to {actual} bytes")),
+            None => self.push_log("preview recv buffer bump unsupported (using OS default)".into()),
+        }
         let vf = format!("scale={PREVIEW_W}:{PREVIEW_H}");
         let mut child = match Command::new("ffmpeg")
             .args([
@@ -824,9 +832,14 @@ impl AppCore {
             }
         });
         let preview_decode_cleanup = self.preview_decode.clone();
+        let preview_log = self.clone();
         thread::spawn(move || {
             let mut rgba = vec![0u8; frame_bytes];
             let mut off = 0usize;
+            // Decoded-frame observability: surfaced through the log so tests
+            // (and users) can tell a healthy preview decode from a stalled
+            // pipe without touching the UI slot.
+            let decoded_frames = std::sync::atomic::AtomicU64::new(0);
             loop {
                 if rgba.len() < frame_bytes {
                     rgba.resize(frame_bytes, 0);
@@ -837,6 +850,11 @@ impl AppCore {
                         off += n;
                         if off >= frame_bytes {
                             off = 0;
+                            let decoded =
+                                decoded_frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                            if decoded == 1 || decoded % 60 == 0 {
+                                preview_log.push_log(format!("[preview] decoded {decoded} preview frames"));
+                            }
                             if let Ok(mut slot) = frame_slot.lock() {
                                 match slot.as_mut() {
                                     Some((_, _, old)) => std::mem::swap(&mut rgba, old),

@@ -88,8 +88,7 @@ jobs:
         fi
         tail -3 /tmp/cbpp_build.log
 
-    - name: SPIR-V facts and lavapipe smoke test (TEMP diagnostics)
-      continue-on-error: true
+    - name: SPIR-V facts and lavapipe smoke test (regression suite)
       run: |
         set +e
         sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers > /dev/null 2>&1
@@ -133,25 +132,51 @@ jobs:
                 i += wc
             print(f"F {name} ver=0x{words[1]:04x} words={n} " + " ".join(rows))
         EOF
-        while IFS= read -r line; do echo "::error::${line:0:230}"; done < /tmp/facts.txt
+        while IFS= read -r line; do echo "FACT ${line:0:230}"; done < /tmp/facts.txt
         PYE=$(tail -2 /tmp/facts.err | head -c 200)
         if [ -n "$PYE" ]; then echo "::error::PYERR $PYE"; fi
-        g++ -std=c++17 -O1 -I driver_cardboardplusplus/build/spirv \
-          -o /tmp/vk_smoke driver_cardboardplusplus/tests/vulkan_pipeline_smoke.cpp -lvulkan \
+        # Phase B/C link the REAL production components (VulkanContext,
+        # VulkanCompose, VideoEncoder + FFmpeg) on top of the SPIR-V replica,
+        # so the shipped code paths run under test on lavapipe.
+        STUB=""
+        [ -f /tmp/openvr_stub/openvr_api.so ] && STUB=/tmp/openvr_stub/openvr_api.so
+        g++ -std=c++17 -O1 -DCBPP_ENCODER_E2E_TEST \
+          -I driver_cardboardplusplus/include -I driver_cardboardplusplus/build/spirv \
+          -o /tmp/vk_smoke driver_cardboardplusplus/tests/vulkan_pipeline_smoke.cpp \
+          driver_cardboardplusplus/src/VulkanContext.cpp \
+          driver_cardboardplusplus/src/VulkanCompose.cpp \
+          driver_cardboardplusplus/src/DriverLog.cpp \
+          driver_cardboardplusplus/src/VideoEncoder.cpp \
+          driver_cardboardplusplus/src/VideoEncoderFFmpeg.cpp \
+          driver_cardboardplusplus/src/VideoEncoderShaders.cpp \
+          $STUB -lvulkan -lavcodec -lavutil -lswscale -lavformat \
           > /tmp/smoke_build.log 2>&1
-        echo "::error::SMOKE compile rc=$? err=$(grep -m1 'error' /tmp/smoke_build.log | head -c 140)"
+        BUILDRC=$?
+        echo "SMOKE compile rc=$BUILDRC"
+        if [ $BUILDRC -ne 0 ]; then
+          grep -m4 -E "error" /tmp/smoke_build.log | while IFS= read -r line; do echo "::error::smoke-build: ${line:0:220}"; done
+          exit 1
+        fi
         ICD=$(find /usr/share/vulkan /etc/vulkan -name 'lvp_icd*.json' -o -name 'swiftshader*.json' 2>/dev/null | head -1)
-        echo "::error::SMOKE icd=$ICD"
+        echo "SMOKE icd=$ICD"
         VK_ICD_FILENAMES="$ICD" VK_DRIVER_FILES="$ICD" \
         /tmp/vk_smoke > /tmp/smoke.log 2>&1
-        echo "::error::SMOKE run rc=$? checks=$(grep -c '^== ' /tmp/smoke.log)"
+        SMOKERC=$?
+        echo "SMOKE run rc=$SMOKERC checks=$(grep -c '^== ' /tmp/smoke.log)"
         L=$(grep '^== ' /tmp/smoke.log | tr '\n' '|')
+        # Compact result lines on the annotation channel (chunked, newest-first).
         echo "::error::A ${L:0:225}"
         echo "::error::B ${L:225:225}"
         echo "::error::C ${L:450:225}"
         echo "::error::D ${L:675:225}"
         echo "::error::E ${L:900:225}"
         echo "::error::F ${L:1125:225}"
+        echo "::error::G ${L:1350:225}"
+        echo "::error::H ${L:1575:225}"
+        if [ $SMOKERC -ne 0 ]; then
+          grep '^== FAIL' /tmp/smoke.log | head -6 | while IFS= read -r line; do echo "::error::smoke: ${line:0:220}"; done
+        fi
+        exit $SMOKERC
 
     - name: Verify the shared object
       run: |
@@ -184,6 +209,12 @@ jobs:
           -o driver_cardboardplusplus/build/eye_format_tests \
           driver_cardboardplusplus/tests/test_eye_format.cpp
         ./driver_cardboardplusplus/build/eye_format_tests
+        # UDP transport: real loopback sockets exercising the send chunker,
+        # pacing, buffer-overflow shapes and the IDR resync policy.
+        g++ -std=c++17 -O2 -I driver_cardboardplusplus/include \
+          -o driver_cardboardplusplus/build/udp_tests \
+          driver_cardboardplusplus/tests/udp_transport_test.cpp
+        ./driver_cardboardplusplus/build/udp_tests
 
     - name: Validate driver manifest and profile
       run: |

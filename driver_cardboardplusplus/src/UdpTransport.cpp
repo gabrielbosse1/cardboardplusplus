@@ -1,4 +1,5 @@
 #include "HmdDriver.h"
+#include "UdpSend.h"
 #include "DriverLog.h"
 #include "DebugLog.h"
 #include "CardboardWire.h"
@@ -6,46 +7,8 @@
 #include <cstdlib>
 #include <cstring>
 using namespace vr;
-namespace {
-static constexpr int kUdpChunkBytes = 1400;
-// Chunk size for non-blocking UDP sends; keeps each datagram inside a safe MTU.
-// Fragments one buffer into 1400-byte datagrams on socket. A full send buffer
-// abandons the whole buffer rather than its tail: the phone parses the stream as
-// 4-byte length-prefixed frames, so a partial frame would leave its declared
-// length unfulfilled and desync the reassembler for the rest of the stream.
-// Returns true when every chunk was accepted by the OS; false when the frame
-// was abandoned mid-way (send buffer full or hard error) — the caller tracks
-// that to trigger an IDR resync, since Annex-B consumers lose that frame's
-// trailing slices and decode with concealment artifacts until the next IDR.
-static bool SendFramedUdp(cbpp::PlatformSocket socket, const sockaddr_in* addr,
-                          const uint8_t* framed, int framedSize,
-                          uint32_t* droppedCounter)
-{
-    int offset = 0;
-    while (offset < framedSize) {
-        int chunkSize = (framedSize - offset > kUdpChunkBytes) ? kUdpChunkBytes : (framedSize - offset);
-        long res = (long)sendto(socket, (const char*)(framed + offset), chunkSize, 0,
-                                (sockaddr*)addr, sizeof(*addr));
-        if (res < 0) {
-            int err = cbpp::PlatformSocketError();
-            if (cbpp::PlatformWouldBlock(err)) {
-                (*droppedCounter)++;
-                if (*droppedCounter % 30 == 1) {
-                    DriverLog("[UDP] Send buffer full, dropping frame (dropped=%d)", (int)*droppedCounter);
-                }
-                return false;
-            } else {
-                char targetIp[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, &addr->sin_addr, targetIp, sizeof(targetIp));
-                DriverLog("[UDP] sendto error %d to %s:%d (size=%d)", err,
-                          targetIp, ntohs(addr->sin_port), chunkSize);
-            }
-            break;
-        }
-        offset += chunkSize;
-    }
-    return offset >= framedSize;
-}
+// The chunker/pacing/resync helpers live in include/UdpSend.h (shared with the
+// transport unit tests, which exercise them against real loopback sockets).
 }
 // Starts the socket layer plus the non-blocking video socket; preview points at localhost, the phone target waits for discovery.
 bool HmdDriver::InitializeUDP()
@@ -174,20 +137,14 @@ void HmdDriver::SendFannedOut(const uint8_t* raw, int rawSize,
     }
     // IDR resync: a frame abandoned mid-send leaves its trailing slices lost;
     // Annex-B decoders (bridge preview ffmpeg, phone) conceal those rows with
-    // smear artifacts until the next IDR. After a few consecutive failed
-    // sends, arm a keyframe so the stream snaps back to a decodable state as
-    // soon as capacity recovers.
+    // smear artifacts until the next IDR. Two consecutive failed sends arm a
+    // keyframe so the stream snaps back to a decodable state as soon as
+    // capacity recovers; any fully delivered frame resets the streak.
     if (rawSize > 0) {
-        if (!allSent) {
-            m_udpConsecutiveDrops++;
-            if (m_udpConsecutiveDrops == 3) {
-                DriverLog("[UDP] %u consecutive dropped frames -> forcing IDR resync", m_udpConsecutiveDrops);
-            }
-            if (m_udpConsecutiveDrops >= 3 && m_pVideoEncoder) {
-                m_pVideoEncoder->RequestKeyframe();
-            }
-        } else {
-            m_udpConsecutiveDrops = 0;
+        if (udp::UdpArmResync(allSent, m_udpConsecutiveDrops,
+                              m_udpDroppedPreview + m_udpDroppedPhone) &&
+            m_pVideoEncoder) {
+            m_pVideoEncoder->RequestKeyframe();
         }
     }
 }
