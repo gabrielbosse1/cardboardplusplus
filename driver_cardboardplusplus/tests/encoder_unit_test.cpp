@@ -252,6 +252,536 @@ static void TestEncoderSettingsMatrix() {
     }
 }
 
+// ===== Phase E: real VideoEncoder internals (CBPP_ENCODER_E2E_TEST) =========
+// Links the production encoder sources on top of lavapipe (VulkanContext +
+// VulkanCompose compose the frame; libx264 encodes it), exactly like the
+// vulkan_pipeline_smoke phase C, and pins the encoder's internal contracts:
+// keyframe policy, GOP cadence + heartbeat pts, heartbeat edge cases, GPU/CPU
+// source switching, duplicate-frame telemetry arithmetic, shutdown drain and
+// the multi-hardware fallback order.
+//
+// Outside SteamVR the OpenVR inline accessors dereference a null driver
+// context; a stub context is installed instead. It serves a FAKE IVRDriverLog
+// so every ENCODER_LOG line lands in a capture sink — the fallback-order and
+// lifecycle tests assert against the real log lines the driver would emit.
+#ifdef CBPP_ENCODER_E2E_TEST
+
+// vulkan.h FIRST (like the smoke test): it declares the vk* prototypes unless
+// VK_NO_PROTOTYPES was defined first, and VulkanContext.h defines that macro
+// for its own dynamic-loader path.
+#include <vulkan/vulkan.h>
+#include "VulkanContext.h"
+#include "VulkanCompose.h"
+#include "VideoEncoder.h"
+#include "openvr_driver.h"
+
+#include <atomic>
+#include <mutex>
+#include <set>
+#include <string>
+
+namespace {
+
+struct CapturedLog {
+    std::mutex m;
+    std::vector<std::string> lines;
+    void add(const char* msg) {
+        std::lock_guard<std::mutex> l(m);
+        lines.emplace_back(msg ? msg : "");
+    }
+    std::vector<std::string> snapshot() {
+        std::lock_guard<std::mutex> l(m);
+        return lines;
+    }
+};
+CapturedLog g_capturedLog;
+
+struct FakeLog final : vr::IVRDriverLog {
+    void Log(const char* pchLogMessage) override { g_capturedLog.add(pchLogMessage); }
+};
+FakeLog g_fakeLog;
+
+struct StubDriverContext final : vr::IVRDriverContext {
+    void* GetGenericInterface(const char* name, vr::EVRInitError* e) override {
+        if (e) *e = vr::VRInitError_None;
+        if (name && strncmp(name, "IVRDriverLog", 12) == 0) return &g_fakeLog;
+        return nullptr;
+    }
+    vr::DriverHandle_t GetDriverHandle() override { return 0; }
+};
+StubDriverContext g_stubContext;
+
+}  // namespace
+
+// Direct DriverLog calls (ComputeFrameHash's NV-MEAN line) also land in the
+// capture; ENCODER_LOG lines arrive through the fake log interface above.
+void DriverLog(const char* pFormat, ...) {
+    char buf[1024];
+    va_list ap;
+    va_start(ap, pFormat);
+    vsnprintf(buf, sizeof(buf), pFormat, ap);
+    va_end(ap);
+    g_capturedLog.add(buf);
+}
+
+namespace {
+
+struct PacketSink {
+    std::mutex m;
+    std::vector<std::vector<uint8_t>> data;
+    std::vector<int64_t> pts;
+    std::vector<bool> key;
+    void attach(VideoEncoder& enc) {
+        enc.SetEncodedPacketCallback([this](uint8_t* d, int s, int64_t p, bool kf) {
+            std::lock_guard<std::mutex> l(m);
+            data.emplace_back(d, d + s);
+            pts.push_back(p);
+            key.push_back(kf);
+        });
+    }
+    size_t size() {
+        std::lock_guard<std::mutex> l(m);
+        return data.size();
+    }
+    std::vector<int64_t> ptsSnapshot() {
+        std::lock_guard<std::mutex> l(m);
+        return pts;
+    }
+    std::vector<bool> keySnapshot() {
+        std::lock_guard<std::mutex> l(m);
+        return key;
+    }
+};
+
+bool HasNalType(const std::vector<uint8_t>& p, uint8_t type) {
+    for (size_t i = 0; i + 4 < p.size(); i++) {
+        if (p[i] == 0 && p[i + 1] == 0 && (p[i + 2] == 1 || (p[i + 2] == 0 && p[i + 3] == 1))) {
+            size_t nal = i + (p[i + 2] == 1 ? 3 : 4);
+            if (nal < p.size() && (p[nal] & 0x1F) == type) return true;
+        }
+    }
+    return false;
+}
+
+bool IsAnnexB(const std::vector<uint8_t>& p) {
+    for (size_t i = 0; i + 4 < p.size() && i < 64; i++) {
+        if (p[i] == 0 && p[i + 1] == 0 && (p[i + 2] == 1 || (p[i + 2] == 0 && p[i + 3] == 1)))
+            return true;
+    }
+    return false;
+}
+
+// Full production chain for one frame: compose -> readback -> convert -> encode.
+bool EncodeOneFrame(VideoEncoder& enc, const GpuImage& gl, const GpuImage& gr, int64_t pts) {
+    if (!enc.ComposeSBSGPU({ gl }, { gr },
+                           { VideoEncoder::LayerBounds{ 0, 0, 1, 1 } },
+                           { VideoEncoder::LayerBounds{ 0, 0, 1, 1 } })) return false;
+    if (!enc.ReadbackToBuffer()) return false;
+    if (!enc.ConvertFrame()) return false;
+    return enc.FinishEncode(pts);
+}
+
+}  // namespace
+
+static void RunEncoderE2EPhase() {
+    printf("--- encoder e2e phase (real VideoEncoder on lavapipe) ---\n");
+    vr::VRDriverContext() = &g_stubContext;
+
+    VulkanContext ctx;
+    bool ctxOk = ctx.Initialize(nullptr);
+    Check(ctxOk, "encoder e2e: VulkanContext on lavapipe");
+    if (!ctxOk) return;
+
+    // Exportable eye images (the SteamVR IPC shape: BGRA8, dedicated
+    // allocation, opaque-fd export), red left / green right.
+    VkDevice dev = ctx.Device();
+    VkPhysicalDevice phys = ctx.Physical();
+    auto getMemFd = (PFN_vkGetMemoryFdKHR)ctx.GetDeviceProc("vkGetMemoryFdKHR");
+    if (!getMemFd) { Check(false, "vkGetMemoryFdKHR available"); return; }
+
+    struct Eye { VkImage img = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; int fd = -1; };
+    auto makeEye = [&](uint8_t r, uint8_t g, uint8_t b) -> Eye {
+        Eye e;
+        VkExternalMemoryImageCreateInfo ext = {};
+        ext.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+        ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+        VkImageCreateInfo ici = {};
+        ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        ici.pNext = &ext;
+        ici.imageType = VK_IMAGE_TYPE_2D;
+        ici.format = VK_FORMAT_B8G8R8A8_UNORM;
+        ici.extent = { 128, 128, 1 };
+        ici.mipLevels = 1;
+        ici.arrayLayers = 1;
+        ici.samples = VK_SAMPLE_COUNT_1_BIT;
+        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        ici.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+        if (vkCreateImage(dev, &ici, nullptr, &e.img) != VK_SUCCESS) { e.img = VK_NULL_HANDLE; return e; }
+        VkMemoryRequirements req = {};
+        vkGetImageMemoryRequirements(dev, e.img, &req);
+        VkExportMemoryAllocateInfo exp = {};
+        exp.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
+        exp.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+        VkMemoryDedicatedAllocateInfo ded = {};
+        ded.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+        ded.image = e.img;
+        ded.pNext = &exp;
+        VkMemoryAllocateInfo ai = {};
+        ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        ai.pNext = &ded;
+        ai.allocationSize = req.size;
+        ai.memoryTypeIndex = 0xFFFFFFFFu;
+        VkPhysicalDeviceMemoryProperties mp = {};
+        vkGetPhysicalDeviceMemoryProperties(phys, &mp);
+        for (uint32_t t = 0; t < mp.memoryTypeCount; t++) {
+            if ((req.memoryTypeBits & (1u << t)) &&
+                (mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+                ai.memoryTypeIndex = t; break;
+            }
+        }
+        if (ai.memoryTypeIndex == 0xFFFFFFFFu) ai.memoryTypeIndex = 0;
+        if (vkAllocateMemory(dev, &ai, nullptr, &e.mem) != VK_SUCCESS) { e.img = VK_NULL_HANDLE; return e; }
+        if (vkBindImageMemory(dev, e.img, e.mem, 0) != VK_SUCCESS) { e.img = VK_NULL_HANDLE; return e; }
+        // Solid fill through a staging buffer + queue copy.
+        VkBufferCreateInfo bci = {};
+        bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bci.size = (VkDeviceSize)128 * 128 * 4;
+        bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        VkBuffer stage = VK_NULL_HANDLE;
+        vkCreateBuffer(dev, &bci, nullptr, &stage);
+        VkMemoryRequirements sreq = {};
+        vkGetBufferMemoryRequirements(dev, stage, &sreq);
+        VkMemoryAllocateInfo sai = {};
+        sai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        sai.allocationSize = sreq.size;
+        sai.memoryTypeIndex = 0xFFFFFFFFu;
+        for (uint32_t t = 0; t < mp.memoryTypeCount; t++) {
+            if ((sreq.memoryTypeBits & (1u << t)) &&
+                (mp.memoryTypes[t].propertyFlags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+                    (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+                sai.memoryTypeIndex = t; break;
+            }
+        }
+        if (sai.memoryTypeIndex == 0xFFFFFFFFu) sai.memoryTypeIndex = 0;
+        VkDeviceMemory smem = VK_NULL_HANDLE;
+        void* smap = nullptr;
+        bool staged = vkAllocateMemory(dev, &sai, nullptr, &smem) == VK_SUCCESS &&
+                      vkBindBufferMemory(dev, stage, smem, 0) == VK_SUCCESS &&
+                      vkMapMemory(dev, smem, 0, bci.size, 0, &smap) == VK_SUCCESS;
+        if (staged) {
+            for (int i = 0; i < 128 * 128; i++) {
+                uint8_t* px = (uint8_t*)smap + (size_t)i * 4;
+                px[0] = b; px[1] = g; px[2] = r; px[3] = 255;  // BGRA
+            }
+            VkCommandPoolCreateInfo pci = {};
+            pci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+            pci.queueFamilyIndex = ctx.GetQueueFamily();
+            VkCommandPool pool = VK_NULL_HANDLE;
+            vkCreateCommandPool(dev, &pci, nullptr, &pool);
+            VkCommandBufferAllocateInfo cai = {};
+            cai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            cai.commandPool = pool;
+            cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            cai.commandBufferCount = 1;
+            VkCommandBuffer cmd = VK_NULL_HANDLE;
+            vkAllocateCommandBuffers(dev, &cai, &cmd);
+            VkCommandBufferBeginInfo bi = {};
+            bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            vkBeginCommandBuffer(cmd, &bi);
+            VkImageMemoryBarrier imb = {};
+            imb.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            imb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            imb.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            imb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            imb.image = e.img;
+            imb.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 0, 0, nullptr, 0, nullptr, 1, &imb);
+            VkBufferImageCopy region = {};
+            region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            region.imageExtent = { 128, 128, 1 };
+            vkCmdCopyBufferToImage(cmd, stage, e.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+            vkEndCommandBuffer(cmd);
+            VkSubmitInfo si = {};
+            si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            si.commandBufferCount = 1;
+            si.pCommandBuffers = &cmd;
+            vkQueueSubmit(ctx.Queue(), 1, &si, VK_NULL_HANDLE);
+            vkQueueWaitIdle(ctx.Queue());
+            vkDestroyCommandPool(dev, pool, nullptr);
+        }
+        vkDestroyBuffer(dev, stage, nullptr);
+        vkFreeMemory(dev, smem, nullptr);
+        VkMemoryGetFdInfoKHR fdInfo = {};
+        fdInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
+        fdInfo.memory = e.mem;
+        fdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+        if (getMemFd(dev, &fdInfo, &e.fd) != VK_SUCCESS) e.fd = -1;
+        return e;
+    };
+
+    Eye eyeL = makeEye(255, 0, 0);
+    Eye eyeR = makeEye(0, 255, 0);
+    Check(eyeL.fd >= 0 && eyeR.fd >= 0, "encoder e2e: exportable eyes created");
+    if (eyeL.fd < 0 || eyeR.fd < 0) return;
+    GpuImage gl = {}; gl.handle = (uint64_t)eyeL.fd; gl.width = 128; gl.height = 128;
+    gl.format = (uint32_t)VK_FORMAT_B8G8R8A8_UNORM;
+    GpuImage gr = gl; gr.handle = (uint64_t)eyeR.fd;
+
+    // ---- A5a: heartbeat + RequestKeyframe on a never-initialized encoder ----
+    {
+        VideoEncoder encFresh;
+        Check(!encFresh.ReencodeLastFrame(0), "A5 heartbeat before any frame returns false (no crash)");
+        encFresh.RequestKeyframe();  // must be a safe no-op
+        encFresh.RequestKeyframe();
+        Check(true, "A3 RequestKeyframe while uninitialized is safe");
+        encFresh.Shutdown();         // double-safe: never initialized
+        Check(true, "A5 Shutdown on a never-initialized encoder is safe");
+    }
+
+    // ---- A4: GOP cadence + heartbeat pts (unforced cadence) ----
+    {
+        PacketSink sink1;
+        VideoEncoder enc;
+        bool ok = enc.Initialize(512, 256, 30, 4000000, false, &ctx, "libx264");
+        Check(ok, "A4 encoder initialized (lavapipe + libx264)");
+        if (ok) {
+            sink1.attach(enc);
+            for (int64_t p = 0; p < 25 && ok; p++) ok = EncodeOneFrame(enc, gl, gr, p);
+            Check(ok, "A4 frames 0..24 encoded through the full chain");
+            // Idle heartbeats: the Windows heartbeat re-sends the last frame at
+            // lastPts+1; with gop 10 the cadence carries on through them, so a
+            // late joiner during idle gets an IDR within 10 re-sends (~1 s at
+            // the 100 ms heartbeat).
+            for (int64_t p = 25; p < 35 && ok; p++) {
+                ok = enc.ReencodeLastFrame(p);
+                if (!ok) break;
+            }
+            Check(ok, "A4 ten idle heartbeats encoded (pts 25..34)");
+            enc.RequestKeyframe();
+            ok = enc.ReencodeLastFrame(35) && enc.ReencodeLastFrame(36);
+            Check(ok, "A4 forced-keyframe + follow-up heartbeats encoded");
+
+            auto pts = sink1.ptsSnapshot();
+            auto key = sink1.keySnapshot();
+            std::lock_guard<std::mutex> l(sink1.m);
+            auto& data = sink1.data;
+            // pts: exactly 0..36 in order — heartbeats continue monotonically
+            // past the last present frame and never collide or regress.
+            bool ptsOk = pts.size() == 37;
+            for (size_t i = 0; ptsOk && i < pts.size(); i++) ptsOk = pts[i] == (int64_t)i;
+            Check(ptsOk, "A4 pts monotonic 0..36, one packet per frame/heartbeat, no regression");
+            bool annexb = !data.empty();
+            for (const auto& p : data) { if (!IsAnnexB(p)) annexb = false; }
+            Check(annexb, "A4 every packet is Annex-B");
+            bool idr0 = HasNalType(data[0], 5) && key[0];
+            Check(idr0, "A4 first encode emits an IDR (flag + NAL type 5)");
+            Check(key[10] && HasNalType(data[10], 5), "A4 GOP cadence: IDR at frame 10 (gop 10)");
+            Check(key[20] && HasNalType(data[20], 5), "A4 GOP cadence: IDR at frame 20");
+            bool midOk = true;
+            for (int i : { 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 24 }) {
+                if (key[(size_t)i]) midOk = false;
+            }
+            Check(midOk, "A4 non-IDR between IDR frames (flags coherent with GOP)");
+            Check(key[30] && HasNalType(data[30], 5),
+                  "A4 heartbeat cadence: the 10th idle re-send is an IDR (late-joiner guarantee)");
+            bool hbMid = true;
+            for (int i : { 25, 26, 27, 28, 29, 31, 32, 33, 34 }) {
+                if (key[(size_t)i]) hbMid = false;
+            }
+            Check(hbMid, "A4 heartbeat re-sends between IDR boundaries are non-IDR");
+            Check(key[35] && HasNalType(data[35], 5),
+                  "A3 KEYFRAME_REQ during idle: forced IDR on the heartbeat");
+            Check(!key[36] && !HasNalType(data[36], 5),
+                  "A3 RequestKeyframe arms EXACTLY one frame (consumed, second is non-IDR)");
+            // A9: shutdown drain — every pts 0..36 delivered exactly once.
+            std::set<int64_t> uniq(pts.begin(), pts.end());
+            Check(uniq.size() == pts.size(), "A9 no duplicate pts within the session (no lost/re-sent frames)");
+        }
+        // The encoder scope above ended (destructor -> Shutdown); assert the
+        // packet count is final: no trailing packets appear after Shutdown
+        // (per-frame drain with delay 0).
+        Check(sink1.size() == 37, "A9 no trailing packets after Shutdown (per-frame drain, delay 0)");
+    }
+
+    // ---- A3: keyframe policy on a present-frame stream ----
+    {
+        PacketSink sink2;
+        VideoEncoder enc;
+        bool ok = enc.Initialize(512, 256, 30, 4000000, false, &ctx, "libx264");
+        if (ok) {
+            sink2.attach(enc);
+            for (int64_t p = 0; p <= 4 && ok; p++) ok = EncodeOneFrame(enc, gl, gr, p);
+            enc.RequestKeyframe();
+            ok = EncodeOneFrame(enc, gl, gr, 5);
+            Check(ok, "A3 frame after RequestKeyframe encoded");
+            ok = EncodeOneFrame(enc, gl, gr, 6);
+            Check(ok, "A3 follow-up frame encoded");
+            auto key = sink2.keySnapshot();
+            std::lock_guard<std::mutex> l(sink2.m);
+            Check(key[5] && HasNalType(sink2.data[5], 5),
+                  "A3 RequestKeyframe makes the next present frame an IDR");
+            Check(!key[6] && !HasNalType(sink2.data[6], 5),
+                  "A3 ...and only that one (flag consumed, frame 6 back to non-IDR)");
+        }
+        if (ok) enc.Shutdown();
+    }
+
+    // ---- A5b/A6: CPU-fallback encoder (odd width refuses GPU NV12) + interleaving ----
+    {
+        VideoEncoder cpuEnc;
+        bool ok = cpuEnc.Initialize(514, 256, 30, 4000000, false, &ctx, "libx264");
+        Check(ok, "A6 CPU-fallback encoder initialized (514 wide refuses GPU NV12)");
+        if (ok) {
+            PacketSink sink2;
+            sink2.attach(cpuEnc);
+            ok = EncodeOneFrame(cpuEnc, gl, gr, 0);
+            Check(ok, "A6 CPU-fallback frame encoded (swscale source)");
+            Check(cpuEnc.ReencodeLastFrame(1), "A5 heartbeat after a CPU-fallback frame succeeds");
+            ok = EncodeOneFrame(cpuEnc, gl, gr, 2);
+            Check(ok, "A6 CPU-fallback frame 2 encoded");
+            // Interleave GPU and CPU encoders — ConvertFrame must pick the
+            // right source for whichever encoder runs.
+            PacketSink sinkG, sinkC;
+            VideoEncoder gpuEnc;
+            bool gok = gpuEnc.Initialize(512, 256, 30, 4000000, false, &ctx, "libx264");
+            Check(gok, "A6 GPU-NV12 encoder initialized (512 wide)");
+            if (gok) {
+                sinkG.attach(gpuEnc);
+                sinkC.attach(cpuEnc);
+                bool alt = true;
+                for (int i = 0; i < 4 && alt; i++) {
+                    alt = EncodeOneFrame(gpuEnc, gl, gr, 10 + 2 * i) &&
+                          EncodeOneFrame(cpuEnc, gl, gr, 11 + 2 * i);
+                }
+                Check(alt, "A6 alternating GPU/CPU source switching produces a frame every time");
+                // The captured log must be free of conversion failures.
+                auto lines = g_capturedLog.snapshot();
+                bool noConvFail = true;
+                for (const auto& s : lines) {
+                    if (s.find("swscale conversion failed") != std::string::npos ||
+                        s.find("avcodec_send_frame failed") != std::string::npos) noConvFail = false;
+                }
+                Check(noConvFail, "A6 no conversion/encode errors logged during switching");
+                Check(sinkG.size() >= 4 && sinkC.size() >= 5,
+                      "A6 both encoders delivered packets every round");
+                gpuEnc.Shutdown();
+            }
+            cpuEnc.Shutdown();
+        }
+    }
+
+    // ---- A8: duplicate-frame hash + telemetry summary arithmetic ----
+    {
+        VideoEncoder enc;
+        bool ok = enc.Initialize(512, 256, 30, 4000000, false, &ctx, "libx264");
+        Check(ok, "A8 telemetry encoder initialized");
+        if (ok) {
+            std::mutex tm;
+            std::vector<cbpp::PayloadTelemetry> summaries;
+            enc.SetTelemetryCallback([&](const cbpp::PayloadTelemetry& t) {
+                std::lock_guard<std::mutex> l(tm);
+                summaries.push_back(t);
+            });
+            // 120 identical frames -> exactly one summary at the 120th encode.
+            bool ok120 = true;
+            for (int64_t p = 0; p < 120 && ok120; p++) ok120 = EncodeOneFrame(enc, gl, gr, p);
+            Check(ok120, "A8 120 identical frames encoded");
+            enc.FinishEncode(120);  // 121st identical frame
+            std::vector<cbpp::PayloadTelemetry> snap;
+            {
+                std::lock_guard<std::mutex> l(tm);
+                snap = summaries;
+            }
+            bool oneSummary = snap.size() == 1;
+            Check(oneSummary, "A8 summary fires at summaryInterval (120 encodes)");
+            if (oneSummary) {
+                const auto& t = snap[0];
+                bool arith = t.frames == 120 && t.summary_frames == 120 &&
+                             t.dup_count == 119;  // identical content: every frame after the first is a dup
+                Check(arith, "A8 identical frames: dup_count == frames-1 (hash-identical)");
+                bool bounds = t.avg_encode_us <= t.max_encode_us &&
+                              t.avg_interval_us <= t.max_interval_us &&
+                              t.max_encode_us > 0 && t.max_interval_us > 0;
+                Check(bounds, "A8 telemetry arithmetic invariants (avg <= max, all sampled)");
+            }
+            // Alternating content: red/green swap each frame -> no dups.
+            Eye eyeR2 = makeEye(0, 0, 255);
+            GpuImage gr2 = gl; gr2.handle = (uint64_t)eyeR2.fd;
+            if (eyeR2.fd >= 0) {
+                for (int64_t p = 121; p < 240; p++) {
+                    const GpuImage& right = (p & 1) ? gr2 : gr;
+                    EncodeOneFrame(enc, gl, right, p);
+                }
+                enc.FinishEncode(240);  // 240th encode -> second summary
+                std::vector<cbpp::PayloadTelemetry> snap2;
+                {
+                    std::lock_guard<std::mutex> l(tm);
+                    snap2 = summaries;
+                }
+                bool two = snap2.size() == 2;
+                Check(two, "A8 second summary fires at the next 120 encodes");
+                if (two) {
+                    Check(snap2[1].dup_count == 0,
+                          "A8 alternating content resets the dup streak (hash changes every frame)");
+                    Check(snap2[1].frames == 120 && snap2[1].summary_frames == 120,
+                          "A8 per-summary counters reset after each summary");
+                }
+            } else {
+                Check(false, "A8 blue eye created for the alternating-content test");
+            }
+            enc.Shutdown();
+        }
+        // Heartbeat after a re-initialized encoder: a fresh encoder has no
+        // frame source, so the heartbeat must refuse (stale GPU NV12 pointer
+        // from the previous instance must never be reachable here).
+        VideoEncoder encNew;
+        bool okNew = encNew.Initialize(512, 256, 30, 4000000, false, &ctx, "libx264");
+        if (okNew) {
+            Check(!encNew.ReencodeLastFrame(0),
+                  "A5 fresh (re-initialized) encoder refuses the heartbeat (no stale source)");
+            encNew.Shutdown();
+        }
+    }
+
+    // ---- A10: hardware fallback order (no hw encoders on the runner) ----
+    {
+        size_t logMark = g_capturedLog.snapshot().size();
+        VideoEncoder enc;
+        bool ok = enc.Initialize(512, 256, 30, 4000000, true, &ctx, nullptr);  // "gpu": full hw candidate chain
+        Check(ok, "A10 gpu-mode encoder falls back to a working codec");
+        auto lines = g_capturedLog.snapshot();
+        int openIdx = -1, lastSkipIdx = -1, vaapiIdx = -1, nvencIdx = -1, qsvIdx = -1, failIdx = -1;
+        for (size_t i = logMark; i < lines.size(); i++) {
+            const std::string& s = lines[i];
+            if (s.find("Opened H264 encoder: libx264") != std::string::npos) openIdx = (int)i;
+            if (s.find("Encoder h264_vaapi") != std::string::npos && s.find("not available") != std::string::npos) vaapiIdx = (int)i;
+            if (s.find("VAAPI frame pool unavailable") != std::string::npos) vaapiIdx = (int)i;
+            if (s.find("Encoder h264_nvenc") != std::string::npos && s.find("not available") != std::string::npos) nvencIdx = (int)i;
+            if (s.find("Encoder h264_qsv") != std::string::npos && s.find("not available") != std::string::npos) qsvIdx = (int)i;
+            if (s.find("trying next encoder") != std::string::npos) lastSkipIdx = (int)i;
+            if (s.find("No usable H264 encoder found") != std::string::npos) failIdx = (int)i;
+        }
+        Check(ok && openIdx >= 0, "A10 libx264 opened after the hardware candidates were skipped");
+        Check(failIdx < 0, "A10 fallback ended in a working encoder (no total failure)");
+        // Documented order vaapi -> nvenc -> qsv -> libx264: each skip that
+        // fired appears before the open, and vaapi's failure precedes nvenc/qsv
+        // skips when those codecs exist in this FFmpeg build.
+        Check(vaapiIdx >= 0, "A10 vaapi candidate attempted and skipped/f failed first (runner has no DRM device)");
+        if (nvencIdx >= 0) Check(vaapiIdx < nvencIdx, "A10 vaapi precedes nvenc in the fallback order");
+        if (qsvIdx >= 0) {
+            if (nvencIdx >= 0) Check(nvencIdx < qsvIdx, "A10 nvenc precedes qsv in the fallback order");
+            Check(qsvIdx < openIdx, "A10 qsv precedes the libx264 open");
+        }
+        if (lastSkipIdx >= 0) Check(lastSkipIdx < openIdx, "A10 skips precede the software open");
+        if (ok) enc.Shutdown();
+    }
+}
+
+#endif  // CBPP_ENCODER_E2E_TEST
+
 int main() {
     printf("=== Encoder unit tests (phase P: pure helpers) ===\n");
     TestFindIdrInsertionPoint();

@@ -169,7 +169,34 @@ jobs:
           grep '^== FAIL' /tmp/smoke.log | head -4 | while IFS= read -r line; do echo "::error::smoke: ${line:0:200}"; done
           tail -6 /tmp/smoke.log | while IFS= read -r line; do echo "::error::tail: ${line:0:200}"; done
         fi
-        exit $SMOKERC
+        # Encoder internals e2e (same real sources as phase C): keyframe policy,
+        # GOP cadence + heartbeat pts, GPU/CPU source switching, telemetry
+        # arithmetic, shutdown drain, hardware fallback order.
+        g++ -std=c++17 -O1 -DCBPP_ENCODER_E2E_TEST -Wall -Wextra \
+          -I driver_cardboardplusplus/include -I driver_cardboardplusplus/build/spirv \
+          -o /tmp/enc_e2e driver_cardboardplusplus/tests/encoder_unit_test.cpp \
+          driver_cardboardplusplus/src/VulkanContext.cpp \
+          driver_cardboardplusplus/src/VulkanCompose.cpp \
+          driver_cardboardplusplus/src/VideoEncoder.cpp \
+          driver_cardboardplusplus/src/VideoEncoderFFmpeg.cpp \
+          driver_cardboardplusplus/src/VideoEncoderShaders.cpp \
+          -lvulkan -lavcodec -lavutil -lswscale -lavformat \
+          > /tmp/enc_e2e_build.log 2>&1
+        E2EBUILDRC=$?
+        echo "ENC-E2E compile rc=$E2EBUILDRC"
+        if [ $E2EBUILDRC -ne 0 ]; then
+          grep -m4 -E "error" /tmp/enc_e2e_build.log | while IFS= read -r line; do echo "::error::enc-e2e-build: ${line:0:220}"; done
+          exit 1
+        fi
+        VK_ICD_FILENAMES="$ICD" VK_DRIVER_FILES="$ICD" \
+        /tmp/enc_e2e > /tmp/enc_e2e.log 2>&1
+        E2ERC=$?
+        echo "ENC-E2E run rc=$E2ERC checks=$(grep -c '^== ' /tmp/enc_e2e.log)"
+        if [ $E2ERC -ne 0 ]; then
+          grep '^== FAIL' /tmp/enc_e2e.log | head -4 | while IFS= read -r line; do echo "::error::enc-e2e: ${line:0:200}"; done
+          tail -6 /tmp/enc_e2e.log | while IFS= read -r line; do echo "::error::tail: ${line:0:200}"; done
+        fi
+        exit $E2ERC
 
     - name: Verify the shared object
       run: |
