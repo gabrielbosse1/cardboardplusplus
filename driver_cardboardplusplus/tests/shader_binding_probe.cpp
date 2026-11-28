@@ -9,6 +9,7 @@
 #include "DriverLog.h"
 #include <d3dcompiler.h>
 #include <cstdio>
+#include <cstdarg>
 #include <cstring>
 #include <cstdint>
 #include <vector>
@@ -17,6 +18,18 @@
 #include "shaders/nv12_cs.hlsli"
 
 #pragma comment(lib, "d3dcompiler.lib")
+
+// Stub for the linker: TranslateToSpirv logs via DriverLog, which in the real
+// driver goes through SteamVR's initialized context. In this probe there is no
+// context, and the real DriverLog.cpp would crash on VRDriverLog(); print to
+// stdout instead (unbuffered main keeps output alive through crashes).
+void DriverLog(const char* pFormat, ...) {
+    va_list args;
+    va_start(args, pFormat);
+    vprintf(pFormat, args);
+    va_end(args);
+    printf("\n");
+}
 
 namespace {
 
