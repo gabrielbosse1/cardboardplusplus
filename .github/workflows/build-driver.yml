@@ -49,8 +49,9 @@ jobs:
         } catch {
           $_.ToString() | Add-Content $log
         }
-        Get-Content $log -Tail 40
-        Get-Content $log -Tail 40 | ForEach-Object { "::error::$_" }
+        $interesting = Get-Content $log | Select-String -Pattern '^(== |  Decorate|  Name|PROBE|probe exit|no shader_probe|cl exit)' | Select-Object -First 45
+        $interesting
+        $interesting | ForEach-Object { "::error::$($_.Line)" }
 
     - name: Build Driver
       run: msbuild driver_cardboardplusplus\driver_cardboardplusplus.sln /p:Configuration=${{ matrix.configuration }} /p:Platform=x64 /p:PlatformToolset=v143
