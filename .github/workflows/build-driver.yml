@@ -49,9 +49,62 @@ jobs:
         } catch {
           $_.ToString() | Add-Content $log
         }
-        $interesting = Get-Content $log | Select-String -Pattern '^(== |  Decorate|  Name|PROBE|probe exit|no shader_probe|cl exit)' | Select-Object -First 45
+        $interesting = Get-Content $log | Select-String -Pattern '^(== |PROBE|probe exit|no shader_probe|cl exit)' | Select-Object -First 30
         $interesting
         $interesting | ForEach-Object { "::error::$($_.Line)" }
+        # Parse the emitted SPIR-V files in PowerShell (crash-proof) and report
+        # the descriptor bindings the vendored translator assigned.
+        foreach ($name in @("compose_ps", "nv12_cs", "compose_vs")) {
+          $path = "$name.spv"
+          if (-not (Test-Path $path)) { "::error::$name : spv missing"; continue }
+          $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $path))
+          $n = [math]::Floor($bytes.Length / 4)
+          if ($n -lt 5) { "::error::$name : too small ($n words)"; continue }
+          $magic = [BitConverter]::ToUInt32($bytes, 0)
+          $ver = [BitConverter]::ToUInt32($bytes, 4)
+          $magicLine = "== $name magic=0x{0:X8} version=0x{1:X8} words={2}" -f $magic, $ver, $n
+          $magicLine
+          "::error::$magicLine"
+          $names = @{}
+          $bindings = @{}
+          $sets = @{}
+          $i = 5
+          while ($i + 1 -lt $n) {
+            $w = [BitConverter]::ToUInt32($bytes, $i*4)
+            $wc = $w -shr 16; $op = $w -band 0xFFFF
+            if ($wc -eq 0) { break }
+            if ($i + $wc -gt $n) { break }
+            if ($op -eq 71 -and $wc -ge 3) {
+              $t = [BitConverter]::ToUInt32($bytes, ($i+1)*4)
+              $d = [BitConverter]::ToUInt32($bytes, ($i+2)*4)
+              $lit = 0
+              if ($wc -ge 4) { $lit = [BitConverter]::ToUInt32($bytes, ($i+3)*4) }
+              if ($d -eq 34) { $bindings[$t] = $lit }
+              if ($d -eq 35) { $sets[$t] = $lit }
+            } elseif ($op -eq 5 -and $wc -ge 2) {
+              $t = [BitConverter]::ToUInt32($bytes, ($i+1)*4)
+              $sb = New-Object System.Text.StringBuilder
+              for ($j = $i + 2; $j -lt ($i + $wc); $j++) {
+                $w4 = [BitConverter]::ToUInt32($bytes, $j*4)
+                foreach ($b in 0..3) {
+                  $c = ($w4 -shr (8*$b)) -band 0xFF
+                  if ($c -eq 0) { $j = $i + $wc; break }
+                  [void]$sb.Append([char]$c)
+                }
+              }
+              $names[$t] = $sb.ToString()
+            }
+            $i += $wc
+          }
+          foreach ($id in $bindings.Keys) {
+            $bnd = $bindings[$id]
+            $st = if ($sets.ContainsKey($id)) { $sets[$id] } else { 0 }
+            $nm = if ($names.ContainsKey($id)) { $names[$id] } else { "?" }
+            $line = "BINDING $name set=$st binding=$bnd id=$id name='$nm'"
+            $line
+            "::error::$line"
+          }
+        }
 
     - name: Build Driver
       run: msbuild driver_cardboardplusplus\driver_cardboardplusplus.sln /p:Configuration=${{ matrix.configuration }} /p:Platform=x64 /p:PlatformToolset=v143
