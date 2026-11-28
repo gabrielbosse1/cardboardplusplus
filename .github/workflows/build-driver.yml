@@ -51,6 +51,58 @@ jobs:
           exit 1
         }
 
+    - name: SPIR-V facts (TEMP diagnostics)
+      if: always()
+      shell: pwsh
+      run: |
+        $lines = @()
+        foreach ($name in @("compose_vs", "compose_ps", "nv12_cs")) {
+          $p = "driver_cardboardplusplus\include\shaders\spirv\$name.spv"
+          if (-not (Test-Path $p)) { $lines += "MISSING $p"; continue }
+          $bytes = [IO.File]::ReadAllBytes($p)
+          $n = [math]::Floor($bytes.Length / 4)
+          $ver = '{0:x8}' -f [BitConverter]::ToUInt32($bytes, 4)
+          $lines += "### $name : $n words, version 0x$ver"
+          $names2 = @{}
+          $i = 5
+          while ($i + 1 -lt $n) {
+            $w = [BitConverter]::ToUInt32($bytes, $i*4)
+            $wc = $w -shr 16; $op = $w -band 0xFFFF
+            if ($wc -eq 0) { break }
+            if ($i + $wc -gt $n) { break }
+            if ($op -eq 5 -and $wc -ge 2) {
+              $t = [BitConverter]::ToUInt32($bytes, ($i+1)*4)
+              $sb = New-Object System.Text.StringBuilder
+              for ($j = $i + 2; $j -lt ($i + $wc); $j++) {
+                $w4 = [BitConverter]::ToUInt32($bytes, $j*4)
+                foreach ($b in 0..3) {
+                  $c = ($w4 -shr (8*$b)) -band 0xFF
+                  if ($c -eq 0) { $j = $i + $wc; break }
+                  [void]$sb.Append([char]$c)
+                }
+              }
+              $names2[$t] = $sb.ToString()
+            } elseif ($op -eq 71 -and $wc -ge 3) {
+              $t = [BitConverter]::ToUInt32($bytes, ($i+1)*4)
+              $d = [BitConverter]::ToUInt32($bytes, ($i+2)*4)
+              $lit = 0
+              if ($wc -ge 4) { $lit = [BitConverter]::ToUInt32($bytes, ($i+3)*4) }
+              if ($d -in 11, 25, 32, 33, 34) {
+                $nm = if ($names2.ContainsKey($t)) { $names2[$t] } else { "$t" }
+                $lines += "| $name | $nm | dec=$d | $lit |"
+              }
+            } elseif ($op -eq 59 -and $wc -ge 4) {
+              $t = [BitConverter]::ToUInt32($bytes, ($i+2)*4)
+              $sc = [BitConverter]::ToUInt32($bytes, ($i+3)*4)
+              $nm = if ($names2.ContainsKey($t)) { $names2[$t] } else { "$t" }
+              $lines += "| $name | $nm | storage | $sc |"
+            }
+            $i += $wc
+          }
+        }
+        $lines | ForEach-Object { Write-Host $_ }
+        $lines | Add-Content $env:GITHUB_STEP_SUMMARY
+
     - name: Build Driver
       run: msbuild driver_cardboardplusplus\driver_cardboardplusplus.sln /p:Configuration=${{ matrix.configuration }} /p:Platform=x64 /p:PlatformToolset=v143
 
