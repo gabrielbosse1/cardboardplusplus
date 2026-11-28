@@ -1,16 +1,14 @@
 // Side-by-side pixel shader: samples the left or right eye by screen half and
-// converts to sRGB. Descriptor layout is binding 0 = cbuffer, 1 = sampler,
-// 2 = t0 image, 3 = t1 image.
+// converts to sRGB. Descriptor layout (set 0): binding 0 = cbuffer,
+// 1 = sampler, 2 = t0 image, 3 = t1 image. The build maps registers to those
+// bindings with -fvk-*-shift (see CMakeLists.txt / scripts/build-spirv.ps1):
+// dxc's one-argument [[vk::binding(n)]] turned out to set the descriptor SET
+// in newer dxc releases, which silently detached every resource.
 static const char* kVkSBSPSSource = R"(
-#ifdef CBPP_VK_BINDINGS
-#define VK_BIND(n) [[vk::binding(n)]]
-#else
-#define VK_BIND(n)
-#endif
-VK_BIND(2) Texture2D<float4> leftEye : register(t0);
-VK_BIND(3) Texture2D<float4> rightEye : register(t1);
-VK_BIND(1) SamplerState samp : register(s0);
-VK_BIND(0) cbuffer Bounds : register(b0) {
+Texture2D<float4> leftEye : register(t0);
+Texture2D<float4> rightEye : register(t1);
+SamplerState samp : register(s0);
+cbuffer Bounds : register(b0) {
     float4 leftRect;
     float4 rightRect;
 };

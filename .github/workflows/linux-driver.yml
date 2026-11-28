@@ -53,25 +53,123 @@ jobs:
       # real openvr_api.so at load time; for a CI link a stub is sufficient and
       # proves the driver does not depend on any OpenVR symbol at link time.
       run: |
-        sudo mkdir -p /tmp/openvr_stub
+        # No sudo: a root-owned stub dir would reject the non-root cat below.
+        mkdir -p /tmp/openvr_stub
         cat > /tmp/openvr_stub/stub.c <<'EOF'
         /* CI stub: the driver's OpenVR driver-API calls are inline accessors
          * (openvr_driver.h), so no real OpenVR symbols are needed at link time.
          * SteamVR provides the context when it loads the driver .so at runtime. */
         int __cbpp_openvr_stub(void) { return 0; }
         EOF
-        gcc -shared -fPIC -o /tmp/openvr_stub/openvr_api.so /tmp/openvr_stub/stub.c
-        ls -la /tmp/openvr_stub/openvr_api.so
+        gcc -shared -fPIC -o /tmp/openvr_stub/libopenvr_api.so /tmp/openvr_stub/stub.c
+        cp /tmp/openvr_stub/libopenvr_api.so /tmp/openvr_stub/openvr_api.so
+        # Both names: find_library(NAMES openvr_api) matches the lib-prefixed
+        # convention, while the SteamVR-style name documents the runtime shape.
+        ls -la /tmp/openvr_stub
 
     - name: Bake commit count into DriverVersion.h
       run: bash scripts/bake-driver-version.sh
 
     - name: Configure and build the driver
       run: |
-        cmake -S driver_cardboardplusplus -B driver_cardboardplusplus/build \
+        # Output goes to a log so failures can be surfaced as annotations
+        # (job logs themselves are not retrievable from this setup).
+        if ! cmake -S driver_cardboardplusplus -B driver_cardboardplusplus/build \
           -DCMAKE_BUILD_TYPE=Release \
-          -DCBPP_OPENVR_DIR=/tmp/openvr_stub
-        cmake --build driver_cardboardplusplus/build --parallel "$(nproc)"
+          -DCBPP_OPENVR_DIR=/tmp/openvr_stub > /tmp/cbpp_build.log 2>&1; then
+          tail -30 /tmp/cbpp_build.log
+          grep -iE "CMake Error|error|unknown|warning" /tmp/cbpp_build.log | head -8 | while IFS= read -r line; do echo "::error::configure: ${line:0:230}"; done
+          exit 1
+        fi
+        if ! cmake --build driver_cardboardplusplus/build --parallel "$(nproc)" >> /tmp/cbpp_build.log 2>&1; then
+          tail -40 /tmp/cbpp_build.log
+          grep -iE "error|unknown|failed|dxc" /tmp/cbpp_build.log | head -8 | while IFS= read -r line; do echo "::error::build: ${line:0:230}"; done
+          exit 1
+        fi
+        tail -3 /tmp/cbpp_build.log
+
+    - name: SPIR-V facts and lavapipe smoke test (regression suite)
+      run: |
+        set +e
+        sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers > /dev/null 2>&1
+        python3 - <<'EOF' > /tmp/facts.txt 2> /tmp/facts.err
+        import struct
+        # SPIR-V decoration ids per the vendored spirv.hpp: Binding=33,
+        # DescriptorSet=34, Location=30 (an earlier revision swapped bind/set,
+        # which misread every dump and briefly pointed the investigation at a
+        # descriptor mismatch that does not exist).
+        DEC = {2: "block", 11: "builtin", 25: "nonwritable", 30: "loc", 33: "bind", 34: "set"}
+        STOR = {0: "in", 1: "out"}
+        for name in ["compose_vs", "compose_ps", "nv12_cs"]:
+            data = open(f"driver_cardboardplusplus/build/spirv/{name}.spv", "rb").read()
+            n = len(data) // 4
+            words = struct.unpack(f"<{n}I", data)
+            nm = {}
+            rows = []
+            i = 5
+            while i + 1 < n:
+                wc = words[i] >> 16; op = words[i] & 0xFFFF
+                if wc == 0 or i + wc > n:
+                    break
+                if op == 5 and wc >= 2:
+                    chars = []
+                    for j in range(i + 2, i + wc):
+                        for s in range(4):
+                            c = (words[j] >> (8 * s)) & 0xFF
+                            if c == 0:
+                                break
+                            chars.append(chr(c))
+                    nm[words[i + 1]] = "".join(chars)
+                elif op == 71 and wc >= 3:
+                    tid, dec = words[i + 1], words[i + 2]
+                    lit = words[i + 3] if wc >= 4 else 0
+                    if dec in (11, 32, 33, 34):
+                        rows.append(f"{nm.get(tid, tid)}:{DEC[dec]}={lit}")
+                elif op == 59 and wc >= 4:
+                    tid, sc = words[i + 2], words[i + 3]
+                    if sc in STOR:
+                        rows.append(f"{nm.get(tid, tid)}:st={STOR[sc]}")
+                i += wc
+            print(f"F {name} ver=0x{words[1]:04x} words={n} " + " ".join(rows))
+        EOF
+        while IFS= read -r line; do echo "FACT ${line:0:230}"; done < /tmp/facts.txt
+        PYE=$(tail -2 /tmp/facts.err | head -c 200)
+        if [ -n "$PYE" ]; then echo "::error::PYERR $PYE"; fi
+        # Phase B/C link the REAL production components (VulkanContext,
+        # VulkanCompose, VideoEncoder + FFmpeg) on top of the SPIR-V replica,
+        # so the shipped code paths run under test on lavapipe. DriverLog.cpp
+        # is NOT linked: outside SteamVR the driver context is null and its
+        # first call would crash — the test provides a stderr sink instead.
+        g++ -std=c++17 -O1 -DCBPP_ENCODER_E2E_TEST \
+          -I driver_cardboardplusplus/include -I driver_cardboardplusplus/build/spirv \
+          -o /tmp/vk_smoke driver_cardboardplusplus/tests/vulkan_pipeline_smoke.cpp \
+          driver_cardboardplusplus/src/VulkanContext.cpp \
+          driver_cardboardplusplus/src/VulkanCompose.cpp \
+          driver_cardboardplusplus/src/VideoEncoder.cpp \
+          driver_cardboardplusplus/src/VideoEncoderFFmpeg.cpp \
+          driver_cardboardplusplus/src/VideoEncoderShaders.cpp \
+          -lvulkan -lavcodec -lavutil -lswscale -lavformat \
+          > /tmp/smoke_build.log 2>&1
+        BUILDRC=$?
+        echo "SMOKE compile rc=$BUILDRC"
+        if [ $BUILDRC -ne 0 ]; then
+          grep -m4 -E "error" /tmp/smoke_build.log | while IFS= read -r line; do echo "::error::smoke-build: ${line:0:220}"; done
+          exit 1
+        fi
+        ICD=$(find /usr/share/vulkan /etc/vulkan -name 'lvp_icd*.json' -o -name 'swiftshader*.json' 2>/dev/null | head -1)
+        echo "SMOKE icd=$ICD"
+        VK_ICD_FILENAMES="$ICD" VK_DRIVER_FILES="$ICD" \
+        /tmp/vk_smoke > /tmp/smoke.log 2>&1
+        SMOKERC=$?
+        echo "SMOKE run rc=$SMOKERC checks=$(grep -c '^== ' /tmp/smoke.log)"
+        # GitHub keeps only the first 10 error annotations per check run, so on
+        # failure emit exactly what pinpoints the problem: FAIL lines and the
+        # raw log tail (a segfault leaves no FAIL/RESULT line behind).
+        if [ $SMOKERC -ne 0 ]; then
+          grep '^== FAIL' /tmp/smoke.log | head -4 | while IFS= read -r line; do echo "::error::smoke: ${line:0:200}"; done
+          tail -6 /tmp/smoke.log | while IFS= read -r line; do echo "::error::tail: ${line:0:200}"; done
+        fi
+        exit $SMOKERC
 
     - name: Verify the shared object
       run: |
@@ -100,6 +198,16 @@ jobs:
           -o driver_cardboardplusplus/build/driver_tests \
           driver_cardboardplusplus/tests/test_wire_protocol.cpp
         ./driver_cardboardplusplus/build/driver_tests
+        g++ -std=c++17 -O2 -I driver_cardboardplusplus/include \
+          -o driver_cardboardplusplus/build/eye_format_tests \
+          driver_cardboardplusplus/tests/test_eye_format.cpp
+        ./driver_cardboardplusplus/build/eye_format_tests
+        # UDP transport: real loopback sockets exercising the send chunker,
+        # pacing, buffer-overflow shapes and the IDR resync policy.
+        g++ -std=c++17 -O2 -I driver_cardboardplusplus/include \
+          -o driver_cardboardplusplus/build/udp_tests \
+          driver_cardboardplusplus/tests/udp_transport_test.cpp
+        ./driver_cardboardplusplus/build/udp_tests
 
     - name: Validate driver manifest and profile
       run: |
@@ -141,12 +249,12 @@ jobs:
         [ -f "$RES/controller_profile.json" ] || { echo "missing controller_profile.json"; find "$RES" -type f 2>/dev/null; exit 1; }
         echo "install script copied resources (incl. controller_profile.json)"
         # Verify the manifest is valid JSON with the expected name.
-        python3 -c "
-import json, sys
-m = json.load(open('$MANIFEST'))
-assert m['name'] == 'cardboardplusplus', m
-print('installed manifest valid')
-"
+        python3 - <<EOF
+        import json, sys
+        m = json.load(open('$MANIFEST'))
+        assert m['name'] == 'cardboardplusplus', m
+        print('installed manifest valid')
+        EOF
         # Verify the bridge app desktop entry + icon are installed for the launcher.
         DESKTOP="$TMPHOME/.local/share/applications/cardboardplusplus.desktop"
         [ -f "$DESKTOP" ] || { echo "missing desktop entry $DESKTOP"; exit 1; }
@@ -177,8 +285,22 @@ print('installed manifest valid')
     - name: Set up Rust
       uses: dtolnay/rust-toolchain@stable
 
-    - name: Install ffmpeg (e2e image decode)
-      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+    - name: Install ffmpeg and fontconfig dev (e2e image decode, font crates)
+      # yeslogic-fontconfig-sys (via the UI font stack) panics in build.rs when
+      # pkg-config cannot find fontconfig; the e2e suite shells out to ffmpeg.
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg pkg-config libfontconfig1-dev
 
     - name: Run bridge tests and e2e suite
-      run: cargo test --manifest-path bridge/Cargo.toml -- --test-threads=1
+      run: |
+        # Same annotation-diagnostics pattern as the driver build step.
+        if ! cargo test --manifest-path bridge/Cargo.toml -- --test-threads=1 \
+            > /tmp/bridge_test.log 2>&1; then
+          tail -40 /tmp/bridge_test.log
+          grep -E "^error" /tmp/bridge_test.log | head -8 | while IFS= read -r line; do echo "::error::bridge: ${line:0:220}"; done
+          grep -E "^test .* FAILED|panicked at" /tmp/bridge_test.log | head -8 | while IFS= read -r line; do echo "::error::bridge: ${line:0:220}"; done
+          # Fall back to raw tail lines so non-standard failures (aborts,
+          # kills, harness exits) are visible through annotations too.
+          tail -12 /tmp/bridge_test.log | while IFS= read -r line; do echo "::error::tail: ${line:0:220}"; done
+          exit 1
+        fi
+        tail -5 /tmp/bridge_test.log

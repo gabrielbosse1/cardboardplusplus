@@ -3,6 +3,106 @@ pub mod driver;
 pub mod mediapipe;
 pub mod phone;
 pub mod telemetry;
+
+/// Enlarges a UDP socket's receive buffer. The driver bursts a whole encoded
+/// frame (~30+ datagrams, several hundred KB on IDRs) within a millisecond;
+/// OS-default buffers are far smaller, so bursts overflowed and the kernel
+/// silently dropped mid-frame datagrams — the decoder lost trailing slices and
+/// drew concealment stripes in the bottom of the frame. std has no
+/// set_recv_buffer_size, so this goes through the raw syscall on each OS.
+/// Returns the size the OS reports after the attempt (doubled values are
+/// normal), or None when unsupported.
+pub fn set_recv_buffer_size(sock: &std::net::UdpSocket, bytes: i32) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        #[cfg(target_os = "macos")]
+        const SOL_SOCKET: i32 = 0xffff;
+        #[cfg(target_os = "macos")]
+        const SO_RCVBUF: i32 = 0x1002;
+        #[cfg(not(target_os = "macos"))]
+        const SOL_SOCKET: i32 = 1;
+        #[cfg(not(target_os = "macos"))]
+        const SO_RCVBUF: i32 = 8;
+        extern "C" {
+            fn setsockopt(fd: i32, level: i32, name: i32, value: *const std::ffi::c_void, len: u32) -> i32;
+        }
+        let rc = unsafe {
+            setsockopt(sock.as_raw_fd(), SOL_SOCKET, SO_RCVBUF, &bytes as *const i32 as *const _, 4)
+        };
+        if rc != 0 {
+            return None;
+        }
+        get_recv_buffer_size(sock)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        const SOL_SOCKET: i32 = 0xffff;
+        const SO_RCVBUF: i32 = 0x1002;
+        extern "system" {
+            fn setsockopt(s: usize, level: i32, name: i32, value: *const u8, len: i32) -> i32;
+        }
+        let rc = unsafe {
+            setsockopt(sock.as_raw_socket(), SOL_SOCKET, SO_RCVBUF, &bytes as *const i32 as *const u8, 4)
+        };
+        if rc != 0 {
+            return None;
+        }
+        get_recv_buffer_size(sock)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (sock, bytes);
+        None
+    }
+}
+
+/// Reads SO_RCVBUF back; used to verify the bump took effect.
+pub fn get_recv_buffer_size(sock: &std::net::UdpSocket) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        #[cfg(target_os = "macos")]
+        const SOL_SOCKET: i32 = 0xffff;
+        #[cfg(target_os = "macos")]
+        const SO_RCVBUF: i32 = 0x1002;
+        #[cfg(not(target_os = "macos"))]
+        const SOL_SOCKET: i32 = 1;
+        #[cfg(not(target_os = "macos"))]
+        const SO_RCVBUF: i32 = 8;
+        extern "C" {
+            fn getsockopt(fd: i32, level: i32, name: i32, value: *mut std::ffi::c_void, len: *mut u32) -> i32;
+        }
+        let mut out: i32 = 0;
+        let mut len: u32 = 4;
+        let rc = unsafe {
+            getsockopt(sock.as_raw_fd(), SOL_SOCKET, SO_RCVBUF, &mut out as *mut i32 as *mut _, &mut len)
+        };
+        if rc == 0 { Some(out) } else { None }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        const SOL_SOCKET: i32 = 0xffff;
+        const SO_RCVBUF: i32 = 0x1002;
+        extern "system" {
+            fn getsockopt(s: usize, level: i32, name: i32, value: *mut u8, len: *mut i32) -> i32;
+        }
+        let mut out: i32 = 0;
+        let mut len: i32 = 4;
+        let rc = unsafe {
+            getsockopt(sock.as_raw_socket(), SOL_SOCKET, SO_RCVBUF, &mut out as *mut i32 as *mut u8, &mut len)
+        };
+        if rc == 0 { Some(out) } else { None }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = sock;
+        None
+    }
+}
+
 // UDP/TCP plane (mirrors CardboardWire.h): video, discovery/control,
 // telemetry, camera, MediaPipe sidecar, and sensor forward.
 pub const VIDEO_PORT: u16 = 42069;
@@ -95,5 +195,21 @@ mod tests {
         assert_eq!(EncoderChoice::Auto.as_str(), "auto");
         assert_eq!(EncoderChoice::Gpu.as_str(), "gpu");
         assert_eq!(EncoderChoice::Cpu.as_str(), "cpu");
+    }
+
+    // The bridge's defense against frame-tail loss: the bump must succeed and
+    // be readable back. Linux clamps to net.core.rmem_max (~208 KB default,
+    // reported doubled), Windows does not clamp — both must apply the request.
+    #[test]
+    fn recv_buffer_bump_applies_and_reads_back() {
+        let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let before = get_recv_buffer_size(&s);
+        let after = set_recv_buffer_size(&s, 4 << 20);
+        assert!(after.is_some(), "setsockopt(SO_RCVBUF) must succeed on this OS");
+        let got = get_recv_buffer_size(&s).expect("SO_RCVBUF readable back");
+        assert!(got > 0, "SO_RCVBUF must be positive");
+        if let Some(b) = before {
+            assert!(got >= b, "bump must not shrink the buffer (before={b}, after={got})");
+        }
     }
 }

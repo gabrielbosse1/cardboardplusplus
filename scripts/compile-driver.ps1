@@ -8,6 +8,9 @@ $root = Split-Path -Parent $PSScriptRoot
 $sln = "$root\driver_cardboardplusplus\driver_cardboardplusplus.sln"
 . "$PSScriptRoot\ffmpeg-deps.ps1"
 Ensure-FfmpegDeps "$root\driver_cardboardplusplus\lib\ffmpeg"
+# Compile the Vulkan SPIR-V headers (compose_vs/ps, nv12_cs) before msbuild;
+# the driver sources include them from include/shaders/spirv.
+& "$PSScriptRoot\build-spirv.ps1"
 & "$PSScriptRoot\bake-driver-version.ps1"
 $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 if (-not (Test-Path $vsWhere)) { throw "vswhere.exe not found - install Visual Studio" }

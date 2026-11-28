@@ -133,10 +133,17 @@ bool VulkanContext::Initialize(const PlatformAdapterId* adapterId)
         }
     }
     if (!m_physical) {
-        DriverLog("Vulkan: no device matches the adapter LUID; using first device (import disabled)");
-        m_physical = devices[0];
-        m_luidMatched = false;
+        DriverLog("Vulkan: no physical device matches the graphics adapter");
+        Destroy();
+        return false;
     }
+#ifdef _WIN32
+    if (!m_luidMatched) {
+        DriverLog("Vulkan: a matching D3D11 adapter LUID is required for eye imports");
+        Destroy();
+        return false;
+    }
+#endif
     // Record extension support and build the enabled-device-extension list in
     // one pass; only request what the device exposes or vkCreateDevice fails.
     // Windows imports shared textures by KMT handle; Linux imports dma-buf
@@ -205,12 +212,7 @@ bool VulkanContext::Initialize(const PlatformAdapterId* adapterId)
         }
     }
     if (picked < 0) {
-        for (uint32_t i = 0; i < qCount; i++) {
-            if (queues[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) { picked = (int)i; break; }
-        }
-    }
-    if (picked < 0) {
-        DriverLog("Vulkan: no graphics queue");
+        DriverLog("Vulkan: no queue supports both graphics and compute");
         Destroy();
         return false;
     }
@@ -255,6 +257,13 @@ bool VulkanContext::Initialize(const PlatformAdapterId* adapterId)
                   fMemModel.vulkanMemoryModel, fMemModel.vulkanMemoryModelDeviceScope,
                   fDrawParams.shaderDrawParameters, fBda.bufferDeviceAddress, use12);
     }
+#ifdef _WIN32
+    if (!use12 || !fMemModel.vulkanMemoryModelDeviceScope) {
+        DriverLog("Vulkan: required SPIR-V 1.5 features are unavailable");
+        Destroy();
+        return false;
+    }
+#endif
     VkDeviceCreateInfo dci = {};
     dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     dci.pNext = use12 ? (void*)&fMemModel : nullptr;

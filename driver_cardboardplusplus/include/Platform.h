@@ -37,6 +37,13 @@
 
 namespace cbpp {
 
+// Address-length type for recvfrom/sendto; int on Windows, socklen_t on POSIX.
+#ifdef _WIN32
+using PlatformSockLen = int;
+#else
+using PlatformSockLen = socklen_t;
+#endif
+
 #ifdef _WIN32
 using PlatformSocket = SOCKET;
 static const PlatformSocket kInvalidSocket = INVALID_SOCKET;
@@ -66,13 +73,6 @@ inline void* PlatformGetSymbol(PlatformModule m, const char* name) {
 #else
 using PlatformSocket = int;
 static const PlatformSocket kInvalidSocket = -1;
-
-// Address-length type for recvfrom/sendto; int on Windows, socklen_t on POSIX.
-#ifdef _WIN32
-using PlatformSockLen = int;
-#else
-using PlatformSockLen = socklen_t;
-#endif
 
 using PlatformModule = void*;
 

@@ -49,3 +49,6 @@ __pycache__/
 *.pyc
 venv/
 .vs/
+
+# Generated Vulkan SPIR-V headers (scripts/build-spirv.ps1)
+driver_cardboardplusplus/include/shaders/spirv/
