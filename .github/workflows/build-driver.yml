@@ -109,6 +109,115 @@ jobs:
         $interesting
         $interesting | ForEach-Object { "::error::$($_.Line)" }
 
+    - name: SPIR-V raw details compose_ps (TEMP)
+      continue-on-error: true
+      shell: pwsh
+      run: |
+        $path = Join-Path (Get-Location) "compose_ps.spv"
+        if (-not (Test-Path $path)) { "::error::compose_ps.spv missing"; exit 0 }
+        $bytes = [System.IO.File]::ReadAllBytes($path)
+        $n = [math]::Floor($bytes.Length / 4)
+        $names = @{}
+        $i = 5
+        while ($i + 1 -lt $n) {
+          $w = [BitConverter]::ToUInt32($bytes, $i*4)
+          $wc = $w -shr 16; $op = $w -band 0xFFFF
+          if ($wc -eq 0) { break }
+          if ($i + $wc -gt $n) { break }
+          if ($op -eq 5 -and $wc -ge 2) {
+            $t = [BitConverter]::ToUInt32($bytes, ($i+1)*4)
+            $sb = New-Object System.Text.StringBuilder
+            for ($j = $i + 2; $j -lt ($i + $wc); $j++) {
+              $w4 = [BitConverter]::ToUInt32($bytes, $j*4)
+              foreach ($b in 0..3) {
+                $c = ($w4 -shr (8*$b)) -band 0xFF
+                if ($c -eq 0) { $j = $i + $wc; break }
+                [void]$sb.Append([char]$c)
+              }
+            }
+            $names[$t] = $sb.ToString()
+          }
+          $i += $wc
+        }
+        $i = 5
+        while ($i + 1 -lt $n) {
+          $w = [BitConverter]::ToUInt32($bytes, $i*4)
+          $wc = $w -shr 16; $op = $w -band 0xFFFF
+          if ($wc -eq 0) { break }
+          if ($i + $wc -gt $n) { break }
+          $line = $null
+          if ($op -eq 71 -and $wc -ge 3) {
+            $t = [BitConverter]::ToUInt32($bytes, ($i+1)*4)
+            $d = [BitConverter]::ToUInt32($bytes, ($i+2)*4)
+            $lit = 0
+            if ($wc -ge 4) { $lit = [BitConverter]::ToUInt32($bytes, ($i+3)*4) }
+            $line = "PS DEC id=$t dec=$d lit=$lit"
+          } elseif ($op -eq 59 -and $wc -ge 4) {
+            $rt = [BitConverter]::ToUInt32($bytes, ($i+1)*4)
+            $t = [BitConverter]::ToUInt32($bytes, ($i+2)*4)
+            $sc = [BitConverter]::ToUInt32($bytes, ($i+3)*4)
+            $nm = if ($names.ContainsKey($t)) { $names[$t] } else { "?" }
+            $line = "PS VAR id=$t type=$rt storage=$sc name='$nm'"
+          }
+          if ($line) { $line; "::error::$line" }
+          $i += $wc
+        }
+
+    - name: SPIR-V raw details nv12_cs (TEMP)
+      continue-on-error: true
+      shell: pwsh
+      run: |
+        $path = Join-Path (Get-Location) "nv12_cs.spv"
+        if (-not (Test-Path $path)) { "::error::nv12_cs.spv missing"; exit 0 }
+        $bytes = [System.IO.File]::ReadAllBytes($path)
+        $n = [math]::Floor($bytes.Length / 4)
+        $names = @{}
+        $i = 5
+        while ($i + 1 -lt $n) {
+          $w = [BitConverter]::ToUInt32($bytes, $i*4)
+          $wc = $w -shr 16; $op = $w -band 0xFFFF
+          if ($wc -eq 0) { break }
+          if ($i + $wc -gt $n) { break }
+          if ($op -eq 5 -and $wc -ge 2) {
+            $t = [BitConverter]::ToUInt32($bytes, ($i+1)*4)
+            $sb = New-Object System.Text.StringBuilder
+            for ($j = $i + 2; $j -lt ($i + $wc); $j++) {
+              $w4 = [BitConverter]::ToUInt32($bytes, $j*4)
+              foreach ($b in 0..3) {
+                $c = ($w4 -shr (8*$b)) -band 0xFF
+                if ($c -eq 0) { $j = $i + $wc; break }
+                [void]$sb.Append([char]$c)
+              }
+            }
+            $names[$t] = $sb.ToString()
+          }
+          $i += $wc
+        }
+        $i = 5
+        while ($i + 1 -lt $n) {
+          $w = [BitConverter]::ToUInt32($bytes, $i*4)
+          $wc = $w -shr 16; $op = $w -band 0xFFFF
+          if ($wc -eq 0) { break }
+          if ($i + $wc -gt $n) { break }
+          $line = $null
+          if ($op -eq 71 -and $wc -ge 3) {
+            $t = [BitConverter]::ToUInt32($bytes, ($i+1)*4)
+            $d = [BitConverter]::ToUInt32($bytes, ($i+2)*4)
+            $lit = 0
+            if ($wc -ge 4) { $lit = [BitConverter]::ToUInt32($bytes, ($i+3)*4) }
+            $line = "CS DEC id=$t dec=$d lit=$lit"
+          } elseif ($op -eq 59 -and $wc -ge 4) {
+            $rt = [BitConverter]::ToUInt32($bytes, ($i+1)*4)
+            $t = [BitConverter]::ToUInt32($bytes, ($i+2)*4)
+            $sc = [BitConverter]::ToUInt32($bytes, ($i+3)*4)
+            $nm = if ($names.ContainsKey($t)) { $names[$t] } else { "?" }
+            $line = "CS VAR id=$t type=$rt storage=$sc name='$nm'"
+          }
+          if ($line) { $line; "::error::$line" }
+          $i += $wc
+        }
+
+
     - name: Build Driver
       run: msbuild driver_cardboardplusplus\driver_cardboardplusplus.sln /p:Configuration=${{ matrix.configuration }} /p:Platform=x64 /p:PlatformToolset=v143
 
