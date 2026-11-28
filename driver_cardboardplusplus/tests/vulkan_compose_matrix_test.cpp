@@ -400,34 +400,38 @@ int main() {
         ComposeCase cc = MakeComposer(512, 256);
         Check(cc.ready, "C17 composer setup");
         if (cc.ready) {
-            // Bounds are PER LAYER: base full-frame, overlay with a subrect
-            // window (center half of each eye). (Passing only the base rects
-            // here made layer 1 fall back to a default full rect and covered
-            // the whole frame - found by this suite's first CI run.)
+            // LayerBounds select the SOURCE subrect of the eye; the layer
+            // still draws full-frame sampling that subrect (mirrors SteamVR
+            // layer subrects). With src-alpha 255 the overlay replaces the
+            // base across the whole frame, showing the gradient's middle
+            // half. (The first draft assumed a clipped coverage window -
+            // disproved by C19's ramp, and the first CI run.)
             std::vector<LayerRect> lb{ LayerRect{ 0, 0, 1, 1 }, LayerRect{ 0.25f, 0.25f, 0.75f, 0.75f } };
             std::vector<LayerRect> rb{ LayerRect{ 0, 0, 1, 1 }, LayerRect{ 0.25f, 0.25f, 0.75f, 0.75f } };
-            bool two = cc.compose.Compose({ gRed, gGrad }, { gGreen, gGreen }, lb, rb);
+            bool two = cc.compose.Compose({ gRed, gGrad }, { gGreen, gGrad }, lb, rb);
             Check(two, "C17 2-layer compose (base opaque + overlay) accepted");
             const uint8_t* nv12 = nullptr;
             size_t sz = 0;
             bool got = two && cc.compose.ToNv12(&nv12, &sz);
             Check(got, "C17 NV12 after overlay compose");
             if (got && nv12) {
-                // Overlay draws the gradient (blue eye w/ red gradient channel)
-                // with src-alpha 255 over the center window of each half.
-                // Outside the window the base layer stays.
-                float baseL = (float)nv12[(size_t)16 * 512 + 16];
-                // Overlay window on the left half: x in [64..191]; at the
-                // center x=128 the gradient eye is sampled at u=0.5 (red=128).
-                // Luma path: linear 128/255 -> sRGB ~0.74 (188) -> BT.601
-                // limited Y ~16 + 65.5*0.737 = 64.3.
-                float overL = (float)nv12[(size_t)128 * 512 + 128];
-                Check(baseL > 77.0f && baseL < 86.0f, "C17 outside the overlay window the base shows (red)");
+                // Left half at screen x: u = 0.25 + (x/256)*0.5. x=16 ->
+                // u=0.281 -> grad ~72 -> sRGB ~145 -> BT.601 Y ~53. x=240 ->
+                // u=0.719 -> grad ~183 -> sRGB ~220 -> Y ~73.
+                float startL = (float)nv12[(size_t)16 * 512 + 16];
+                float endL = (float)nv12[(size_t)16 * 512 + 240];
                 char msg[160];
                 snprintf(msg, sizeof(msg),
-                         "C17 overlay region shows the gradient (center window replaced the base, overL=%.1f)",
-                         overL);
-                Check(overL > 56.0f && overL < 72.0f, msg);
+                         "C17 overlay subrect ramp rises across the left half (startL=%.1f endL=%.1f)",
+                         startL, endL);
+                Check(endL > startL + 10.0f && startL > 45.0f && startL < 62.0f, msg);
+                // Right half: same mapping over the gGrad overlay eye.
+                float startR = (float)nv12[(size_t)16 * 512 + 272];
+                float endR = (float)nv12[(size_t)16 * 512 + 496];
+                snprintf(msg, sizeof(msg),
+                         "C17 overlay subrect ramp rises across the right half (startR=%.1f endR=%.1f)",
+                         startR, endR);
+                Check(endR > startR + 10.0f && startR > 45.0f && startR < 62.0f, msg);
             }
             // kMaxLayers = 4 accepted.
             bool four = cc.compose.Compose(
@@ -594,26 +598,44 @@ int main() {
         long fdAfterResize = FdCount();
         Check(fdAfterResize > fdAfter10,
               "C20 changed geometry with the same handle takes the recreate (import) path");
-        // Prune: exceed the 16-entry aux cache, compose with two handles, the
-        // stale imports must be freed (fd count falls back).
+        // Prune: fill the aux cache to 15 entries (< kMaxAux=16, so no prune
+        // runs yet) with 6 frames x 2 fresh 32x32 eyes on top of the 3 already
+        // cached; snapshot fds; then compose one frame with two NEW handles -
+        // the cache hits 17 and PruneAux must free the 15 stale imports
+        // (fd count falls back below the snapshot).
         std::vector<EyeRes> extra;
-        for (int i = 0; i < 18; i++) {
+        for (int i = 0; i < 14; i++) {
             extra.push_back(MakeEye(g_dev, g_phys, g_queue, g_qfam, 32, 32,
                                     (uint8_t)(40 + i), 0, (uint8_t)(200 - i), false));
         }
         bool imported = true;
         for (const auto& e : extra) if (e.fd < 0) imported = false;
         if (imported) {
+            auto eyeGpu = [&](const EyeRes& e) {
+                GpuImage g = {};
+                g.handle = (uint64_t)e.fd;
+                g.width = 32; g.height = 32;
+                g.format = (uint32_t)VK_FORMAT_B8G8R8A8_UNORM;
+                return g;
+            };
+            std::vector<LayerRect> one{ LayerRect{0,0,1,1} };
+            bool filled = true;
+            for (int i = 0; i < 6 && filled; i++) {
+                // One layer per frame: left = a fresh eye, right = the next
+                // fresh eye (Compose rejects mismatched L/R counts).
+                filled = cc.compose.Compose({ eyeGpu(extra[2 * i]) },
+                                            { eyeGpu(extra[2 * i + 1]) },
+                                            one, one);
+            }
+            Check(filled, "C20 cache-fill frames compose (15 entries, under the limit)");
             long fdFull = FdCount();
-            std::vector<GpuImage> gl, gr;
-            std::vector<LayerRect> lb, rb;
-            gl.push_back(gRed); gr.push_back(gGreen);
-            lb.push_back(LayerRect{0,0,1,1}); rb.push_back(LayerRect{0,0,1,1});
-            bool ok20 = cc.compose.Compose(gl, gr, lb, rb);
+            bool ok20 = cc.compose.Compose({ eyeGpu(extra[12]) }, { eyeGpu(extra[13]) }, one, one);
             long fdAfterPrune = FdCount();
             Check(ok20, "C20 compose after cache overfill works");
-            Check(fdAfterPrune < fdFull,
-                  "C20 prune frees the stale aux imports (fd count drops)");
+            char msg[160];
+            snprintf(msg, sizeof(msg),
+                     "C20 prune frees the stale aux imports (fd %ld -> %ld)", fdFull, fdAfterPrune);
+            Check(fdAfterPrune < fdFull, msg);
         } else {
             Check(false, "C20 auxiliary eye imports created");
         }
