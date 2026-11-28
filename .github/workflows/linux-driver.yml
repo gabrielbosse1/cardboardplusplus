@@ -15,6 +15,8 @@ jobs:
   # SteamVR loads at runtime provides the context at load time, not link time.
   driver:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # TEMP: let the SPIR-V header commit step push to the branch
     steps:
     - uses: actions/checkout@v4
       with:
@@ -72,6 +74,30 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release \
           -DCBPP_OPENVR_DIR=/tmp/openvr_stub
         cmake --build driver_cardboardplusplus/build --parallel "$(nproc)"
+
+    - name: Commit generated SPIR-V headers (TEMP)
+      # The Linux build generates compose_vs/ps and nv12_cs SPIR-V with dxc.
+      # Commit the headers so the Windows build can embed the identical,
+      # DXC-annotated SPIR-V instead of runtime-translating through dxbc-spirv
+      # (whose BasicResourceMapping emits one descriptor set per resource,
+      # breaking the pipeline layouts). Run manually via workflow_dispatch so
+      # the checkout is the branch head, never a pull_request merge ref.
+      if: github.event_name == 'workflow_dispatch'
+      run: |
+        mkdir -p driver_cardboardplusplus/include/shaders/spirv
+        cp driver_cardboardplusplus/build/spirv/compose_vs.spv.h \
+           driver_cardboardplusplus/build/spirv/compose_ps.spv.h \
+           driver_cardboardplusplus/build/spirv/nv12_cs.spv.h \
+           driver_cardboardplusplus/include/shaders/spirv/
+        git config user.name "ci-log-bot"
+        git config user.email "ci-log-bot@users.noreply.github.com"
+        git add -f driver_cardboardplusplus/include/shaders/spirv/
+        if git diff --cached --quiet; then
+          echo "SPIR-V headers already up to date"
+          exit 0
+        fi
+        git commit -m "Record DXC-generated SPIR-V headers for Windows embedding"
+        git push origin HEAD:arena/ad49431b-cardboardplusplus
 
     - name: Verify the shared object
       run: |
