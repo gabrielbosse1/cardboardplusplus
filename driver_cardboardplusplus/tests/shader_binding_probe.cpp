@@ -36,34 +36,38 @@ namespace {
 void ScanSpirv(const char* name, const std::vector<uint32_t>& words) {
     printf("== %s: %zu words, version=0x%08x\n", name, words.size(),
            words.size() > 1 ? words[1] : 0);
+    auto at = [&words](size_t idx) -> uint32_t {
+        return idx < words.size() ? words[idx] : 0;
+    };
     size_t i = 5;
-    while (i < words.size()) {
-        uint32_t w = words[i];
+    while (i + 1 < words.size()) {
+        uint32_t w = at(i);
         uint32_t wc = w >> 16, op = w & 0xFFFF;
-        if (wc == 0) break;
-        if (op == 71 && wc >= 4) {  // OpDecorate target decoration [literal]
-            uint32_t target = words[i + 1], dec = words[i + 2];
-            uint32_t lit = (wc >= 4) ? words[i + 3] : 0;
+        if (wc == 0) { printf("  (zero word count at %zu)\n", i); break; }
+        if (i + wc > words.size()) { printf("  (truncated instruction at %zu)\n", i); break; }
+        if (op == 71 && wc >= 3) {  // OpDecorate target decoration [literal]
+            uint32_t target = at(i + 1), dec = at(i + 2);
+            uint32_t lit = (wc >= 4) ? at(i + 3) : 0;
             if (dec == 34) printf("  Decorate id=%u Binding=%u\n", target, lit);
             if (dec == 35) printf("  Decorate id=%u DescriptorSet=%u\n", target, lit);
-            if (dec == 11) printf("  Decorate id=%u BuiltIn=%u\n", target, lit);
-        } else if (op == 5 && wc >= 3) {  // OpName target name...
-            uint32_t target = words[i + 1];
-            char name[80];
+        } else if (op == 5 && wc >= 2) {  // OpName target name...
+            uint32_t target = at(i + 1);
+            char nm[80];
             size_t n = 0;
-            for (size_t j = i + 2; j < i + wc && n < sizeof(name) - 1; j++) {
-                uint32_t w4 = words[j];
-                for (int b = 0; b < 4 && n < sizeof(name) - 1; b++) {
+            for (size_t j = i + 2; j < i + wc && n < sizeof(nm) - 1; j++) {
+                uint32_t w4 = at(j);
+                for (int b = 0; b < 4 && n < sizeof(nm) - 1; b++) {
                     char c = (char)((w4 >> (8 * b)) & 0xFF);
                     if (c == '\0') { j = i + wc; break; }
-                    name[n++] = c;
+                    nm[n++] = c;
                 }
             }
-            name[n] = '\0';
-            printf("  Name id=%u \"%s\"\n", target, name);
+            nm[n] = '\0';
+            printf("  Name id=%u \"%s\"\n", target, nm);
         }
         i += wc;
     }
+    printf("== %s: scan complete\n", name);
 }
 
 }  // namespace
@@ -76,9 +80,9 @@ int main() {
         const char* src;
         const char* target;
     } shaders[] = {
-        {"compose_vs", kVkBlitVSSource, "vs_5_0"},
         {"compose_ps", kVkSBSPSSource, "ps_5_0"},
         {"nv12_cs", kNv12CSSource, "cs_5_0"},
+        {"compose_vs", kVkBlitVSSource, "vs_5_0"},
     };
     for (const Shader& s : shaders) {
         printf("== %s: before D3DCompile\n", s.name);
