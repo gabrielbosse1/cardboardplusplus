@@ -56,6 +56,8 @@ void ScanSpirv(const char* name, const std::vector<uint32_t>& words) {
 }  // namespace
 
 int main() {
+    setvbuf(stdout, nullptr, _IONBF, 0);  // survive crashes without losing output
+    printf("PROBE START\n");
     struct Shader {
         const char* name;
         const char* src;
@@ -66,6 +68,7 @@ int main() {
         {"nv12_cs", kNv12CSSource, "cs_5_0"},
     };
     for (const Shader& s : shaders) {
+        printf("== %s: before D3DCompile\n", s.name);
         ID3DBlob* code = nullptr;
         ID3DBlob* err = nullptr;
         HRESULT hr = D3DCompile(s.src, strlen(s.src), s.name, nullptr, nullptr,
@@ -79,8 +82,11 @@ int main() {
         }
         printf("== %s: DXBC %zu bytes\n", s.name, code->GetBufferSize());
         std::vector<uint32_t> words;
+        printf("== %s: before TranslateToSpirv\n", s.name);
         bool ok = spirv::TranslateToSpirv(code->GetBufferPointer(),
                                           code->GetBufferSize(), s.name, words);
+        printf("== %s: after TranslateToSpirv ok=%d words=%zu\n", s.name,
+               ok ? 1 : 0, words.size());
         if (ok) {
             ScanSpirv(s.name, words);
         } else {
