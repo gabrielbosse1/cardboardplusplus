@@ -246,7 +246,9 @@ static void RunRealComponentPhase() {
         return e;
     };
 
+    printf("[B] makeEye left\n");
     EyeRes eyeL = makeEye(255, 0, 0);    // red, BGRA bytes set as (r,g,b)
+    printf("[B] makeEye right\n");
     EyeRes eyeR = makeEye(0, 255, 0);    // green
     Check(eyeL.img != VK_NULL_HANDLE && eyeL.fd >= 0, "exportable left eye created + fd exported");
     Check(eyeR.img != VK_NULL_HANDLE && eyeR.fd >= 0, "exportable right eye created + fd exported");
@@ -260,11 +262,13 @@ static void RunRealComponentPhase() {
     GpuImage gl = {}; gl.handle = (uint64_t)eyeL.fd; gl.width = 128; gl.height = 128;
     gl.format = (uint32_t)VK_FORMAT_B8G8R8A8_UNORM;
     GpuImage gr = gl; gr.handle = (uint64_t)eyeR.fd;
+    printf("[B] compose.Compose\n");
     bool composed = compose.Compose({ gl }, { gr },
                                     { LayerRect{ 0, 0, 1, 1 } }, { LayerRect{ 0, 0, 1, 1 } });
     Check(composed, "real VulkanCompose::Compose (production fd import + draw)");
     if (!composed) return;
 
+    printf("[B] ToNv12\n");
     const uint8_t* nv12 = nullptr;
     size_t nv12Size = 0;
     bool nv12Ok = compose.ToNv12(&nv12, &nv12Size);
@@ -277,6 +281,7 @@ static void RunRealComponentPhase() {
         Check(yR > 140.6f && yR < 148.6f, "phase B Y(480,16) green ~144.6");
     }
 
+    printf("[B] CopyToHost\n");
     compose.CopyToHost();
     const uint8_t* host = compose.HostData();
     Check(host != nullptr, "real VulkanCompose::CopyToHost + HostData");
@@ -291,6 +296,7 @@ static void RunRealComponentPhase() {
     // Degenerate-bounds regression: the startup smear. A layer with zero-area
     // rects must be skipped, leaving the cleared target (Y ~ 16 for BT.601
     // black) instead of a stretched texel row.
+    printf("[B] degenerate compose\n");
     bool composedDeg = compose.Compose({ gl }, { gr },
                                        { LayerRect{ 0, 0, 0, 0 } }, { LayerRect{ 0, 0, 0, 0 } });
     const uint8_t* nv12d = nullptr;
@@ -310,6 +316,7 @@ static void RunRealComponentPhase() {
 
     // NV12 dims guard: the uint-packed compute path needs w%4==0 and h%2==0;
     // Setup must stay ready for compose but refuse the GPU NV12 conversion.
+    printf("[B] odd-dims compose\n");
     VulkanCompose odd;
     odd.Init(&ctx);
     odd.Setup(514, 256);  // 514 % 4 == 2
@@ -323,6 +330,7 @@ static void RunRealComponentPhase() {
 #ifdef CBPP_ENCODER_E2E_TEST
     printf("== PHASE C: real VideoEncoder encode chain ==\n");
     VideoEncoder enc;
+    printf("[C] encoder Initialize\n");
     bool encOk = enc.Initialize(512, 256, 30, 4000000, false, &ctx, "libx264");
     Check(encOk, "VideoEncoder::Initialize (lavapipe compose + libx264)");
     if (encOk) {
@@ -334,15 +342,20 @@ static void RunRealComponentPhase() {
             packets.emplace_back(d, d + s);
             keyflags.push_back(kf);
         });
+        printf("[C] ComposeSBSGPU\n");
         Check(enc.ComposeSBSGPU({ gl }, { gr },
                                 { VideoEncoder::LayerBounds{ 0, 0, 1, 1 } },
                                 { VideoEncoder::LayerBounds{ 0, 0, 1, 1 } }),
               "encoder ComposeSBSGPU over imported fd eyes");
+        printf("[C] Readback\n");
         Check(enc.ReadbackToBuffer(), "encoder ReadbackToBuffer (GPU NV12 or CPU fallback)");
+        printf("[C] Convert\n");
         Check(enc.ConvertFrame(), "encoder ConvertFrame");
+        printf("[C] FinishEncode\n");
         Check(enc.FinishEncode(0), "encoder FinishEncode(0)");
         // Idle heartbeat path: re-encode the last produced frame without a
         // new compose; keeps late joiners decodable while SteamVR idles.
+        printf("[C] heartbeat\n");
         Check(enc.ReencodeLastFrame(1), "ReencodeLastFrame(1) idle heartbeat");
 
         size_t nPkts = 0;
