@@ -5,6 +5,8 @@
 // assignment matches the Vulkan descriptor layout used by VulkanCompose
 // (compose PS/VS: 0=UBO, 1=sampler, 2/3=sampled images; NV12 CS: 0=UBO,
 // 1=storage buffer).
+// Each stage runs under an SEH guard so one faulting shader cannot block the
+// rest; the faulting scan offset is reported.
 #include "SpirvCompiler.h"
 #include "DriverLog.h"
 #include <d3dcompiler.h>
@@ -13,6 +15,7 @@
 #include <cstring>
 #include <cstdint>
 #include <vector>
+#include <windows.h>
 #include "shaders/compose_vs.hlsli"
 #include "shaders/compose_ps.hlsli"
 #include "shaders/nv12_cs.hlsli"
@@ -31,7 +34,7 @@ void DriverLog(const char* pFormat, ...) {
     printf("\n");
 }
 
-namespace {
+static size_t g_scanOff = 0;
 
 void ScanSpirv(const char* name, const std::vector<uint32_t>& words) {
     printf("== %s: %zu words, version=0x%08x\n", name, words.size(),
@@ -41,6 +44,7 @@ void ScanSpirv(const char* name, const std::vector<uint32_t>& words) {
     };
     size_t i = 5;
     while (i + 1 < words.size()) {
+        g_scanOff = i;
         uint32_t w = at(i);
         uint32_t wc = w >> 16, op = w & 0xFFFF;
         if (wc == 0) { printf("  (zero word count at %zu)\n", i); break; }
@@ -70,7 +74,24 @@ void ScanSpirv(const char* name, const std::vector<uint32_t>& words) {
     printf("== %s: scan complete\n", name);
 }
 
-}  // namespace
+static unsigned long g_sehCode = 0;
+
+// Objects with destructors live here; the SEH wrapper must stay object-free.
+static void RunStage(const char* name, const void* dxbc, size_t dxbcSize) {
+    std::vector<uint32_t> words;
+    bool ok = spirv::TranslateToSpirv(dxbc, dxbcSize, name, words);
+    printf("== %s: translate ok=%d words=%zu\n", name, ok ? 1 : 0, words.size());
+    if (ok) ScanSpirv(name, words);
+}
+
+static void RunStageGuarded(const char* name, const void* dxbc, size_t dxbcSize) {
+    __try {
+        RunStage(name, dxbc, dxbcSize);
+    } __except (g_sehCode = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {
+        printf("== %s: EXCEPTION 0x%08lx (scan offset %zu)\n", name, g_sehCode,
+               g_scanOff);
+    }
+}
 
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);  // survive crashes without losing output
@@ -98,18 +119,9 @@ int main() {
             continue;
         }
         printf("== %s: DXBC %zu bytes\n", s.name, code->GetBufferSize());
-        std::vector<uint32_t> words;
-        printf("== %s: before TranslateToSpirv\n", s.name);
-        bool ok = spirv::TranslateToSpirv(code->GetBufferPointer(),
-                                          code->GetBufferSize(), s.name, words);
-        printf("== %s: after TranslateToSpirv ok=%d words=%zu\n", s.name,
-               ok ? 1 : 0, words.size());
-        if (ok) {
-            ScanSpirv(s.name, words);
-        } else {
-            printf("== %s: TranslateToSpirv FAILED\n", s.name);
-        }
+        RunStageGuarded(s.name, code->GetBufferPointer(), code->GetBufferSize());
         code->Release();
+        printf("== %s: stage done\n", s.name);
     }
     printf("PROBE DONE\n");
     return 0;
