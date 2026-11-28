@@ -31,15 +31,26 @@ jobs:
       continue-on-error: true
       shell: pwsh
       run: |
-        $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-        $vsRoot = & $vswhere -latest -property installationPath
-        $devCmd = Join-Path $vsRoot "Common7\Tools\VsDevCmd.bat"
-        cmd /c "`"$devCmd`" -arch=x64 >nul && cl /nologo /EHsc /std:c++17 /wd4146 /wd4297 /wd4245 /wd4389 /wd4324 /I driver_cardboardplusplus\include /I driver_cardboardplusplus\include\dxil-spirv\dxbc-spirv /Fe:shader_probe.exe /Fo:shader_probe_ driver_cardboardplusplus\tests\shader_binding_probe.cpp driver_cardboardplusplus\src\SpirvCompiler.cpp driver_cardboardplusplus\src\DriverLog.cpp /link /LIBPATH:driver_cardboardplusplus\lib\dxil-spirv dxbc-spirv.lib dxil-spirv-sbv.lib /LIBPATH:driver_cardboardplusplus\lib openvr_api.lib"
-        .\shader_probe.exe *> shader-bindings.txt
-        Write-Host "--- probe output start ---"
-        Get-Content shader-bindings.txt | Select-Object -First 40
-        Write-Host "--- probe output end ---"
-        Get-Content shader-bindings.txt | Select-Object -First 40 | ForEach-Object { "::error::$_" }
+        $log = "probe-run.txt"
+        "probe step start" | Set-Content $log
+        try {
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsRoot = & $vswhere -latest -property installationPath
+          $devCmd = Join-Path $vsRoot "Common7\Tools\VsDevCmd.bat"
+          "vsRoot=$vsRoot" | Add-Content $log
+          cmd /c "`"$devCmd`" -arch=x64 >nul && cl /nologo /EHsc /std:c++17 /wd4146 /wd4297 /wd4245 /wd4389 /wd4324 /I driver_cardboardplusplus\include /I driver_cardboardplusplus\include\dxil-spirv\dxbc-spirv /Fe:shader_probe.exe /Fo:shader_probe_ driver_cardboardplusplus\tests\shader_binding_probe.cpp driver_cardboardplusplus\src\SpirvCompiler.cpp driver_cardboardplusplus\src\DriverLog.cpp /link /LIBPATH:driver_cardboardplusplus\lib\dxil-spirv dxbc-spirv.lib dxil-spirv-sbv.lib /LIBPATH:driver_cardboardplusplus\lib openvr_api.lib" *>> $log
+          "cl exit=$LASTEXITCODE" | Add-Content $log
+          if (Test-Path .\shader_probe.exe) {
+            .\shader_probe.exe *>> $log
+            "probe exit=$LASTEXITCODE" | Add-Content $log
+          } else {
+            "shader_probe.exe was not produced" | Add-Content $log
+          }
+        } catch {
+          $_.ToString() | Add-Content $log
+        }
+        Get-Content $log -Tail 40
+        Get-Content $log -Tail 40 | ForEach-Object { "::error::$_" }
 
     - name: Build Driver
       run: msbuild driver_cardboardplusplus\driver_cardboardplusplus.sln /p:Configuration=${{ matrix.configuration }} /p:Platform=x64 /p:PlatformToolset=v143
