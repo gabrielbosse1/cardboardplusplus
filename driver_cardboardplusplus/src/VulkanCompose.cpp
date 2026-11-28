@@ -769,6 +769,13 @@ int VulkanCompose::FindOrImportEye(const GpuImage& src) {
         Fail("eye image has no handle");
         return -1;
     }
+    // A zero-extent eye would fail vkCreateImage, which used to Fail() the
+    // whole composer; a malformed layer must only lose its own frame.
+    if (src.width == 0 || src.height == 0) {
+        FRAME_LOG("VK-COMPOSE: eye image has zero extent (%ux%u), frame dropped",
+                  src.width, src.height);
+        return -1;
+    }
     for (size_t i = 0; i < m_aux.size(); i++) {
         if (m_aux[i].handle == src.handle && m_aux[i].width == src.width &&
             m_aux[i].height == src.height && m_aux[i].srcFormat == src.format)
@@ -998,8 +1005,13 @@ bool VulkanCompose::Compose(const std::vector<GpuImage>& lefts,
                             const std::vector<LayerRect>& rightBounds) {
     if (!IsReady()) return false;
     size_t n = lefts.size();
+    // A bad layer count is a caller bug, not a composer fault: reject the
+    // frame WITHOUT Fail()-ing — disabling the whole pipeline for one
+    // over-submitted or mismatched call starved the stream until re-init
+    // (a black-screen candidate at app transitions).
     if (n != rights.size() || n == 0 || n > kMaxLayers) {
-        Fail("layer count mismatch (1..4 supported)");
+        FRAME_LOG("VK-COMPOSE: layer count mismatch (L=%zu R=%zu, 1..%u supported), frame dropped",
+                  lefts.size(), rights.size(), (unsigned)kMaxLayers);
         return false;
     }
 
@@ -1170,13 +1182,15 @@ bool VulkanCompose::Compose(const std::vector<GpuImage>& lefts,
     beginRender(m_cmd, &rpi, VK_SUBPASS_CONTENTS_INLINE);
     for (size_t i = 0; i < n; i++) {
         // A layer whose bounds have no extent would sample a single texel row
-        // or column and stretch it across the whole target (seen as a
+        // or column and stretch it across that half of the target (seen as a
         // horizontal smear when SteamVR submits such layers at startup). Skip
-        // layers whose rects are degenerate on both eyes.
-        const bool degenerate =
-            (m_bounds[i].map[2] <= 0.0f || m_bounds[i].map[3] <= 0.0f) &&
-            (m_bounds[i].map[6] <= 0.0f || m_bounds[i].map[7] <= 0.0f);
-        if (degenerate) continue;
+        // the layer when EITHER eye's rect is degenerate: a one-sided
+        // zero-area rect previously smeared its half of the frame.
+        const bool degenerateL =
+            m_bounds[i].map[2] <= 0.0f || m_bounds[i].map[3] <= 0.0f;
+        const bool degenerateR =
+            m_bounds[i].map[6] <= 0.0f || m_bounds[i].map[7] <= 0.0f;
+        if (degenerateL || degenerateR) continue;
         bindPipe(m_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, (i == 0) ? m_pipelineOpaque : m_pipelineAlpha);
         VkDescriptorSet set = m_descSets[i];
         bindSets(m_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &set, 0, nullptr);

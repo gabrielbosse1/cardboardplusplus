@@ -66,12 +66,33 @@ bool VulkanContext::Initialize(const PlatformAdapterId* adapterId)
     app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     app.pApplicationName = "cardboardplusplus-driver";
     app.apiVersion = apiVersion;
-    const char* instanceExts[] = { VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME };
+    // External-memory capabilities is the load-bearing extension; debug-utils
+    // is added when the loader offers it so the test suite can attach a
+    // validation messenger (multi-hardware API-misuse proxy). Harmless without
+    // a validation layer installed.
+    std::vector<const char*> instanceExts;
+    instanceExts.push_back(VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME);
+    auto vkEnumerateInstanceExtensionProperties = (PFN_vkEnumerateInstanceExtensionProperties)
+        m_vkGetInstanceProcAddr(VK_NULL_HANDLE, "vkEnumerateInstanceExtensionProperties");
+    if (vkEnumerateInstanceExtensionProperties) {
+        uint32_t n = 0;
+        if (vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr) == VK_SUCCESS && n > 0) {
+            std::vector<VkExtensionProperties> props(n);
+            if (vkEnumerateInstanceExtensionProperties(nullptr, &n, props.data()) == VK_SUCCESS) {
+                for (const auto& e : props) {
+                    if (strcmp(e.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0) {
+                        instanceExts.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+                        break;
+                    }
+                }
+            }
+        }
+    }
     VkInstanceCreateInfo ici = {};
     ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     ici.pApplicationInfo = &app;
-    ici.enabledExtensionCount = 1;
-    ici.ppEnabledExtensionNames = instanceExts;
+    ici.enabledExtensionCount = (uint32_t)instanceExts.size();
+    ici.ppEnabledExtensionNames = instanceExts.data();
     VkResult res = vkCreateInstance(&ici, nullptr, &m_instance);
     if (res != VK_SUCCESS) {
         DriverLog("Vulkan: vkCreateInstance failed (%d)", res);

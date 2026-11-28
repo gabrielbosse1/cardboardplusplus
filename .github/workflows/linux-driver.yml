@@ -168,6 +168,7 @@ jobs:
         if [ $SMOKERC -ne 0 ]; then
           grep '^== FAIL' /tmp/smoke.log | head -4 | while IFS= read -r line; do echo "::error::smoke: ${line:0:200}"; done
           tail -6 /tmp/smoke.log | while IFS= read -r line; do echo "::error::tail: ${line:0:200}"; done
+          exit $SMOKERC
         fi
         # Encoder internals e2e (same real sources as phase C): keyframe policy,
         # GOP cadence + heartbeat pts, GPU/CPU source switching, telemetry
@@ -195,8 +196,36 @@ jobs:
         if [ $E2ERC -ne 0 ]; then
           grep '^== FAIL' /tmp/enc_e2e.log | head -4 | while IFS= read -r line; do echo "::error::enc-e2e: ${line:0:200}"; done
           tail -6 /tmp/enc_e2e.log | while IFS= read -r line; do echo "::error::tail: ${line:0:200}"; done
+          exit $E2ERC
         fi
-        exit $E2ERC
+        # Vulkan compose matrix: resolution/layer/degenerate/subrect policy on
+        # the real VulkanCompose, determinism, fd-leak soak, and (when the
+        # runner has it) the KHRONOS validation layer as the multi-hardware
+        # API-misuse proxy.
+        sudo apt-get install -y --no-install-recommends vulkan-validationlayers > /dev/null 2>&1 || true
+        g++ -std=c++17 -O1 -Wall -Wextra \
+          -I driver_cardboardplusplus/include -I driver_cardboardplusplus/build/spirv \
+          -o /tmp/vk_matrix driver_cardboardplusplus/tests/vulkan_compose_matrix_test.cpp \
+          driver_cardboardplusplus/src/VulkanContext.cpp \
+          driver_cardboardplusplus/src/VulkanCompose.cpp \
+          -lvulkan -lswscale -lavutil \
+          > /tmp/vk_matrix_build.log 2>&1
+        MATBUILDRC=$?
+        echo "VK-MATRIX compile rc=$MATBUILDRC"
+        if [ $MATBUILDRC -ne 0 ]; then
+          grep -m4 -E "error" /tmp/vk_matrix_build.log | while IFS= read -r line; do echo "::error::vk-matrix-build: ${line:0:220}"; done
+          exit 1
+        fi
+        VK_ICD_FILENAMES="$ICD" VK_DRIVER_FILES="$ICD" \
+        /tmp/vk_matrix > /tmp/vk_matrix.log 2>&1
+        MATRC=$?
+        echo "VK-MATRIX run rc=$MATRC checks=$(grep -c '^== ' /tmp/vk_matrix.log)"
+        if [ $MATRC -ne 0 ]; then
+          grep '^== FAIL' /tmp/vk_matrix.log | head -4 | while IFS= read -r line; do echo "::error::vk-matrix: ${line:0:200}"; done
+          grep -m3 'VVL-ERROR' /tmp/vk_matrix.log | while IFS= read -r line; do echo "::error::vvl: ${line:0:200}"; done
+          tail -6 /tmp/vk_matrix.log | while IFS= read -r line; do echo "::error::tail: ${line:0:200}"; done
+        fi
+        exit $MATRC
 
     - name: Verify the shared object
       run: |
