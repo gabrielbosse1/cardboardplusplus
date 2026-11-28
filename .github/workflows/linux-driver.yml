@@ -92,26 +92,17 @@ jobs:
       continue-on-error: true
       run: |
         set +e
-        S="$GITHUB_STEP_SUMMARY"
-        echo "### SPIR-V facts + lavapipe smoke (TEMP)" >> "$S"
         sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers > /dev/null 2>&1
-        echo "mesa install rc=$?" >> "$S"
-        python3 - <<'EOF' > /tmp/facts.md 2> /tmp/facts.err
-        import base64, struct, os
-        DEC = {2: "block", 11: "builtin", 25: "nonwritable", 32: "location", 33: "set", 34: "binding"}
-        STOR = {0: "input", 1: "output", 3: "ubuffer", 4: "sbuffer", 5: "pushconst"}
-        out = []
-        b64 = {}
+        python3 - <<'EOF' > /tmp/facts.txt 2> /tmp/facts.err
+        import struct
+        DEC = {2: "block", 11: "builtin", 25: "nonwritable", 32: "loc", 33: "set", 34: "bind"}
+        STOR = {0: "in", 1: "out"}
         for name in ["compose_vs", "compose_ps", "nv12_cs"]:
-            p = f"driver_cardboardplusplus/build/spirv/{name}.spv"
-            data = open(p, "rb").read()
+            data = open(f"driver_cardboardplusplus/build/spirv/{name}.spv", "rb").read()
             n = len(data) // 4
             words = struct.unpack(f"<{n}I", data)
-            out.append(f"")
-            out.append(f"### {name}: {n} words, version 0x{words[1]:08x}")
-            out.append("| shader | object | kind | value |")
-            out.append("|---|---|---|---|")
             nm = {}
+            rows = []
             i = 5
             while i + 1 < n:
                 wc = words[i] >> 16; op = words[i] & 0xFFFF
@@ -129,33 +120,33 @@ jobs:
                 elif op == 71 and wc >= 3:
                     tid, dec = words[i + 1], words[i + 2]
                     lit = words[i + 3] if wc >= 4 else 0
-                    if dec in DEC:
-                        out.append(f"| {name} | {nm.get(tid, tid)} | {DEC[dec]} | {lit} |")
+                    if dec in (11, 32, 33, 34):
+                        rows.append(f"{nm.get(tid, tid)}:{DEC[dec]}={lit}")
                 elif op == 59 and wc >= 4:
                     tid, sc = words[i + 2], words[i + 3]
-                    out.append(f"| {name} | {nm.get(tid, tid)} | storage | {STOR.get(sc, sc)} |")
+                    if sc in STOR:
+                        rows.append(f"{nm.get(tid, tid)}:st={STOR[sc]}")
                 i += wc
-            b64[name] = base64.b64encode(data).decode()
-        with open("/tmp/facts_b64.md", "a") as f:
-            for name, s in b64.items():
-                f.write(f"<details><summary>{name}.spv base64</summary>\n\n```\n{s}\n```\n</details>\n")
-        print("\n".join(out))
+            print(f"F {name} ver=0x{words[1]:04x} words={n} " + " ".join(rows))
         EOF
-        echo "python rc=$?" >> "$S"
-        cat /tmp/facts.md >> "$S" 2>/dev/null
-        cat /tmp/facts.err >> "$S" 2>/dev/null
-        cat /tmp/facts_b64.md >> "$S" 2>/dev/null
+        while IFS= read -r line; do echo "::error::${line:0:230}"; done < /tmp/facts.txt
+        PYE=$(tail -2 /tmp/facts.err | head -c 200)
+        if [ -n "$PYE" ]; then echo "::error::PYERR $PYE"; fi
         g++ -std=c++17 -O1 -I driver_cardboardplusplus/build/spirv \
           -o /tmp/vk_smoke driver_cardboardplusplus/tests/vulkan_pipeline_smoke.cpp -lvulkan \
           > /tmp/smoke_build.log 2>&1
-        echo "harness compile rc=$?" >> "$S"
-        tail -12 /tmp/smoke_build.log >> "$S" 2>/dev/null
+        echo "::error::SMOKE compile rc=$? err=$(grep -m1 'error' /tmp/smoke_build.log | head -c 140)"
         VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json \
         VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json \
         /tmp/vk_smoke > /tmp/smoke.log 2>&1
-        echo "smoke rc=$?" >> "$S"
-        cat /tmp/smoke.log >> "$S" 2>/dev/null
-        echo "STEP DONE" >> "$S"
+        echo "::error::SMOKE run rc=$? checks=$(grep -c '^== ' /tmp/smoke.log)"
+        L=$(grep '^== ' /tmp/smoke.log | tr '\n' '|')
+        echo "::error::A ${L:0:225}"
+        echo "::error::B ${L:225:225}"
+        echo "::error::C ${L:450:225}"
+        echo "::error::D ${L:675:225}"
+        echo "::error::E ${L:900:225}"
+        echo "::error::F ${L:1125:225}"
 
     - name: Verify the shared object
       run: |
