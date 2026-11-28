@@ -150,6 +150,30 @@ fn settings_post_lands_on_the_driver_wire() {
     assert_eq!(bridge.http.post("/settings", "not json").0, 400);
 }
 #[test]
+fn unknown_encoder_name_falls_back_on_the_wire() {
+    // E17: a config/REST typo must degrade gracefully on the BRIDGE_CFG wire
+    // (auto fallback), and case/whitespace variants must resolve correctly.
+    let _gate = serial();
+    if live_mode() {
+        return;
+    }
+    let bridge = start_bridge();
+    let driver = FakeDriver::new();
+    bridge.wait_status("driver_connected", serde_json::json!(true), Duration::from_secs(5));
+    let (code, sent) = bridge.http.post_json("/settings", r#"{"encoder":"nonsense-codec"}"#);
+    assert_eq!(code, 200);
+    assert_eq!(
+        sent["sent"]["encoder"],
+        serde_json::json!("auto"),
+        "unknown encoder name must resolve to auto, never panic or drop the push"
+    );
+    driver.wait_capture("BRIDGE_CFG 60 20000 auto", Duration::from_secs(3));
+    let (code, sent) = bridge.http.post_json("/settings", r#"{"encoder":" H264_NVENC "}"#);
+    assert_eq!(code, 200);
+    assert_eq!(sent["sent"]["encoder"], serde_json::json!("h264_nvenc"), "ffmpeg spelling + trim must resolve");
+    driver.wait_capture("BRIDGE_CFG 60 20000 h264_nvenc", Duration::from_secs(3));
+}
+#[test]
 fn camera_frames_drive_hand_detection_and_skeleton_forward() {
     let _gate = serial();
     if live_mode() {

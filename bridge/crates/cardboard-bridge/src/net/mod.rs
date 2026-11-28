@@ -213,3 +213,60 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod encoder_choice_tests {
+    use super::EncoderChoice;
+
+    #[test]
+    fn encoder_from_name_accepts_short_and_ffmpeg_names() {
+        // E13: config files and the REST API may use either spelling; parsing
+        // must be case-insensitive and whitespace-tolerant.
+        assert_eq!(EncoderChoice::from_name("amf"), EncoderChoice::Amf);
+        assert_eq!(EncoderChoice::from_name("H264_AMF"), EncoderChoice::Amf);
+        assert_eq!(EncoderChoice::from_name(" nvenc "), EncoderChoice::Nvenc);
+        assert_eq!(EncoderChoice::from_name("h264_nvenc"), EncoderChoice::Nvenc);
+        assert_eq!(EncoderChoice::from_name("h264_qsv"), EncoderChoice::Qsv);
+        assert_eq!(EncoderChoice::from_name("QSV"), EncoderChoice::Qsv);
+        assert_eq!(EncoderChoice::from_name("libx264"), EncoderChoice::Libx264);
+        assert_eq!(EncoderChoice::from_name("gpu"), EncoderChoice::Gpu);
+        assert_eq!(EncoderChoice::from_name("CPU"), EncoderChoice::Cpu);
+        assert_eq!(EncoderChoice::from_name("auto"), EncoderChoice::Auto);
+    }
+    #[test]
+    fn encoder_from_name_unknown_or_empty_falls_back_to_auto() {
+        // E17: a typo in the config must degrade to auto, never panic and
+        // never leave the BRIDGE_CFG push unsent.
+        assert_eq!(EncoderChoice::from_name("nonsense-codec"), EncoderChoice::Auto);
+        assert_eq!(EncoderChoice::from_name(""), EncoderChoice::Auto);
+        assert_eq!(EncoderChoice::from_name("  "), EncoderChoice::Auto);
+    }
+    #[test]
+    fn encoder_picker_index_maps_ui_order_and_out_of_range_falls_back_to_gpu() {
+        // E18: the Stream-tab picker index (stale UI selections included)
+        // must never break the BRIDGE_CFG push: out-of-range -> gpu.
+        assert_eq!(EncoderChoice::from(0), EncoderChoice::Gpu);
+        assert_eq!(EncoderChoice::from(1), EncoderChoice::Cpu);
+        assert_eq!(EncoderChoice::from(2), EncoderChoice::Nvenc);
+        assert_eq!(EncoderChoice::from(3), EncoderChoice::Qsv);
+        assert_eq!(EncoderChoice::from(4), EncoderChoice::Libx264);
+        assert_eq!(EncoderChoice::from(9), EncoderChoice::Gpu);
+        assert_eq!(EncoderChoice::from(-3), EncoderChoice::Gpu);
+    }
+    #[test]
+    fn encoder_wire_names_roundtrip_through_from_name() {
+        // BRIDGE_CFG wire names must stay ffmpeg ids/aliases the driver parses.
+        for (choice, wire) in [
+            (EncoderChoice::Auto, "auto"),
+            (EncoderChoice::Amf, "h264_amf"),
+            (EncoderChoice::Nvenc, "h264_nvenc"),
+            (EncoderChoice::Qsv, "h264_qsv"),
+            (EncoderChoice::Libx264, "libx264"),
+            (EncoderChoice::Gpu, "gpu"),
+            (EncoderChoice::Cpu, "cpu"),
+        ] {
+            assert_eq!(choice.as_str(), wire);
+            assert_eq!(EncoderChoice::from_name(wire), choice);
+        }
+    }
+}

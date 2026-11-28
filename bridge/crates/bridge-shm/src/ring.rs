@@ -244,3 +244,168 @@ fn bytes_to<T: Copy>(b: &[u8]) -> Option<&T> {
     }
     Some(unsafe { &*(b.as_ptr() as *const T) })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mem::SharedMemory;
+    use crate::protocol::payload;
+
+    /// Test-side producer writing the exact wire layout the driver emits.
+    /// Serialize all tests: `BridgeConsumer::open` binds the canonical region
+    /// name, so parallel tests would fight over one mapping.
+    static RING_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct TestProducer {
+        mem: SharedMemory,
+        base: *mut u8,
+        slot_size: u32,
+        slot_count: u32,
+        seq: u64,
+    }
+    impl TestProducer {
+        fn create(slot_size: u32, slot_count: u32) -> Self {
+            let size = HEADER_SIZE + slot_size as usize * slot_count as usize;
+            let mem = SharedMemory::create(&crate::mem::region_name(), size, 0)
+                .expect("test region created");
+            let base = mem.base();
+            unsafe {
+                let header = &mut *(base as *mut RegionHeader);
+                header.magic = MAGIC;
+                header.version = PROTOCOL_VERSION;
+                header.header_size = HEADER_SIZE as u32;
+                header.slot_size = slot_size;
+                header.slot_count = slot_count;
+                header.write_seq = 0;
+                header.read_seq = 0;
+                header.dropped = 0;
+            }
+            Self { mem, base, slot_size, slot_count, seq: 0 }
+        }
+        fn write_pose(&mut self, x: f32) {
+            let i = self.seq;
+            let pose = payload::Pose { pos: [x, 0.0, 0.0], ..Default::default() };
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    (&pose as *const payload::Pose) as *const u8,
+                    std::mem::size_of::<payload::Pose>(),
+                )
+            };
+            let off = slot_offset(i, self.slot_count, self.slot_size);
+            let slot = unsafe { self.base.add(off) } as *mut SlotHeader;
+            unsafe {
+                (*slot).slot_seq = i;
+                (*slot).msg_type = MsgType::POSE;
+                (*slot).payload_len = bytes.len() as u32;
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), (slot as *mut u8).add(16), bytes.len());
+                (&mut *(self.base as *mut RegionHeader)).write_seq = i + 1;
+            }
+            self.seq += 1;
+        }
+        /// Simulates an overwritten slot the consumer has not read yet (the
+        /// producer lapped the ring while the consumer was away).
+        fn corrupt_slot(&mut self, i: u64) {
+            let off = slot_offset(i, self.slot_count, self.slot_size);
+            let slot = unsafe { self.base.add(off) } as *mut SlotHeader;
+            unsafe { (*slot).slot_seq = u64::MAX; }
+        }
+        fn set_magic(&mut self, magic: [u8; 4]) {
+            unsafe { (&mut *(self.base as *mut RegionHeader)).magic = magic; }
+        }
+        fn set_version(&mut self, version: u32) {
+            unsafe { (&mut *(self.base as *mut RegionHeader)).version = version; }
+        }
+    }
+
+    #[test]
+    fn consumer_reads_messages_in_order_and_decodes_payloads() {
+        let _g = RING_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut prod = TestProducer::create(128, 4);
+        prod.write_pose(1.0);
+        prod.write_pose(2.0);
+        prod.write_pose(3.0);
+        let mut c = BridgeConsumer::open(HEADER_SIZE + 128 * 4).expect("consumer open");
+        assert_eq!(c.pending(), 3);
+        let mut seen = Vec::new();
+        while let Some(msg) = c.try_consume() {
+            match msg {
+                BridgeMessage::Pose(p) => seen.push(p.pos[0]),
+                other => panic!("unexpected message {other:?}"),
+            }
+        }
+        assert_eq!(seen, vec![1.0, 2.0, 3.0], "messages must arrive in write order");
+        assert_eq!(c.pending(), 0, "caught up");
+        assert!(c.try_consume().is_none());
+    }
+
+    #[test]
+    fn open_starts_at_write_seq_and_skips_stale_slots() {
+        let _g = RING_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut prod = TestProducer::create(128, 4);
+        for x in 0..5u32 {
+            prod.write_pose(x as f32);
+        }
+        // The consumer starts at the driver's live cursor: stale slots are
+        // skipped, never replayed (the bridge must not re-decode old frames).
+        let mut c = BridgeConsumer::open(HEADER_SIZE + 128 * 4).expect("consumer open");
+        assert_eq!(c.pending(), 0);
+        assert!(c.try_consume().is_none());
+        prod.write_pose(9.0);
+        match c.try_consume().expect("fresh message") {
+            BridgeMessage::Pose(p) => assert_eq!(p.pos[0], 9.0),
+            other => panic!("unexpected message {other:?}"),
+        }
+    }
+
+    #[test]
+    fn overwrite_counts_dropped_and_resyncs_to_write_cursor() {
+        let _g = RING_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut prod = TestProducer::create(128, 4);
+        for x in 0..4u32 {
+            prod.write_pose(x as f32); // seq 0..3 fill the 4 slots
+        }
+        let mut c = BridgeConsumer::open(HEADER_SIZE + 128 * 4).expect("consumer open");
+        // Producer laps the ring while the consumer is away: seq 4,5 land in
+        // slots 0,1 (the consumer's seq-0 slot no longer holds seq 0).
+        prod.write_pose(4.0);
+        prod.write_pose(5.0);
+        prod.corrupt_slot(0);
+        // The gap must be counted as dropped and the consumer resynced.
+        // (The consumer opened at write_seq=4, so only seq 4..5 are dropped.)
+        assert!(c.try_consume().is_none(), "invalid slot yields None");
+        assert_eq!(c.dropped(), 2, "skipped seqs 4..5 counted dropped on resync");
+        assert_eq!(c.pending(), 0);
+        // After resync new messages flow again.
+        prod.write_pose(6.0);
+        match c.try_consume().expect("post-resync message") {
+            BridgeMessage::Pose(p) => assert_eq!(p.pos[0], 6.0),
+            other => panic!("unexpected message {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_rejects_bad_magic() {
+        let _g = RING_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut prod = TestProducer::create(128, 4);
+        prod.write_pose(1.0);
+        prod.set_magic(*b"NOPE");
+        let err = BridgeConsumer::open(HEADER_SIZE + 128 * 4).err().expect("must fail");
+        assert!(
+            matches!(err, crate::mem::MemError::InvalidState(m) if m.contains("magic")),
+            "bad magic must be an InvalidState rejection, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn open_rejects_version_mismatch() {
+        let _g = RING_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut prod = TestProducer::create(128, 4);
+        prod.write_pose(1.0);
+        prod.set_version(PROTOCOL_VERSION + 1);
+        let err = BridgeConsumer::open(HEADER_SIZE + 128 * 4).err().expect("must fail");
+        assert!(
+            matches!(err, crate::mem::MemError::InvalidState(m) if m.contains("version")),
+            "version mismatch must be an InvalidState rejection, got {err:?}"
+        );
+    }
+}

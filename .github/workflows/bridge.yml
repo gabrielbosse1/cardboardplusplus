@@ -17,7 +17,20 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
 
     - name: Run bridge tests
-      run: cargo test --manifest-path bridge/Cargo.toml
+      shell: pwsh
+      run: |
+        # Tee the output so failures reach the annotation budget (job logs
+        # themselves are not retrievable from this setup).
+        cargo test --manifest-path bridge/Cargo.toml 2>&1 | Tee-Object -FilePath cargo-test.log
+        exit $LASTEXITCODE
+    - name: Bridge failure annotations
+      if: failure()
+      shell: pwsh
+      run: |
+        Get-Content cargo-test.log -ErrorAction SilentlyContinue |
+          Select-String -Pattern 'panicked at|assertion|error\[E|error:|test result: FAILED|failures:' |
+          Select-Object -First 8 |
+          ForEach-Object { $m = $_.ToString().Trim(); if ($m.Length -gt 220) { $m = $m.Substring(0, 220) }; "::error::$m" }
 
   installer:
     # Web Setup.exe compiles offline (payload downloads at install time),
